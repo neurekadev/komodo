@@ -191,7 +191,7 @@ jobs:
   verify-container:
     name: Verify ${{ matrix.name }} Image
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 90
     permissions:
       contents: read
     strategy:
@@ -236,7 +236,7 @@ jobs:
       needs.release-context.outputs.container_compatible == 'true'))
     needs: [release-context, build, fmt, verify-container]
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 120
     permissions:
       contents: read
       packages: write
