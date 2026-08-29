@@ -7,6 +7,7 @@ COPY ./lib ./lib
 COPY ./client/core/rs ./client/core/rs
 COPY ./client/periphery ./client/periphery
 COPY ./bin/cli ./bin/cli
+COPY ./xtask ./xtask
 
 # Compile bin
 RUN cargo build -p komodo_cli --release && cargo strip
