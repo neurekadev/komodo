@@ -3,7 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
-    tags: ['[0-9]+.[0-9]+.[0-9]+\+neureka.[0-9]+']
+    tags: ["[0-9]*.[0-9]*.[0-9]*"]
   pull_request:
     branches: [main]
 
@@ -444,4 +444,4 @@ jobs:
         uses: neurekadev/create-release-action@1
         with:
           github-token: ${{ github.token }}
-          api-key: ${{ secrets.AI_API_KEY }}
+          api-key: ${{ secrets.INFERENCE_API_KEY }}
