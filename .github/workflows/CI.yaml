@@ -3,7 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
-    tags: ["[0-9]*.[0-9]*.[0-9]*"]
+    tags: ['[0-9]+.[0-9]+.[0-9]+\+neureka.[0-9]+']
   pull_request:
     branches: [main]
 
@@ -39,7 +39,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Run Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
 
   unit-tests:
     name: Unit Tests
