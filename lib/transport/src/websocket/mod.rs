@@ -9,8 +9,8 @@ use encoding::{
   EncodedResponse, JsonMessage,
 };
 use periphery_client::transport::{
-  EncodedTransportMessage, RequestMessage, ResponseMessage,
-  TerminalMessage, TransportMessage,
+  EncodedTransportMessage, FileTransferTransportMessage,
+  RequestMessage, ResponseMessage, TerminalMessage, TransportMessage,
 };
 use serde::Serialize;
 use tokio_util::sync::CancellationToken;
@@ -167,6 +167,15 @@ pub trait WebsocketSenderExt: WebsocketSender + Send {
     data: anyhow::Result<Vec<u8>>,
   ) -> impl Future<Output = anyhow::Result<()>> + Send {
     self.send_message(TerminalMessage::new(channel, data))
+  }
+
+  fn send_file_transfer(
+    &mut self,
+    channel: Uuid,
+    data: anyhow::Result<Vec<u8>>,
+  ) -> impl Future<Output = anyhow::Result<()>> + Send {
+    self
+      .send_message(FileTransferTransportMessage::new(channel, data))
   }
 }
 

@@ -7,8 +7,8 @@ use komodo_client::entities::{
 };
 use mogh_resolver::Resolve;
 use periphery_client::api::{
-  build::*, compose::*, container::*, docker::*, git::*, keys::*,
-  poll::*, stats::*, swarm::*, terminal::*, *,
+  build::*, compose::*, container::*, docker::*, file_manager::*,
+  git::*, keys::*, poll::*, stats::*, swarm::*, terminal::*, *,
 };
 use serde::{Deserialize, Serialize};
 use strum::EnumDiscriminants;
@@ -22,6 +22,7 @@ mod build;
 mod compose;
 mod container;
 mod docker;
+mod file_manager;
 mod git;
 mod keys;
 mod poll;
@@ -56,6 +57,19 @@ pub enum PeripheryRequest {
   ListGitProviders(ListGitProviders),
   ListImageRegistries(ListImageRegistries),
   ListSecrets(ListSecrets),
+
+  // File Manager
+  GetFileManagerCapabilities(GetFileManagerCapabilities),
+  ListFileManagerDirectory(ListFileManagerDirectory),
+  ReadFileManagerText(ReadFileManagerText),
+  PreflightFileManagerOperation(PreflightFileManagerOperation),
+  CommitFileManagerOperation(CommitFileManagerOperation),
+  GetFileManagerOperationStatus(GetFileManagerOperationStatus),
+  GetFileManagerJournalStatus(GetFileManagerJournalStatus),
+  UndoFileManagerOperation(UndoFileManagerOperation),
+  RedoFileManagerOperation(RedoFileManagerOperation),
+  StartFileManagerUpload(StartFileManagerUpload),
+  StartFileManagerDownload(StartFileManagerDownload),
 
   // Repo (Write)
   CloneRepo(CloneRepo),

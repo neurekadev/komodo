@@ -432,6 +432,7 @@ export enum Operation {
 	PruneDockerBuilders = "PruneDockerBuilders",
 	PruneBuildx = "PruneBuildx",
 	PruneSystem = "PruneSystem",
+	FileManager = "FileManager",
 	CreateStack = "CreateStack",
 	UpdateStack = "UpdateStack",
 	RenameStack = "RenameStack",
@@ -6645,6 +6646,38 @@ export interface CloseAlert {
 }
 
 /**
+ * A filesystem root exposed by the File Manager.
+ *
+ * Core resolves this logical target to a trusted host root. Host paths are
+ * never accepted from, or returned to, API clients.
+ */
+export type FileManagerTarget =
+	| { type: "Stack", params: {
+	stack: string;
+}}
+	| { type: "Volume", params: {
+	server: string;
+	volume: string;
+}};
+
+export enum FileManagerConflictAction {
+	Skip = "skip",
+	Overwrite = "overwrite",
+}
+
+export interface FileManagerConflictDecision {
+	path: string;
+	action: FileManagerConflictAction;
+}
+
+export interface CommitFileManagerOperation {
+	target: FileManagerTarget;
+	plan_id: string;
+	decisions?: FileManagerConflictDecision[];
+	confirmed?: boolean;
+}
+
+/**
  * Exports matching resources, and writes to the target sync's resource file. Response: [Update]
  * 
  * Note. Will fail if the Sync is not `managed`.
@@ -7896,6 +7929,105 @@ export interface ExportResourcesToToml {
 	existing?: ResourcesToml;
 }
 
+export interface FileManagerLimits {
+	max_text_bytes: U64;
+	max_entries: U64;
+	max_depth: U64;
+	max_archive_expanded_bytes: U64;
+	max_archive_expansion_ratio: U64;
+	minimum_free_bytes: U64;
+}
+
+export interface FileManagerCapabilities {
+	available: boolean;
+	read_only: boolean;
+	reason?: string;
+	managed_file?: string;
+	limits: FileManagerLimits;
+}
+
+export enum FileManagerEntryKind {
+	File = "file",
+	Directory = "directory",
+	Symlink = "symlink",
+	Special = "special",
+}
+
+export interface FileManagerConflict {
+	path: string;
+	existing_kind: FileManagerEntryKind;
+	incoming_kind: FileManagerEntryKind;
+}
+
+/** An opaque optimistic-concurrency revision. */
+export interface FileManagerRevision {
+	id: string;
+}
+
+export interface FileManagerEntry {
+	/** Normalized root-relative path using `/` separators. */
+	path: string;
+	name: string;
+	kind: FileManagerEntryKind;
+	size: U64;
+	/** Unix timestamp in milliseconds. */
+	modified_at: I64;
+	revision: FileManagerRevision;
+	/** The entry is the database-managed compose source. */
+	managed?: boolean;
+}
+
+export interface FileManagerDirectory {
+	path: string;
+	entries: FileManagerEntry[];
+}
+
+export interface FileManagerJournalStatus {
+	can_undo: boolean;
+	can_redo: boolean;
+	undo_description?: string;
+	redo_description?: string;
+	expires_at?: I64;
+}
+
+export enum FileManagerOperationState {
+	Pending = "pending",
+	Running = "running",
+	Complete = "complete",
+	Failed = "failed",
+	Cancelled = "cancelled",
+}
+
+export interface FileManagerOperationStatus {
+	operation_id: string;
+	state: FileManagerOperationState;
+	completed_entries: U64;
+	total_entries: U64;
+	completed_bytes: U64;
+	total_bytes: U64;
+	error?: string;
+}
+
+export interface FileManagerPreflight {
+	plan_id: string;
+	expires_at: I64;
+	conflicts: FileManagerConflict[];
+	confirmation_required: boolean;
+}
+
+export interface FileManagerTextFile {
+	path: string;
+	contents: string;
+	revision: FileManagerRevision;
+}
+
+export interface FileManagerTransferTicket {
+	operation_id: string;
+	token: string;
+	url: string;
+	expires_at: I64;
+}
+
 /**
  * **Admin only.**
  * Find a user.
@@ -8244,6 +8376,19 @@ export interface GetDeploymentsSummaryResponse {
 	unhealthy: I64;
 	/** The number of Deployments with Unknown state */
 	unknown: I64;
+}
+
+export interface GetFileManagerCapabilities {
+	target: FileManagerTarget;
+}
+
+export interface GetFileManagerJournalStatus {
+	target: FileManagerTarget;
+}
+
+export interface GetFileManagerOperationStatus {
+	target: FileManagerTarget;
+	operation_id: string;
 }
 
 /**
@@ -9351,6 +9496,11 @@ export interface ListDeployments {
 	sort_desc?: boolean;
 }
 
+export interface ListFileManagerDirectory {
+	target: FileManagerTarget;
+	path?: string;
+}
+
 /** List actions matching optional query. Response: [ListFullActionsResponse]. */
 export interface ListFullActions {
 	/** optional structured query to filter actions. */
@@ -10335,6 +10485,63 @@ export interface PauseStack {
 	services?: string[];
 }
 
+export type FileManagerOperation =
+	| { type: "CreateFile", params: {
+	path: string;
+}}
+	| { type: "CreateDirectory", params: {
+	path: string;
+}}
+	| { type: "Rename", params: {
+	path: string;
+	new_name: string;
+}}
+	| { type: "Move", params: {
+	paths: string[];
+	destination: string;
+}}
+	| { type: "Copy", params: {
+	paths: string[];
+	destination: string;
+}}
+	| { type: "Delete", params: {
+	paths: string[];
+}}
+	| { type: "WriteText", params: {
+	path: string;
+	contents: string;
+	expected_revision: FileManagerRevision;
+}}
+	| { type: "CreateArchive", params: {
+	paths: string[];
+	destination: string;
+	format: FileManagerArchiveFormat;
+}}
+	| { type: "ExtractArchive", params: {
+	path: string;
+	destination: string;
+}};
+
+export interface PreflightFileManagerOperation {
+	target: FileManagerTarget;
+	operation: FileManagerOperation;
+}
+
+export interface PrepareFileManagerDownload {
+	target: FileManagerTarget;
+	paths: string[];
+}
+
+export interface PrepareFileManagerUpload {
+	target: FileManagerTarget;
+	destination: string;
+	file_names: string[];
+	total_bytes?: U64;
+	overwrite?: boolean;
+	confirmed?: boolean;
+	expected_revision?: FileManagerRevision;
+}
+
 /**
  * Prunes the docker buildx cache on the target server. Response: [Update].
  * 
@@ -10448,6 +10655,16 @@ export interface PushRecentlyViewed {
 export interface PushoverAlerterEndpoint {
 	/** The pushover URL including application and user tokens in parameters. */
 	url: string;
+}
+
+export interface ReadFileManagerText {
+	target: FileManagerTarget;
+	path: string;
+}
+
+export interface RedoFileManagerOperation {
+	target: FileManagerTarget;
+	confirmed?: boolean;
 }
 
 /** Trigger a refresh of the cached latest hash and message. */
@@ -11293,6 +11510,11 @@ export interface TotalDiskUsage {
 	total_gb: number;
 }
 
+export interface UndoFileManagerOperation {
+	target: FileManagerTarget;
+	confirmed?: boolean;
+}
+
 /** Unpauses all containers on the target server. Response: [Update] */
 export interface UnpauseAllContainers {
 	/** Name or id */
@@ -11891,6 +12113,13 @@ export type ExecuteRequest =
 	| { type: "RotateAllServerKeys", params: RotateAllServerKeys }
 	| { type: "RotateCoreKeys", params: RotateCoreKeys };
 
+export enum FileManagerArchiveFormat {
+	Zip = "zip",
+	Tar = "tar",
+	TarGz = "tar_gz",
+	SevenZip = "seven_zip",
+}
+
 /**
  * One representative IANA zone for each distinct base UTC offset in the tz database.
  * https://en.wikipedia.org/wiki/List_of_tz_database_time_zones.
@@ -12044,6 +12273,11 @@ export type ReadRequest =
 	| { type: "ListAllStackServices", params: ListAllStackServices }
 	| { type: "ListCommonStackExtraArgs", params: ListCommonStackExtraArgs }
 	| { type: "ListCommonStackBuildExtraArgs", params: ListCommonStackBuildExtraArgs }
+	| { type: "GetFileManagerCapabilities", params: GetFileManagerCapabilities }
+	| { type: "ListFileManagerDirectory", params: ListFileManagerDirectory }
+	| { type: "ReadFileManagerText", params: ReadFileManagerText }
+	| { type: "GetFileManagerOperationStatus", params: GetFileManagerOperationStatus }
+	| { type: "GetFileManagerJournalStatus", params: GetFileManagerJournalStatus }
 	| { type: "GetDeploymentsSummary", params: GetDeploymentsSummary }
 	| { type: "GetDeployment", params: GetDeployment }
 	| { type: "GetDeploymentContainer", params: GetDeploymentContainer }
@@ -12202,6 +12436,12 @@ export type WriteRequest =
 	| { type: "RefreshStackCache", params: RefreshStackCache }
 	| { type: "CheckStackForUpdate", params: CheckStackForUpdate }
 	| { type: "BatchCheckStackForUpdate", params: BatchCheckStackForUpdate }
+	| { type: "PreflightFileManagerOperation", params: PreflightFileManagerOperation }
+	| { type: "CommitFileManagerOperation", params: CommitFileManagerOperation }
+	| { type: "PrepareFileManagerUpload", params: PrepareFileManagerUpload }
+	| { type: "PrepareFileManagerDownload", params: PrepareFileManagerDownload }
+	| { type: "UndoFileManagerOperation", params: UndoFileManagerOperation }
+	| { type: "RedoFileManagerOperation", params: RedoFileManagerOperation }
 	| { type: "CreateDeployment", params: CreateDeployment }
 	| { type: "CopyDeployment", params: CopyDeployment }
 	| { type: "CreateDeploymentFromContainer", params: CreateDeploymentFromContainer }
@@ -12298,4 +12538,3 @@ export type WsLoginMessage =
 	key: string;
 	secret: string;
 }};
-

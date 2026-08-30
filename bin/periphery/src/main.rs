@@ -14,6 +14,7 @@ mod api;
 mod config;
 mod connection;
 mod docker;
+mod file_manager;
 mod helpers;
 mod stack;
 mod state;
@@ -26,6 +27,7 @@ async fn app() -> anyhow::Result<()> {
   mogh_logger::init(&config.logging)?;
 
   let startup_span = info_span!("PeripheryStartup");
+  file_manager::initialize().await?;
 
   let mut handles = async {
     info!("Komodo Periphery version: v{}", env!("CARGO_PKG_VERSION"));
@@ -48,7 +50,6 @@ async fn app() -> anyhow::Result<()> {
 
     stats::spawn_polling_thread();
     docker::stats::spawn_polling_thread();
-
     let handles = FuturesUnordered::new();
 
     // Spawn client side connections

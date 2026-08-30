@@ -16,6 +16,7 @@ use crate::{
   state::periphery_connections,
 };
 
+pub mod file_manager;
 pub mod terminal;
 
 #[derive(Debug)]

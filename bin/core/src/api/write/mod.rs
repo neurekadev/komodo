@@ -24,6 +24,7 @@ mod alerter;
 mod build;
 mod builder;
 mod deployment;
+mod file_manager;
 mod onboarding;
 mod permissions;
 mod procedure;
@@ -96,6 +97,14 @@ pub enum WriteRequest {
   RefreshStackCache(RefreshStackCache),
   CheckStackForUpdate(CheckStackForUpdate),
   BatchCheckStackForUpdate(BatchCheckStackForUpdate),
+
+  // ==== FILE MANAGER ====
+  PreflightFileManagerOperation(PreflightFileManagerOperation),
+  CommitFileManagerOperation(CommitFileManagerOperation),
+  PrepareFileManagerUpload(PrepareFileManagerUpload),
+  PrepareFileManagerDownload(PrepareFileManagerDownload),
+  UndoFileManagerOperation(UndoFileManagerOperation),
+  RedoFileManagerOperation(RedoFileManagerOperation),
 
   // ==== DEPLOYMENT ====
   CreateDeployment(CreateDeployment),

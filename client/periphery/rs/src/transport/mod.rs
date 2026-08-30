@@ -7,6 +7,8 @@ use encoding::{
 
 mod login;
 pub use login::*;
+mod file_transfer;
+pub use file_transfer::*;
 use serde::de::DeserializeOwned;
 use strum::EnumDiscriminants;
 use uuid::Uuid;
@@ -33,6 +35,7 @@ pub enum TransportMessage {
   Request(EncodedRequestMessage),
   Response(EncodedResponseMessage),
   Terminal(EncodedTerminalMessage),
+  FileTransfer(EncodedFileTransferMessage),
 }
 
 impl Encode<EncodedTransportMessage> for TransportMessage {
@@ -44,6 +47,7 @@ impl Encode<EncodedTransportMessage> for TransportMessage {
       TransportMessage::Request(data) => data.0.into_vec(),
       TransportMessage::Response(data) => data.0.into_vec(),
       TransportMessage::Terminal(data) => data.0.into_vec(),
+      TransportMessage::FileTransfer(data) => data.0.into_vec(),
     };
     bytes.push(variant_byte);
     EncodedTransportMessage(bytes)
@@ -71,6 +75,9 @@ impl Decode<TransportMessage> for EncodedTransportMessage {
         Terminal => TransportMessage::Terminal(
           EncodedTerminalMessage(EncodedChannel::from_vec(bytes)),
         ),
+        FileTransfer => TransportMessage::FileTransfer(
+          EncodedFileTransferMessage(EncodedChannel::from_vec(bytes)),
+        ),
       };
     Ok(message)
   }
@@ -84,6 +91,7 @@ impl TransportMessageVariant {
       1 => Request,
       2 => Response,
       3 => Terminal,
+      4 => FileTransfer,
       other => {
         return Err(anyhow!(
           "Got unrecognized TransportMessageVariant byte: {other}"
@@ -100,6 +108,7 @@ impl TransportMessageVariant {
       Request => 1,
       Response => 2,
       Terminal => 3,
+      FileTransfer => 4,
     }
   }
 }
@@ -238,6 +247,55 @@ impl Decode<WithChannel<anyhow::Result<Vec<u8>>>>
     Ok(self.0.decode()?.map(|data| {
       data.decode().and_then(|r| {
         r.context("Terminal should not recieve Pending byte")
+      })
+    }))
+  }
+}
+
+// =======================
+//  FILE TRANSFER MESSAGE
+// =======================
+
+#[derive(Debug)]
+pub struct EncodedFileTransferMessage(
+  EncodedChannel<EncodedResponse<Vec<u8>>>,
+);
+
+impl_cast_bytes_vec!(EncodedFileTransferMessage, EncodedChannel);
+
+pub struct FileTransferTransportMessage(
+  WithChannel<anyhow::Result<Vec<u8>>>,
+);
+
+impl FileTransferTransportMessage {
+  pub fn new(channel: Uuid, bytes: anyhow::Result<Vec<u8>>) -> Self {
+    Self(WithChannel {
+      channel,
+      data: bytes,
+    })
+  }
+}
+
+impl Encode<EncodedTransportMessage>
+  for FileTransferTransportMessage
+{
+  fn encode(self) -> EncodedTransportMessage {
+    TransportMessage::FileTransfer(EncodedFileTransferMessage(
+      self.0.map_encode(),
+    ))
+    .encode()
+  }
+}
+
+impl Decode<WithChannel<anyhow::Result<Vec<u8>>>>
+  for EncodedFileTransferMessage
+{
+  fn decode(
+    self,
+  ) -> anyhow::Result<WithChannel<anyhow::Result<Vec<u8>>>> {
+    Ok(self.0.decode()?.map(|data| {
+      data.decode().and_then(|response| {
+        response.context("File transfer cannot be pending")
       })
     }))
   }

@@ -128,6 +128,9 @@ async fn handle_socket<W: Websocket>(
         TransportMessage::Terminal(message) => {
           crate::terminal::handle_message(message).await
         }
+        TransportMessage::FileTransfer(message) => {
+          crate::file_manager::handle_transfer_message(message).await
+        }
         // Rest shouldn't be received by Periphery
         _ => {}
       }

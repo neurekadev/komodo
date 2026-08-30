@@ -80,6 +80,13 @@ export type ReadResponses = {
   ListCommonStackExtraArgs: Types.ListCommonStackExtraArgsResponse;
   ListCommonStackBuildExtraArgs: Types.ListCommonStackBuildExtraArgsResponse;
 
+  // ==== FILE MANAGER ====
+  GetFileManagerCapabilities: Types.FileManagerCapabilities;
+  ListFileManagerDirectory: Types.FileManagerDirectory;
+  ReadFileManagerText: Types.FileManagerTextFile;
+  GetFileManagerOperationStatus: Types.FileManagerOperationStatus;
+  GetFileManagerJournalStatus: Types.FileManagerJournalStatus;
+
   // ==== DEPLOYMENT ====
   GetDeploymentsSummary: Types.GetDeploymentsSummaryResponse;
   GetDeployment: Types.GetDeploymentResponse;
@@ -228,6 +235,14 @@ export type WriteResponses = {
   RefreshStackCache: Types.NoData;
   CheckStackForUpdate: Types.CheckStackForUpdateResponse;
   BatchCheckStackForUpdate: Types.BatchCheckStackForUpdateResponse;
+
+  // ==== FILE MANAGER ====
+  PreflightFileManagerOperation: Types.FileManagerPreflight;
+  CommitFileManagerOperation: Types.Update;
+  PrepareFileManagerUpload: Types.FileManagerTransferTicket;
+  PrepareFileManagerDownload: Types.FileManagerTransferTicket;
+  UndoFileManagerOperation: Types.Update;
+  RedoFileManagerOperation: Types.Update;
 
   // ==== DEPLOYMENT ====
   CreateDeployment: Types.Deployment;

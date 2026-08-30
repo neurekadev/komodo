@@ -260,6 +260,9 @@ pub type ResponseChannels =
 pub type TerminalChannels =
   CloneCache<Uuid, Sender<anyhow::Result<Vec<u8>>>>;
 
+pub type FileTransferChannels =
+  CloneCache<Uuid, Sender<anyhow::Result<Vec<u8>>>>;
+
 #[derive(Debug)]
 pub struct PeripheryConnection {
   /// The connection args
@@ -278,6 +281,8 @@ pub struct PeripheryConnection {
   pub responses: Arc<ResponseChannels>,
   /// Forward bytes from Periphery to terminal channel handlers.
   pub terminals: Arc<TerminalChannels>,
+  /// Forward binary file-transfer frames to active HTTP streams.
+  pub file_transfers: Arc<FileTransferChannels>,
 }
 
 impl PeripheryConnection {
@@ -297,6 +302,7 @@ impl PeripheryConnection {
         error: Default::default(),
         responses: Default::default(),
         terminals: Default::default(),
+        file_transfers: Default::default(),
       }
       .into(),
       receiever,
@@ -322,6 +328,7 @@ impl PeripheryConnection {
         error: self.error.clone(),
         responses: self.responses.clone(),
         terminals: self.terminals.clone(),
+        file_transfers: self.file_transfers.clone(),
       }
       .into(),
       receiever,
@@ -465,6 +472,26 @@ impl PeripheryConnection {
         }
         Err(e) => {
           warn!("Failed to read Terminal message | {e:#}");
+        }
+      },
+      TransportMessage::FileTransfer(data) => match data.decode() {
+        Ok(WithChannel { channel, data }) => {
+          let Some(transfer) =
+            self.file_transfers.get(&channel).await
+          else {
+            warn!(
+              "Failed to forward file transfer | No channel found at {channel}"
+            );
+            return;
+          };
+          if let Err(error) = transfer.send(data).await {
+            warn!(
+              "Failed to forward file transfer at {channel} | {error:#}"
+            );
+          }
+        }
+        Err(error) => {
+          warn!("Failed to decode file-transfer message | {error:#}");
         }
       },
       //

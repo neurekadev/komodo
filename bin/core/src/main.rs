@@ -14,6 +14,7 @@ mod auth;
 mod cloud;
 mod config;
 mod connection;
+mod file_manager;
 mod helpers;
 mod monitor;
 mod network;

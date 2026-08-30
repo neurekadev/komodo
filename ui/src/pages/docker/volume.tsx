@@ -1,17 +1,22 @@
 import ContainersSection from "@/components/docker/containers-section";
 import DockerLabelsSection from "@/components/docker/labels-section";
 import DockerOptions from "@/components/docker/options";
+import FileManager from "@/components/file-manager";
 import InspectSection from "@/components/inspect-section";
 import { useExecute, usePermissions, useRead, useSetTitle } from "@/lib/hooks";
 import { useServer } from "@/resources/server";
 import ResourceSubPage from "@/resources/sub-page";
 import { ICONS } from "@/lib/icons";
-import { ConfirmButton } from "mogh_ui";
+import { ConfirmButton, MobileFriendlyTabsSelector, TabNoContent } from "mogh_ui";
 import { DataTable } from "mogh_ui";
 import { Section } from "mogh_ui";
-import { Center, Group, Loader, Text } from "@mantine/core";
+import { Center, Group, Loader, Stack, Tabs, Text } from "@mantine/core";
+import { useLocalStorage } from "@mantine/hooks";
 import { Types } from "komodo_client";
 import { useNavigate, useParams } from "react-router-dom";
+import { useMemo } from "react";
+
+type VolumeView = "Info" | "Files";
 
 export default function Volume() {
   const { type, id, volume } = useParams() as {
@@ -36,6 +41,10 @@ function VolumeInner({
   serverId: string;
   volumeName: string;
 }) {
+  const [view, setView] = useLocalStorage<VolumeView>({
+    key: `volume-${serverId}-${volumeName}-tab-v1`,
+    defaultValue: "Info",
+  });
   const server = useServer(serverId);
   useSetTitle(`${server?.name} | Volume | ${volumeName}`);
   const nav = useNavigate();
@@ -97,6 +106,21 @@ function VolumeInner({
 
   const intention = unused ? "Critical" : "Good";
 
+  const tabs = useMemo<TabNoContent[]>(
+    () => [
+      { value: "Info", icon: ICONS.Info },
+      { value: "Files", icon: ICONS.FileManager },
+    ],
+    [],
+  );
+  const selector = (
+    <MobileFriendlyTabsSelector
+      tabs={tabs}
+      value={view}
+      onValueChange={setView as any}
+    />
+  );
+
   return (
     <ResourceSubPage
       entityTypeName="Volume"
@@ -127,44 +151,58 @@ function VolumeInner({
         )
       }
     >
-      {containers && containers.length > 0 && (
-        <ContainersSection serverId={serverId} containers={containers} />
-      )}
+      <Tabs value={view}>
+        {view === "Files" ? (
+          <FileManager
+            target={{
+              type: "Volume",
+              params: { server: serverId, volume: volumeName },
+            }}
+            titleOther={selector}
+          />
+        ) : (
+          <Stack>
+            <Group justify="end">{selector}</Group>
+            {containers && containers.length > 0 && (
+              <ContainersSection serverId={serverId} containers={containers} />
+            )}
 
-      {/* TOP LEVEL NETWORK INFO */}
-      <Section title="Details" icon={<ICONS.Info size="1.3rem" />}>
-        <DataTable
-          tableKey="volume-info"
-          data={[volume]}
-          columns={[
-            {
-              accessorKey: "Driver",
-              header: "Driver",
-            },
-            {
-              accessorKey: "Scope",
-              header: "Scope",
-            },
-            {
-              accessorKey: "CreatedAt",
-              header: "Created At",
-            },
-            {
-              accessorKey: "UsageData.Size",
-              header: "Used Size",
-            },
-          ]}
-        />
-        {volume.Options && (
-          <DockerOptions options={Object.entries(volume.Options)} />
+            <Section title="Details" icon={<ICONS.Info size="1.3rem" />}>
+              <DataTable
+                tableKey="volume-info"
+                data={[volume]}
+                columns={[
+                  {
+                    accessorKey: "Driver",
+                    header: "Driver",
+                  },
+                  {
+                    accessorKey: "Scope",
+                    header: "Scope",
+                  },
+                  {
+                    accessorKey: "CreatedAt",
+                    header: "Created At",
+                  },
+                  {
+                    accessorKey: "UsageData.Size",
+                    header: "Used Size",
+                  },
+                ]}
+              />
+              {volume.Options && (
+                <DockerOptions options={Object.entries(volume.Options)} />
+              )}
+            </Section>
+
+            {specific.includes(Types.SpecificPermission.Inspect) && (
+              <InspectSection json={volume} showToggle />
+            )}
+
+            <DockerLabelsSection labels={volume?.Labels} />
+          </Stack>
         )}
-      </Section>
-
-      {specific.includes(Types.SpecificPermission.Inspect) && (
-        <InspectSection json={volume} showToggle />
-      )}
-
-      <DockerLabelsSection labels={volume?.Labels} />
+      </Tabs>
     </ResourceSubPage>
   );
 }

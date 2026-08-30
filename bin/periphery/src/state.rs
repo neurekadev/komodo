@@ -11,7 +11,9 @@ use komodo_client::entities::{
 };
 use mogh_cache::{CloneCache, CloneVecCache};
 use mogh_pki::{PkiKind, RotatableKeyPair, SpkiPublicKey};
-use periphery_client::transport::EncodedTransportMessage;
+use periphery_client::transport::{
+  EncodedTransportMessage, FileTransferMessage,
+};
 use tokio::sync::{Mutex, OnceCell, RwLock, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use transport::channel::BufferedChannel;
@@ -217,6 +219,38 @@ pub fn terminal_channels() -> &'static TerminalChannels {
 pub struct TerminalChannel {
   pub sender: mpsc::Sender<TerminalStdinMessage>,
   pub cancel: CancellationToken,
+}
+
+#[derive(Default)]
+pub struct FileTransferChannels(
+  CloneCache<Uuid, mpsc::Sender<anyhow::Result<FileTransferMessage>>>,
+);
+
+impl FileTransferChannels {
+  pub async fn get(
+    &self,
+    channel: &Uuid,
+  ) -> Option<mpsc::Sender<anyhow::Result<FileTransferMessage>>> {
+    self.0.get(channel).await
+  }
+
+  pub async fn insert(
+    &self,
+    channel: Uuid,
+    sender: mpsc::Sender<anyhow::Result<FileTransferMessage>>,
+  ) {
+    self.0.insert(channel, sender).await;
+  }
+
+  pub async fn remove(&self, channel: &Uuid) {
+    self.0.remove(channel).await;
+  }
+}
+
+pub fn file_transfer_channels() -> &'static FileTransferChannels {
+  static FILE_TRANSFERS: OnceLock<FileTransferChannels> =
+    OnceLock::new();
+  FILE_TRANSFERS.get_or_init(Default::default)
 }
 
 pub fn terminal_triggers() -> &'static TerminalTriggers {

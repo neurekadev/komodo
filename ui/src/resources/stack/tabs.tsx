@@ -13,8 +13,15 @@ import StackInfo from "./info";
 import StackServices from "./services";
 import StackLog from "./log";
 import TerminalSection from "@/components/terminal/section";
+import FileManager from "@/components/file-manager";
 
-type StackTabsView = "Config" | "Info" | "Services" | "Log" | "Terminals";
+type StackTabsView =
+  | "Config"
+  | "Info"
+  | "Services"
+  | "Files"
+  | "Log"
+  | "Terminals";
 
 export default function StackTabs({ id }: { id: string }) {
   const [_view, setView] = useLocalStorage<StackTabsView>({
@@ -74,6 +81,10 @@ export default function StackTabs({ id }: { id: string }) {
         icon: ICONS.Service,
       },
       {
+        value: "Files",
+        icon: ICONS.FileManager,
+      },
+      {
         value: "Log",
         disabled: hideLogs,
         icon: ICONS.Log,
@@ -122,6 +133,14 @@ export default function StackTabs({ id }: { id: string }) {
       break;
     case "Services":
       View = <StackServices id={id} titleOther={Selector} />;
+      break;
+    case "Files":
+      View = (
+        <FileManager
+          target={{ type: "Stack", params: { stack: id } }}
+          titleOther={Selector}
+        />
+      );
       break;
     case "Log":
       View = <StackLog id={id} titleOther={Selector} />;

@@ -4,8 +4,8 @@ use encoding::{
 };
 use futures_util::FutureExt;
 use periphery_client::transport::{
-  EncodedTransportMessage, RequestMessage, ResponseMessage,
-  TerminalMessage,
+  EncodedTransportMessage, FileTransferTransportMessage,
+  RequestMessage, ResponseMessage, TerminalMessage,
 };
 use serde::Serialize;
 use tokio::sync::{Mutex, MutexGuard, mpsc};
@@ -136,6 +136,16 @@ impl Sender<EncodedTransportMessage> {
         channel,
         Err(anyhow!("pty exited")),
       ))
+      .await
+  }
+
+  pub async fn send_file_transfer(
+    &self,
+    channel: Uuid,
+    data: anyhow::Result<Vec<u8>>,
+  ) -> anyhow::Result<()> {
+    self
+      .send_message(FileTransferTransportMessage::new(channel, data))
       .await
   }
 }

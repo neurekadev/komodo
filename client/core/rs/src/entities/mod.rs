@@ -39,6 +39,8 @@ pub mod config;
 pub mod deployment;
 /// Networks, Images, Containers.
 pub mod docker;
+/// Shared secure filesystem browsing types.
+pub mod file_manager;
 /// Subtypes of [LogConfig][logger::LogConfig].
 pub mod logger;
 /// Subtypes of [CreationKey][creation_key::CreationKey]
@@ -1247,6 +1249,7 @@ pub enum Operation {
   PruneDockerBuilders,
   PruneBuildx,
   PruneSystem,
+  FileManager,
 
   // Stack
   CreateStack,
