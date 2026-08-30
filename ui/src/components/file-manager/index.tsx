@@ -400,6 +400,9 @@ export default function FileManager({
   const [sortAscending, setSortAscending] = useState(true);
   const [editorPath, setEditorPath] = useState<string>();
   const [draft, setDraft] = useState("");
+  const editorSource = useRef<{ path: string; contents: string } | undefined>(
+    undefined,
+  );
   const [discardEditorOpen, setDiscardEditorOpen] = useState(false);
   const [action, setAction] = useState<ActionDialog>(null);
   const [actionValue, setActionValue] = useState("");
@@ -531,8 +534,22 @@ export default function FileManager({
   );
 
   useEffect(() => {
-    if (textFile.data) setDraft(textFile.data.contents);
-  }, [textFile.data]);
+    if (!editorPath) {
+      editorSource.current = undefined;
+      return;
+    }
+    if (!textFile.data || textFile.data.path !== editorPath) return;
+    const previous = editorSource.current;
+    setDraft((current) =>
+      previous?.path !== textFile.data.path || current === previous.contents
+        ? textFile.data.contents
+        : current,
+    );
+    editorSource.current = {
+      path: textFile.data.path,
+      contents: textFile.data.contents,
+    };
+  }, [editorPath, textFile.data]);
 
   useEffect(() => {
     setSelected([]);
