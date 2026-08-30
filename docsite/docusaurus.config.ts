@@ -18,7 +18,7 @@ const config: Config = {
 
   // GitHub pages deployment config.
   // If you aren't using GitHub pages, you don't need these.
-  organizationName: "moghtech", // Usually your GitHub org/user name.
+  organizationName: "neurekadev", // Usually your GitHub org/user name.
   projectName: "komodo", // Usually your repo name.
   trailingSlash: false,
   deploymentBranch: "gh-pages-docs",
@@ -45,7 +45,7 @@ const config: Config = {
       {
         docs: {
           sidebarPath: "./sidebars.ts",
-          editUrl: "https://github.com/moghtech/komodo/tree/main/docsite",
+          editUrl: "https://github.com/neurekadev/komodo/tree/main/docsite",
         },
         blog: false,
         theme: {
@@ -99,7 +99,7 @@ const config: Config = {
           position: "right",
         },
         {
-          href: "https://github.com/moghtech/komodo",
+          href: "https://github.com/neurekadev/komodo",
           label: "GitHub",
           position: "right",
         },
@@ -127,7 +127,7 @@ const config: Config = {
         {
           title: "Project",
           items: [
-            { label: "GitHub", href: "https://github.com/moghtech/komodo" },
+            { label: "GitHub", href: "https://github.com/neurekadev/komodo" },
             { label: "Donate", href: "https://opencollective.com/komodo" },
             { label: "Demo", href: "https://demo.komo.do" },
           ],

@@ -48,13 +48,13 @@ function HomepageHeader() {
           </Link>
           <Link
             className={"button button--secondary button--lg " + styles["mobile-full-grid"]}
-            to="https://github.com/moghtech/komodo"
+            to="https://github.com/neurekadev/komodo"
           >
             GitHub
           </Link>
           <Link
             className={"button button--secondary button--lg " + styles["mobile-full-grid"]}
-            to="https://github.com/moghtech/komodo#screenshots"
+            to="https://github.com/neurekadev/komodo#screenshots"
           >
             Screenshots
           </Link>

@@ -81,7 +81,7 @@ km attach <container> [options]
 ### Install
 
 There are binaries available for **Linux** (x86_64 / aarch64), **MacOS** (apple silicon), as
-well as a distroless image: **`ghcr.io/moghtech/komodo-cli`**.
+well as a distroless image: **`ghcr.io/neurekadev/komodo-cli`**.
 
 #### Linux
 
@@ -109,7 +109,7 @@ brew tap moghtech/komodo && \
 
 You can alias a docker run command:
 ```bash
-alias km='docker run --rm -v $HOME/.config/komodo:/config ghcr.io/moghtech/komodo-cli:2 km'
+alias km='docker run --rm -v $HOME/.config/komodo:/config ghcr.io/neurekadev/komodo-cli:3 km'
 km config
 ```
 
@@ -163,15 +163,15 @@ You can use it-tools to convert this TOML file to your preferred format:
 
 Quick download to `./komodo/komodo.cli.toml`:
 ```bash
-wget -P komodo https://raw.githubusercontent.com/moghtech/komodo/main/config/komodo.cli.toml
+wget -P komodo https://raw.githubusercontent.com/neurekadev/komodo/main/config/komodo.cli.toml
 ```
 
 ```mdx-code-block
 import RemoteCodeFile from "@site/src/components/RemoteCodeFile";
 
 <RemoteCodeFile
-	title="https://github.com/moghtech/komodo/blob/main/config/komodo.cli.toml"
-	url="https://raw.githubusercontent.com/moghtech/komodo/main/config/komodo.cli.toml"
+	title="https://github.com/neurekadev/komodo/blob/main/config/komodo.cli.toml"
+	url="https://raw.githubusercontent.com/neurekadev/komodo/main/config/komodo.cli.toml"
 	language="toml"
 />
 ```

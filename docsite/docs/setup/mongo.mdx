@@ -4,17 +4,24 @@
 
 ## Quick Start
 
-1. Copy `komodo/mongo.compose.yaml` and `komodo/compose.env` to your host:
-```bash
-wget -P komodo https://raw.githubusercontent.com/moghtech/komodo/main/compose/mongo.compose.yaml && \
-  wget -P komodo https://raw.githubusercontent.com/moghtech/komodo/main/compose/compose.env
-```
-2. Edit the variables in `komodo/compose.env`.
-3. Deploy using command:
+1. Create the installation directory and download the MongoDB template as `compose.yaml` and the environment file as `.env`:
 
 ```bash
-docker compose -p komodo -f komodo/mongo.compose.yaml --env-file komodo/compose.env up -d
+mkdir -p komodo
+cd komodo
+curl -fsSL -o compose.yaml https://raw.githubusercontent.com/neurekadev/komodo/main/compose/mongo.compose.yaml
+curl -fsSL -o .env https://raw.githubusercontent.com/neurekadev/komodo/main/compose/compose.env
 ```
+
+2. Edit `.env`, replacing the example host, credentials, and secrets.
+3. Review the resolved configuration and deploy:
+
+```bash
+docker compose config
+docker compose up -d
+```
+
+Docker Compose discovers `compose.yaml` and `.env` automatically. The `.env` file sets `COMPOSE_PROJECT_NAME=komodo`, preserving the established `komodo_*` volume names.
 
 ```mdx-code-block
 import ComposeAndEnv from "@site/src/components/ComposeAndEnv";

@@ -2,6 +2,7 @@
 
 ```mdx-code-block
 import RemoteCodeFile from "@site/src/components/RemoteCodeFile";
+import ComposeAndEnv from "@site/src/components/ComposeAndEnv";
 ```
 
 Every server you want to manage with Komodo needs the **Periphery** agent installed.
@@ -16,7 +17,7 @@ Connecting a server has 3 steps:
 
 ## Install Periphery
 
-You can install Periphery as a systemd managed process, run it as a [docker container](https://github.com/moghtech/komodo/pkgs/container/komodo-periphery), or run the binary directly with another process manager.
+You can install Periphery as a systemd managed process, run it as a [docker container](https://github.com/neurekadev/komodo/pkgs/container/komodo-periphery), or run the binary directly with another process manager.
 
 ### Systemd
 
@@ -85,14 +86,28 @@ An example of such a setup can be found here: https://github.com/bpbradley/ansib
 
 ### Container
 
-You can use a docker compose file:
+Create a directory containing the host-facing `compose.yaml` and `.env` files:
+
+```bash
+mkdir -p komodo
+cd komodo
+curl -fsSL -o compose.yaml https://raw.githubusercontent.com/neurekadev/komodo/main/compose/periphery.compose.yaml
+curl -fsSL -o .env https://raw.githubusercontent.com/neurekadev/komodo/main/compose/compose.env
+```
+
+Edit `.env` and set `PERIPHERY_CORE_ADDRESS`, `PERIPHERY_CONNECT_AS`, and an optional `PERIPHERY_ONBOARDING_KEY`. Set `PERIPHERY_DOCKER_VOLUME_ROOT` to Docker's absolute host volume directory; `/var/lib/docker/volumes` is standard, while rootless or customized Docker installations use a different absolute path.
+
+Review and start the deployment without additional Compose flags:
+
+```bash
+docker compose config
+docker compose up -d
+```
+
+Periphery stores its keys, repositories, stacks, builds, SSL material, and File Manager journal beneath `/data` in the `komodo_data` named volume. Docker's host volume root remains mounted separately at the same absolute path so the File Manager can access named volumes.
 
 ```mdx-code-block
-<RemoteCodeFile
-	title="https://github.com/moghtech/komodo/blob/main/compose/periphery.compose.yaml"
-	url="https://raw.githubusercontent.com/moghtech/komodo/main/compose/periphery.compose.yaml"
-	language="yaml"
-/>
+<ComposeAndEnv file_name="periphery.compose.yaml" />
 ```
 
 ### Binary
@@ -154,8 +169,8 @@ The onboarding key is no longer needed after the initial connection, and the Per
 
 | Component | Install Method | Default path                           |
 | --------- | -------------- | -------------------------------------- |
-| Core      | Container      | `/config/keys/core.key`                |
-| Periphery | Container      | `/config/keys/periphery.key`           |
+| Core      | Container      | `/data/keys/core.key`                  |
+| Periphery | Container      | `/data/keys/periphery.key`             |
 | Periphery | Systemd        | `${root_directory}/keys/periphery.key` |
 
 Keys can also be specified inline in config instead of as file paths.
@@ -193,13 +208,13 @@ You can use it-tools to convert this TOML file to your preferred format:
 Quick download to `./komodo/periphery.config.toml`:
 
 ```bash
-wget -P komodo https://raw.githubusercontent.com/moghtech/komodo/main/config/periphery.config.toml
+wget -P komodo https://raw.githubusercontent.com/neurekadev/komodo/main/config/periphery.config.toml
 ```
 
 ```mdx-code-block
 <RemoteCodeFile
-	title="https://github.com/moghtech/komodo/blob/main/config/periphery.config.toml"
-	url="https://raw.githubusercontent.com/moghtech/komodo/main/config/periphery.config.toml"
+	title="https://github.com/neurekadev/komodo/blob/main/config/periphery.config.toml"
+	url="https://raw.githubusercontent.com/neurekadev/komodo/main/config/periphery.config.toml"
 	language="toml"
 />
 ```

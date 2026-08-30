@@ -24,23 +24,19 @@ services:
       MONGO_INITDB_ROOT_PASSWORD: ${KOMODO_DATABASE_PASSWORD}
   
   core:
-    image: ghcr.io/moghtech/komodo-core:${COMPOSE_KOMODO_IMAGE_TAG:-2}
+    image: ghcr.io/neurekadev/komodo-core:${COMPOSE_KOMODO_IMAGE_TAG:-3}
     init: true
     restart: unless-stopped
     depends_on:
       - mongo
     ports:
       - 9120:9120
-    env_file: ./compose.env
+    env_file: ./.env
     environment:
       KOMODO_DATABASE_ADDRESS: mongo:27017
     volumes:
-      ## Attach the Core / Periphery communication keys
-      - keys:/config/keys
-      ## Store dated backups of the database - https://komo.do/docs/setup/backup
-      - ${COMPOSE_KOMODO_BACKUPS_PATH}:/backups
-      ## Store sync files on server
-      # - /path/to/syncs:/syncs
+      ## Share keys, backups, syncs, and repository cache with Periphery.
+      - data:/data
       ## Optionally mount a custom core.config.toml
       # - /path/to/core.config.toml:/config/config.toml
       ## Optionally mount custom root CA certificate to trust
@@ -48,27 +44,24 @@ services:
 
   ## Deploy Periphery container using this block,
   ## or deploy the Periphery binary with systemd using 
-  ## https://github.com/moghtech/komodo/tree/main/scripts
+  ## https://github.com/neurekadev/komodo/tree/main/scripts
   periphery:
-    image: ghcr.io/moghtech/komodo-periphery:${COMPOSE_KOMODO_IMAGE_TAG:-2}
+    image: ghcr.io/neurekadev/komodo-periphery:${COMPOSE_KOMODO_IMAGE_TAG:-3}
     init: true
     restart: unless-stopped
     depends_on:
       - core
-    env_file: ./compose.env
+    env_file: ./.env
     volumes:
-      ## Attach the Core / Periphery communication keys
-      - keys:/config/keys
+      ## Share keys and Periphery-managed state with Core.
+      - data:/data
       ## Mount external docker socket
       - /var/run/docker.sock:/var/run/docker.sock
+      ## Allow the File Manager to access local Docker named volumes.
+      ## Keep Docker's absolute host volume root identical inside the container.
+      - ${PERIPHERY_DOCKER_VOLUME_ROOT:-/var/lib/docker/volumes}:${PERIPHERY_DOCKER_VOLUME_ROOT:-/var/lib/docker/volumes}
       ## Allow Periphery to see processes outside of container
       - /proc:/proc
-      ## Specify the Periphery agent root directory.
-      ## All your configs / repos must be children of this directory for Periphery to be able to see it.
-      ## Must be the same inside and outside the container,
-      ## or docker will get confused. See https://github.com/moghtech/komodo/discussions/180.
-      ## Default: /etc/komodo.
-      - ${PERIPHERY_ROOT_DIRECTORY:-/etc/komodo}:${PERIPHERY_ROOT_DIRECTORY:-/etc/komodo}
       ## Optionally mount a custom periphery.config.toml
       # - /path/to/periphery.config.toml:/config/config.toml
       ## Optionally mount custom root CA certificate to trust
@@ -79,4 +72,4 @@ volumes:
   mongo-data:
   mongo-config:
   # Core / Periphery
-  keys:
+  data:

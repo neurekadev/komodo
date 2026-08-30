@@ -121,6 +121,22 @@ jobs:
             arch: arm64
             runner: ubuntu-24.04-arm
             platform: linux/arm64
+          - name: Docs AMD64
+            kind: container
+            component: docs
+            context: docsite
+            dockerfile: docsite/Dockerfile
+            arch: amd64
+            runner: ubuntu-24.04
+            platform: linux/amd64
+          - name: Docs ARM64
+            kind: container
+            component: docs
+            context: docsite
+            dockerfile: docsite/Dockerfile
+            arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
 
     steps:
       - name: Check Out Repository
@@ -139,12 +155,17 @@ jobs:
       - name: Validate Compose Models
         if: matrix.kind == 'workspace'
         run: |
+          set -euo pipefail
           docker compose -f dev.compose.yaml config --quiet
           docker compose -f dev.compose.yaml -f expose.compose.yaml config --quiet
           docker compose -f .devcontainer/dev.compose.yaml config --quiet
-          docker compose --env-file compose/compose.env -f compose/ferretdb.compose.yaml config --quiet
-          docker compose --env-file compose/compose.env -f compose/mongo.compose.yaml config --quiet
-          docker compose --env-file compose/compose.env -f compose/periphery.compose.yaml config --quiet
+          for variant in ferretdb mongo periphery; do
+            directory="$RUNNER_TEMP/compose-$variant"
+            mkdir -p "$directory"
+            cp "compose/$variant.compose.yaml" "$directory/compose.yaml"
+            cp compose/compose.env "$directory/.env"
+            docker compose --project-directory "$directory" config --quiet
+          done
 
       - name: Set Up Docker Buildx
         if: matrix.kind == 'container'
@@ -228,6 +249,22 @@ jobs:
             description: Komodo CLI
             context: .
             dockerfile: bin/cli/aio.Dockerfile
+            arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+          - name: Docs AMD64
+            component: docs
+            description: Komodo Documentation
+            context: docsite
+            dockerfile: docsite/Dockerfile
+            arch: amd64
+            runner: ubuntu-24.04
+            platform: linux/amd64
+          - name: Docs ARM64
+            component: docs
+            description: Komodo Documentation
+            context: docsite
+            dockerfile: docsite/Dockerfile
             arch: arm64
             runner: ubuntu-24.04-arm
             platform: linux/arm64
@@ -332,6 +369,9 @@ jobs:
           - name: CLI
             component: cli
             description: Komodo CLI
+          - name: Docs
+            component: docs
+            description: Komodo Documentation
     env:
       IMAGE: ghcr.io/${{ github.repository_owner }}/komodo-${{ matrix.component }}
       SOURCE_VERSION: ${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || (github.ref_type == 'tag' && github.ref_name || 'edge') }}
@@ -447,7 +487,10 @@ jobs:
           persist-credentials: false
 
       - name: Create Release
-        uses: neurekadev/create-release-action@1
+        uses: neurekadev/create-release-action@2
         with:
           github-token: ${{ github.token }}
           api-key: ${{ secrets.INFERENCE_API_KEY }}
+          base-url: https://api.openai.com/v1
+          model: gpt-5.6-luna
+          reasoning-effort: xhigh
