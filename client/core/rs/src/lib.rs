@@ -28,7 +28,10 @@
 //! let update = client.execute(RunBuild { build: "test-build".to_string() }).await?:
 //! ```
 
-use std::{sync::OnceLock, time::Duration};
+use std::sync::OnceLock;
+
+#[cfg(not(feature = "blocking"))]
+use std::time::Duration;
 
 use anyhow::Context;
 use api::read::GetVersion;
