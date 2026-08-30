@@ -62,6 +62,7 @@ pub struct PreflightFileManagerOperation {
 pub struct CommitFileManagerOperation {
   pub target: PeripheryFileManagerTarget,
   pub actor: String,
+  pub operation_id: String,
   pub plan_id: String,
   pub decisions: Vec<FileManagerConflictDecision>,
   pub confirmed: bool,
@@ -96,6 +97,7 @@ pub struct GetFileManagerJournalStatus {
 pub struct UndoFileManagerOperation {
   pub target: PeripheryFileManagerTarget,
   pub actor: String,
+  pub operation_id: String,
   pub confirmed: bool,
 }
 
@@ -105,6 +107,7 @@ pub struct UndoFileManagerOperation {
 pub struct RedoFileManagerOperation {
   pub target: PeripheryFileManagerTarget,
   pub actor: String,
+  pub operation_id: String,
   pub confirmed: bool,
 }
 
@@ -114,6 +117,7 @@ pub struct RedoFileManagerOperation {
 pub struct StartFileManagerUpload {
   pub target: PeripheryFileManagerTarget,
   pub actor: String,
+  pub operation_id: String,
   pub destination: String,
   pub file_name: String,
   pub total_bytes: u64,
@@ -126,6 +130,8 @@ pub struct StartFileManagerUpload {
 #[error(anyhow::Error)]
 pub struct StartFileManagerDownload {
   pub target: PeripheryFileManagerTarget,
+  pub actor: String,
+  pub operation_id: String,
   pub paths: Vec<String>,
 }
 

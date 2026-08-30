@@ -7,7 +7,9 @@ use anyhow::{Context as _, anyhow};
 use komodo_client::entities::{
   ResourceTarget,
   file_manager::{
-    FileManagerEntry, FileManagerEntryKind, FileManagerRevision,
+    FileManagerEntry, FileManagerEntryKind,
+    FileManagerOperationPhase, FileManagerOperationState,
+    FileManagerOperationStatus, FileManagerRevision,
     FileManagerTarget, FileManagerTextFile,
   },
   permission::PermissionLevel,
@@ -25,6 +27,120 @@ use komodo_client::entities::komodo_timestamp;
 use crate::{permission::get_check_permissions, resource};
 
 const TRANSFER_TTL_MS: i64 = 5 * 60 * 1_000;
+const OPERATION_TTL_MS: i64 = 24 * 60 * 60 * 1_000;
+
+#[derive(Clone)]
+struct CoreOperationRecord {
+  actor: String,
+  target: FileManagerTarget,
+  expires_at: i64,
+  status: FileManagerOperationStatus,
+}
+
+fn operation_statuses()
+-> &'static RwLock<HashMap<String, CoreOperationRecord>> {
+  static STATUSES: OnceLock<
+    RwLock<HashMap<String, CoreOperationRecord>>,
+  > = OnceLock::new();
+  STATUSES.get_or_init(Default::default)
+}
+
+pub fn create_operation_status(
+  actor: String,
+  target: FileManagerTarget,
+  description: impl Into<String>,
+) -> String {
+  let operation_id = Uuid::new_v4().to_string();
+  insert_operation_status(
+    operation_id.clone(),
+    actor,
+    target,
+    description,
+  );
+  operation_id
+}
+
+fn insert_operation_status(
+  operation_id: String,
+  actor: String,
+  target: FileManagerTarget,
+  description: impl Into<String>,
+) {
+  let now = komodo_timestamp();
+  let mut statuses = operation_statuses().write().unwrap();
+  statuses.retain(|_, status| status.expires_at > now);
+  statuses.insert(
+    operation_id.clone(),
+    CoreOperationRecord {
+      actor,
+      target,
+      expires_at: now + OPERATION_TTL_MS,
+      status: FileManagerOperationStatus {
+        operation_id: operation_id.clone(),
+        state: FileManagerOperationState::Pending,
+        phase: FileManagerOperationPhase::Queued,
+        description: description.into(),
+        ..Default::default()
+      },
+    },
+  );
+}
+
+pub fn set_operation_finalizing(operation_id: &str) {
+  if let Some(record) =
+    operation_statuses().write().unwrap().get_mut(operation_id)
+  {
+    record.status.state = FileManagerOperationState::Running;
+    record.status.phase = FileManagerOperationPhase::Finalizing;
+  }
+}
+
+pub fn complete_operation(operation_id: &str) {
+  if let Some(record) =
+    operation_statuses().write().unwrap().get_mut(operation_id)
+  {
+    record.status.state = FileManagerOperationState::Complete;
+    record.status.phase = FileManagerOperationPhase::Finalizing;
+    record.status.completed_entries = record.status.total_entries;
+    record.status.completed_bytes = record.status.total_bytes;
+    record.status.error = None;
+  }
+}
+
+pub fn fail_operation(operation_id: &str, error: impl Into<String>) {
+  if let Some(record) =
+    operation_statuses().write().unwrap().get_mut(operation_id)
+  {
+    record.status.state = FileManagerOperationState::Failed;
+    record.status.error = Some(error.into());
+  }
+}
+
+pub fn cancel_operation(
+  operation_id: &str,
+  message: impl Into<String>,
+) {
+  if let Some(record) =
+    operation_statuses().write().unwrap().get_mut(operation_id)
+  {
+    record.status.state = FileManagerOperationState::Cancelled;
+    record.status.error = Some(message.into());
+  }
+}
+
+pub fn get_core_operation_status(
+  operation_id: &str,
+  actor: &str,
+  target: &FileManagerTarget,
+) -> Option<FileManagerOperationStatus> {
+  let now = komodo_timestamp();
+  let mut statuses = operation_statuses().write().unwrap();
+  statuses.retain(|_, status| status.expires_at > now);
+  statuses.get(operation_id).and_then(|record| {
+    (record.actor == actor && &record.target == target)
+      .then(|| record.status.clone())
+  })
+}
 
 #[derive(Clone)]
 pub enum TransferSessionKind {
@@ -64,8 +180,19 @@ pub fn create_transfer_session(
 ) -> (String, TransferSession) {
   let now = komodo_timestamp();
   let token = Uuid::new_v4().to_string();
+  let operation_id = Uuid::new_v4().to_string();
+  let description = match &kind {
+    TransferSessionKind::Upload { .. } => "Upload file",
+    TransferSessionKind::Download { .. } => "Download files",
+  };
+  insert_operation_status(
+    operation_id.clone(),
+    actor.clone(),
+    target.clone(),
+    description,
+  );
   let session = TransferSession {
-    operation_id: Uuid::new_v4().to_string(),
+    operation_id,
     actor,
     target,
     expires_at: now + TRANSFER_TTL_MS,
@@ -216,5 +343,79 @@ pub fn managed_revision(contents: &str) -> FileManagerRevision {
   hash.update(contents.as_bytes());
   FileManagerRevision {
     id: hex::encode(hash.finalize()),
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn target() -> FileManagerTarget {
+    FileManagerTarget::Volume {
+      server: "server-1".into(),
+      volume: "volume-1".into(),
+    }
+  }
+
+  #[test]
+  fn core_operation_status_is_scoped_and_reaches_terminal_state() {
+    let target = target();
+    let operation_id = create_operation_status(
+      "actor-1".into(),
+      target.clone(),
+      "Copy files",
+    );
+
+    assert!(
+      get_core_operation_status(&operation_id, "actor-2", &target)
+        .is_none()
+    );
+    let queued =
+      get_core_operation_status(&operation_id, "actor-1", &target)
+        .unwrap();
+    assert_eq!(queued.state, FileManagerOperationState::Pending);
+    assert_eq!(queued.phase, FileManagerOperationPhase::Queued);
+    assert_eq!(queued.description, "Copy files");
+
+    set_operation_finalizing(&operation_id);
+    assert_eq!(
+      get_core_operation_status(&operation_id, "actor-1", &target)
+        .unwrap()
+        .phase,
+      FileManagerOperationPhase::Finalizing
+    );
+    complete_operation(&operation_id);
+    assert_eq!(
+      get_core_operation_status(&operation_id, "actor-1", &target)
+        .unwrap()
+        .state,
+      FileManagerOperationState::Complete
+    );
+  }
+
+  #[test]
+  fn transfer_session_registers_status_before_streaming_begins() {
+    let target = target();
+    let (token, session) = create_transfer_session(
+      "actor-1".into(),
+      target.clone(),
+      TransferSessionKind::Upload {
+        destination: String::new(),
+        file_name: "notes.txt".into(),
+        total_bytes: 12,
+        overwrite: false,
+        expected_revision: None,
+      },
+    );
+
+    let status = get_core_operation_status(
+      &session.operation_id,
+      "actor-1",
+      &target,
+    )
+    .unwrap();
+    assert_eq!(status.state, FileManagerOperationState::Pending);
+    assert_eq!(status.description, "Upload file");
+    assert!(consume_transfer_session(&token, "actor-1").is_ok());
   }
 }

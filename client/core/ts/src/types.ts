@@ -7998,9 +7998,26 @@ export enum FileManagerOperationState {
 	Cancelled = "cancelled",
 }
 
+export enum FileManagerOperationPhase {
+	Queued = "queued",
+	Preparing = "preparing",
+	Snapshotting = "snapshotting",
+	Applying = "applying",
+	Verifying = "verifying",
+	Transferring = "transferring",
+	Finalizing = "finalizing",
+	RollingBack = "rolling_back",
+}
+
+export interface FileManagerOperationTicket {
+	operation_id: string;
+}
+
 export interface FileManagerOperationStatus {
 	operation_id: string;
 	state: FileManagerOperationState;
+	phase: FileManagerOperationPhase;
+	description: string;
 	completed_entries: U64;
 	total_entries: U64;
 	completed_bytes: U64;

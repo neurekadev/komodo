@@ -27,10 +27,10 @@ use zip::{
 
 use super::{
   MAX_ARCHIVE_EXPANDED_BYTES, MAX_ARCHIVE_EXPANSION_RATIO,
-  MAX_ENTRIES, MINIMUM_FREE_BYTES, copy_host_to_capability,
-  decision_for, journal_root, path::MAX_DEPTH,
-  path::open_parent_nofollow, path::relative_path, path_string,
-  remove_entry,
+  MAX_ENTRIES, MINIMUM_FREE_BYTES, OperationProgress,
+  copy_host_to_capability, copy_with_progress, decision_for,
+  journal_root, path::MAX_DEPTH, path::open_parent_nofollow,
+  path::relative_path, path_string, remove_entry,
 };
 
 struct TemporaryDirectory(PathBuf);
@@ -47,6 +47,7 @@ pub fn create(
   destination: &str,
   format: FileManagerArchiveFormat,
   decisions: &[FileManagerConflictDecision],
+  progress: Option<&OperationProgress>,
 ) -> anyhow::Result<()> {
   if paths.is_empty() {
     return Err(anyhow!("Select at least one entry to archive"));
@@ -75,13 +76,17 @@ pub fn create(
     .follow(FollowSymlinks::No);
   let output = parent.open_with(&temporary, &options)?;
   let result = match format {
-    FileManagerArchiveFormat::Zip => create_zip(root, paths, output),
-    FileManagerArchiveFormat::Tar => create_tar(root, paths, output),
+    FileManagerArchiveFormat::Zip => {
+      create_zip(root, paths, output, progress)
+    }
+    FileManagerArchiveFormat::Tar => {
+      create_tar(root, paths, output, progress)
+    }
     FileManagerArchiveFormat::TarGz => {
-      create_tar_gz(root, paths, output)
+      create_tar_gz(root, paths, output, progress)
     }
     FileManagerArchiveFormat::SevenZip => {
-      create_seven_zip(root, paths, output)
+      create_seven_zip(root, paths, output, progress)
     }
   };
   if let Err(error) = result {
@@ -96,6 +101,7 @@ pub fn create_download_zip(
   root: &Dir,
   paths: &[String],
   output: &Path,
+  progress: Option<&OperationProgress>,
 ) -> anyhow::Result<()> {
   if paths.is_empty() {
     return Err(anyhow!("Select at least one entry to download"));
@@ -108,6 +114,10 @@ pub fn create_download_zip(
   let directory_options = SimpleFileOptions::default()
     .compression_method(CompressionMethod::Stored)
     .unix_permissions(0o755);
+  let options = ZipEntryOptions {
+    file: options,
+    directory: directory_options,
+  };
   let mut count = 0;
   for path in paths {
     let path = relative_path(path, false)?;
@@ -118,8 +128,8 @@ pub fn create_download_zip(
       &name,
       &path_string(&path)?,
       options,
-      directory_options,
       &mut count,
+      progress,
     )?;
   }
   writer.finish()?.sync_all()?;
@@ -131,6 +141,7 @@ pub fn extract(
   archive_path: &str,
   destination: &str,
   decisions: &[FileManagerConflictDecision],
+  progress: Option<&OperationProgress>,
 ) -> anyhow::Result<()> {
   let archive_path = relative_path(archive_path, false)?;
   let destination = relative_path(destination, false)?;
@@ -164,22 +175,22 @@ pub fn extract(
   let mut source =
     archive_parent.open_with(archive_name, &read_options)?;
   let mut staged = fs::File::create(&staged_archive)?;
-  std::io::copy(&mut source, &mut staged)?;
+  copy_with_progress(&mut source, &mut staged, progress)?;
   staged.sync_all()?;
 
   (|| {
     match detect_format(&staged_archive)? {
       DetectedArchive::Zip => {
-        extract_zip(&staged_archive, &extracted)?
+        extract_zip(&staged_archive, &extracted, progress)?
       }
       DetectedArchive::Tar => {
-        extract_tar(&staged_archive, &extracted)?
+        extract_tar(&staged_archive, &extracted, progress)?
       }
       DetectedArchive::TarGz => {
-        extract_tar_gz(&staged_archive, &extracted)?
+        extract_tar_gz(&staged_archive, &extracted, progress)?
       }
       DetectedArchive::SevenZip => {
-        extract_seven_zip(&staged_archive, &extracted)?
+        extract_seven_zip(&staged_archive, &extracted, progress)?
       }
       DetectedArchive::Rar => {
         return Err(anyhow!(
@@ -212,6 +223,7 @@ pub fn extract(
       &extracted,
       &destination_parent,
       &destination_name,
+      progress,
     )?;
     Ok(())
   })()
@@ -221,6 +233,7 @@ fn create_zip(
   root: &Dir,
   paths: &[String],
   output: cap_std::fs::File,
+  progress: Option<&OperationProgress>,
 ) -> anyhow::Result<()> {
   let mut writer = ZipWriter::new(output);
   let options = SimpleFileOptions::default()
@@ -229,6 +242,10 @@ fn create_zip(
   let directory_options = SimpleFileOptions::default()
     .compression_method(CompressionMethod::Stored)
     .unix_permissions(0o755);
+  let options = ZipEntryOptions {
+    file: options,
+    directory: directory_options,
+  };
   let mut count = 0_u64;
   for path in paths {
     let path = relative_path(path, false)?;
@@ -239,12 +256,18 @@ fn create_zip(
       &name,
       &path_string(&path)?,
       options,
-      directory_options,
       &mut count,
+      progress,
     )?;
   }
   writer.finish()?.sync_all()?;
   Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct ZipEntryOptions {
+  file: SimpleFileOptions,
+  directory: SimpleFileOptions,
 }
 
 fn add_zip_entry<W: Write + std::io::Seek>(
@@ -252,9 +275,9 @@ fn add_zip_entry<W: Write + std::io::Seek>(
   parent: &Dir,
   name: &OsStr,
   archive_name: &str,
-  file_options: SimpleFileOptions,
-  directory_options: SimpleFileOptions,
+  options: ZipEntryOptions,
   count: &mut u64,
+  progress: Option<&OperationProgress>,
 ) -> anyhow::Result<()> {
   *count += 1;
   if *count > MAX_ENTRIES {
@@ -265,14 +288,17 @@ fn add_zip_entry<W: Write + std::io::Seek>(
     return Err(anyhow!("Archives cannot contain symbolic links"));
   }
   if metadata.is_file() {
-    writer.start_file(archive_name, file_options)?;
+    writer.start_file(archive_name, options.file)?;
     let mut options = OpenOptions::new();
     options.read(true).follow(FollowSymlinks::No);
     let mut file = parent.open_with(name, &options)?;
-    std::io::copy(&mut file, writer)?;
+    copy_with_progress(&mut file, writer, progress)?;
+    if let Some(progress) = progress {
+      progress.add_entry();
+    }
   } else if metadata.is_dir() {
     writer
-      .add_directory(format!("{archive_name}/"), directory_options)?;
+      .add_directory(format!("{archive_name}/"), options.directory)?;
     let dir = parent.open_dir_nofollow(name)?;
     for entry in dir.entries()? {
       let entry = entry?;
@@ -284,10 +310,13 @@ fn add_zip_entry<W: Write + std::io::Seek>(
         &dir,
         OsStr::new(&child),
         &format!("{archive_name}/{child}"),
-        file_options,
-        directory_options,
+        options,
         count,
+        progress,
       )?;
+    }
+    if let Some(progress) = progress {
+      progress.add_entry();
     }
   } else {
     return Err(anyhow!("Archives cannot contain special entries"));
@@ -299,9 +328,10 @@ fn create_tar(
   root: &Dir,
   paths: &[String],
   output: cap_std::fs::File,
+  progress: Option<&OperationProgress>,
 ) -> anyhow::Result<()> {
   let mut builder = TarBuilder::new(output);
-  append_tar_paths(root, paths, &mut builder)?;
+  append_tar_paths(root, paths, &mut builder, progress)?;
   builder.finish()?;
   builder.into_inner()?.sync_all()?;
   Ok(())
@@ -311,10 +341,11 @@ fn create_tar_gz(
   root: &Dir,
   paths: &[String],
   output: cap_std::fs::File,
+  progress: Option<&OperationProgress>,
 ) -> anyhow::Result<()> {
   let encoder = GzEncoder::new(output, Compression::default());
   let mut builder = TarBuilder::new(encoder);
-  append_tar_paths(root, paths, &mut builder)?;
+  append_tar_paths(root, paths, &mut builder, progress)?;
   builder.finish()?;
   let encoder = builder.into_inner()?;
   encoder.finish()?.sync_all()?;
@@ -325,6 +356,7 @@ fn append_tar_paths<W: Write>(
   root: &Dir,
   paths: &[String],
   builder: &mut TarBuilder<W>,
+  progress: Option<&OperationProgress>,
 ) -> anyhow::Result<()> {
   let mut count = 0_u64;
   for path in paths {
@@ -336,6 +368,7 @@ fn append_tar_paths<W: Write>(
       &name,
       &path_string(&path)?,
       &mut count,
+      progress,
     )?;
   }
   Ok(())
@@ -347,6 +380,7 @@ fn append_tar_entry<W: Write>(
   name: &OsStr,
   archive_name: &str,
   count: &mut u64,
+  progress: Option<&OperationProgress>,
 ) -> anyhow::Result<()> {
   *count += 1;
   if *count > MAX_ENTRIES {
@@ -365,7 +399,14 @@ fn append_tar_entry<W: Write>(
     let mut options = OpenOptions::new();
     options.read(true).follow(FollowSymlinks::No);
     let file = parent.open_with(name, &options)?;
-    builder.append_data(&mut header, archive_name, file)?;
+    builder.append_data(
+      &mut header,
+      archive_name,
+      ProgressReader::new(file, progress),
+    )?;
+    if let Some(progress) = progress {
+      progress.add_entry();
+    }
   } else if metadata.is_dir() {
     header.set_size(0);
     header.set_mode(0o755);
@@ -388,7 +429,11 @@ fn append_tar_entry<W: Write>(
         OsStr::new(&child),
         &format!("{archive_name}/{child}"),
         count,
+        progress,
       )?;
+    }
+    if let Some(progress) = progress {
+      progress.add_entry();
     }
   } else {
     return Err(anyhow!("Archives cannot contain special entries"));
@@ -400,6 +445,7 @@ fn create_seven_zip(
   root: &Dir,
   paths: &[String],
   output: cap_std::fs::File,
+  progress: Option<&OperationProgress>,
 ) -> anyhow::Result<()> {
   let mut writer = ArchiveWriter::new(output)?;
   let mut count = 0_u64;
@@ -412,6 +458,7 @@ fn create_seven_zip(
       &name,
       &path_string(&path)?,
       &mut count,
+      progress,
     )?;
   }
   writer.finish()?.sync_all()?;
@@ -424,6 +471,7 @@ fn add_seven_zip_entry<W: Write + std::io::Seek>(
   name: &OsStr,
   archive_name: &str,
   count: &mut u64,
+  progress: Option<&OperationProgress>,
 ) -> anyhow::Result<()> {
   *count += 1;
   if *count > MAX_ENTRIES {
@@ -439,8 +487,11 @@ fn add_seven_zip_entry<W: Write + std::io::Seek>(
     let file = parent.open_with(name, &options)?;
     writer.push_archive_entry(
       ArchiveEntry::new_file(archive_name),
-      Some(file),
+      Some(ProgressReader::new(file, progress)),
     )?;
+    if let Some(progress) = progress {
+      progress.add_entry();
+    }
   } else if metadata.is_dir() {
     writer.push_archive_entry::<cap_std::fs::File>(
       ArchiveEntry::new_directory(archive_name),
@@ -458,7 +509,11 @@ fn add_seven_zip_entry<W: Write + std::io::Seek>(
         OsStr::new(&child),
         &format!("{archive_name}/{child}"),
         count,
+        progress,
       )?;
+    }
+    if let Some(progress) = progress {
+      progress.add_entry();
     }
   } else {
     return Err(anyhow!("Archives cannot contain special entries"));
@@ -473,6 +528,36 @@ enum DetectedArchive {
   TarGz,
   SevenZip,
   Rar,
+}
+
+struct ProgressReader<'a, R> {
+  inner: R,
+  progress: Option<&'a OperationProgress>,
+}
+
+impl<'a, R> ProgressReader<'a, R> {
+  fn new(inner: R, progress: Option<&'a OperationProgress>) -> Self {
+    Self { inner, progress }
+  }
+}
+
+impl<R: Read> Read for ProgressReader<'_, R> {
+  fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+    let read = self.inner.read(buffer)?;
+    if let Some(progress) = self.progress {
+      progress.add_bytes(read as u64);
+    }
+    Ok(read)
+  }
+}
+
+impl<R: std::io::Seek> std::io::Seek for ProgressReader<'_, R> {
+  fn seek(
+    &mut self,
+    position: std::io::SeekFrom,
+  ) -> std::io::Result<u64> {
+    self.inner.seek(position)
+  }
 }
 
 fn detect_format(path: &Path) -> anyhow::Result<DetectedArchive> {
@@ -503,6 +588,7 @@ fn detect_format(path: &Path) -> anyhow::Result<DetectedArchive> {
 fn extract_zip(
   source: &Path,
   destination: &Path,
+  progress: Option<&OperationProgress>,
 ) -> anyhow::Result<()> {
   let file = fs::File::open(source)?;
   let compressed_size = file.metadata()?.len().max(1);
@@ -540,13 +626,17 @@ fn extract_zip(
         fs::create_dir_all(parent)?;
       }
       let mut file = create_safe_file(&output)?;
-      let copied = std::io::copy(&mut entry, &mut file)?;
+      let copied =
+        copy_with_progress(&mut entry, &mut file, progress)?;
       if copied != entry.size() {
         return Err(anyhow!(
           "Archive entry size changed during extraction"
         ));
       }
       file.sync_all()?;
+    }
+    if let Some(progress) = progress {
+      progress.add_entry();
     }
   }
   Ok(())
@@ -555,15 +645,17 @@ fn extract_zip(
 fn extract_tar(
   source: &Path,
   destination: &Path,
+  progress: Option<&OperationProgress>,
 ) -> anyhow::Result<()> {
   let file = fs::File::open(source)?;
   let compressed_size = file.metadata()?.len().max(1);
-  extract_tar_reader(file, compressed_size, destination)
+  extract_tar_reader(file, compressed_size, destination, progress)
 }
 
 fn extract_tar_gz(
   source: &Path,
   destination: &Path,
+  progress: Option<&OperationProgress>,
 ) -> anyhow::Result<()> {
   let file = fs::File::open(source)?;
   let compressed_size = file.metadata()?.len().max(1);
@@ -571,6 +663,7 @@ fn extract_tar_gz(
     GzDecoder::new(file),
     compressed_size,
     destination,
+    progress,
   )
 }
 
@@ -578,6 +671,7 @@ fn extract_tar_reader<R: Read>(
   reader: R,
   compressed_size: u64,
   destination: &Path,
+  progress: Option<&OperationProgress>,
 ) -> anyhow::Result<()> {
   let mut archive = TarArchive::new(reader);
   let mut count = 0_u64;
@@ -611,13 +705,17 @@ fn extract_tar_reader<R: Read>(
         fs::create_dir_all(parent)?;
       }
       let mut file = create_safe_file(&output)?;
-      let copied = std::io::copy(&mut entry, &mut file)?;
+      let copied =
+        copy_with_progress(&mut entry, &mut file, progress)?;
       if copied != size {
         return Err(anyhow!(
           "Archive entry size changed during extraction"
         ));
       }
       file.sync_all()?;
+    }
+    if let Some(progress) = progress {
+      progress.add_entry();
     }
   }
   Ok(())
@@ -626,6 +724,7 @@ fn extract_tar_reader<R: Read>(
 fn extract_seven_zip(
   source: &Path,
   destination: &Path,
+  progress: Option<&OperationProgress>,
 ) -> anyhow::Result<()> {
   let compressed_size = fs::metadata(source)?.len().max(1);
   let mut count = 0_u64;
@@ -668,7 +767,15 @@ fn extract_seven_zip(
           sevenz_rust2::Error::Other(Cow::Owned(error.to_string()))
         },
       )?;
-      sevenz_rust2::default_entry_extract_fn(entry, reader, output)
+      let result =
+        sevenz_rust2::default_entry_extract_fn(entry, reader, output);
+      if result.is_ok()
+        && let Some(progress) = progress
+      {
+        progress.add_bytes(entry.size());
+        progress.add_entry();
+      }
+      result
     },
   )?;
   Ok(())
@@ -840,7 +947,7 @@ mod tests {
     archive.write_all(b"safe contents").unwrap();
     archive.finish().unwrap();
 
-    extract_zip(&archive_path, &extracted).unwrap();
+    extract_zip(&archive_path, &extracted, None).unwrap();
     assert_eq!(
       fs::read(extracted.join("folder/config.txt")).unwrap(),
       b"safe contents"
@@ -863,7 +970,7 @@ mod tests {
     archive.write_all(b"unsafe").unwrap();
     archive.finish().unwrap();
 
-    assert!(extract_zip(&archive_path, &extracted).is_err());
+    assert!(extract_zip(&archive_path, &extracted, None).is_err());
     assert!(!directory.join("escape.txt").exists());
     fs::remove_dir_all(directory).unwrap();
   }

@@ -5,6 +5,7 @@ use komodo_client::{
     file_manager::{
       FileManagerCapabilities, FileManagerDirectory,
       FileManagerEntryKind, FileManagerJournalStatus,
+      FileManagerOperationPhase, FileManagerOperationState,
       FileManagerOperationStatus, FileManagerTextFile,
     },
     permission::PermissionLevel,
@@ -16,7 +17,8 @@ use periphery_client::api::file_manager as periphery;
 use crate::{
   config::core_config,
   file_manager::{
-    can_write, managed_entry, managed_text, resolve_target,
+    can_write, get_core_operation_status, managed_entry,
+    managed_text, resolve_target,
   },
   helpers::periphery_client,
 };
@@ -129,16 +131,42 @@ impl Resolve<ReadArgs> for GetFileManagerOperationStatus {
     let resolved =
       resolve_target(&self.target, user, PermissionLevel::Read)
         .await?;
-    Ok(
-      periphery_client(&resolved.server)
-        .await?
-        .request(periphery::GetFileManagerOperationStatus {
-          target: resolved.periphery,
-          actor: user.id.clone(),
-          operation_id: self.operation_id,
-        })
-        .await?,
-    )
+    let core_status = get_core_operation_status(
+      &self.operation_id,
+      &user.id,
+      &self.target,
+    );
+    if core_status.as_ref().is_some_and(|status| {
+      matches!(
+        status.state,
+        FileManagerOperationState::Complete
+          | FileManagerOperationState::Failed
+          | FileManagerOperationState::Cancelled
+      ) || status.phase == FileManagerOperationPhase::Finalizing
+    }) {
+      return Ok(core_status.unwrap());
+    }
+    let periphery_status = periphery_client(&resolved.server)
+      .await?
+      .request(periphery::GetFileManagerOperationStatus {
+        target: resolved.periphery,
+        actor: user.id.clone(),
+        operation_id: self.operation_id,
+      })
+      .await;
+    match periphery_status {
+      Ok(mut status)
+        if core_status.is_some()
+          && status.state == FileManagerOperationState::Complete =>
+      {
+        status.state = FileManagerOperationState::Running;
+        status.phase = FileManagerOperationPhase::Finalizing;
+        Ok(status)
+      }
+      Ok(status) => Ok(status),
+      Err(_) if core_status.is_some() => Ok(core_status.unwrap()),
+      Err(error) => Err(error.into()),
+    }
   }
 }
 

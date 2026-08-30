@@ -28,7 +28,8 @@ use sha2::{Digest as _, Sha256};
 use crate::{
   auth::KomodoAuthImpl,
   file_manager::{
-    TransferSessionKind, consume_transfer_session, resolve_target,
+    TransferSessionKind, cancel_operation, complete_operation,
+    consume_transfer_session, fail_operation, resolve_target,
   },
   helpers::{
     periphery_client,
@@ -37,6 +38,7 @@ use crate::{
 };
 
 struct DownloadAudit {
+  operation_id: String,
   target: ResourceTarget,
   paths: Vec<String>,
   user: User,
@@ -46,13 +48,22 @@ struct DownloadAudit {
 impl DownloadAudit {
   async fn finish(&mut self, result: anyhow::Result<Vec<String>>) {
     self.finalized = true;
-    let _ = audit_transfer(
+    let operation_error =
+      result.as_ref().err().map(ToString::to_string);
+    let audit = audit_transfer(
       self.target.clone(),
       "Download files",
       result,
       &self.user,
     )
     .await;
+    if let Some(error) = operation_error {
+      fail_operation(&self.operation_id, error);
+    } else if let Err(error) = audit {
+      fail_operation(&self.operation_id, error.to_string());
+    } else {
+      complete_operation(&self.operation_id);
+    }
   }
 }
 
@@ -61,6 +72,10 @@ impl Drop for DownloadAudit {
     if self.finalized {
       return;
     }
+    cancel_operation(
+      &self.operation_id,
+      "Download was cancelled before completion",
+    );
     let target = self.target.clone();
     let user = self.user.clone();
     tokio::spawn(async move {
@@ -98,13 +113,27 @@ async fn upload(
     expected_revision,
   } = session.kind
   else {
+    fail_operation(
+      &session.operation_id,
+      "Transfer token is not an upload token",
+    );
     return Err(
       anyhow!("Transfer token is not an upload token").into(),
     );
   };
-  let resolved =
-    resolve_target(&session.target, &user, PermissionLevel::Write)
-      .await?;
+  let resolved = match resolve_target(
+    &session.target,
+    &user,
+    PermissionLevel::Write,
+  )
+  .await
+  {
+    Ok(resolved) => resolved,
+    Err(error) => {
+      fail_operation(&session.operation_id, error.to_string());
+      return Err(error.into());
+    }
+  };
   let path = if destination.is_empty() {
     file_name.clone()
   } else {
@@ -116,6 +145,7 @@ async fn upload(
       .start_file_manager_upload(StartFileManagerUpload {
         target: resolved.periphery,
         actor: user.id.clone(),
+        operation_id: session.operation_id.clone(),
         destination,
         file_name,
         total_bytes,
@@ -166,16 +196,23 @@ async fn upload(
 
   match result {
     Ok((bytes, _checksum)) => {
-      audit_transfer(
+      if let Err(error) = audit_transfer(
         resolved.resource,
         "Upload file",
         Ok(vec![path]),
         &user,
       )
-      .await?;
+      .await
+      {
+        fail_operation(&session.operation_id, error.to_string());
+        return Err(error.into());
+      }
+      complete_operation(&session.operation_id);
       Ok(Json(FileManagerOperationStatus {
         operation_id: session.operation_id,
         state: komodo_client::entities::file_manager::FileManagerOperationState::Complete,
+        phase: komodo_client::entities::file_manager::FileManagerOperationPhase::Finalizing,
+        description: "Upload file".into(),
         completed_entries: 1,
         total_entries: 1,
         completed_bytes: bytes,
@@ -184,6 +221,7 @@ async fn upload(
       }))
     }
     Err(error) => {
+      fail_operation(&session.operation_id, error.to_string());
       audit_transfer(
         resolved.resource,
         "Upload file",
@@ -202,23 +240,43 @@ async fn download(
 ) -> mogh_error::Result<Response<Body>> {
   let session = consume_transfer_session(&token, &user.id)?;
   let TransferSessionKind::Download { paths } = session.kind else {
+    fail_operation(
+      &session.operation_id,
+      "Transfer token is not a download token",
+    );
     return Err(
       anyhow!("Transfer token is not a download token").into(),
     );
   };
-  let resolved =
-    resolve_target(&session.target, &user, PermissionLevel::Read)
-      .await?;
-  let result = periphery_client(&resolved.server)
-    .await?
-    .start_file_manager_download(StartFileManagerDownload {
-      target: resolved.periphery,
-      paths: paths.clone(),
-    })
-    .await;
+  let resolved = match resolve_target(
+    &session.target,
+    &user,
+    PermissionLevel::Read,
+  )
+  .await
+  {
+    Ok(resolved) => resolved,
+    Err(error) => {
+      fail_operation(&session.operation_id, error.to_string());
+      return Err(error.into());
+    }
+  };
+  let result = async {
+    periphery_client(&resolved.server)
+      .await?
+      .start_file_manager_download(StartFileManagerDownload {
+        target: resolved.periphery,
+        actor: user.id.clone(),
+        operation_id: session.operation_id.clone(),
+        paths: paths.clone(),
+      })
+      .await
+  }
+  .await;
   let (metadata, transfer) = match result {
     Ok(result) => result,
     Err(error) => {
+      fail_operation(&session.operation_id, error.to_string());
       audit_transfer(
         resolved.resource,
         "Download files",
@@ -232,6 +290,7 @@ async fn download(
   let expected_bytes = metadata.total_bytes;
   let expected_hash = metadata.sha256.clone();
   let audit = DownloadAudit {
+    operation_id: session.operation_id,
     target: resolved.resource,
     paths,
     user,

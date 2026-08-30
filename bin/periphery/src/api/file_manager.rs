@@ -53,6 +53,7 @@ impl Resolve<Args> for CommitFileManagerOperation {
     file_manager::commit(
       &self.target,
       &self.actor,
+      &self.operation_id,
       &self.plan_id,
       &self.decisions,
       self.confirmed,
@@ -89,8 +90,13 @@ impl Resolve<Args> for UndoFileManagerOperation {
     self,
     _: &Args,
   ) -> anyhow::Result<FileManagerCommitResponse> {
-    file_manager::undo(&self.target, &self.actor, self.confirmed)
-      .await
+    file_manager::undo(
+      &self.target,
+      &self.actor,
+      &self.operation_id,
+      self.confirmed,
+    )
+    .await
   }
 }
 
@@ -99,8 +105,13 @@ impl Resolve<Args> for RedoFileManagerOperation {
     self,
     _: &Args,
   ) -> anyhow::Result<FileManagerCommitResponse> {
-    file_manager::redo(&self.target, &self.actor, self.confirmed)
-      .await
+    file_manager::redo(
+      &self.target,
+      &self.actor,
+      &self.operation_id,
+      self.confirmed,
+    )
+    .await
   }
 }
 
@@ -115,7 +126,13 @@ impl Resolve<Args> for StartFileManagerDownload {
     self,
     args: &Args,
   ) -> anyhow::Result<StartFileManagerDownloadResponse> {
-    file_manager::start_download(&args.core, self.target, self.paths)
-      .await
+    file_manager::start_download(
+      &args.core,
+      self.target,
+      self.actor,
+      self.operation_id,
+      self.paths,
+    )
+    .await
   }
 }

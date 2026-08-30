@@ -238,11 +238,11 @@ export type WriteResponses = {
 
   // ==== FILE MANAGER ====
   PreflightFileManagerOperation: Types.FileManagerPreflight;
-  CommitFileManagerOperation: Types.Update;
+  CommitFileManagerOperation: Types.FileManagerOperationTicket;
   PrepareFileManagerUpload: Types.FileManagerTransferTicket;
   PrepareFileManagerDownload: Types.FileManagerTransferTicket;
-  UndoFileManagerOperation: Types.Update;
-  RedoFileManagerOperation: Types.Update;
+  UndoFileManagerOperation: Types.FileManagerOperationTicket;
+  RedoFileManagerOperation: Types.FileManagerOperationTicket;
 
   // ==== DEPLOYMENT ====
   CreateDeployment: Types.Deployment;

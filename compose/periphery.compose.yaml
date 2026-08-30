@@ -46,6 +46,9 @@ services:
       - keys:/config/keys
       ## Mount external docker socket
       - /var/run/docker.sock:/var/run/docker.sock
+      ## Allow the File Manager to access local Docker named volumes.
+      ## Set this to Docker's absolute volume root when using a nonstandard data root.
+      - ${PERIPHERY_DOCKER_VOLUME_ROOT:-/var/lib/docker/volumes}:${PERIPHERY_DOCKER_VOLUME_ROOT:-/var/lib/docker/volumes}
       ## Allow Periphery to see processes outside of container
       - /proc:/proc
       ## Specify the Periphery agent root directory.

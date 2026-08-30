@@ -263,12 +263,43 @@ pub enum FileManagerOperationState {
 
 #[typeshare]
 #[derive(
+  Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize,
+)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum FileManagerOperationPhase {
+  #[default]
+  Queued,
+  Preparing,
+  Snapshotting,
+  Applying,
+  Verifying,
+  Transferring,
+  Finalizing,
+  RollingBack,
+}
+
+#[typeshare]
+#[derive(
+  Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize,
+)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+pub struct FileManagerOperationTicket {
+  pub operation_id: String,
+}
+
+#[typeshare]
+#[derive(
   Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize,
 )]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 pub struct FileManagerOperationStatus {
   pub operation_id: String,
   pub state: FileManagerOperationState,
+  #[serde(default)]
+  pub phase: FileManagerOperationPhase,
+  #[serde(default)]
+  pub description: String,
   pub completed_entries: U64,
   pub total_entries: U64,
   pub completed_bytes: U64,

@@ -5,6 +5,7 @@ services:
       # Mount the root folder that contains .git
       - ../:/workspace:cached
       - /var/run/docker.sock:/var/run/docker.sock
+      - ${PERIPHERY_DOCKER_VOLUME_ROOT:-/var/lib/docker/volumes}:${PERIPHERY_DOCKER_VOLUME_ROOT:-/var/lib/docker/volumes}
       - /proc:/proc
       - repos:/etc/komodo/repos
       - stacks:/etc/komodo/stacks

@@ -7,7 +7,11 @@ import { useExecute, usePermissions, useRead, useSetTitle } from "@/lib/hooks";
 import { useServer } from "@/resources/server";
 import ResourceSubPage from "@/resources/sub-page";
 import { ICONS } from "@/lib/icons";
-import { ConfirmButton, MobileFriendlyTabsSelector, TabNoContent } from "mogh_ui";
+import {
+  ConfirmButton,
+  MobileFriendlyTabsSelector,
+  TabNoContent,
+} from "mogh_ui";
 import { DataTable } from "mogh_ui";
 import { Section } from "mogh_ui";
 import { Center, Group, Loader, Stack, Tabs, Text } from "@mantine/core";
@@ -159,7 +163,7 @@ function VolumeInner({
           />
         ) : (
           <Stack>
-            <Group justify="end">{selector}</Group>
+            <Group justify="start">{selector}</Group>
             {containers && containers.length > 0 && (
               <ContainersSection serverId={serverId} containers={containers} />
             )}

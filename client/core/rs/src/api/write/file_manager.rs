@@ -6,10 +6,10 @@ use crate::entities::{
   U64,
   file_manager::{
     FileManagerConflictDecision, FileManagerOperation,
-    FileManagerPreflight, FileManagerRevision, FileManagerTarget,
+    FileManagerOperationTicket, FileManagerPreflight,
+    FileManagerRevision, FileManagerTarget,
     FileManagerTransferTicket,
   },
-  update::Update,
 };
 
 use super::KomodoWriteRequest;
@@ -29,7 +29,7 @@ pub struct PreflightFileManagerOperation {
 #[derive(Serialize, Deserialize, Debug, Clone, Resolve)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[empty_traits(KomodoWriteRequest)]
-#[response(Update)]
+#[response(FileManagerOperationTicket)]
 #[error(mogh_error::Error)]
 pub struct CommitFileManagerOperation {
   pub target: FileManagerTarget,
@@ -73,7 +73,7 @@ pub struct PrepareFileManagerDownload {
 #[derive(Serialize, Deserialize, Debug, Clone, Resolve)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[empty_traits(KomodoWriteRequest)]
-#[response(Update)]
+#[response(FileManagerOperationTicket)]
 #[error(mogh_error::Error)]
 pub struct UndoFileManagerOperation {
   pub target: FileManagerTarget,
@@ -85,7 +85,7 @@ pub struct UndoFileManagerOperation {
 #[derive(Serialize, Deserialize, Debug, Clone, Resolve)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[empty_traits(KomodoWriteRequest)]
-#[response(Update)]
+#[response(FileManagerOperationTicket)]
 #[error(mogh_error::Error)]
 pub struct RedoFileManagerOperation {
   pub target: FileManagerTarget,

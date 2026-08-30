@@ -12,8 +12,8 @@ use komodo_client::{
   entities::{
     Operation, ResourceTarget,
     file_manager::{
-      FileManagerOperation, FileManagerPreflight,
-      FileManagerRevision, FileManagerTarget,
+      FileManagerOperation, FileManagerOperationTicket,
+      FileManagerPreflight, FileManagerRevision, FileManagerTarget,
       FileManagerTransferTicket,
     },
     komodo_timestamp,
@@ -24,12 +24,15 @@ use komodo_client::{
 };
 use mogh_resolver::Resolve;
 use periphery_client::api::file_manager as periphery;
+use uuid::Uuid;
 
 use crate::{
   config::core_config,
   file_manager::{
     ResolvedFileManagerTarget, TransferSessionKind,
-    create_transfer_session, managed_revision, resolve_target,
+    complete_operation, create_operation_status,
+    create_transfer_session, fail_operation, managed_revision,
+    resolve_target, set_operation_finalizing,
   },
   helpers::{
     periphery_client,
@@ -121,33 +124,47 @@ impl Resolve<WriteArgs> for CommitFileManagerOperation {
   async fn resolve(
     self,
     WriteArgs { user }: &WriteArgs,
-  ) -> mogh_error::Result<Update> {
+  ) -> mogh_error::Result<FileManagerOperationTicket> {
     ensure_writes_enabled()?;
     let resolved =
       resolve_target(&self.target, user, PermissionLevel::Write)
         .await?;
     let managed =
       managed_plans().write().unwrap().remove(&self.plan_id);
-    let operation = "Commit file operation";
-    let result = async {
-      if let Some(plan) = &managed {
-        if plan.actor != user.id {
-          return Err(anyhow!("Preflight plan belongs to another user"));
-        }
-        if plan.expires_at < komodo_timestamp() {
-          return Err(anyhow!("Preflight plan has expired"));
-        }
+    if let Some(plan) = &managed {
+      if plan.actor != user.id {
+        return Err(
+          anyhow!("Preflight plan belongs to another user").into(),
+        );
       }
+      if plan.expires_at < komodo_timestamp() {
+        return Err(anyhow!("Preflight plan has expired").into());
+      }
+    }
+    let operation_id = create_operation_status(
+      user.id.clone(),
+      self.target.clone(),
+      "File operation",
+    );
+    let ticket = FileManagerOperationTicket {
+      operation_id: operation_id.clone(),
+    };
+    let actor = user.clone();
+    let target = self.target;
+    tokio::spawn(async move {
+      let result = async {
       let response = periphery_client(&resolved.server)
         .await?
         .request(periphery::CommitFileManagerOperation {
           target: resolved.periphery.clone(),
-          actor: user.id.clone(),
+          actor: actor.id.clone(),
+          operation_id: operation_id.clone(),
           plan_id: self.plan_id,
           decisions: self.decisions,
           confirmed: self.confirmed,
         })
         .await?;
+      set_operation_finalizing(&operation_id);
       if let Some(plan) = &managed
         && let Err(error) = update_managed_source(
           &plan.stack_name,
@@ -160,7 +177,8 @@ impl Resolve<WriteArgs> for CommitFileManagerOperation {
           .await?
           .request(periphery::UndoFileManagerOperation {
             target: resolved.periphery.clone(),
-            actor: user.id.clone(),
+            actor: actor.id.clone(),
+            operation_id: Uuid::new_v4().to_string(),
             confirmed: true,
           })
           .await;
@@ -169,8 +187,8 @@ impl Resolve<WriteArgs> for CommitFileManagerOperation {
         ));
       }
       push_history(
-        &self.target,
-        &user.id,
+        &target,
+        &actor.id,
         HistoryEntry {
           managed: managed.map(|plan| ManagedHistory {
             stack_name: plan.stack_name,
@@ -179,16 +197,27 @@ impl Resolve<WriteArgs> for CommitFileManagerOperation {
           }),
         },
       );
-      anyhow::Ok(response)
+      anyhow::Ok(response.affected_paths)
     }
     .await;
-    audit_result(
-      resolved.resource,
-      operation,
-      result.map(|response| response.affected_paths),
-      user,
-    )
-    .await
+      let operation_error =
+        result.as_ref().err().map(ToString::to_string);
+      let audit = audit_result(
+        resolved.resource,
+        "File operation",
+        result,
+        &actor,
+      )
+      .await;
+      if let Some(error) = operation_error {
+        fail_operation(&operation_id, error);
+      } else if let Err(error) = audit {
+        fail_operation(&operation_id, error.error.to_string());
+      } else {
+        complete_operation(&operation_id);
+      }
+    });
+    Ok(ticket)
   }
 }
 
@@ -196,18 +225,30 @@ impl Resolve<WriteArgs> for UndoFileManagerOperation {
   async fn resolve(
     self,
     WriteArgs { user }: &WriteArgs,
-  ) -> mogh_error::Result<Update> {
+  ) -> mogh_error::Result<FileManagerOperationTicket> {
     ensure_writes_enabled()?;
     let resolved =
       resolve_target(&self.target, user, PermissionLevel::Write)
         .await?;
     let entry = pop_undo(&self.target, &user.id);
-    let result = async {
+    let operation_id = create_operation_status(
+      user.id.clone(),
+      self.target.clone(),
+      "Undo file operation",
+    );
+    let ticket = FileManagerOperationTicket {
+      operation_id: operation_id.clone(),
+    };
+    let actor = user.clone();
+    let target = self.target;
+    tokio::spawn(async move {
+      let result = async {
       let response = periphery_client(&resolved.server)
         .await?
         .request(periphery::UndoFileManagerOperation {
           target: resolved.periphery.clone(),
-          actor: user.id.clone(),
+          actor: actor.id.clone(),
+          operation_id: operation_id.clone(),
           confirmed: self.confirmed,
         })
         .await;
@@ -215,11 +256,12 @@ impl Resolve<WriteArgs> for UndoFileManagerOperation {
         Ok(response) => response,
         Err(error) => {
           if let Some(entry) = entry.clone() {
-            restore_undo(&self.target, &user.id, entry);
+            restore_undo(&target, &actor.id, entry);
           }
           return Err(error);
         }
       };
+      set_operation_finalizing(&operation_id);
       if let Some(ManagedHistory {
         stack_name,
         before,
@@ -232,28 +274,40 @@ impl Resolve<WriteArgs> for UndoFileManagerOperation {
           .await?
           .request(periphery::RedoFileManagerOperation {
             target: resolved.periphery.clone(),
-            actor: user.id.clone(),
+            actor: actor.id.clone(),
+            operation_id: Uuid::new_v4().to_string(),
             confirmed: true,
           })
           .await;
-        restore_undo(&self.target, &user.id, entry.clone().unwrap());
+        restore_undo(&target, &actor.id, entry.clone().unwrap());
         return Err(error.context(
           "Host undo was rolled back after the managed source changed",
         ));
       }
       if let Some(entry) = entry {
-        push_redo(&self.target, &user.id, entry);
+        push_redo(&target, &actor.id, entry);
       }
-      anyhow::Ok(response)
+      anyhow::Ok(response.affected_paths)
     }
     .await;
-    audit_result(
-      resolved.resource,
-      "Undo file operation",
-      result.map(|response| response.affected_paths),
-      user,
-    )
-    .await
+      let operation_error =
+        result.as_ref().err().map(ToString::to_string);
+      let audit = audit_result(
+        resolved.resource,
+        "Undo file operation",
+        result,
+        &actor,
+      )
+      .await;
+      if let Some(error) = operation_error {
+        fail_operation(&operation_id, error);
+      } else if let Err(error) = audit {
+        fail_operation(&operation_id, error.error.to_string());
+      } else {
+        complete_operation(&operation_id);
+      }
+    });
+    Ok(ticket)
   }
 }
 
@@ -261,18 +315,30 @@ impl Resolve<WriteArgs> for RedoFileManagerOperation {
   async fn resolve(
     self,
     WriteArgs { user }: &WriteArgs,
-  ) -> mogh_error::Result<Update> {
+  ) -> mogh_error::Result<FileManagerOperationTicket> {
     ensure_writes_enabled()?;
     let resolved =
       resolve_target(&self.target, user, PermissionLevel::Write)
         .await?;
     let entry = pop_redo(&self.target, &user.id);
-    let result = async {
+    let operation_id = create_operation_status(
+      user.id.clone(),
+      self.target.clone(),
+      "Redo file operation",
+    );
+    let ticket = FileManagerOperationTicket {
+      operation_id: operation_id.clone(),
+    };
+    let actor = user.clone();
+    let target = self.target;
+    tokio::spawn(async move {
+      let result = async {
       let response = periphery_client(&resolved.server)
         .await?
         .request(periphery::RedoFileManagerOperation {
           target: resolved.periphery.clone(),
-          actor: user.id.clone(),
+          actor: actor.id.clone(),
+          operation_id: operation_id.clone(),
           confirmed: self.confirmed,
         })
         .await;
@@ -280,11 +346,12 @@ impl Resolve<WriteArgs> for RedoFileManagerOperation {
         Ok(response) => response,
         Err(error) => {
           if let Some(entry) = entry.clone() {
-            restore_redo(&self.target, &user.id, entry);
+            restore_redo(&target, &actor.id, entry);
           }
           return Err(error);
         }
       };
+      set_operation_finalizing(&operation_id);
       if let Some(ManagedHistory {
         stack_name,
         before,
@@ -297,28 +364,40 @@ impl Resolve<WriteArgs> for RedoFileManagerOperation {
           .await?
           .request(periphery::UndoFileManagerOperation {
             target: resolved.periphery.clone(),
-            actor: user.id.clone(),
+            actor: actor.id.clone(),
+            operation_id: Uuid::new_v4().to_string(),
             confirmed: true,
           })
           .await;
-        restore_redo(&self.target, &user.id, entry.clone().unwrap());
+        restore_redo(&target, &actor.id, entry.clone().unwrap());
         return Err(error.context(
           "Host redo was rolled back after the managed source changed",
         ));
       }
       if let Some(entry) = entry {
-        restore_undo(&self.target, &user.id, entry);
+        restore_undo(&target, &actor.id, entry);
       }
-      anyhow::Ok(response)
+      anyhow::Ok(response.affected_paths)
     }
     .await;
-    audit_result(
-      resolved.resource,
-      "Redo file operation",
-      result.map(|response| response.affected_paths),
-      user,
-    )
-    .await
+      let operation_error =
+        result.as_ref().err().map(ToString::to_string);
+      let audit = audit_result(
+        resolved.resource,
+        "Redo file operation",
+        result,
+        &actor,
+      )
+      .await;
+      if let Some(error) = operation_error {
+        fail_operation(&operation_id, error);
+      } else if let Err(error) = audit {
+        fail_operation(&operation_id, error.error.to_string());
+      } else {
+        complete_operation(&operation_id);
+      }
+    });
+    Ok(ticket)
   }
 }
 

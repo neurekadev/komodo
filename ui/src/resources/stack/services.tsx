@@ -2,7 +2,7 @@ import { Fragment, ReactNode } from "react";
 import { useStack } from ".";
 import { useRead } from "@/lib/hooks";
 import { Types } from "komodo_client";
-import { Section } from "mogh_ui";
+import { DividedChildren, Section } from "mogh_ui";
 import { DataTable, SortableHeader } from "mogh_ui";
 import StackServiceLink from "@/components/stack-service-link";
 import { StatusBadge } from "mogh_ui";
@@ -214,6 +214,24 @@ function StackServicesServer({
               ports={row.original.container?.ports ?? []}
               serverId={serverId}
             />
+          ),
+        },
+        {
+          accessorKey: "container.volumes.0",
+          header: ({ column }) => (
+            <SortableHeader column={column} title="Volumes" />
+          ),
+          cell: ({ row }) => (
+            <DividedChildren wrap="nowrap">
+              {row.original.container?.volumes?.map((volume) => (
+                <DockerResourceLink
+                  key={volume}
+                  type="Volume"
+                  serverId={serverId}
+                  name={volume}
+                />
+              ))}
+            </DividedChildren>
           ),
         },
       ]}

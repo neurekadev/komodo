@@ -1,7 +1,7 @@
 import { KOMODO_BASE_URL } from "@/main";
 import { useRead, useWrite } from "@/lib/hooks";
 import { ICONS } from "@/lib/icons";
-import { updateLogToText } from "@/lib/utils";
+import { useFileOperations } from "@/components/file-manager/operations";
 import {
   ActionIcon,
   Alert,
@@ -14,7 +14,6 @@ import {
   Loader,
   Menu,
   Modal,
-  Progress,
   ScrollArea,
   Select,
   Stack,
@@ -51,6 +50,8 @@ import {
   Folder,
   FolderOpen,
   FolderPlus,
+  FolderUp,
+  FilePlus,
   Pencil,
   Redo2,
   Scissors,
@@ -84,6 +85,8 @@ type PendingCommit = {
   operation: Types.FileManagerOperation;
   preflight: Types.FileManagerPreflight;
   clearClipboardOnSuccess?: boolean;
+  notificationId: string;
+  label: string;
 };
 type FileVisual = {
   icon: LucideIcon;
@@ -135,14 +138,7 @@ const IMAGE_EXTENSIONS = [
   ".avif",
   ".heic",
 ];
-const VIDEO_EXTENSIONS = [
-  ".mp4",
-  ".mkv",
-  ".mov",
-  ".avi",
-  ".webm",
-  ".m4v",
-];
+const VIDEO_EXTENSIONS = [".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v"];
 const AUDIO_EXTENSIONS = [
   ".mp3",
   ".wav",
@@ -152,13 +148,7 @@ const AUDIO_EXTENSIONS = [
   ".aac",
   ".opus",
 ];
-const SPREADSHEET_EXTENSIONS = [
-  ".csv",
-  ".tsv",
-  ".xls",
-  ".xlsx",
-  ".ods",
-];
+const SPREADSHEET_EXTENSIONS = [".csv", ".tsv", ".xls", ".xlsx", ".ods"];
 const DOCUMENT_EXTENSIONS = [".pdf", ".doc", ".docx", ".odt", ".rtf"];
 const SCRIPT_EXTENSIONS = [
   ".sh",
@@ -361,20 +351,32 @@ const formatBytes = (bytes: number) => {
 
 const isEditingElement = (target: EventTarget | null) => {
   const element = target instanceof HTMLElement ? target : null;
-  return !!element?.closest("input, textarea, [contenteditable=true], .monaco-editor");
+  return !!element?.closest(
+    "input, textarea, [contenteditable=true], .monaco-editor",
+  );
 };
 
-const reportUpdateFailure = (update: Types.Update) => {
-  if (update.success) return false;
-  const message =
-    update.logs.findLast((log) => !log.success)?.stderr ||
-    "The file operation failed. Open its update for details.";
-  notifications.show({
-    title: "File operation failed",
-    message: updateLogToText(message),
-    color: "red",
-  });
-  return true;
+const operationLabel = (operation: Types.FileManagerOperation) => {
+  switch (operation.type) {
+    case "CreateFile":
+      return "Create file";
+    case "CreateDirectory":
+      return "Create folder";
+    case "Rename":
+      return "Rename";
+    case "Move":
+      return "Move";
+    case "Copy":
+      return "Copy";
+    case "Delete":
+      return "Delete";
+    case "WriteText":
+      return "Save text file";
+    case "CreateArchive":
+      return "Create archive";
+    case "ExtractArchive":
+      return "Extract archive";
+  }
 };
 
 export default function FileManager({
@@ -385,6 +387,7 @@ export default function FileManager({
   titleOther?: ReactNode;
 }) {
   const queryClient = useQueryClient();
+  const operations = useFileOperations();
   const desktop = useMediaQuery("(min-width: 62em)");
   const inputRef = useRef<HTMLInputElement>(null);
   const uploadDestinationRef = useRef<string | undefined>(undefined);
@@ -397,21 +400,19 @@ export default function FileManager({
   const [sortAscending, setSortAscending] = useState(true);
   const [editorPath, setEditorPath] = useState<string>();
   const [draft, setDraft] = useState("");
+  const [discardEditorOpen, setDiscardEditorOpen] = useState(false);
   const [action, setAction] = useState<ActionDialog>(null);
   const [actionValue, setActionValue] = useState("");
   const [actionPaths, setActionPaths] = useState<string[]>([]);
   const [actionDestination, setActionDestination] = useState("");
   const [archiveFormat, setArchiveFormat] =
-    useState<Types.FileManagerArchiveFormat>(Types.FileManagerArchiveFormat.Zip);
+    useState<Types.FileManagerArchiveFormat>(
+      Types.FileManagerArchiveFormat.Zip,
+    );
   const [pendingCommit, setPendingCommit] = useState<PendingCommit>();
   const [decisions, setDecisions] = useState<
     Record<string, Types.FileManagerConflictAction>
   >({});
-  const [transfer, setTransfer] = useState<{
-    label: string;
-    percent?: number;
-    cancel?: () => void;
-  }>();
 
   const capabilities = useRead("GetFileManagerCapabilities", { target }).data;
   const directory = useRead(
@@ -432,24 +433,43 @@ export default function FileManager({
 
   const { mutateAsync: preflight, isPending: preflightPending } = useWrite(
     "PreflightFileManagerOperation",
+    { onError: () => undefined },
   );
   const { mutateAsync: commit, isPending: commitPending } = useWrite(
     "CommitFileManagerOperation",
+    {
+      onError: () => undefined,
+    },
   );
-  const { mutateAsync: prepareUpload } = useWrite("PrepareFileManagerUpload");
+  const { mutateAsync: prepareUpload } = useWrite("PrepareFileManagerUpload", {
+    onError: () => undefined,
+  });
   const { mutateAsync: prepareDownload } = useWrite(
     "PrepareFileManagerDownload",
+    {
+      onError: () => undefined,
+    },
   );
   const { mutateAsync: undo, isPending: undoPending } = useWrite(
     "UndoFileManagerOperation",
+    {
+      onError: () => undefined,
+    },
   );
   const { mutateAsync: redo, isPending: redoPending } = useWrite(
     "RedoFileManagerOperation",
+    {
+      onError: () => undefined,
+    },
   );
 
   const readOnly = capabilities?.read_only ?? true;
   const busy =
-    preflightPending || commitPending || undoPending || redoPending || !!transfer;
+    preflightPending ||
+    commitPending ||
+    undoPending ||
+    redoPending ||
+    operations.isWriteActive(target);
 
   const entries = useMemo(() => {
     const result = [...(directory.data?.entries ?? [])];
@@ -499,29 +519,52 @@ export default function FileManager({
   useEffect(() => {
     setSelected([]);
     setSelectionAnchor(undefined);
-    setEditorPath(undefined);
   }, [path]);
+
+  const editorDirty = !!textFile.data && draft !== textFile.data.contents;
+
+  const requestEditorClose = useCallback(() => {
+    if (editorDirty) setDiscardEditorOpen(true);
+    else setEditorPath(undefined);
+  }, [editorDirty]);
+
+  useEffect(() => {
+    if (!editorDirty) return;
+    const warn = (event: BeforeUnloadEvent) => event.preventDefault();
+    window.addEventListener("beforeunload", warn);
+    return () => window.removeEventListener("beforeunload", warn);
+  }, [editorDirty]);
 
   const completeCommit = useCallback(
     async (
       plan: PendingCommit,
       conflictDecisions: Types.FileManagerConflictDecision[] = [],
     ) => {
-      const update = await commit({
-        target,
-        plan_id: plan.preflight.plan_id,
-        decisions: conflictDecisions,
-        confirmed: true,
-      });
-      setPendingCommit(undefined);
-      setDecisions({});
-      await refresh();
-      if (reportUpdateFailure(update)) return;
-      if (plan.clearClipboardOnSuccess) setClipboard(undefined);
-      setSelected([]);
-      notifications.show({ message: "File operation completed.", color: "green" });
+      try {
+        const ticket = await commit({
+          target,
+          plan_id: plan.preflight.plan_id,
+          decisions: conflictDecisions,
+          confirmed: true,
+        });
+        setPendingCommit(undefined);
+        setDecisions({});
+        const status = await operations.track(
+          ticket.operation_id,
+          target,
+          plan.label,
+          true,
+          plan.notificationId,
+        );
+        if (status.state !== Types.FileManagerOperationState.Complete) return;
+        await refresh();
+        if (plan.clearClipboardOnSuccess) setClipboard(undefined);
+        setSelected([]);
+      } catch (error) {
+        operations.failPending(plan.notificationId, plan.label, error);
+      }
     },
-    [commit, refresh, target],
+    [commit, operations, refresh, target],
   );
 
   const runOperation = useCallback(
@@ -529,24 +572,76 @@ export default function FileManager({
       operation: Types.FileManagerOperation,
       options: { clearClipboardOnSuccess?: boolean } = {},
     ) => {
-      const result = await preflight({ target, operation });
-      const plan = { operation, preflight: result, ...options };
-      if (result.confirmation_required || result.conflicts.length > 0) {
-        setDecisions(
-          Object.fromEntries(
-            result.conflicts.map((conflict) => [
-              conflict.path,
-              Types.FileManagerConflictAction.Overwrite,
-            ]),
-          ),
-        );
-        setPendingCommit(plan);
-      } else {
-        await completeCommit(plan);
+      const label = operationLabel(operation);
+      const notificationId = operations.begin(label);
+      try {
+        const result = await preflight({ target, operation });
+        const plan = {
+          operation,
+          preflight: result,
+          notificationId,
+          label,
+          ...options,
+        };
+        if (result.confirmation_required || result.conflicts.length > 0) {
+          operations.waiting(notificationId, label);
+          setDecisions(
+            Object.fromEntries(
+              result.conflicts.map((conflict) => [
+                conflict.path,
+                Types.FileManagerConflictAction.Overwrite,
+              ]),
+            ),
+          );
+          setPendingCommit(plan);
+        } else {
+          await completeCommit(plan);
+        }
+      } catch (error) {
+        operations.failPending(notificationId, label, error);
       }
     },
-    [completeCommit, preflight, target],
+    [completeCommit, operations, preflight, target],
   );
+
+  const runHistoryOperation = useCallback(
+    async (kind: "undo" | "redo") => {
+      const label =
+        kind === "undo" ? "Undo file operation" : "Redo file operation";
+      const notificationId = operations.begin(label);
+      try {
+        const ticket =
+          kind === "undo"
+            ? await undo({ target, confirmed: true })
+            : await redo({ target, confirmed: true });
+        const status = await operations.track(
+          ticket.operation_id,
+          target,
+          label,
+          true,
+          notificationId,
+        );
+        if (status.state === Types.FileManagerOperationState.Complete) {
+          await refresh();
+          setSelected([]);
+        }
+      } catch (error) {
+        operations.failPending(notificationId, label, error);
+      }
+    },
+    [operations, redo, refresh, target, undo],
+  );
+
+  const cancelPendingCommit = useCallback(() => {
+    if (pendingCommit) {
+      operations.cancelPending(
+        pendingCommit.notificationId,
+        pendingCommit.label,
+      );
+    }
+    setPendingCommit(undefined);
+    setDecisions({});
+  }, [operations, pendingCommit]);
 
   const selectEntry = (
     entry: Types.FileManagerEntry,
@@ -588,17 +683,37 @@ export default function FileManager({
   const selectedEntries = entries.filter((entry) =>
     selectedPathSet.has(entry.path),
   );
-  const selectionContainsManaged = selectedEntries.some((entry) => entry.managed);
+  const selectionContainsManaged = selectedEntries.some(
+    (entry) => entry.managed,
+  );
   const canChangeSelection =
     !readOnly && selected.length > 0 && !selectionContainsManaged;
+  const canRenameSelection = canChangeSelection && selected.length === 1;
+  const canArchiveSelection = canChangeSelection;
+  const canExtractSelection =
+    canChangeSelection &&
+    selected.length === 1 &&
+    selectedEntries[0]?.kind === Types.FileManagerEntryKind.File;
+  const hasMoreAction =
+    canRenameSelection ||
+    canArchiveSelection ||
+    canExtractSelection ||
+    canChangeSelection;
 
   const paste = useCallback(
     async (destination = path) => {
       if (!clipboard || readOnly) return;
+      const paths = clipboard.paths.filter(
+        (source) =>
+          source !== destination &&
+          !destination.startsWith(`${source}/`) &&
+          (clipboard.mode === "copy" || parentPath(source) !== destination),
+      );
+      if (!paths.length) return;
       await runOperation(
         {
           type: clipboard.mode === "copy" ? "Copy" : "Move",
-          params: { paths: clipboard.paths, destination },
+          params: { paths, destination },
         },
         { clearClipboardOnSuccess: clipboard.mode === "move" },
       );
@@ -629,8 +744,7 @@ export default function FileManager({
     } else if (modifier && event.key.toLowerCase() === "z" && !event.shiftKey) {
       event.preventDefault();
       if (journal.data?.can_undo && !readOnly) {
-        reportUpdateFailure(await undo({ target, confirmed: true }));
-        await refresh();
+        await runHistoryOperation("undo");
       }
     } else if (
       modifier &&
@@ -639,8 +753,7 @@ export default function FileManager({
     ) {
       event.preventDefault();
       if (journal.data?.can_redo && !readOnly) {
-        reportUpdateFailure(await redo({ target, confirmed: true }));
-        await refresh();
+        await runHistoryOperation("redo");
       }
     } else if (event.key === "ArrowLeft") {
       event.preventDefault();
@@ -665,8 +778,8 @@ export default function FileManager({
       event.preventDefault();
       await runOperation({ type: "Delete", params: { paths: selected } });
     } else if (event.key === "Escape") {
-      setSelected([]);
-      setEditorPath(undefined);
+      if (editorPath) requestEditorClose();
+      else setSelected([]);
     }
   };
 
@@ -718,30 +831,32 @@ export default function FileManager({
   const uploadFiles = async (files: File[], destination = path) => {
     if (!files.length || readOnly) return;
     let uploadedCount = 0;
-    try {
-      for (const file of files) {
-        const collisionEntry =
-          destination === path
-            ? entries.find((entry) => entry.name === file.name)
-            : undefined;
-        const collision = !!collisionEntry;
-        if (collisionEntry?.managed) {
-          notifications.show({
-            title: "Upload blocked",
-            message: `${file.name} is managed by the stack editor and cannot be replaced by upload.`,
-            color: "red",
-          });
-          continue;
-        }
-        if (
-          collision &&
-          !globalThis.confirm(
-            `${file.name} already exists. Overwrite it with the uploaded file?`,
-          )
-        ) {
-          continue;
-        }
-        setTransfer({ label: `Uploading ${file.name}`, percent: 0 });
+    for (const file of files) {
+      let operationId: string | undefined;
+      const collisionEntry =
+        destination === path
+          ? entries.find((entry) => entry.name === file.name)
+          : undefined;
+      const collision = !!collisionEntry;
+      if (collisionEntry?.managed) {
+        notifications.show({
+          title: "Upload blocked",
+          message: `${file.name} is managed by the stack editor and cannot be replaced by upload.`,
+          color: "red",
+        });
+        continue;
+      }
+      if (
+        collision &&
+        !globalThis.confirm(
+          `${file.name} already exists. Overwrite it with the uploaded file?`,
+        )
+      ) {
+        continue;
+      }
+      const label = `Upload ${file.name}`;
+      const notificationId = operations.begin(label);
+      try {
         const ticket = await prepareUpload({
           target,
           destination,
@@ -751,25 +866,21 @@ export default function FileManager({
           confirmed: collision,
           expected_revision: collisionEntry?.revision,
         });
+        operationId = ticket.operation_id;
+        const statusPromise = operations.track(
+          ticket.operation_id,
+          target,
+          label,
+          true,
+          notificationId,
+        );
         await new Promise<void>((resolve, reject) => {
           const request = new XMLHttpRequest();
           request.open("POST", KOMODO_BASE_URL + ticket.url);
           const jwt = MoghAuth.LOGIN_TOKENS.jwt();
           if (jwt) request.setRequestHeader("authorization", jwt);
           request.withCredentials = true;
-          setTransfer({
-            label: `Uploading ${file.name}`,
-            percent: 0,
-            cancel: () => request.abort(),
-          });
-          request.upload.onprogress = (event) =>
-            setTransfer({
-              label: `Uploading ${file.name}`,
-              percent: event.lengthComputable
-                ? Math.round((event.loaded / event.total) * 100)
-                : undefined,
-              cancel: () => request.abort(),
-            });
+          operations.setCancel(notificationId, () => request.abort());
           request.onload = () =>
             request.status >= 200 && request.status < 300
               ? resolve()
@@ -779,24 +890,25 @@ export default function FileManager({
             reject(new DOMException("Upload cancelled", "AbortError"));
           request.send(file);
         });
-        uploadedCount += 1;
+        const status = await statusPromise;
+        if (status.state === Types.FileManagerOperationState.Complete) {
+          uploadedCount += 1;
+        }
+      } catch (error) {
+        if (operationId) operations.untrack(operationId);
+        if ((error as DOMException)?.name === "AbortError") {
+          operations.cancelPending(notificationId, label);
+        } else {
+          operations.failPending(notificationId, label, error);
+        }
+      } finally {
+        operations.setCancel(notificationId);
       }
-      if (uploadedCount > 0) {
-        notifications.show({ message: "Upload completed.", color: "green" });
-        await refresh();
-      }
-    } catch (error) {
-      if ((error as DOMException)?.name !== "AbortError") {
-        notifications.show({
-          title: "Upload failed",
-          message: error instanceof Error ? error.message : String(error),
-          color: "red",
-        });
-      }
-    } finally {
-      setTransfer(undefined);
-      if (inputRef.current) inputRef.current.value = "";
     }
+    if (uploadedCount > 0) {
+      await refresh();
+    }
+    if (inputRef.current) inputRef.current.value = "";
   };
 
   const openUpload = (destination = path) => {
@@ -807,12 +919,21 @@ export default function FileManager({
   const download = async (paths = selected) => {
     if (!paths.length) return;
     const controller = new AbortController();
+    const label =
+      paths.length === 1 ? `Download ${fileName(paths[0])}` : "Download files";
+    const notificationId = operations.begin(label);
+    let operationId: string | undefined;
     try {
-      setTransfer({
-        label: "Preparing download",
-        cancel: () => controller.abort(),
-      });
       const ticket = await prepareDownload({ target, paths });
+      operationId = ticket.operation_id;
+      const statusPromise = operations.track(
+        ticket.operation_id,
+        target,
+        label,
+        false,
+        notificationId,
+      );
+      operations.setCancel(notificationId, () => controller.abort());
       const jwt = MoghAuth.LOGIN_TOKENS.jwt();
       const response = await fetch(KOMODO_BASE_URL + ticket.url, {
         headers: jwt ? { authorization: jwt } : {},
@@ -842,39 +963,59 @@ export default function FileManager({
         link.click();
         URL.revokeObjectURL(link.href);
       }
-      notifications.show({ message: "Download completed.", color: "green" });
+      await statusPromise;
     } catch (error) {
-      if ((error as DOMException)?.name !== "AbortError") {
-        notifications.show({
-          title: "Download failed",
-          message: error instanceof Error ? error.message : String(error),
-          color: "red",
-        });
-      }
+      if (operationId) operations.untrack(operationId);
+      if ((error as DOMException)?.name === "AbortError")
+        operations.cancelPending(notificationId, label);
+      else operations.failPending(notificationId, label, error);
     } finally {
-      setTransfer(undefined);
+      operations.setCancel(notificationId);
     }
   };
 
   const onDrop = async (event: React.DragEvent, destination = path) => {
     event.preventDefault();
+    event.stopPropagation();
     const droppedFiles = Array.from(event.dataTransfer.files);
     if (droppedFiles.length) {
       await uploadFiles(droppedFiles, destination);
       return;
     }
-    const paths = JSON.parse(
-      event.dataTransfer.getData("application/x-komodo-file-paths") || "[]",
-    ) as string[];
-    if (paths.length && !readOnly) {
-      await runOperation({ type: "Move", params: { paths, destination } });
+    let droppedPaths: string[] = [];
+    try {
+      const parsed = JSON.parse(
+        event.dataTransfer.getData("application/x-komodo-file-paths") || "[]",
+      );
+      if (Array.isArray(parsed)) {
+        droppedPaths = parsed.filter(
+          (candidate): candidate is string => typeof candidate === "string",
+        );
+      }
+    } catch {
+      return;
     }
+    if (!droppedPaths.length || readOnly) return;
+    const movablePaths = [...new Set(droppedPaths)].filter(
+      (source) =>
+        source !== destination &&
+        !destination.startsWith(`${source}/`) &&
+        parentPath(source) !== destination,
+    );
+    if (!movablePaths.length) return;
+    await runOperation({
+      type: "Move",
+      params: { paths: movablePaths, destination },
+    });
   };
 
-  const extractArchive = (
-    archivePath: string,
-    destinationDirectory: string,
-  ) =>
+  const ignoreDrop = (event: React.DragEvent) => {
+    event.preventDefault();
+    event.stopPropagation();
+    event.dataTransfer.dropEffect = "none";
+  };
+
+  const extractArchive = (archivePath: string, destinationDirectory: string) =>
     runOperation({
       type: "ExtractArchive",
       params: {
@@ -892,12 +1033,14 @@ export default function FileManager({
     destination,
     archiveDestination,
     containsManaged = !!entry?.managed,
+    showOpen = true,
   }: {
     entry?: Types.FileManagerEntry;
     paths: string[];
     destination?: string;
     archiveDestination: string;
     containsManaged?: boolean;
+    showOpen?: boolean;
   }) => {
     const canMutate =
       !readOnly && paths.length > 0 && !containsManaged && !busy;
@@ -909,13 +1052,17 @@ export default function FileManager({
 
     return (
       <>
-        <Menu.Item
-          leftSection={<FolderOpen size={15} />}
-          disabled={!canOpen}
-          onClick={() => (entry ? openEntry(entry) : setPath(destination ?? ""))}
-        >
-          Open
-        </Menu.Item>
+        {showOpen && (
+          <Menu.Item
+            leftSection={<FolderOpen size={15} />}
+            disabled={!canOpen}
+            onClick={() =>
+              entry ? openEntry(entry) : setPath(destination ?? "")
+            }
+          >
+            Open
+          </Menu.Item>
+        )}
         {paths.length > 0 && (
           <Menu.Item
             leftSection={<ICONS.Download size={15} />}
@@ -938,10 +1085,8 @@ export default function FileManager({
               </Menu.Sub.Target>
               <Menu.Sub.Dropdown>
                 <Menu.Item
-                  leftSection={<FileIcon size={15} />}
-                  onClick={() =>
-                    openAction("create-file", { destination })
-                  }
+                  leftSection={<FilePlus size={15} />}
+                  onClick={() => openAction("create-file", { destination })}
                 >
                   File
                 </Menu.Item>
@@ -960,14 +1105,14 @@ export default function FileManager({
               disabled={readOnly || busy}
               onClick={() => openUpload(destination)}
             >
-              Upload here
+              Upload
             </Menu.Item>
             <Menu.Item
               leftSection={<Clipboard size={15} />}
               disabled={!clipboard || readOnly || busy}
               onClick={() => void paste(destination)}
             >
-              Paste here
+              Paste
             </Menu.Item>
           </>
         )}
@@ -1079,7 +1224,8 @@ export default function FileManager({
         <Loader />
       ) : !capabilities.available ? (
         <Alert color="yellow" title="File Manager unavailable">
-          {capabilities.reason ?? "This target cannot expose a filesystem root."}
+          {capabilities.reason ??
+            "This target cannot expose a filesystem root."}
         </Alert>
       ) : (
         <Stack gap="sm">
@@ -1092,7 +1238,11 @@ export default function FileManager({
 
           <Group justify="space-between" align="center">
             <Group gap={4}>
-              <Button variant="subtle" size="compact-sm" onClick={() => setPath("")}>
+              <Button
+                variant="subtle"
+                size="compact-sm"
+                onClick={() => setPath("")}
+              >
                 Root
               </Button>
               {breadcrumbs.map((part, index) => {
@@ -1114,7 +1264,7 @@ export default function FileManager({
             <Group gap={4}>
               <ToolbarButton
                 label="New file"
-                icon={<FileIcon size={17} />}
+                icon={<FilePlus size={17} />}
                 disabled={readOnly || busy}
                 onClick={() => openAction("create-file")}
               />
@@ -1160,7 +1310,7 @@ export default function FileManager({
                   <ActionIcon
                     variant="subtle"
                     aria-label="More file actions"
-                    disabled={busy}
+                    disabled={busy || !hasMoreAction}
                   >
                     <EllipsisVertical size={17} />
                   </ActionIcon>
@@ -1168,28 +1318,22 @@ export default function FileManager({
                 <Menu.Dropdown>
                   <Menu.Item
                     leftSection={<Pencil size={15} />}
-                    disabled={selected.length !== 1 || !canChangeSelection}
+                    disabled={!canRenameSelection}
                     onClick={() => openAction("rename")}
                   >
                     Rename
                   </Menu.Item>
                   <Menu.Item
                     leftSection={<FileArchive size={15} />}
-                    disabled={!canChangeSelection}
+                    disabled={!canArchiveSelection}
                     onClick={() => openAction("archive")}
                   >
                     Create archive
                   </Menu.Item>
                   <Menu.Item
                     leftSection={<FolderOpen size={15} />}
-                    disabled={
-                      selected.length !== 1 ||
-                      readOnly ||
-                      selectedEntries[0]?.kind !== Types.FileManagerEntryKind.File
-                    }
-                    onClick={() =>
-                      void extractArchive(selected[0], path)
-                    }
+                    disabled={!canExtractSelection}
+                    onClick={() => void extractArchive(selected[0], path)}
                   >
                     Extract here
                   </Menu.Item>
@@ -1199,7 +1343,10 @@ export default function FileManager({
                     leftSection={<ICONS.Delete size={15} />}
                     disabled={!canChangeSelection}
                     onClick={() =>
-                      runOperation({ type: "Delete", params: { paths: selected } })
+                      runOperation({
+                        type: "Delete",
+                        params: { paths: selected },
+                      })
                     }
                   >
                     Delete
@@ -1211,43 +1358,24 @@ export default function FileManager({
                 label={journal.data?.undo_description ?? "Undo"}
                 icon={<Undo2 size={17} />}
                 disabled={readOnly || !journal.data?.can_undo || busy}
-                onClick={async () => {
-                  reportUpdateFailure(await undo({ target, confirmed: true }));
-                  await refresh();
-                }}
+                onClick={() => void runHistoryOperation("undo")}
               />
               <ToolbarButton
                 label={journal.data?.redo_description ?? "Redo"}
                 icon={<Redo2 size={17} />}
                 disabled={readOnly || !journal.data?.can_redo || busy}
-                onClick={async () => {
-                  reportUpdateFailure(await redo({ target, confirmed: true }));
-                  await refresh();
-                }}
+                onClick={() => void runHistoryOperation("redo")}
               />
             </Group>
           </Group>
 
           {clipboard && (
             <Text size="xs" c="dimmed">
-              {clipboard.paths.length} item{clipboard.paths.length === 1 ? "" : "s"}{" "}
-              ready to {clipboard.mode === "copy" ? "copy" : "move"}.
+              {clipboard.paths.length} item
+              {clipboard.paths.length === 1 ? "" : "s"} ready to{" "}
+              {clipboard.mode === "copy" ? "copy" : "move"}.
             </Text>
           )}
-          {transfer && (
-            <Stack gap={4}>
-              <Group justify="space-between">
-                <Text size="sm">{transfer.label}</Text>
-                {transfer.cancel && (
-                  <Button size="compact-xs" variant="subtle" onClick={transfer.cancel}>
-                    Cancel
-                  </Button>
-                )}
-              </Group>
-              <Progress value={transfer.percent ?? 100} animated={transfer.percent == null} />
-            </Stack>
-          )}
-
           <Box
             ref={explorerRef}
             tabIndex={0}
@@ -1263,28 +1391,40 @@ export default function FileManager({
                     target={target}
                     currentPath={path}
                     onSelect={setPath}
+                    onDrop={(event, destination) =>
+                      void onDrop(event, destination)
+                    }
+                    ignoreDrop={ignoreDrop}
+                    backgroundMenu={contextMenuItems({
+                      paths: [],
+                      destination: path,
+                      archiveDestination: path,
+                      showOpen: false,
+                    })}
                     contextMenu={(entry) =>
                       contextMenuItems({
                         entry,
                         paths: entry ? [entry.path] : [],
                         destination: entry?.path ?? "",
-                        archiveDestination: entry
-                          ? parentPath(entry.path)
-                          : "",
+                        archiveDestination: entry ? parentPath(entry.path) : "",
                       })
                     }
                   />
                 </ScrollArea>
               )}
-              <ScrollArea h={520} style={{ flex: 1 }} className="bordered-light">
+              <ScrollArea
+                h={520}
+                style={{ flex: 1 }}
+                className="bordered-light"
+              >
                 {directory.isPending ? (
                   <Group justify="center" p="xl">
                     <Loader />
                   </Group>
                 ) : directory.isError ? (
                   <Alert color="red" title="Unable to read directory" m="md">
-                    The path could not be listed. It may have changed or no longer be
-                    accessible.
+                    The path could not be listed. It may have changed or no
+                    longer be accessible.
                   </Alert>
                 ) : (
                   <Table highlightOnHover stickyHeader verticalSpacing="xs">
@@ -1293,9 +1433,13 @@ export default function FileManager({
                         <Table.Th w={42}>
                           <Checkbox
                             aria-label="Select all entries"
-                            checked={entries.length > 0 && selected.length === entries.length}
+                            checked={
+                              entries.length > 0 &&
+                              selected.length === entries.length
+                            }
                             indeterminate={
-                              selected.length > 0 && selected.length < entries.length
+                              selected.length > 0 &&
+                              selected.length < entries.length
                             }
                             onChange={(event) =>
                               setSelected(
@@ -1312,6 +1456,36 @@ export default function FileManager({
                       </Table.Tr>
                     </Table.Thead>
                     <Table.Tbody>
+                      {path && (
+                        <Table.Tr
+                          onClick={() => setPath(parentPath(path))}
+                          style={{ cursor: "pointer" }}
+                        >
+                          <Table.Td />
+                          <Table.Td>
+                            <Group gap="xs" wrap="nowrap">
+                              <FolderUp
+                                size={18}
+                                color="var(--mantine-color-yellow-text)"
+                                opacity={0.9}
+                              />
+                              <Text size="sm" ff="monospace">
+                                ..
+                              </Text>
+                            </Group>
+                          </Table.Td>
+                          <Table.Td>
+                            <Text size="sm" c="dimmed">
+                              —
+                            </Text>
+                          </Table.Td>
+                          <Table.Td>
+                            <Text size="sm" c="dimmed">
+                              —
+                            </Text>
+                          </Table.Td>
+                        </Table.Tr>
+                      )}
                       {entries.map((entry) => {
                         const entryIsSelected = selectedPathSet.has(entry.path);
                         const contextPaths = entryIsSelected
@@ -1321,73 +1495,90 @@ export default function FileManager({
                           <Menu key={entry.path} shadow="md">
                             <Menu.ContextMenu>
                               <Table.Tr
-                          bg={entryIsSelected ? "accent.1" : undefined}
-                          draggable={!readOnly && !entry.managed}
-                          onDragStart={(event) =>
-                            event.dataTransfer.setData(
-                              "application/x-komodo-file-paths",
-                              JSON.stringify(
-                                entryIsSelected ? selected : [entry.path],
-                              ),
-                            )
-                          }
-                          onDragOver={(event) => {
-                            if (entry.kind === Types.FileManagerEntryKind.Directory)
-                              event.preventDefault();
-                          }}
-                          onDrop={(event) => {
-                            if (entry.kind === Types.FileManagerEntryKind.Directory)
-                              void onDrop(event, entry.path);
-                          }}
-                          onClick={(event) => selectEntry(entry, event)}
-                          onContextMenu={() => {
-                            if (!entryIsSelected) {
-                              setSelected([entry.path]);
-                              setSelectionAnchor(entry.path);
-                            }
-                          }}
-                          onDoubleClick={() => openEntry(entry)}
-                          style={{ cursor: "default" }}
-                        >
-                          <Table.Td>
-                            <Checkbox
-                              aria-label={`Select ${entry.name}`}
-                              checked={entryIsSelected}
-                              onChange={() =>
-                                setSelected((current) =>
-                                  current.includes(entry.path)
-                                    ? current.filter((item) => item !== entry.path)
-                                    : [...current, entry.path],
-                                )
-                              }
-                              onClick={(event) => event.stopPropagation()}
-                            />
-                          </Table.Td>
-                          <Table.Td>
-                            <Group gap="xs" wrap="nowrap">
-                              <EntryIcon entry={entry} />
-                              <Text size="sm" ff="monospace" truncate>
-                                {entry.name}
-                              </Text>
-                              {entry.managed && (
-                                <Badge size="xs" variant="light">
-                                  managed
-                                </Badge>
-                              )}
-                            </Group>
-                          </Table.Td>
-                          <Table.Td>
-                            <Text size="sm" c="dimmed">
-                              {entry.kind === Types.FileManagerEntryKind.Directory
-                                ? "—"
-                                : formatBytes(entry.size)}
-                            </Text>
-                          </Table.Td>
-                          <Table.Td>
-                            <Text size="sm" c="dimmed">
-                              {new Date(entry.modified_at).toLocaleString()}
-                            </Text>
-                          </Table.Td>
+                                bg={entryIsSelected ? "accent.1" : undefined}
+                                draggable={!readOnly && !entry.managed}
+                                onDragStart={(event) =>
+                                  event.dataTransfer.setData(
+                                    "application/x-komodo-file-paths",
+                                    JSON.stringify(
+                                      entryIsSelected ? selected : [entry.path],
+                                    ),
+                                  )
+                                }
+                                onDragOver={(event) => {
+                                  event.stopPropagation();
+                                  if (
+                                    entry.kind ===
+                                    Types.FileManagerEntryKind.Directory
+                                  ) {
+                                    event.preventDefault();
+                                    event.dataTransfer.dropEffect = "move";
+                                  }
+                                }}
+                                onDrop={(event) => {
+                                  if (
+                                    entry.kind ===
+                                    Types.FileManagerEntryKind.Directory
+                                  ) {
+                                    void onDrop(event, entry.path);
+                                  } else {
+                                    ignoreDrop(event);
+                                  }
+                                }}
+                                onClick={(event) => selectEntry(entry, event)}
+                                onContextMenu={() => {
+                                  if (!entryIsSelected) {
+                                    setSelected([entry.path]);
+                                    setSelectionAnchor(entry.path);
+                                  }
+                                }}
+                                onDoubleClick={() => openEntry(entry)}
+                                style={{ cursor: "default" }}
+                              >
+                                <Table.Td>
+                                  <Checkbox
+                                    aria-label={`Select ${entry.name}`}
+                                    checked={entryIsSelected}
+                                    onChange={() =>
+                                      setSelected((current) =>
+                                        current.includes(entry.path)
+                                          ? current.filter(
+                                              (item) => item !== entry.path,
+                                            )
+                                          : [...current, entry.path],
+                                      )
+                                    }
+                                    onClick={(event) => event.stopPropagation()}
+                                  />
+                                </Table.Td>
+                                <Table.Td>
+                                  <Group gap="xs" wrap="nowrap">
+                                    <EntryIcon entry={entry} />
+                                    <Text size="sm" ff="monospace" truncate>
+                                      {entry.name}
+                                    </Text>
+                                    {entry.managed && (
+                                      <Badge size="xs" variant="light">
+                                        managed
+                                      </Badge>
+                                    )}
+                                  </Group>
+                                </Table.Td>
+                                <Table.Td>
+                                  <Text size="sm" c="dimmed">
+                                    {entry.kind ===
+                                    Types.FileManagerEntryKind.Directory
+                                      ? "—"
+                                      : formatBytes(entry.size)}
+                                  </Text>
+                                </Table.Td>
+                                <Table.Td>
+                                  <Text size="sm" c="dimmed">
+                                    {new Date(
+                                      entry.modified_at,
+                                    ).toLocaleString()}
+                                  </Text>
+                                </Table.Td>
                               </Table.Tr>
                             </Menu.ContextMenu>
                             <Menu.Dropdown>
@@ -1412,7 +1603,8 @@ export default function FileManager({
                         <Table.Tr>
                           <Table.Td colSpan={4}>
                             <Text ta="center" c="dimmed" py="xl">
-                              This directory is empty. Drop files here to upload them.
+                              This directory is empty. Drop files here to upload
+                              them.
                             </Text>
                           </Table.Td>
                         </Table.Tr>
@@ -1441,9 +1633,9 @@ export default function FileManager({
 
       <Modal
         opened={!!editorPath}
-        onClose={() => setEditorPath(undefined)}
+        onClose={requestEditorClose}
         title={editorPath ? fileName(editorPath) : "File editor"}
-        size="xl"
+        size="min(92vw, 1600px)"
       >
         {textFile.isPending ? (
           <Loader />
@@ -1483,8 +1675,42 @@ export default function FileManager({
             )}
           </Stack>
         ) : (
-          <Alert color="red">This file cannot be opened as editable text.</Alert>
+          <Alert color="red">
+            This file cannot be opened as editable text.
+          </Alert>
         )}
+      </Modal>
+
+      <Modal
+        opened={discardEditorOpen}
+        onClose={() => setDiscardEditorOpen(false)}
+        title="Discard unsaved changes?"
+        size="sm"
+        centered
+      >
+        <Stack>
+          <Text size="sm">
+            This file has unsaved changes. Closing it will permanently discard
+            your draft.
+          </Text>
+          <Group justify="end">
+            <Button
+              variant="default"
+              onClick={() => setDiscardEditorOpen(false)}
+            >
+              Keep editing
+            </Button>
+            <Button
+              color="red"
+              onClick={() => {
+                setDiscardEditorOpen(false);
+                setEditorPath(undefined);
+              }}
+            >
+              Discard changes
+            </Button>
+          </Group>
+        </Stack>
       </Modal>
 
       <Modal
@@ -1520,7 +1746,10 @@ export default function FileManager({
               data={[
                 { value: Types.FileManagerArchiveFormat.Zip, label: "ZIP" },
                 { value: Types.FileManagerArchiveFormat.Tar, label: "TAR" },
-                { value: Types.FileManagerArchiveFormat.TarGz, label: "TAR.GZ" },
+                {
+                  value: Types.FileManagerArchiveFormat.TarGz,
+                  label: "TAR.GZ",
+                },
                 { value: Types.FileManagerArchiveFormat.SevenZip, label: "7z" },
               ]}
             />
@@ -1543,14 +1772,14 @@ export default function FileManager({
 
       <Modal
         opened={!!pendingCommit}
-        onClose={() => setPendingCommit(undefined)}
+        onClose={cancelPendingCommit}
         title="Confirm file operation"
         size="lg"
       >
         <Stack>
           <Alert color="yellow" title="Review required">
-            This operation can replace or remove existing data. Review every conflict
-            before continuing.
+            This operation can replace or remove existing data. Review every
+            conflict before continuing.
           </Alert>
           {pendingCommit?.preflight.conflicts.map((conflict) => (
             <Group key={conflict.path} justify="space-between" wrap="nowrap">
@@ -1559,7 +1788,8 @@ export default function FileManager({
                   {conflict.path}
                 </Text>
                 <Text size="xs" c="dimmed">
-                  Existing {conflict.existing_kind}; incoming {conflict.incoming_kind}
+                  Existing {conflict.existing_kind}; incoming{" "}
+                  {conflict.incoming_kind}
                 </Text>
               </Stack>
               <Select
@@ -1576,13 +1806,16 @@ export default function FileManager({
                     value: Types.FileManagerConflictAction.Overwrite,
                     label: "Overwrite",
                   },
-                  { value: Types.FileManagerConflictAction.Skip, label: "Skip" },
+                  {
+                    value: Types.FileManagerConflictAction.Skip,
+                    label: "Skip",
+                  },
                 ]}
               />
             </Group>
           ))}
           <Group justify="end">
-            <Button variant="default" onClick={() => setPendingCommit(undefined)}>
+            <Button variant="default" onClick={cancelPendingCommit}>
               Cancel
             </Button>
             <Button
@@ -1640,63 +1873,83 @@ function DirectoryTree({
   currentPath,
   onSelect,
   contextMenu,
+  backgroundMenu,
+  onDrop,
+  ignoreDrop,
 }: {
   target: Types.FileManagerTarget;
   currentPath: string;
   onSelect: (path: string) => void;
   contextMenu: (entry?: Types.FileManagerEntry) => ReactNode;
+  backgroundMenu: ReactNode;
+  onDrop: (event: React.DragEvent, destination: string) => void;
+  ignoreDrop: (event: React.DragEvent) => void;
 }) {
   const [expanded, setExpanded] = useState(true);
   return (
-    <Stack gap={2}>
-      <Menu shadow="md">
-        <Menu.ContextMenu>
-          <Button
-            variant={currentPath === "" ? "light" : "subtle"}
-            justify="start"
-            size="compact-sm"
-            leftSection={
-              <ActionIcon
-                component="span"
-                variant="transparent"
-                size="xs"
-                onClick={(event) => {
+    <Menu shadow="md">
+      <Menu.ContextMenu>
+        <Stack gap={2} mih={500} onDragOver={ignoreDrop} onDrop={ignoreDrop}>
+          <Menu shadow="md">
+            <Menu.ContextMenu>
+              <Button
+                variant={currentPath === "" ? "light" : "subtle"}
+                justify="start"
+                size="compact-sm"
+                leftSection={
+                  <ActionIcon
+                    component="span"
+                    variant="transparent"
+                    size="xs"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      setExpanded((value) => !value);
+                    }}
+                  >
+                    {expanded ? (
+                      <ChevronDown size={14} />
+                    ) : (
+                      <ChevronRight size={14} />
+                    )}
+                  </ActionIcon>
+                }
+                onClick={() => onSelect("")}
+                onContextMenu={(event) => event.stopPropagation()}
+                onDragOver={(event) => {
+                  event.preventDefault();
                   event.stopPropagation();
-                  setExpanded((value) => !value);
+                  event.dataTransfer.dropEffect = "move";
                 }}
+                onDrop={(event) => onDrop(event, "")}
               >
-                {expanded ? (
-                  <ChevronDown size={14} />
-                ) : (
-                  <ChevronRight size={14} />
-                )}
-              </ActionIcon>
-            }
-            onClick={() => onSelect("")}
-          >
-            <Group gap="xs" wrap="nowrap">
-              <Folder
-                size={16}
-                color="var(--mantine-color-yellow-text)"
-                opacity={0.9}
-              />
-              <Text size="sm">Root</Text>
-            </Group>
-          </Button>
-        </Menu.ContextMenu>
-        <Menu.Dropdown>{contextMenu()}</Menu.Dropdown>
-      </Menu>
-      {expanded && (
-        <TreeChildren
-          target={target}
-          path=""
-          currentPath={currentPath}
-          onSelect={onSelect}
-          contextMenu={contextMenu}
-          depth={1}
-        />
-      )}
-    </Stack>
+                <Group gap="xs" wrap="nowrap">
+                  <Folder
+                    size={16}
+                    color="var(--mantine-color-yellow-text)"
+                    opacity={0.9}
+                  />
+                  <Text size="sm">Root</Text>
+                </Group>
+              </Button>
+            </Menu.ContextMenu>
+            <Menu.Dropdown>{contextMenu()}</Menu.Dropdown>
+          </Menu>
+          {expanded && (
+            <TreeChildren
+              target={target}
+              path=""
+              currentPath={currentPath}
+              onSelect={onSelect}
+              contextMenu={contextMenu}
+              onDrop={onDrop}
+              ignoreDrop={ignoreDrop}
+              depth={1}
+            />
+          )}
+        </Stack>
+      </Menu.ContextMenu>
+      <Menu.Dropdown>{backgroundMenu}</Menu.Dropdown>
+    </Menu>
   );
 }
 
@@ -1706,6 +1959,8 @@ function TreeChildren({
   currentPath,
   onSelect,
   contextMenu,
+  onDrop,
+  ignoreDrop,
   depth,
 }: {
   target: Types.FileManagerTarget;
@@ -1713,6 +1968,8 @@ function TreeChildren({
   currentPath: string;
   onSelect: (path: string) => void;
   contextMenu: (entry?: Types.FileManagerEntry) => ReactNode;
+  onDrop: (event: React.DragEvent, destination: string) => void;
+  ignoreDrop: (event: React.DragEvent) => void;
   depth: number;
 }) {
   const directory = useRead("ListFileManagerDirectory", { target, path });
@@ -1729,6 +1986,8 @@ function TreeChildren({
             currentPath={currentPath}
             onSelect={onSelect}
             contextMenu={contextMenu}
+            onDrop={onDrop}
+            ignoreDrop={ignoreDrop}
             depth={depth}
           />
         ))}
@@ -1742,6 +2001,8 @@ function TreeDirectory({
   currentPath,
   onSelect,
   contextMenu,
+  onDrop,
+  ignoreDrop,
   depth,
 }: {
   target: Types.FileManagerTarget;
@@ -1749,9 +2010,13 @@ function TreeDirectory({
   currentPath: string;
   onSelect: (path: string) => void;
   contextMenu: (entry?: Types.FileManagerEntry) => ReactNode;
+  onDrop: (event: React.DragEvent, destination: string) => void;
+  ignoreDrop: (event: React.DragEvent) => void;
   depth: number;
 }) {
-  const [expanded, setExpanded] = useState(currentPath.startsWith(`${entry.path}/`));
+  const [expanded, setExpanded] = useState(
+    currentPath.startsWith(`${entry.path}/`),
+  );
   return (
     <>
       <Menu shadow="md">
@@ -1779,6 +2044,13 @@ function TreeDirectory({
               </ActionIcon>
             }
             onClick={() => onSelect(entry.path)}
+            onContextMenu={(event) => event.stopPropagation()}
+            onDragOver={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              event.dataTransfer.dropEffect = "move";
+            }}
+            onDrop={(event) => onDrop(event, entry.path)}
           >
             <Group gap="xs" wrap="nowrap" style={{ minWidth: 0 }}>
               <Folder
@@ -1801,6 +2073,8 @@ function TreeDirectory({
           currentPath={currentPath}
           onSelect={onSelect}
           contextMenu={contextMenu}
+          onDrop={onDrop}
+          ignoreDrop={ignoreDrop}
           depth={depth + 1}
         />
       )}
