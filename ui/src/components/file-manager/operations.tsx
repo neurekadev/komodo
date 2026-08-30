@@ -47,7 +47,12 @@ type OperationContextValue = {
 
 const OperationContext = createContext<OperationContextValue | null>(null);
 
-const targetKey = (target: Types.FileManagerTarget) => JSON.stringify(target);
+export const fileManagerTargetKey = (target: Types.FileManagerTarget) =>
+  JSON.stringify(
+    target.type === "Stack"
+      ? [target.type, target.params.stack]
+      : [target.type, target.params.server, target.params.volume],
+  );
 
 const queryTargets = (
   queryKey: readonly unknown[],
@@ -58,10 +63,18 @@ const queryTargets = (
     !!params &&
     typeof params === "object" &&
     "target" in params &&
-    targetKey((params as { target: Types.FileManagerTarget }).target) ===
-      targetKey(target)
+    fileManagerTargetKey(
+      (params as { target: Types.FileManagerTarget }).target,
+    ) === fileManagerTargetKey(target)
   );
 };
+
+class FileOperationStatusTimeoutError extends Error {
+  constructor() {
+    super("File operation status request timed out");
+    this.name = "FileOperationStatusTimeoutError";
+  }
+}
 
 const withTimeout = async <T,>(promise: Promise<T>, timeoutMs: number) => {
   let timeout: ReturnType<typeof setTimeout> | undefined;
@@ -70,7 +83,7 @@ const withTimeout = async <T,>(promise: Promise<T>, timeoutMs: number) => {
       promise,
       new Promise<never>((_, reject) => {
         timeout = setTimeout(
-          () => reject(new Error("File operation status request timed out")),
+          () => reject(new FileOperationStatusTimeoutError()),
           timeoutMs,
         );
       }),
@@ -299,6 +312,7 @@ export function FileOperationProvider({ children }: { children: ReactNode }) {
               withCloseButton: false,
             });
           } catch (error) {
+            if (error instanceof FileOperationStatusTimeoutError) return;
             const count =
               (failures.current.get(operation.operationId) ?? 0) + 1;
             failures.current.set(operation.operationId, count);
@@ -446,9 +460,10 @@ export function FileOperationProvider({ children }: { children: ReactNode }) {
 
   const isWriteActive = useCallback(
     (target: Types.FileManagerTarget) => {
-      const key = targetKey(target);
+      const key = fileManagerTargetKey(target);
       return operations.some(
-        (operation) => operation.write && targetKey(operation.target) === key,
+        (operation) =>
+          operation.write && fileManagerTargetKey(operation.target) === key,
       );
     },
     [operations],

@@ -1,7 +1,10 @@
 import { KOMODO_BASE_URL } from "@/main";
 import { useRead, useWrite } from "@/lib/hooks";
 import { ICONS } from "@/lib/icons";
-import { useFileOperations } from "@/components/file-manager/operations";
+import {
+  fileManagerTargetKey,
+  useFileOperations,
+} from "@/components/file-manager/operations";
 import {
   ActionIcon,
   Alert,
@@ -509,9 +512,9 @@ export default function FileManager({
           !!params &&
           typeof params === "object" &&
           "target" in params &&
-          JSON.stringify(
+          fileManagerTargetKey(
             (params as { target: Types.FileManagerTarget }).target,
-          ) === JSON.stringify(target)
+          ) === fileManagerTargetKey(target)
         );
       };
       await Promise.all([
