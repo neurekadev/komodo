@@ -2,6 +2,8 @@
 
 # Build Core
 FROM rust:1.97.1-trixie AS core-builder
+ENV CARGO_HTTP_TIMEOUT=600 \
+  CARGO_NET_RETRY=10
 RUN cargo install cargo-strip
 
 WORKDIR /builder
@@ -23,8 +25,8 @@ FROM node:22.12-alpine AS ui-builder
 WORKDIR /builder
 COPY ./ui ./ui
 COPY ./client/core/ts ./client
-RUN cd client && yarn && yarn build && yarn link
-RUN cd ui && yarn link komodo_client && yarn && yarn build
+RUN cd client && yarn --network-timeout 600000 && yarn build && yarn link
+RUN cd ui && yarn link komodo_client && yarn --network-timeout 600000 && yarn build
 
 # Final Image
 FROM debian:trixie-slim
