@@ -36,25 +36,43 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.97.1
+
+      - name: Restore Binaries Cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: ${{ env.CACHE_PREFIX }}-binaries-${{ matrix.arch }}
+          cache-workspace-crates: true
+          cache-bin: false
+
+      - name: Build Binaries
+        run: cargo build --locked --release --bin core --bin periphery --bin km
+
+      - name: Prepare Binaries Output
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/binaries" "$RUNNER_TEMP/binaries-context"
+          install -m 0755 target/release/core "$RUNNER_TEMP/binaries-context/core"
+          install -m 0755 target/release/periphery "$RUNNER_TEMP/binaries-context/periphery"
+          install -m 0755 target/release/km "$RUNNER_TEMP/binaries-context/km"
+
       - name: Set Up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
-      - name: Prepare Binaries Output
-        run: mkdir -p "$RUNNER_TEMP/binaries"
-
-      - name: Build Binaries
+      - name: Package Binaries
         id: binaries
         uses: docker/build-push-action@v7
         with:
-          context: .
-          file: bin/chef.binaries.Dockerfile
+          context: ${{ runner.temp }}/binaries-context
+          file: ${{ github.workspace }}/bin/artifact.Dockerfile
           platforms: ${{ matrix.platform }}
           outputs: type=oci,dest=${{ runner.temp }}/binaries/binaries.oci.tar
           push: false
           provenance: false
           sbom: false
-          cache-from: type=gha,scope=${{ env.CACHE_PREFIX }}-binaries-${{ matrix.arch }}
-          cache-to: type=gha,scope=${{ env.CACHE_PREFIX }}-binaries-${{ matrix.arch }},mode=max,ignore-error=true
+          cache-from: type=gha,scope=${{ env.CACHE_PREFIX }}-binaries-package-${{ matrix.arch }}
+          cache-to: type=gha,scope=${{ env.CACHE_PREFIX }}-binaries-package-${{ matrix.arch }},mode=max,ignore-error=true
 
       - name: Export Binaries Digest
         env:
