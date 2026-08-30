@@ -1,0 +1,247 @@
+name: Build Images
+
+on:
+  workflow_call:
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-binaries:
+    name: Build Binaries ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: AMD64
+            arch: amd64
+            runner: ubuntu-24.04
+            platform: linux/amd64
+          - name: ARM64
+            arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+    env:
+      CACHE_PREFIX: ${{ github.event_name == 'pull_request' && 'ci' || 'publish' }}
+
+    steps:
+      - name: Check Out Repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set Up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Prepare Binaries Output
+        run: mkdir -p "$RUNNER_TEMP/binaries"
+
+      - name: Build Binaries
+        id: binaries
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: bin/chef.binaries.Dockerfile
+          platforms: ${{ matrix.platform }}
+          outputs: type=oci,dest=${{ runner.temp }}/binaries/binaries.oci.tar
+          push: false
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=${{ env.CACHE_PREFIX }}-binaries-${{ matrix.arch }}
+          cache-to: type=gha,scope=${{ env.CACHE_PREFIX }}-binaries-${{ matrix.arch }},mode=max,ignore-error=true
+
+      - name: Export Binaries Digest
+        env:
+          DIGEST: ${{ steps.binaries.outputs.digest }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Build produced an invalid binaries digest: $DIGEST" >&2
+            exit 1
+          fi
+          printf '%s\n' "$DIGEST" > "$RUNNER_TEMP/binaries/digest"
+
+      - name: Upload Binaries
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-binaries-${{ matrix.arch }}
+          path: ${{ runner.temp }}/binaries
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  build-ui:
+    name: Build UI
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      CACHE_PREFIX: ${{ github.event_name == 'pull_request' && 'ci' || 'publish' }}
+
+    steps:
+      - name: Check Out Repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set Up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build UI
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ui/Dockerfile
+          platforms: linux/amd64
+          outputs: type=local,dest=${{ runner.temp }}/ui
+          push: false
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=${{ env.CACHE_PREFIX }}-ui-amd64
+          cache-to: type=gha,scope=${{ env.CACHE_PREFIX }}-ui-amd64,mode=max,ignore-error=true
+
+      - name: Upload UI
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-ui
+          path: ${{ runner.temp }}/ui
+          if-no-files-found: error
+          retention-days: 1
+
+  validate-compose:
+    name: Validate Compose Models
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check Out Repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Validate Compose Models
+        run: |
+          docker compose -f dev.compose.yaml config --quiet
+          docker compose -f dev.compose.yaml -f expose.compose.yaml config --quiet
+          docker compose -f .devcontainer/dev.compose.yaml config --quiet
+          docker compose --env-file compose/compose.env -f compose/ferretdb.compose.yaml config --quiet
+          docker compose --env-file compose/compose.env -f compose/mongo.compose.yaml config --quiet
+          docker compose --env-file compose/compose.env -f compose/periphery.compose.yaml config --quiet
+
+  build-images:
+    name: Build ${{ matrix.name }}
+    needs:
+      - build-binaries
+      - build-ui
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Core AMD64
+            component: core
+            dockerfile: bin/core/single-arch.Dockerfile
+            arch: amd64
+            runner: ubuntu-24.04
+            platform: linux/amd64
+          - name: Core ARM64
+            component: core
+            dockerfile: bin/core/single-arch.Dockerfile
+            arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+          - name: Periphery AMD64
+            component: periphery
+            dockerfile: bin/periphery/single-arch.Dockerfile
+            arch: amd64
+            runner: ubuntu-24.04
+            platform: linux/amd64
+          - name: Periphery ARM64
+            component: periphery
+            dockerfile: bin/periphery/single-arch.Dockerfile
+            arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+          - name: CLI AMD64
+            component: cli
+            dockerfile: bin/cli/single-arch.Dockerfile
+            arch: amd64
+            runner: ubuntu-24.04
+            platform: linux/amd64
+          - name: CLI ARM64
+            component: cli
+            dockerfile: bin/cli/single-arch.Dockerfile
+            arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+    env:
+      CACHE_PREFIX: ${{ github.event_name == 'pull_request' && 'ci' || 'publish' }}
+      SOURCE_VERSION: ${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || (github.ref_type == 'tag' && github.ref_name || 'edge') }}
+
+    steps:
+      - name: Check Out Repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Download Binaries
+        uses: actions/download-artifact@v8
+        with:
+          name: build-binaries-${{ matrix.arch }}
+          path: ${{ runner.temp }}/binaries
+
+      - name: Download UI
+        uses: actions/download-artifact@v8
+        with:
+          name: build-ui
+          path: ${{ runner.temp }}/ui
+
+      - name: Prepare Binaries Context
+        id: binaries
+        run: |
+          set -euo pipefail
+          digest="$(< "$RUNNER_TEMP/binaries/digest")"
+          if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Downloaded an invalid binaries digest: $digest" >&2
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/binaries-layout"
+          tar -xf "$RUNNER_TEMP/binaries/binaries.oci.tar" -C "$RUNNER_TEMP/binaries-layout"
+          jq -e --arg digest "$digest" '.manifests[] | select(.digest == $digest)' \
+            "$RUNNER_TEMP/binaries-layout/index.json" >/dev/null
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Set Up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build Image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: ${{ matrix.platform }}
+          push: false
+          provenance: false
+          sbom: false
+          build-contexts: |
+            binaries=oci-layout://${{ runner.temp }}/binaries-layout@${{ steps.binaries.outputs.digest }}
+            ui=${{ runner.temp }}/ui
+          build-args: |
+            BINARIES_IMAGE=binaries
+            UI_IMAGE=ui
+            GIT_TAG=${{ env.SOURCE_VERSION }}
+            GIT_HASH=${{ github.sha }}
+          cache-from: type=gha,scope=${{ env.CACHE_PREFIX }}-${{ matrix.component }}-${{ matrix.arch }}
+          cache-to: type=gha,scope=${{ env.CACHE_PREFIX }}-${{ matrix.component }}-${{ matrix.arch }},mode=max,ignore-error=true

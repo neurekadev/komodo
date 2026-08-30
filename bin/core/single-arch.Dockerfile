@@ -2,27 +2,30 @@
 ## Sets up the necessary runtime container dependencies for Komodo Core.
 
 ARG BINARIES_IMAGE=ghcr.io/moghtech/komodo-binaries:2
+ARG UI_IMAGE=ghcr.io/moghtech/komodo-ui:2
+ARG GIT_TAG=dev
+ARG GIT_HASH=unknown
 
 # This is required to work with COPY --from
 FROM ${BINARIES_IMAGE} AS binaries
-
-# Build UI
-FROM node:22.12-alpine AS ui-builder
-WORKDIR /builder
-COPY ./ui ./ui
-COPY ./client/core/ts ./client
-RUN cd client && yarn && yarn build && yarn link
-RUN cd ui && yarn link komodo_client && yarn && yarn build
+FROM ${UI_IMAGE} AS ui
 
 FROM debian:trixie-slim
+
+ARG GIT_TAG
+ARG GIT_HASH
+ENV GIT_TAG=$GIT_TAG \
+  GIT_HASH=$GIT_HASH
 
 COPY ./bin/core/starship.toml /starship.toml
 COPY ./bin/core/debian-deps.sh .
 RUN sh ./debian-deps.sh && rm ./debian-deps.sh
-	
+
+WORKDIR /app
+
 # Copy
 COPY ./config/core.config.toml /config/.default.config.toml
-COPY --from=ui-builder /builder/ui/dist /app/ui
+COPY --from=ui /ui /app/ui
 COPY --from=binaries /core /usr/local/bin/core
 COPY --from=binaries /km /usr/local/bin/km
 COPY --from=denoland/deno:bin /deno /usr/local/bin/deno

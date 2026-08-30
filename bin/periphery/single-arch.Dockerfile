@@ -2,15 +2,24 @@
 ## Sets up the necessary runtime container dependencies for Komodo Periphery.
 
 ARG BINARIES_IMAGE=ghcr.io/moghtech/komodo-binaries:2
+ARG GIT_TAG=dev
+ARG GIT_HASH=unknown
 
 # This is required to work with COPY --from
 FROM ${BINARIES_IMAGE} AS binaries
 
 FROM debian:trixie-slim
 
+ARG GIT_TAG
+ARG GIT_HASH
+ENV GIT_TAG=$GIT_TAG \
+  GIT_HASH=$GIT_HASH
+
 COPY ./bin/periphery/starship.toml /starship.toml
 COPY ./bin/periphery/debian-deps.sh .
 RUN sh ./debian-deps.sh && rm ./debian-deps.sh
+
+WORKDIR /app
 
 COPY --from=binaries /periphery /usr/local/bin/periphery
 
