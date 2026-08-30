@@ -496,21 +496,39 @@ export default function FileManager({
     return result;
   }, [directory.data?.entries, sortAscending, sortKey]);
 
-  const refresh = useCallback(async () => {
-    await Promise.all([
-      queryClient.invalidateQueries({
-        predicate: ({ queryKey }) => queryKey[0] === "ListFileManagerDirectory",
-      }),
-      queryClient.invalidateQueries({
-        queryKey: ["GetFileManagerJournalStatus", { target }],
-      }),
-      editorPath
-        ? queryClient.invalidateQueries({
-            queryKey: ["ReadFileManagerText", { target, path: editorPath }],
-          })
-        : Promise.resolve(),
-    ]);
-  }, [editorPath, queryClient, target]);
+  const editorDirty = !!textFile.data && draft !== textFile.data.contents;
+
+  const refresh = useCallback(
+    async (forceEditor = false) => {
+      const matchesTarget = (queryKey: readonly unknown[]) => {
+        const params = queryKey[1];
+        return (
+          !!params &&
+          typeof params === "object" &&
+          "target" in params &&
+          JSON.stringify(
+            (params as { target: Types.FileManagerTarget }).target,
+          ) === JSON.stringify(target)
+        );
+      };
+      await Promise.all([
+        queryClient.invalidateQueries({
+          predicate: ({ queryKey }) =>
+            queryKey[0] === "ListFileManagerDirectory" &&
+            matchesTarget(queryKey),
+        }),
+        queryClient.invalidateQueries({
+          queryKey: ["GetFileManagerJournalStatus", { target }],
+        }),
+        editorPath && (!editorDirty || forceEditor)
+          ? queryClient.invalidateQueries({
+              queryKey: ["ReadFileManagerText", { target, path: editorPath }],
+            })
+          : Promise.resolve(),
+      ]);
+    },
+    [editorDirty, editorPath, queryClient, target],
+  );
 
   useEffect(() => {
     if (textFile.data) setDraft(textFile.data.contents);
@@ -520,8 +538,6 @@ export default function FileManager({
     setSelected([]);
     setSelectionAnchor(undefined);
   }, [path]);
-
-  const editorDirty = !!textFile.data && draft !== textFile.data.contents;
 
   const requestEditorClose = useCallback(() => {
     if (editorDirty) setDiscardEditorOpen(true);
@@ -557,7 +573,7 @@ export default function FileManager({
           plan.notificationId,
         );
         if (status.state !== Types.FileManagerOperationState.Complete) return;
-        await refresh();
+        await refresh(plan.operation.type === "WriteText");
         if (plan.clearClipboardOnSuccess) setClipboard(undefined);
         setSelected([]);
       } catch (error) {

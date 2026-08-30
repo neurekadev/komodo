@@ -17,6 +17,7 @@ import {
 } from "react";
 
 const STORAGE_KEY = "komodo-file-manager-operations-v1";
+const STATUS_REQUEST_TIMEOUT_MS = 10_000;
 
 type TrackedOperation = {
   operationId: string;
@@ -47,6 +48,37 @@ type OperationContextValue = {
 const OperationContext = createContext<OperationContextValue | null>(null);
 
 const targetKey = (target: Types.FileManagerTarget) => JSON.stringify(target);
+
+const queryTargets = (
+  queryKey: readonly unknown[],
+  target: Types.FileManagerTarget,
+) => {
+  const params = queryKey[1];
+  return (
+    !!params &&
+    typeof params === "object" &&
+    "target" in params &&
+    targetKey((params as { target: Types.FileManagerTarget }).target) ===
+      targetKey(target)
+  );
+};
+
+const withTimeout = async <T,>(promise: Promise<T>, timeoutMs: number) => {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timeout = setTimeout(
+          () => reject(new Error("File operation status request timed out")),
+          timeoutMs,
+        );
+      }),
+    ]);
+  } finally {
+    if (timeout !== undefined) clearTimeout(timeout);
+  }
+};
 
 const loadOperations = (): TrackedOperation[] => {
   try {
@@ -166,6 +198,7 @@ export function FileOperationProvider({ children }: { children: ReactNode }) {
     useState<TrackedOperation[]>(loadOperations);
   const operationsRef = useRef(operations);
   const polling = useRef(false);
+  const restoredNotifications = useRef(new Set<string>());
   const failures = useRef(new Map<string, number>());
   const cancellations = useRef(new Map<string, () => void>());
   const waiters = useRef(
@@ -220,9 +253,9 @@ export function FileOperationProvider({ children }: { children: ReactNode }) {
       if (complete) {
         void queryClient.invalidateQueries({
           predicate: ({ queryKey }) =>
-            queryKey[0] === "ListFileManagerDirectory" ||
-            queryKey[0] === "GetFileManagerJournalStatus" ||
-            queryKey[0] === "ReadFileManagerText",
+            (queryKey[0] === "ListFileManagerDirectory" ||
+              queryKey[0] === "GetFileManagerJournalStatus") &&
+            queryTargets(queryKey, operation.target),
         });
       }
     },
@@ -236,12 +269,12 @@ export function FileOperationProvider({ children }: { children: ReactNode }) {
       await Promise.all(
         operationsRef.current.map(async (operation) => {
           try {
-            const status = await komodo_client().read(
-              "GetFileManagerOperationStatus",
-              {
+            const status = await withTimeout(
+              komodo_client().read("GetFileManagerOperationStatus", {
                 target: operation.target,
                 operation_id: operation.operationId,
-              },
+              }),
+              STATUS_REQUEST_TIMEOUT_MS,
             );
             failures.current.delete(operation.operationId);
             if (
@@ -291,7 +324,11 @@ export function FileOperationProvider({ children }: { children: ReactNode }) {
   }, [settle]);
 
   useEffect(() => {
-    for (const operation of operations) {
+    for (const operation of operationsRef.current) {
+      if (restoredNotifications.current.has(operation.notificationId)) {
+        continue;
+      }
+      restoredNotifications.current.add(operation.notificationId);
       notifications.show({
         id: operation.notificationId,
         title: operation.label,
@@ -304,10 +341,13 @@ export function FileOperationProvider({ children }: { children: ReactNode }) {
     void poll();
     const interval = window.setInterval(() => void poll(), 500);
     return () => window.clearInterval(interval);
-  }, [operations.length, poll]);
+  }, [poll]);
 
   const begin = useCallback((label: string): string => {
-    const notificationId = crypto.randomUUID();
+    const notificationId =
+      typeof globalThis.crypto?.randomUUID === "function"
+        ? globalThis.crypto.randomUUID()
+        : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
     notifications.show({
       id: notificationId,
       title: label,
