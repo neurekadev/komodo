@@ -272,6 +272,8 @@ export function FileOperationProvider({ children }: { children: ReactNode }) {
     status: Types.FileManagerOperationStatus;
   }>();
   const [applyToAll, setApplyToAll] = useState(false);
+  const pendingDecisionId =
+    pendingConflict?.status.pending_conflict?.decision_id;
   const operationsRef = useRef(operations);
   const polling = useRef(false);
   const restoredNotifications = useRef(new Set<string>());
@@ -289,6 +291,10 @@ export function FileOperationProvider({ children }: { children: ReactNode }) {
     operationsRef.current = operations;
     localStorage.setItem(STORAGE_KEY, JSON.stringify(operations));
   }, [operations]);
+
+  useEffect(() => {
+    setApplyToAll(false);
+  }, [pendingDecisionId]);
 
   const removeOperation = useCallback((operationId: string) => {
     setOperations((current) =>
@@ -376,7 +382,8 @@ export function FileOperationProvider({ children }: { children: ReactNode }) {
                 <StatusMessage
                   status={status}
                   cancel={
-                    status.cancellable
+                    cancellations.current.get(operation.notificationId) ??
+                    (status.cancellable
                       ? () => {
                           void komodo_client().write(
                             "CancelFileManagerOperation",
@@ -386,7 +393,7 @@ export function FileOperationProvider({ children }: { children: ReactNode }) {
                             },
                           );
                         }
-                      : cancellations.current.get(operation.notificationId)
+                      : undefined)
                   }
                 />
               ),
@@ -448,7 +455,7 @@ export function FileOperationProvider({ children }: { children: ReactNode }) {
   }, [settle]);
 
   useEffect(() => {
-    for (const operation of operationsRef.current) {
+    for (const operation of operations) {
       if (restoredNotifications.current.has(operation.notificationId)) {
         continue;
       }
@@ -462,6 +469,9 @@ export function FileOperationProvider({ children }: { children: ReactNode }) {
         withCloseButton: false,
       });
     }
+  }, [operations]);
+
+  useEffect(() => {
     void poll();
     const interval = window.setInterval(() => void poll(), 1_000);
     return () => window.clearInterval(interval);
@@ -679,6 +689,8 @@ export function FileOperationProvider({ children }: { children: ReactNode }) {
               <Button
                 variant="default"
                 onClick={() => {
+                  setPendingConflict(undefined);
+                  setApplyToAll(false);
                   void komodo_client().write("CancelFileManagerOperation", {
                     target: pendingConflict.operation.target,
                     operation_id: pendingConflict.operation.operationId,
@@ -706,7 +718,9 @@ export function FileOperationProvider({ children }: { children: ReactNode }) {
                         const pending =
                           pendingConflict.status.pending_conflict;
                         if (!pending) return;
+                        const applyToAllRemaining = applyToAll;
                         setPendingConflict(undefined);
+                        setApplyToAll(false);
                         void komodo_client().write(
                           "ResolveFileManagerOperationConflict",
                           {
@@ -715,7 +729,7 @@ export function FileOperationProvider({ children }: { children: ReactNode }) {
                               pendingConflict.operation.operationId,
                             decision_id: pending.decision_id,
                             action,
-                            apply_to_all: applyToAll,
+                            apply_to_all: applyToAllRemaining,
                           },
                         );
                       }}
