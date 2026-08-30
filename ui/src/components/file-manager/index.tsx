@@ -71,6 +71,7 @@ type ActionDialog =
 type PendingCommit = {
   operation: Types.FileManagerOperation;
   preflight: Types.FileManagerPreflight;
+  clearClipboardOnSuccess?: boolean;
 };
 
 const joinPath = (...parts: string[]) =>
@@ -251,6 +252,7 @@ export default function FileManager({
       setDecisions({});
       await refresh();
       if (reportUpdateFailure(update)) return;
+      if (plan.clearClipboardOnSuccess) setClipboard(undefined);
       setSelected([]);
       notifications.show({ message: "File operation completed.", color: "green" });
     },
@@ -258,8 +260,12 @@ export default function FileManager({
   );
 
   const runOperation = useCallback(
-    async (operation: Types.FileManagerOperation) => {
+    async (
+      operation: Types.FileManagerOperation,
+      options: { clearClipboardOnSuccess?: boolean } = {},
+    ) => {
       const result = await preflight({ target, operation });
+      const plan = { operation, preflight: result, ...options };
       if (result.confirmation_required || result.conflicts.length > 0) {
         setDecisions(
           Object.fromEntries(
@@ -269,9 +275,9 @@ export default function FileManager({
             ]),
           ),
         );
-        setPendingCommit({ operation, preflight: result });
+        setPendingCommit(plan);
       } else {
-        await completeCommit({ operation, preflight: result });
+        await completeCommit(plan);
       }
     },
     [completeCommit, preflight, target],
@@ -323,11 +329,13 @@ export default function FileManager({
   const paste = useCallback(
     async (destination = path) => {
       if (!clipboard || readOnly) return;
-      await runOperation({
-        type: clipboard.mode === "copy" ? "Copy" : "Move",
-        params: { paths: clipboard.paths, destination },
-      });
-      if (clipboard.mode === "move") setClipboard(undefined);
+      await runOperation(
+        {
+          type: clipboard.mode === "copy" ? "Copy" : "Move",
+          params: { paths: clipboard.paths, destination },
+        },
+        { clearClipboardOnSuccess: clipboard.mode === "move" },
+      );
     },
     [clipboard, path, readOnly, runOperation],
   );
@@ -434,6 +442,7 @@ export default function FileManager({
 
   const uploadFiles = async (files: File[], destination = path) => {
     if (!files.length || readOnly) return;
+    let uploadedCount = 0;
     try {
       for (const file of files) {
         const collisionEntry =
@@ -495,9 +504,12 @@ export default function FileManager({
             reject(new DOMException("Upload cancelled", "AbortError"));
           request.send(file);
         });
+        uploadedCount += 1;
       }
-      notifications.show({ message: "Upload completed.", color: "green" });
-      await refresh();
+      if (uploadedCount > 0) {
+        notifications.show({ message: "Upload completed.", color: "green" });
+        await refresh();
+      }
     } catch (error) {
       if ((error as DOMException)?.name !== "AbortError") {
         notifications.show({
@@ -532,15 +544,15 @@ export default function FileManager({
       const downloadName =
         disposition.match(/filename="?([^";]+)"?/i)?.[1] ??
         (selected.length === 1 ? fileName(selected[0]) : "komodo-files.zip");
-      const filePicker = (
-        window as Window & {
-          showSaveFilePicker?: (options: unknown) => Promise<{
-            createWritable: () => Promise<WritableStream>;
-          }>;
-        }
-      ).showSaveFilePicker;
-      if (filePicker && response.body) {
-        const handle = await filePicker({ suggestedName: downloadName });
+      const pickerWindow = window as Window & {
+        showSaveFilePicker?: (options: unknown) => Promise<{
+          createWritable: () => Promise<WritableStream>;
+        }>;
+      };
+      if (pickerWindow.showSaveFilePicker && response.body) {
+        const handle = await pickerWindow.showSaveFilePicker({
+          suggestedName: downloadName,
+        });
         await response.body.pipeTo(await handle.createWritable());
       } else {
         const blob = await response.blob();
