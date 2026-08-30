@@ -1,6 +1,14 @@
 import { komodo_client } from "@/lib/hooks";
 import { updateLogToText } from "@/lib/utils";
-import { Button, Group, Progress, Stack, Text } from "@mantine/core";
+import {
+  Button,
+  Checkbox,
+  Group,
+  Modal,
+  Progress,
+  Stack,
+  Text,
+} from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import { useQueryClient } from "@tanstack/react-query";
 import { Types } from "komodo_client";
@@ -43,6 +51,7 @@ type OperationContextValue = {
     write: boolean,
     notificationId?: string,
   ) => Promise<Types.FileManagerOperationStatus>;
+  discover: (target: Types.FileManagerTarget) => Promise<void>;
   untrack: (operationId: string) => void;
   isWriteActive: (target: Types.FileManagerTarget) => boolean;
 };
@@ -165,6 +174,16 @@ const formatBytes = (bytes: number) => {
   return `${value.toFixed(value >= 10 ? 1 : 2)} ${unit}`;
 };
 
+const formatDuration = (milliseconds: number) => {
+  const seconds = Math.max(0, Math.floor(milliseconds / 1_000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  const remainder = seconds % 60;
+  if (minutes < 60) return `${minutes}m ${remainder}s`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h ${minutes % 60}m`;
+};
+
 function StatusMessage({
   status,
   cancel,
@@ -173,6 +192,30 @@ function StatusMessage({
   cancel?: () => void;
 }) {
   const percent = progressValue(status);
+  const elapsed = Math.max(
+    1,
+    Date.now() - (status.started_at ?? Date.now()),
+  );
+  const phaseElapsed = Math.max(
+    1,
+    Date.now() - (status.phase_started_at ?? status.started_at ?? Date.now()),
+  );
+  const bytesPerSecond =
+    status.completed_bytes > 0
+      ? status.completed_bytes / (phaseElapsed / 1_000)
+      : undefined;
+  const entriesPerSecond =
+    status.completed_entries > 0
+      ? status.completed_entries / (phaseElapsed / 1_000)
+      : undefined;
+  const eta =
+    status.total_bytes > status.completed_bytes && bytesPerSecond
+      ? ((status.total_bytes - status.completed_bytes) / bytesPerSecond) * 1_000
+      : status.total_entries > status.completed_entries && entriesPerSecond
+        ? ((status.total_entries - status.completed_entries) /
+            entriesPerSecond) *
+          1_000
+        : undefined;
   const detail =
     status.total_bytes > 0
       ? `${formatBytes(status.completed_bytes)} / ${formatBytes(status.total_bytes)}`
@@ -186,7 +229,9 @@ function StatusMessage({
   return (
     <Stack gap={5}>
       <Group justify="space-between" gap="md">
-        <Text size="sm">{phaseLabel(status.phase)}</Text>
+        <Text size="sm">
+          {phaseLabel(status.phase ?? Types.FileManagerOperationPhase.Queued)}
+        </Text>
         {cancel ? (
           <Button size="compact-xs" variant="subtle" onClick={cancel}>
             Cancel
@@ -200,7 +245,18 @@ function StatusMessage({
       <Progress value={percent ?? 100} animated={percent === undefined} />
       {detail && (
         <Text size="xs" c="dimmed">
-          {detail}
+          {detail} · elapsed {formatDuration(elapsed)}
+          {bytesPerSecond
+            ? ` · ${formatBytes(bytesPerSecond)}/s`
+            : entriesPerSecond
+              ? ` · ${entriesPerSecond.toFixed(1)} entries/s`
+              : ""}
+          {eta ? ` · ETA ${formatDuration(eta)}` : ""}
+        </Text>
+      )}
+      {(status.temporary_storage_bytes ?? 0) > 0 && (
+        <Text size="xs" c="dimmed">
+          Temporary storage: {formatBytes(status.temporary_storage_bytes ?? 0)}
         </Text>
       )}
     </Stack>
@@ -211,6 +267,11 @@ export function FileOperationProvider({ children }: { children: ReactNode }) {
   const queryClient = useQueryClient();
   const [operations, setOperations] =
     useState<TrackedOperation[]>(loadOperations);
+  const [pendingConflict, setPendingConflict] = useState<{
+    operation: TrackedOperation;
+    status: Types.FileManagerOperationStatus;
+  }>();
+  const [applyToAll, setApplyToAll] = useState(false);
   const operationsRef = useRef(operations);
   const polling = useRef(false);
   const restoredNotifications = useRef(new Set<string>());
@@ -263,6 +324,11 @@ export function FileOperationProvider({ children }: { children: ReactNode }) {
       failures.current.delete(operation.operationId);
       timeouts.current.delete(operation.operationId);
       cancellations.current.delete(operation.notificationId);
+      setPendingConflict((current) =>
+        current?.operation.operationId === operation.operationId
+          ? undefined
+          : current,
+      );
       for (const resolve of waiters.current.get(operation.operationId) ?? []) {
         resolve(status);
       }
@@ -309,7 +375,19 @@ export function FileOperationProvider({ children }: { children: ReactNode }) {
               message: (
                 <StatusMessage
                   status={status}
-                  cancel={cancellations.current.get(operation.notificationId)}
+                  cancel={
+                    status.cancellable
+                      ? () => {
+                          void komodo_client().write(
+                            "CancelFileManagerOperation",
+                            {
+                              target: operation.target,
+                              operation_id: operation.operationId,
+                            },
+                          );
+                        }
+                      : cancellations.current.get(operation.notificationId)
+                  }
                 />
               ),
               color: "blue",
@@ -317,6 +395,15 @@ export function FileOperationProvider({ children }: { children: ReactNode }) {
               autoClose: false,
               withCloseButton: false,
             });
+            if (status.pending_conflict) {
+              setPendingConflict({ operation, status });
+            } else {
+              setPendingConflict((current) =>
+                current?.operation.operationId === operation.operationId
+                  ? undefined
+                  : current,
+              );
+            }
           } catch (error) {
             if (error instanceof FileOperationStatusTimeoutError) {
               const count =
@@ -340,17 +427,16 @@ export function FileOperationProvider({ children }: { children: ReactNode }) {
             const count =
               (failures.current.get(operation.operationId) ?? 0) + 1;
             failures.current.set(operation.operationId, count);
-            if (count >= 3) {
-              settle(operation, {
-                operation_id: operation.operationId,
-                state: Types.FileManagerOperationState.Failed,
-                phase: Types.FileManagerOperationPhase.Finalizing,
-                description: operation.label,
-                completed_entries: 0,
-                total_entries: 0,
-                completed_bytes: 0,
-                total_bytes: 0,
-                error: errorText(error),
+            if (count === 3) {
+              notifications.update({
+                id: operation.notificationId,
+                title: operation.label,
+                message:
+                  "Operation status is temporarily unavailable; reconnecting without assuming the job failed…",
+                color: "yellow",
+                loading: true,
+                autoClose: false,
+                withCloseButton: false,
               });
             }
           }
@@ -377,7 +463,7 @@ export function FileOperationProvider({ children }: { children: ReactNode }) {
       });
     }
     void poll();
-    const interval = window.setInterval(() => void poll(), 500);
+    const interval = window.setInterval(() => void poll(), 1_000);
     return () => window.clearInterval(interval);
   }, [poll]);
 
@@ -485,6 +571,30 @@ export function FileOperationProvider({ children }: { children: ReactNode }) {
     [begin],
   );
 
+  const discover = useCallback(
+    async (target: Types.FileManagerTarget) => {
+      const response = await komodo_client().read(
+        "ListActiveFileManagerOperations",
+        { target },
+      );
+      setOperations((current) => {
+        const known = new Set(current.map((item) => item.operationId));
+        const restored = response.operations
+          .filter((status) => !known.has(status.operation_id))
+          .map((status) => ({
+            operationId: status.operation_id,
+            notificationId: status.operation_id,
+            target,
+            label: status.description || "File operation",
+            write: true,
+            startedAt: status.started_at || Date.now(),
+          }));
+        return restored.length ? [...current, ...restored] : current;
+      });
+    },
+    [],
+  );
+
   const untrack = useCallback(
     (operationId: string) => {
       removeOperation(operationId);
@@ -515,6 +625,7 @@ export function FileOperationProvider({ children }: { children: ReactNode }) {
       failPending,
       setCancel,
       track,
+      discover,
       untrack,
       isWriteActive,
     }),
@@ -522,6 +633,7 @@ export function FileOperationProvider({ children }: { children: ReactNode }) {
       begin,
       cancelPending,
       failPending,
+      discover,
       isWriteActive,
       setCancel,
       submitting,
@@ -534,6 +646,91 @@ export function FileOperationProvider({ children }: { children: ReactNode }) {
   return (
     <OperationContext.Provider value={value}>
       {children}
+      <Modal
+        opened={!!pendingConflict?.status.pending_conflict}
+        onClose={() => undefined}
+        withCloseButton={false}
+        closeOnClickOutside={false}
+        closeOnEscape={false}
+        title="File conflict"
+        centered
+      >
+        {pendingConflict?.status.pending_conflict && (
+          <Stack>
+            <Text size="sm">
+              A file already exists immediately before publish. Choose what to
+              do; existing data has not been changed yet.
+            </Text>
+            <Stack gap={2}>
+              <Text ff="monospace" size="sm">
+                {pendingConflict.status.pending_conflict.conflict.path}
+              </Text>
+              <Text size="xs" c="dimmed">
+                Existing {pendingConflict.status.pending_conflict.conflict.existing_kind};
+                incoming {pendingConflict.status.pending_conflict.conflict.incoming_kind}
+              </Text>
+            </Stack>
+            <Checkbox
+              checked={applyToAll}
+              onChange={(event) => setApplyToAll(event.currentTarget.checked)}
+              label="Apply to all remaining conflicts in this operation"
+            />
+            <Group justify="space-between">
+              <Button
+                variant="default"
+                onClick={() => {
+                  void komodo_client().write("CancelFileManagerOperation", {
+                    target: pendingConflict.operation.target,
+                    operation_id: pendingConflict.operation.operationId,
+                  });
+                }}
+              >
+                Cancel operation
+              </Button>
+              <Group>
+                {[Types.FileManagerConflictAction.Skip, Types.FileManagerConflictAction.Overwrite].map(
+                  (action) => (
+                    <Button
+                      key={action}
+                      color={
+                        action === Types.FileManagerConflictAction.Overwrite
+                          ? "red"
+                          : undefined
+                      }
+                      variant={
+                        action === Types.FileManagerConflictAction.Skip
+                          ? "default"
+                          : "filled"
+                      }
+                      onClick={() => {
+                        const pending =
+                          pendingConflict.status.pending_conflict;
+                        if (!pending) return;
+                        setPendingConflict(undefined);
+                        void komodo_client().write(
+                          "ResolveFileManagerOperationConflict",
+                          {
+                            target: pendingConflict.operation.target,
+                            operation_id:
+                              pendingConflict.operation.operationId,
+                            decision_id: pending.decision_id,
+                            action,
+                            apply_to_all: applyToAll,
+                          },
+                        );
+                      }}
+                    >
+                      {action === Types.FileManagerConflictAction.Skip
+                        ? "Skip"
+                        : "Overwrite"}
+                    </Button>
+                  ),
+                )}
+              </Group>
+            </Group>
+          </Stack>
+        )}
+      </Modal>
     </OperationContext.Provider>
   );
 }

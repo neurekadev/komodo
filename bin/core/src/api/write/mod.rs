@@ -101,6 +101,10 @@ pub enum WriteRequest {
   // ==== FILE MANAGER ====
   PreflightFileManagerOperation(PreflightFileManagerOperation),
   CommitFileManagerOperation(CommitFileManagerOperation),
+  ResolveFileManagerOperationConflict(
+    ResolveFileManagerOperationConflict,
+  ),
+  CancelFileManagerOperation(CancelFileManagerOperation),
   PrepareFileManagerUpload(PrepareFileManagerUpload),
   PrepareFileManagerDownload(PrepareFileManagerDownload),
   UndoFileManagerOperation(UndoFileManagerOperation),

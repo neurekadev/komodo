@@ -218,6 +218,7 @@ async fn upload(
         completed_bytes: bytes,
         total_bytes: bytes,
         error: None,
+        ..Default::default()
       }))
     }
     Err(error) => {

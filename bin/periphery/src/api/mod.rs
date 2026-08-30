@@ -65,6 +65,11 @@ pub enum PeripheryRequest {
   PreflightFileManagerOperation(PreflightFileManagerOperation),
   CommitFileManagerOperation(CommitFileManagerOperation),
   GetFileManagerOperationStatus(GetFileManagerOperationStatus),
+  ListActiveFileManagerOperations(ListActiveFileManagerOperations),
+  ResolveFileManagerOperationConflict(
+    ResolveFileManagerOperationConflict,
+  ),
+  CancelFileManagerOperation(CancelFileManagerOperation),
   GetFileManagerJournalStatus(GetFileManagerJournalStatus),
   UndoFileManagerOperation(UndoFileManagerOperation),
   RedoFileManagerOperation(RedoFileManagerOperation),

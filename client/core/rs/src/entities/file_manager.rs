@@ -197,10 +197,19 @@ impl FileManagerOperation {
   }
 
   pub fn requires_confirmation(&self) -> bool {
+    matches!(self, FileManagerOperation::Delete { .. })
+  }
+
+  /// Whether this operation is retained in user-visible undo history.
+  pub fn is_undoable(&self) -> bool {
     matches!(
       self,
-      FileManagerOperation::Delete { .. }
-        | FileManagerOperation::ExtractArchive { .. }
+      FileManagerOperation::CreateFile { .. }
+        | FileManagerOperation::CreateDirectory { .. }
+        | FileManagerOperation::Rename { .. }
+        | FileManagerOperation::Move { .. }
+        | FileManagerOperation::Copy { .. }
+        | FileManagerOperation::Delete { .. }
     )
   }
 }
@@ -218,7 +227,9 @@ pub enum FileManagerConflictAction {
 }
 
 #[typeshare]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+  Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize,
+)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 pub struct FileManagerConflict {
   pub path: String,
@@ -232,6 +243,17 @@ pub struct FileManagerConflict {
 pub struct FileManagerConflictDecision {
   pub path: String,
   pub action: FileManagerConflictAction,
+}
+
+#[typeshare]
+#[derive(
+  Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize,
+)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+pub struct FileManagerPendingConflict {
+  /// Opaque, single-use identifier for the currently pending decision.
+  pub decision_id: String,
+  pub conflict: FileManagerConflict,
 }
 
 #[typeshare]
@@ -256,6 +278,7 @@ pub enum FileManagerOperationState {
   #[default]
   Pending,
   Running,
+  WaitingForInput,
   Complete,
   Failed,
   Cancelled,
@@ -300,11 +323,39 @@ pub struct FileManagerOperationStatus {
   pub phase: FileManagerOperationPhase,
   #[serde(default)]
   pub description: String,
+  /// Server timestamp in milliseconds when the operation was accepted.
+  #[serde(default)]
+  pub started_at: I64,
+  /// Server timestamp in milliseconds when this status last changed.
+  #[serde(default)]
+  pub updated_at: I64,
+  /// Server timestamp in milliseconds when the current phase began.
+  #[serde(default)]
+  pub phase_started_at: I64,
+  /// Whether the server can still accept a cancellation request.
+  #[serde(default)]
+  pub cancellable: bool,
+  /// Bytes currently retained in staging or internal rollback storage.
+  #[serde(default)]
+  pub temporary_storage_bytes: U64,
+  /// A conflict awaiting an explicit overwrite or skip decision.
+  #[serde(default)]
+  pub pending_conflict: Option<FileManagerPendingConflict>,
+  /// Counters are scoped to `phase` and reset on each phase transition.
   pub completed_entries: U64,
   pub total_entries: U64,
   pub completed_bytes: U64,
   pub total_bytes: U64,
   pub error: Option<String>,
+}
+
+#[typeshare]
+#[derive(
+  Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize,
+)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+pub struct FileManagerActiveOperations {
+  pub operations: Vec<FileManagerOperationStatus>,
 }
 
 #[typeshare]
@@ -318,6 +369,12 @@ pub struct FileManagerJournalStatus {
   pub undo_description: Option<String>,
   pub redo_description: Option<String>,
   pub expires_at: Option<I64>,
+  /// Bytes retained for the current undo/redo history.
+  #[serde(default)]
+  pub retained_storage_bytes: U64,
+  /// Server-safe explanation of where File Manager data is stored.
+  #[serde(default)]
+  pub storage_description: String,
 }
 
 #[typeshare]
@@ -349,6 +406,38 @@ mod tests {
         path: "file".into()
       }
       .requires_confirmation()
+    );
+    assert!(
+      !FileManagerOperation::ExtractArchive {
+        path: "archive.zip".into(),
+        destination: "archive".into(),
+      }
+      .requires_confirmation()
+    );
+  }
+
+  #[test]
+  fn only_reversible_file_operations_enter_undo_history() {
+    assert!(
+      FileManagerOperation::Delete {
+        paths: vec!["file".into()]
+      }
+      .is_undoable()
+    );
+    assert!(
+      !FileManagerOperation::WriteText {
+        path: "file".into(),
+        contents: "changed".into(),
+        expected_revision: Default::default(),
+      }
+      .is_undoable()
+    );
+    assert!(
+      !FileManagerOperation::ExtractArchive {
+        path: "archive.zip".into(),
+        destination: "archive".into(),
+      }
+      .is_undoable()
     );
   }
 

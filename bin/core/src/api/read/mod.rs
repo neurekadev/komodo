@@ -180,6 +180,7 @@ enum ReadRequest {
   ListFileManagerDirectory(ListFileManagerDirectory),
   ReadFileManagerText(ReadFileManagerText),
   GetFileManagerOperationStatus(GetFileManagerOperationStatus),
+  ListActiveFileManagerOperations(ListActiveFileManagerOperations),
   GetFileManagerJournalStatus(GetFileManagerJournalStatus),
 
   // ==== DEPLOYMENT ====

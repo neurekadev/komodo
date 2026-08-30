@@ -1,7 +1,8 @@
 use komodo_client::entities::file_manager::{
-  FileManagerCapabilities, FileManagerDirectory,
-  FileManagerJournalStatus, FileManagerOperationStatus,
-  FileManagerPreflight, FileManagerTextFile,
+  FileManagerActiveOperations, FileManagerCapabilities,
+  FileManagerDirectory, FileManagerJournalStatus,
+  FileManagerOperationStatus, FileManagerPreflight,
+  FileManagerTextFile,
 };
 use mogh_resolver::Resolve;
 use periphery_client::api::file_manager::*;
@@ -76,6 +77,47 @@ impl Resolve<Args> for GetFileManagerOperationStatus {
   }
 }
 
+impl Resolve<Args> for ListActiveFileManagerOperations {
+  async fn resolve(
+    self,
+    _: &Args,
+  ) -> anyhow::Result<FileManagerActiveOperations> {
+    file_manager::list_active_operations(&self.target, &self.actor)
+      .await
+  }
+}
+
+impl Resolve<Args> for ResolveFileManagerOperationConflict {
+  async fn resolve(
+    self,
+    _: &Args,
+  ) -> anyhow::Result<FileManagerOperationStatus> {
+    file_manager::resolve_operation_conflict(
+      &self.target,
+      &self.actor,
+      &self.operation_id,
+      self.decision_id,
+      self.action,
+      self.apply_to_all,
+    )
+    .await
+  }
+}
+
+impl Resolve<Args> for CancelFileManagerOperation {
+  async fn resolve(
+    self,
+    _: &Args,
+  ) -> anyhow::Result<FileManagerOperationStatus> {
+    file_manager::cancel_file_manager_operation(
+      &self.target,
+      &self.actor,
+      &self.operation_id,
+    )
+    .await
+  }
+}
+
 impl Resolve<Args> for GetFileManagerJournalStatus {
   async fn resolve(
     self,
@@ -95,6 +137,7 @@ impl Resolve<Args> for UndoFileManagerOperation {
       &self.actor,
       &self.operation_id,
       self.confirmed,
+      self.rollback_operation_id.as_deref(),
     )
     .await
   }

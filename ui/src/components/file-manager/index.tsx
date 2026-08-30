@@ -437,6 +437,12 @@ export default function FileManager({
     { enabled: !!editorPath && capabilities?.available === true },
   );
 
+  useEffect(() => {
+    if (capabilities?.available) {
+      void operations.discover(target).catch(() => undefined);
+    }
+  }, [capabilities?.available, operations, target]);
+
   const { mutateAsync: preflight, isPending: preflightPending } = useWrite(
     "PreflightFileManagerOperation",
     { onError: () => undefined },
@@ -622,14 +628,7 @@ export default function FileManager({
         };
         if (result.confirmation_required || result.conflicts.length > 0) {
           operations.waiting(notificationId, label);
-          setDecisions(
-            Object.fromEntries(
-              result.conflicts.map((conflict) => [
-                conflict.path,
-                Types.FileManagerConflictAction.Overwrite,
-              ]),
-            ),
-          );
+          setDecisions({});
           setPendingCommit(plan);
         } else {
           await completeCommit(plan);
@@ -1413,6 +1412,17 @@ export default function FileManager({
               {clipboard.mode === "copy" ? "copy" : "move"}.
             </Text>
           )}
+          {!!journal.data?.retained_storage_bytes && (
+            <Text
+              size="xs"
+              c="dimmed"
+              title={journal.data.storage_description}
+            >
+              File Manager recovery storage: {formatBytes(
+                journal.data.retained_storage_bytes ?? 0,
+              )}
+            </Text>
+          )}
           <Box
             ref={explorerRef}
             tabIndex={0}
@@ -1832,6 +1842,7 @@ export default function FileManager({
               <Select
                 w={130}
                 value={decisions[conflict.path]}
+                placeholder="Choose…"
                 onChange={(value) =>
                   setDecisions((current) => ({
                     ...current,
@@ -1857,6 +1868,11 @@ export default function FileManager({
             </Button>
             <Button
               color="red"
+              disabled={
+                !!pendingCommit?.preflight.conflicts.some(
+                  (conflict) => !decisions[conflict.path],
+                )
+              }
               onClick={() =>
                 pendingCommit &&
                 void completeCommit(

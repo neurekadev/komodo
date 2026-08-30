@@ -3,9 +3,9 @@ use serde::{Deserialize, Serialize};
 use typeshare::typeshare;
 
 use crate::entities::file_manager::{
-  FileManagerCapabilities, FileManagerDirectory,
-  FileManagerJournalStatus, FileManagerOperationStatus,
-  FileManagerTarget, FileManagerTextFile,
+  FileManagerActiveOperations, FileManagerCapabilities,
+  FileManagerDirectory, FileManagerJournalStatus,
+  FileManagerOperationStatus, FileManagerTarget, FileManagerTextFile,
 };
 
 use super::KomodoReadRequest;
@@ -52,6 +52,16 @@ pub struct ReadFileManagerText {
 pub struct GetFileManagerOperationStatus {
   pub target: FileManagerTarget,
   pub operation_id: String,
+}
+
+#[typeshare]
+#[derive(Serialize, Deserialize, Debug, Clone, Resolve)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[empty_traits(KomodoReadRequest)]
+#[response(FileManagerActiveOperations)]
+#[error(mogh_error::Error)]
+pub struct ListActiveFileManagerOperations {
+  pub target: FileManagerTarget,
 }
 
 #[typeshare]

@@ -77,18 +77,18 @@ export interface ActionConfig {
 	schedule_format?: ScheduleFormat;
 	/**
 	 * Optionally provide a schedule for the procedure to run on.
-	 * 
+	 *
 	 * There are 2 ways to specify a schedule:
-	 * 
+	 *
 	 * 1. Regular CRON expression:
-	 * 
+	 *
 	 * (second, minute, hour, day, month, day-of-week)
 	 * ```text
 	 * 0 0 0 1,15 * ?
 	 * ```
-	 * 
+	 *
 	 * 2. "English" expression via [english-to-cron](https://crates.io/crates/english-to-cron):
-	 * 
+	 *
 	 * ```text
 	 * at midnight on the 1st and 15th of the month
 	 * ```
@@ -233,7 +233,7 @@ export interface ActionQuerySpecifics {
 
 export type ActionQuery = ResourceQuery<ActionQuerySpecifics>;
 
-export type AlerterEndpoint = 
+export type AlerterEndpoint =
 	/** Send alert serialized to JSON to an http endpoint. */
 	| { type: "Custom", params: CustomAlerterEndpoint }
 	/** Send alert to a Slack app */
@@ -246,7 +246,7 @@ export type AlerterEndpoint =
 	| { type: "Pushover", params: PushoverAlerterEndpoint };
 
 /** Used to reference a specific resource across all resource types */
-export type ResourceTarget = 
+export type ResourceTarget =
 	| { type: "System", id: string }
 	| { type: "Swarm", id: string }
 	| { type: "Server", id: string }
@@ -307,7 +307,7 @@ export interface AlerterConfig {
 	enabled?: boolean;
 	/**
 	 * Where to route the alert messages.
-	 * 
+	 *
 	 * Default: Custom endpoint `http://localhost:7000`
 	 */
 	endpoint?: AlerterEndpoint;
@@ -383,7 +383,7 @@ export interface CheckStackForUpdateResponse {
 
 export type BatchCheckStackForUpdateResponse = CheckStackForUpdateResponse[];
 
-export type BatchExecutionResponseItem = 
+export type BatchExecutionResponseItem =
 	| { status: "Ok", data: Update }
 	| { status: "Err", data: BatchExecutionResponseItemErr };
 
@@ -580,7 +580,7 @@ export interface Update {
 	success: boolean;
 	/**
 	 * The user id that triggered the update.
-	 * 
+	 *
 	 * Also can take these values for operations triggered automatically:
 	 * - `Procedure`: The operation was triggered as part of a procedure run
 	 * - `Github`: The operation was triggered by a github webhook
@@ -650,7 +650,7 @@ export interface BuildConfig {
 	/**
 	 * An alternate name for the image pushed to the repository.
 	 * If this is empty, it will use the build name.
-	 * 
+	 *
 	 * Can be used in conjunction with `image_tag` to direct multiple builds
 	 * with different configs to push to the same image registry, under different,
 	 * independantly versioned tags.
@@ -660,7 +660,7 @@ export interface BuildConfig {
 	 * An extra tag put after the build version, for the image pushed to the repository.
 	 * Eg. in image tag of `aarch64` would push to moghtech/komodo-core:1.13.2-aarch64.
 	 * If this is empty, the image tag will just be the build version.
-	 * 
+	 *
 	 * Can be used in conjunction with `image_name` to direct multiple builds
 	 * with different configs to push to the same image registry, under different,
 	 * independantly versioned tags.
@@ -680,14 +680,14 @@ export interface BuildConfig {
 	git_provider: string;
 	/**
 	 * Whether to use https to clone the repo (versus http). Default: true
-	 * 
+	 *
 	 * Note. Komodo does not currently support cloning repos via ssh.
 	 */
 	git_https: boolean;
 	/**
 	 * The git account used to access private repos.
 	 * Passing empty string can only clone public repos.
-	 * 
+	 *
 	 * Note. A token for the account must be available in the core config or the builder server's periphery config
 	 * for the configured git provider.
 	 */
@@ -739,16 +739,16 @@ export interface BuildConfig {
 	dockerfile?: string;
 	/**
 	 * Docker build arguments.
-	 * 
+	 *
 	 * These values are visible in the final image by running `docker inspect`.
 	 */
 	build_args?: string;
 	/**
 	 * Secret arguments.
-	 * 
+	 *
 	 * These values remain hidden in the final image by using
 	 * docker secret mounts. See <https://docs.docker.com/build/building/secrets>.
-	 * 
+	 *
 	 * The values can be used in RUN commands:
 	 * ```sh
 	 * RUN --mount=type=secret,id=SECRET_KEY \
@@ -858,7 +858,7 @@ export interface BuildQuerySpecifics {
 
 export type BuildQuery = ResourceQuery<BuildQuerySpecifics>;
 
-export type BuilderConfig = 
+export type BuilderConfig =
 	/** Use a Periphery address as a Builder. */
 	| { type: "Url", params: UrlBuilderConfig }
 	/** Use a connected server as a Builder. */
@@ -887,7 +887,7 @@ export interface BuilderQuerySpecifics {
 export type BuilderQuery = ResourceQuery<BuilderQuerySpecifics>;
 
 /** A wrapper for all Komodo exections. */
-export type Execution = 
+export type Execution =
 	/** The "null" execution. Does nothing. */
 	| { type: "None", params: NoData }
 	/** Deploy the target stack. (alias: `stack`, `st`) */
@@ -1006,18 +1006,18 @@ export interface ProcedureConfig {
 	schedule_format?: ScheduleFormat;
 	/**
 	 * Optionally provide a schedule for the procedure to run on.
-	 * 
+	 *
 	 * There are 2 ways to specify a schedule:
-	 * 
+	 *
 	 * 1. Regular CRON expression:
-	 * 
+	 *
 	 * (second, minute, hour, day, month, day-of-week)
 	 * ```text
 	 * 0 0 0 1,15 * ?
 	 * ```
-	 * 
+	 *
 	 * 2. "English" expression via [english-to-cron](https://crates.io/crates/english-to-cron):
-	 * 
+	 *
 	 * ```text
 	 * at midnight on the 1st and 15th of the month
 	 * ```
@@ -1079,7 +1079,7 @@ export interface GitProviderAccount {
 	_id?: MongoId;
 	/**
 	 * The domain of the provider.
-	 * 
+	 *
 	 * For git, this cannot include the protocol eg 'http://',
 	 * which is controlled with 'https' field.
 	 */
@@ -1107,7 +1107,7 @@ export interface ImageRegistryAccount {
 	_id?: MongoId;
 	/**
 	 * The domain of the provider.
-	 * 
+	 *
 	 * For docker registry, this can include 'http://...',
 	 * however this is not recommended and won't work unless "insecure registries" are enabled
 	 * on your hosts. See <https://docs.docker.com/reference/cli/dockerd/#insecure-registries>.
@@ -1124,7 +1124,7 @@ export interface ImageRegistryAccount {
 
 export type CreateImageRegistryAccountResponse = ImageRegistryAccount;
 
-export type UserConfig = 
+export type UserConfig =
 	/** User that logs in with username / password */
 	| { type: "Local", data: {
 	password: string;
@@ -1233,7 +1233,7 @@ export interface Variable {
 	/**
 	 * If marked as secret, the variable value will be hidden in updates / logs.
 	 * Additionally the value will not be served in read requests by non admin users.
-	 * 
+	 *
 	 * Note that the value is NOT encrypted in the database, and will likely show up in database logs.
 	 * The security of these variables comes down to the security
 	 * of the database (system level encryption, network isolation, etc.)
@@ -1252,7 +1252,7 @@ export type DeleteImageRegistryAccountResponse = ImageRegistryAccount;
 /**
  * An public key used to authenticate new Periphery -> Core connections
  * to join Komodo as a newly created Server.
- * 
+ *
  * Server onboarding keys correspond to private / public key pairs.
  * While the public key is stored, the private key will only be returned to the user,
  * The private key will not be stored or available afterwards, just like the api key "secret".
@@ -1274,7 +1274,7 @@ export interface OnboardingKey {
 	tags?: string[];
 	/**
 	 * Allows the Onboarding Key to be used to:
-	 * 
+	 *
 	 * 1. Enable a disabled Server
 	 * 2. Remove Server 'address' configuration, allowing Periphery -> Core connection.
 	 * 3. Update existing Server's public keys.
@@ -1297,7 +1297,7 @@ export type DeleteUserResponse = User;
 
 export type DeleteVariableResponse = Variable;
 
-export type DeploymentImage = 
+export type DeploymentImage =
 	/** Deploy any external image. */
 	| { type: "Image", params: {
 	/** The docker image, can be from any registry that works with docker and that the host server can reach. */
@@ -1331,14 +1331,14 @@ export enum TerminationSignal {
 export interface DeploymentConfig {
 	/**
 	 * The Swarm to deploy the Deployment on (as a Swarm Service), setting the Deployment into Swarm mode.
-	 * 
+	 *
 	 * Note. If both swarm_id and server_id are set,
 	 * swarm_id overrides server_id and the Deployment will be in Swarm mode.
 	 */
 	swarm_id?: string;
 	/**
 	 * The Server to deploy the Deployment on, setting the Deployment into Container mode.
-	 * 
+	 *
 	 * Note. If both swarm_id and server_id are set,
 	 * swarm_id overrides server_id and the Deployment will be in Swarm mode.
 	 */
@@ -1356,7 +1356,7 @@ export interface DeploymentConfig {
 	/**
 	 * Configure the account used to pull the image from the registry.
 	 * Used with `docker login`.
-	 * 
+	 *
 	 * - If the field is empty string, will use the same account config as the build, or none at all if using image.
 	 * - If the field contains an account, a token for the account must be available.
 	 * - Will get the registry domain from the build / image
@@ -1395,7 +1395,7 @@ export interface DeploymentConfig {
 	command?: string;
 	/**
 	 * The number of replicas for the Service.
-	 * 
+	 *
 	 * Note. Only used in Swarm mode.
 	 */
 	replicas: number;
@@ -1407,7 +1407,7 @@ export interface DeploymentConfig {
 	 * Extra args which are interpolated into the
 	 * `docker run` / `docker service create` command,
 	 * and affect the container configuration.
-	 * 
+	 *
 	 * - Container ref: https://docs.docker.com/reference/cli/docker/container/run/#options
 	 * - Swarm Service ref: https://docs.docker.com/reference/cli/docker/service/create/#options
 	 */
@@ -1459,7 +1459,7 @@ export type Deployment = Resource<DeploymentConfig, DeploymentInfo>;
 
 /**
  * Variants de/serialized from/to snake_case.
- * 
+ *
  * Eg.
  * - NotDeployed -> not_deployed
  * - Restarting -> restarting
@@ -1593,26 +1593,26 @@ export type GetActionResponse = Action;
 export enum SeverityLevel {
 	/**
 	 * No problem.
-	 * 
+	 *
 	 * Aliases: ok, low, l
 	 */
 	Ok = "OK",
 	/**
 	 * Problem is imminent.
-	 * 
+	 *
 	 * Aliases: warning, w, medium, m
 	 */
 	Warning = "WARNING",
 	/**
 	 * Problem fully realized.
-	 * 
+	 *
 	 * Aliases: critical, c, high, h
 	 */
 	Critical = "CRITICAL",
 }
 
 /** The variants of data related to the alert. */
-export type AlertData = 
+export type AlertData =
 	/** A null alert */
 	| { type: "None", data: {
 }}
@@ -2053,14 +2053,14 @@ export interface RepoConfig {
 	git_provider: string;
 	/**
 	 * Whether to use https to clone the repo (versus http). Default: true
-	 * 
+	 *
 	 * Note. Komodo does not currently support cloning repos via ssh.
 	 */
 	git_https: boolean;
 	/**
 	 * The git account used to access private repos.
 	 * Passing empty string can only clone public repos.
-	 * 
+	 *
 	 * Note. A token for the account must be available in the core config or the builder server's periphery config
 	 * for the configured git provider.
 	 */
@@ -2102,7 +2102,7 @@ export interface RepoConfig {
 	 * The environment variables passed to the compose file.
 	 * They will be written to path defined in env_file_path,
 	 * which is given relative to the run directory.
-	 * 
+	 *
 	 * If it is empty, no file will be written.
 	 */
 	environment?: string;
@@ -2150,7 +2150,7 @@ export interface ResourceSyncConfig {
 	git_provider: string;
 	/**
 	 * Whether to use https to clone the repo (versus http). Default: true
-	 * 
+	 *
 	 * Note. Komodo does not currently support cloning repos via ssh.
 	 */
 	git_https: boolean;
@@ -2163,7 +2163,7 @@ export interface ResourceSyncConfig {
 	/**
 	 * The git account used to access private repos.
 	 * Passing empty string can only clone public repos.
-	 * 
+	 *
 	 * Note. A token for the account must be available in the core config or the builder server's periphery config
 	 * for the configured git provider.
 	 */
@@ -2224,7 +2224,7 @@ export interface ResourceSyncConfig {
 	file_contents?: string;
 }
 
-export type DiffData = 
+export type DiffData =
 	/** Resource will be created */
 	| { type: "Create", data: {
 	/** The name of resource to create */
@@ -2489,14 +2489,14 @@ export interface StackFileDependency {
 export interface StackConfig {
 	/**
 	 * The Swarm to deploy the Stack on, setting the Stack into Swarm mode.
-	 * 
+	 *
 	 * Note. If both swarm_id and server_id are set,
 	 * swarm_id overrides server_id and the Stack will be in Swarm mode.
 	 */
 	swarm_id?: string;
 	/**
 	 * The Server to deploy the Stack on, setting the Stack into Compose mode.
-	 * 
+	 *
 	 * Note. If both swarm_id and server_id are set,
 	 * swarm_id overrides server_id and the Stack will be in Swarm mode.
 	 */
@@ -2507,7 +2507,7 @@ export interface StackConfig {
 	 * Optionally specify a custom project name for the stack.
 	 * If this is empty string, it will default to the stack name.
 	 * Used with `docker compose -p {project_name}` / `docker stack deploy {project_name}`.
-	 * 
+	 *
 	 * Note. Can be used to import pre-existing stacks with names that do not match Stack name.
 	 */
 	project_name?: string;
@@ -2515,14 +2515,14 @@ export interface StackConfig {
 	 * Whether to automatically `compose pull` before redeploying stack.
 	 * Ensured latest images are deployed.
 	 * Will fail if the compose file specifies a locally build image.
-	 * 
+	 *
 	 * Note. Not used in Swarm mode.
 	 */
 	auto_pull: boolean;
 	/**
 	 * Whether to `docker compose build` before `compose down` / `compose up`.
 	 * Combine with build_extra_args for custom behaviors.
-	 * 
+	 *
 	 * Note. Not used in Swarm mode.
 	 */
 	run_build?: boolean;
@@ -2558,14 +2558,14 @@ export interface StackConfig {
 	git_provider: string;
 	/**
 	 * Whether to use https to clone the repo (versus http). Default: true
-	 * 
+	 *
 	 * Note. Komodo does not currently support cloning repos via ssh.
 	 */
 	git_https: boolean;
 	/**
 	 * The git account used to access private repos.
 	 * Passing empty string can only clone public repos.
-	 * 
+	 *
 	 * Note. A token for the account must be available in the core config or the builder server's periphery config
 	 * for the configured git provider.
 	 */
@@ -2616,14 +2616,14 @@ export interface StackConfig {
 	 * The name of the written environment file before `docker compose up`.
 	 * Relative to the run directory root.
 	 * Default: .env
-	 * 
+	 *
 	 * Note. Not used in Swarm mode.
 	 */
 	env_file_path: string;
 	/**
 	 * Add additional env files to attach with `--env-file`.
 	 * Relative to the run directory root.
-	 * 
+	 *
 	 * Note. It is already included as an `additional_file`.
 	 * Don't add it again there.
 	 */
@@ -2633,7 +2633,7 @@ export interface StackConfig {
 	 * Can add any files associated with the stack to enable editing them in the UI.
 	 * Doing so will also include diffing these when deciding to deploy in `DeployStackIfChanged`.
 	 * Relative to the run directory.
-	 * 
+	 *
 	 * Note. If the config file is .env and should be included in compose command
 	 * using `--env-file`, add it to `additional_env_files` instead.
 	 */
@@ -2650,10 +2650,10 @@ export interface StackConfig {
 	post_deploy?: SystemCommand;
 	/**
 	 * The extra arguments to pass to the deploy command.
-	 * 
+	 *
 	 * - For Compose stack, uses `docker compose up -d [EXTRA_ARGS]`.
 	 * - For Swarm mode. `docker stack deploy [EXTRA_ARGS] STACK_NAME`
-	 * 
+	 *
 	 * If empty, no extra arguments will be passed.
 	 */
 	extra_args?: string[];
@@ -2661,7 +2661,7 @@ export interface StackConfig {
 	 * The extra arguments to pass after `docker compose build`.
 	 * If empty, no extra build arguments will be passed.
 	 * Only used if `run_build: true`
-	 * 
+	 *
 	 * Note. Not used in Swarm mode.
 	 */
 	build_extra_args?: string[];
@@ -2669,7 +2669,7 @@ export interface StackConfig {
 	 * Optional command wrapper for secrets management tools.
 	 * Wraps the docker compose up command with a prefix command.
 	 * Use [[COMPOSE_COMMAND]] as placeholder for the full compose command.
-	 * 
+	 *
 	 * Examples:
 	 * - "op run -- [[COMPOSE_COMMAND]]" (1password CLI)
 	 * - "sops exec-file --no-fifo /path/to/secret.env '[[COMPOSE_COMMAND]]'" (sops)
@@ -2700,9 +2700,9 @@ export interface StackConfig {
 	 * The environment variables passed to the compose file.
 	 * They will be written to path defined in env_file_path,
 	 * which is given relative to the run directory.
-	 * 
+	 *
 	 * If it is empty, no file will be written.
-	 * 
+	 *
 	 * Note. Not used in Swarm mode.
 	 */
 	environment?: string;
@@ -2721,21 +2721,21 @@ export interface StackServiceNames {
 	/**
 	 * Will either be the declared container_name in the compose file,
 	 * or a pattern to match auto named containers.
-	 * 
+	 *
 	 * Auto named containers are composed of three parts:
-	 * 
+	 *
 	 * 1. The name of the compose project (top level name field of compose file).
 	 * This defaults to the name of the parent folder of the compose file.
 	 * Komodo will always set it to be the name of the stack, but imported stacks
 	 * will have a different name.
 	 * 2. The service name
 	 * 3. The replica number
-	 * 
+	 *
 	 * Example: stacko-mongo-1.
-	 * 
+	 *
 	 * This stores only 1. and 2., ie stacko-mongo.
 	 * Containers will be matched via regex like `^container_name-?[0-9]*$``
-	 * 
+	 *
 	 * Note. Setting container_name is not supported by Swarm,
 	 * so will always be 1. and 2. in Swarm mode.
 	 */
@@ -3026,7 +3026,7 @@ export type GetUpdateResponse = Update;
 
 /**
  * Permission users at the group level.
- * 
+ *
  * All users that are part of a group inherit the group's permissions.
  * A user can be a part of multiple groups. A user's permission on a particular resource
  * will be resolved to be the maximum permission level between the user's own permissions and
@@ -4151,7 +4151,7 @@ export interface SwarmService {
 	 * Swarm service state.
 	 * - Healthy if all associated tasks match their desired state (or report no desired state)
 	 * - Unhealthy otherwise
-	 * 
+	 *
 	 * Not included in docker cli return, computed by Komodo
 	 */
 	State: SwarmState;
@@ -4413,7 +4413,7 @@ export interface SwarmServiceListItem {
 	 * Swarm service state.
 	 * - Healthy if all associated tasks match their desired state (or report no desired state)
 	 * - Unhealthy otherwise
-	 * 
+	 *
 	 * Not included in docker cli return, computed by Komodo
 	 */
 	State: SwarmState;
@@ -4476,7 +4476,7 @@ export interface SwarmStack {
 	 * Swarm stack state.
 	 * - Healthy if all associated tasks match their desired state (or report no desired state)
 	 * - Unhealthy otherwise
-	 * 
+	 *
 	 * Not included in docker cli return, computed by Komodo
 	 */
 	State: SwarmState;
@@ -4515,7 +4515,7 @@ export interface ConfigSpec {
 
 /**
  * Swarm config details.
- * 
+ *
  * This would be just "SwarmConfig", but that would
  * conflict with the Swarm (Komodo resource) Config type,
  * which is also SwarmConfig.
@@ -5288,7 +5288,7 @@ export type ListNetworksResponse = NetworkListItem[];
 
 export type ListOnboardingKeysResponse = OnboardingKey[];
 
-export type UserTarget = 
+export type UserTarget =
 	/** User Id */
 	| { type: "User", id: string }
 	/** UserGroup Id */
@@ -5764,7 +5764,7 @@ export type ListSwarmServicesResponse = SwarmServiceListItem[];
 /**
  * Swarm stack list item.
  * Returned by `docker stack ls --format json`
- * 
+ *
  * https://docs.docker.com/reference/cli/docker/stack/ls/#format
  */
 export interface SwarmStackListItem {
@@ -5774,7 +5774,7 @@ export interface SwarmStackListItem {
 	 * Swarm stack state.
 	 * - Healthy if all associated tasks match their desired state
 	 * - Unhealthy otherwise
-	 * 
+	 *
 	 * Not included in docker cli return, computed by Komodo
 	 */
 	State?: SwarmState;
@@ -5836,7 +5836,7 @@ export type ListSystemProcessesResponse = SystemProcess[];
 
 export type ListTagsResponse = Tag[];
 
-export type TerminalTarget = 
+export type TerminalTarget =
 	| { type: "Server", params: {
 	server?: string;
 }}
@@ -6130,7 +6130,7 @@ export interface AwsBuilderConfig {
 	git_providers?: GitProvider[];
 	/**
 	 * Which image registries are available on the AMI.
-	 * 
+	 *
 	 * Pre v2.3.0, called `docker_registries`
 	 */
 	image_registries?: ImageRegistry[];
@@ -6141,11 +6141,11 @@ export interface AwsBuilderConfig {
 /**
  * **Admin only.** Backs up the Komodo Core database to compressed jsonl files.
  * Response: [Update]. Aliases: `backup-database`, `backup-db`, `backup`.
- * 
+ *
  * Mount a folder to `/backups`, and Core will use it to create
  * timestamped database dumps, which can be restored using
  * the Komodo CLI.
- * 
+ *
  * https://komo.do/docs/setup/backup
  */
 export interface BackupCoreDatabase {
@@ -6156,7 +6156,7 @@ export interface BatchBuildRepo {
 	/**
 	 * Id or name or wildcard pattern or regex.
 	 * Supports multiline and comma delineated combinations of the above.
-	 * 
+	 *
 	 * Example:
 	 * ```text
 	 * # match all foo-* repos
@@ -6178,7 +6178,7 @@ export interface BatchCheckDeploymentForUpdate {
 	/**
 	 * Id or name or wildcard pattern or regex.
 	 * Supports multiline and comma delineated combinations of the above.
-	 * 
+	 *
 	 * Example:
 	 * ```text
 	 * # match all foo-* deployments
@@ -6212,7 +6212,7 @@ export interface BatchCheckStackForUpdate {
 	/**
 	 * Id or name or wildcard pattern or regex.
 	 * Supports multiline and comma delineated combinations of the above.
-	 * 
+	 *
 	 * Example:
 	 * ```text
 	 * # match all foo-* stacks
@@ -6251,7 +6251,7 @@ export interface BatchCloneRepo {
 	/**
 	 * Id or name or wildcard pattern or regex.
 	 * Supports multiline and comma delineated combinations of the above.
-	 * 
+	 *
 	 * Example:
 	 * ```text
 	 * # match all foo-* repos
@@ -6282,7 +6282,7 @@ export interface BatchDeploy {
 	/**
 	 * Id or name or wildcard pattern or regex.
 	 * Supports multiline and comma delineated combinations of the above.
-	 * 
+	 *
 	 * Example:
 	 * ```text
 	 * # match all foo-* deployments
@@ -6304,7 +6304,7 @@ export interface BatchDeployStack {
 	/**
 	 * Id or name or wildcard pattern or regex.
 	 * Supports multiline and comma delineated combinations of the above.
-	 * 
+	 *
 	 * Example:
 	 * ```text
 	 * # match all foo-* stacks
@@ -6326,7 +6326,7 @@ export interface BatchDeployStackIfChanged {
 	/**
 	 * Id or name or wildcard pattern or regex.
 	 * Supports multiline and comma delineated combinations of the above.
-	 * 
+	 *
 	 * Example:
 	 * ```text
 	 * # match all foo-* stacks
@@ -6348,7 +6348,7 @@ export interface BatchDestroyDeployment {
 	/**
 	 * Id or name or wildcard pattern or regex.
 	 * Supports multiline and comma delineated combinations of the above.
-	 * 
+	 *
 	 * Example:
 	 * ```text
 	 * # match all foo-* deployments
@@ -6370,7 +6370,7 @@ export interface BatchDestroyStack {
 	/**
 	 * Id or name or wildcard pattern or regex.
 	 * Supports multiline and comma delineated combinations of the above.
-	 * 
+	 *
 	 * Example:
 	 * ```text
 	 * # match all foo-* stacks
@@ -6397,7 +6397,7 @@ export interface BatchPullRepo {
 	/**
 	 * Id or name or wildcard pattern or regex.
 	 * Supports multiline and comma delineated combinations of the above.
-	 * 
+	 *
 	 * Example:
 	 * ```text
 	 * # match all foo-* repos
@@ -6419,7 +6419,7 @@ export interface BatchPullStack {
 	/**
 	 * Id or name or wildcard pattern or regex.
 	 * Supports multiline and comma delineated combinations of the above.
-	 * 
+	 *
 	 * Example:
 	 * ```text
 	 * # match all foo-* stacks
@@ -6441,7 +6441,7 @@ export interface BatchRunAction {
 	/**
 	 * Id or name or wildcard pattern or regex.
 	 * Supports multiline and comma delineated combinations of the above.
-	 * 
+	 *
 	 * Example:
 	 * ```text
 	 * # match all foo-* actions
@@ -6463,7 +6463,7 @@ export interface BatchRunBuild {
 	/**
 	 * Id or name or wildcard pattern or regex.
 	 * Supports multiline and comma delineated combinations of the above.
-	 * 
+	 *
 	 * Example:
 	 * ```text
 	 * # match all foo-* builds
@@ -6485,7 +6485,7 @@ export interface BatchRunProcedure {
 	/**
 	 * Id or name or wildcard pattern or regex.
 	 * Supports multiline and comma delineated combinations of the above.
-	 * 
+	 *
 	 * Example:
 	 * ```text
 	 * # match all foo-* procedures
@@ -6504,9 +6504,9 @@ export interface BatchRunProcedure {
 
 /**
  * Builds the target repo, using the attached builder. Response: [Update].
- * 
+ *
  * Note. Repo must have builder attached at `builder_id`.
- * 
+ *
  * 1. Spawns the target builder instance (For AWS type. For Server type, just use CloneRepo).
  * 2. Clones the repo on the builder using `git clone https://{$token?}@github.com/${repo} -b ${branch}`.
  * The token will only be used if a github account is specified,
@@ -6547,6 +6547,26 @@ export interface CancelAction {
 export interface CancelBuild {
 	/** Can be id or name */
 	build: string;
+}
+
+/**
+ * A filesystem root exposed by the File Manager.
+ *
+ * Core resolves this logical target to a trusted host root. Host paths are
+ * never accepted from, or returned to, API clients.
+ */
+export type FileManagerTarget =
+	| { type: "Stack", params: {
+	stack: string;
+}}
+	| { type: "Volume", params: {
+	server: string;
+	volume: string;
+}};
+
+export interface CancelFileManagerOperation {
+	target: FileManagerTarget;
+	operation_id: string;
 }
 
 /** Cancels the target procedure run. Response: [Update] */
@@ -6622,9 +6642,9 @@ export interface ClearRepoCache {
 
 /**
  * Clones the target repo. Response: [Update].
- * 
+ *
  * Note. Repo must have server attached at `server_id`.
- * 
+ *
  * 1. Clones the repo on the target server using `git clone https://{$token?}@github.com/${repo} -b ${branch}`.
  * The token will only be used if a github account is specified,
  * and must be declared in the periphery configuration on the target server.
@@ -6645,21 +6665,6 @@ export interface CloseAlert {
 	id: string;
 }
 
-/**
- * A filesystem root exposed by the File Manager.
- *
- * Core resolves this logical target to a trusted host root. Host paths are
- * never accepted from, or returned to, API clients.
- */
-export type FileManagerTarget =
-	| { type: "Stack", params: {
-	stack: string;
-}}
-	| { type: "Volume", params: {
-	server: string;
-	volume: string;
-}};
-
 export enum FileManagerConflictAction {
 	Skip = "skip",
 	Overwrite = "overwrite",
@@ -6679,7 +6684,7 @@ export interface CommitFileManagerOperation {
 
 /**
  * Exports matching resources, and writes to the target sync's resource file. Response: [Update]
- * 
+ *
  * Note. Will fail if the Sync is not `managed`.
  */
 export interface CommitSync {
@@ -6713,7 +6718,7 @@ export enum ContainerTerminalMode {
 export interface InitTerminal {
 	/**
 	 * The shell command (eg `bash`) to init the shell.
-	 * 
+	 *
 	 * Default:
 	 * - Server: Configured on each Periphery
 	 * - Container: `sh`
@@ -6743,7 +6748,7 @@ export interface ConnectTerminalQuery {
 	/**
 	 * Pass to init the terminal session
 	 * for when the terminal doesn't already exist.
-	 * 
+	 *
 	 * Example: ?...(query)&init[command]=bash&init[recreate]=DifferentCommand
 	 */
 	init?: InitTerminal;
@@ -7128,7 +7133,7 @@ export interface CreateBuild {
 }
 
 /** Partial representation of [BuilderConfig] */
-export type PartialBuilderConfig = 
+export type PartialBuilderConfig =
 	| { type: "Url", params: _PartialUrlBuilderConfig }
 	| { type: "Server", params: _PartialServerBuilderConfig }
 	| { type: "Aws", params: _PartialAwsBuilderConfig };
@@ -7172,7 +7177,7 @@ export interface CreateGitProviderAccount {
 /**
  * **Admin only.** Create an image registry account.
  * Response: [ImageRegistryAccount].
- * 
+ *
  * Pre v2.3.0, called `CreateDockerRegistryAccount`
  */
 export interface CreateImageRegistryAccount {
@@ -7182,7 +7187,7 @@ export interface CreateImageRegistryAccount {
 /**
  * **Admin only.** Create a local user.
  * Response: [User].
- * 
+ *
  * Note. Not to be confused with /auth/SignUpLocalUser.
  * This method requires admin user credentials, and can
  * bypass disabled user registration.
@@ -7197,7 +7202,7 @@ export interface CreateLocalUser {
 /**
  * Create a docker network on the server.
  * Response: [Update]
- * 
+ *
  * `docker network create {name}`
  */
 export interface CreateNetwork {
@@ -7210,7 +7215,7 @@ export interface CreateNetwork {
 /**
  * **Admin only.** Create a Server onboarding key.
  * Response: [CreateOnboardingKeyResponse].
- * 
+ *
  * Note. The 'periphery_public_key' on default Server config will
  * be overridden with the actual public key once its generated by Periphery
  * as part of the onboarding flow.
@@ -7233,7 +7238,7 @@ export interface CreateOnboardingKey {
 	tags?: string[];
 	/**
 	 * Allows the Onboarding Key to be used to:
-	 * 
+	 *
 	 * 1. Enable a disabled Server
 	 * 2. Remove Server 'address' configuration, allowing Periphery -> Core connection.
 	 * 3. Update existing Server's public keys.
@@ -7316,7 +7321,7 @@ export interface CreateSwarm {
 
 /**
  * `docker config create [OPTIONS] CONFIG file|-`
- * 
+ *
  * https://docs.docker.com/reference/cli/docker/config/create/
  */
 export interface CreateSwarmConfig {
@@ -7334,7 +7339,7 @@ export interface CreateSwarmConfig {
 
 /**
  * `docker config create [OPTIONS] CONFIG file|-`
- * 
+ *
  * https://docs.docker.com/reference/cli/docker/config/create/
  */
 export interface CreateSwarmSecret {
@@ -7375,7 +7380,7 @@ export interface CreateTerminal {
 	target: TerminalTarget;
 	/**
 	 * The shell command (eg `bash`) to init the shell.
-	 * 
+	 *
 	 * Default:
 	 * - Server: Configured on each Periphery
 	 * - ContainerExec: `sh`
@@ -7384,7 +7389,7 @@ export interface CreateTerminal {
 	command?: string;
 	/**
 	 * For container terminals, choose 'exec' or 'attach'.
-	 * 
+	 *
 	 * Default
 	 * - Server: ignored
 	 * - Container / Stack / Deployment: `exec`
@@ -7474,7 +7479,7 @@ export interface DeleteBuilder {
 /**
  * Deletes the deployment at the given id, and returns the deleted deployment.
  * Response: [Deployment].
- * 
+ *
  * Note. If the associated container is running, it will be deleted as part of
  * the deployment clean up.
  */
@@ -7506,7 +7511,7 @@ export interface DeleteImage {
 /**
  * **Admin only.** Delete an image registry account.
  * Response: [ImageRegistryAccount].
- * 
+ *
  * Pre v2.3.0, called `DeleteDockerRegistryAccount`
  */
 export interface DeleteImageRegistryAccount {
@@ -7589,7 +7594,7 @@ export interface DeleteSwarm {
 
 /**
  * Delete a tag, and return the deleted tag. Response: [Tag].
- * 
+ *
  * Note. Will also remove this tag from all attached resources.
  */
 export interface DeleteTag {
@@ -7645,7 +7650,7 @@ export interface DeleteVolume {
 
 /**
  * Deploys the container / swarm service for the target Deployment. Response: [Update].
- * 
+ *
  * For Server based Deployments (just a container):
  * 1. Pulls the image onto the target server.
  * 2. If the container is already running,
@@ -7675,7 +7680,7 @@ export interface DeployStack {
 	/**
 	 * Filter to only deploy specific services.
 	 * If empty, will deploy all services.
-	 * 
+	 *
 	 * Note. For Swarm mode Stacks, this field is not supported and will be ignored.
 	 */
 	services?: string[];
@@ -7704,7 +7709,7 @@ export interface DeployStackIfChanged {
 /**
  * Stops and destroys the container on the target server.
  * Reponse: [Update].
- * 
+ *
  * 1. The container is stopped and removed using `docker container rm ${container_name}`.
  */
 export interface DestroyContainer {
@@ -7721,7 +7726,7 @@ export interface DestroyContainer {
 /**
  * Stops and destroys the container for the target deployment.
  * Reponse: [Update].
- * 
+ *
  * 1. The container is stopped and removed using `docker container rm ${container_name}`.
  */
 export interface DestroyDeployment {
@@ -7799,7 +7804,7 @@ export interface ResourceToml<PartialConfig> {
 	tags?: string[];
 	/**
 	 * Optional. Only relevant for deployments / stacks.
-	 * 
+	 *
 	 * Will ensure deployment / stack is running with the latest configuration.
 	 * Deploy actions to achieve this will be included in the sync.
 	 * Default is false.
@@ -7807,7 +7812,7 @@ export interface ResourceToml<PartialConfig> {
 	deploy?: boolean;
 	/**
 	 * Optional. Only relevant for deployments / stacks using the 'deploy' sync feature.
-	 * 
+	 *
 	 * Specify other deployments / stacks by name as dependencies.
 	 * The sync will ensure the deployment / stack will only be deployed 'after' its dependencies.
 	 */
@@ -7929,6 +7934,74 @@ export interface ExportResourcesToToml {
 	existing?: ResourcesToml;
 }
 
+export enum FileManagerOperationState {
+	Pending = "pending",
+	Running = "running",
+	WaitingForInput = "waiting_for_input",
+	Complete = "complete",
+	Failed = "failed",
+	Cancelled = "cancelled",
+}
+
+export enum FileManagerOperationPhase {
+	Queued = "queued",
+	Preparing = "preparing",
+	Snapshotting = "snapshotting",
+	Applying = "applying",
+	Verifying = "verifying",
+	Transferring = "transferring",
+	Finalizing = "finalizing",
+	RollingBack = "rolling_back",
+}
+
+export enum FileManagerEntryKind {
+	File = "file",
+	Directory = "directory",
+	Symlink = "symlink",
+	Special = "special",
+}
+
+export interface FileManagerConflict {
+	path: string;
+	existing_kind: FileManagerEntryKind;
+	incoming_kind: FileManagerEntryKind;
+}
+
+export interface FileManagerPendingConflict {
+	/** Opaque, single-use identifier for the currently pending decision. */
+	decision_id: string;
+	conflict: FileManagerConflict;
+}
+
+export interface FileManagerOperationStatus {
+	operation_id: string;
+	state: FileManagerOperationState;
+	phase?: FileManagerOperationPhase;
+	description?: string;
+	/** Server timestamp in milliseconds when the operation was accepted. */
+	started_at?: I64;
+	/** Server timestamp in milliseconds when this status last changed. */
+	updated_at?: I64;
+	/** Server timestamp in milliseconds when the current phase began. */
+	phase_started_at?: I64;
+	/** Whether the server can still accept a cancellation request. */
+	cancellable?: boolean;
+	/** Bytes currently retained in staging or internal rollback storage. */
+	temporary_storage_bytes?: U64;
+	/** A conflict awaiting an explicit overwrite or skip decision. */
+	pending_conflict?: FileManagerPendingConflict;
+	/** Counters are scoped to `phase` and reset on each phase transition. */
+	completed_entries: U64;
+	total_entries: U64;
+	completed_bytes: U64;
+	total_bytes: U64;
+	error?: string;
+}
+
+export interface FileManagerActiveOperations {
+	operations: FileManagerOperationStatus[];
+}
+
 export interface FileManagerLimits {
 	max_text_bytes: U64;
 	max_entries: U64;
@@ -7944,19 +8017,6 @@ export interface FileManagerCapabilities {
 	reason?: string;
 	managed_file?: string;
 	limits: FileManagerLimits;
-}
-
-export enum FileManagerEntryKind {
-	File = "file",
-	Directory = "directory",
-	Symlink = "symlink",
-	Special = "special",
-}
-
-export interface FileManagerConflict {
-	path: string;
-	existing_kind: FileManagerEntryKind;
-	incoming_kind: FileManagerEntryKind;
 }
 
 /** An opaque optimistic-concurrency revision. */
@@ -7988,41 +8048,14 @@ export interface FileManagerJournalStatus {
 	undo_description?: string;
 	redo_description?: string;
 	expires_at?: I64;
-}
-
-export enum FileManagerOperationState {
-	Pending = "pending",
-	Running = "running",
-	Complete = "complete",
-	Failed = "failed",
-	Cancelled = "cancelled",
-}
-
-export enum FileManagerOperationPhase {
-	Queued = "queued",
-	Preparing = "preparing",
-	Snapshotting = "snapshotting",
-	Applying = "applying",
-	Verifying = "verifying",
-	Transferring = "transferring",
-	Finalizing = "finalizing",
-	RollingBack = "rolling_back",
+	/** Bytes retained for the current undo/redo history. */
+	retained_storage_bytes?: U64;
+	/** Server-safe explanation of where File Manager data is stored. */
+	storage_description?: string;
 }
 
 export interface FileManagerOperationTicket {
 	operation_id: string;
-}
-
-export interface FileManagerOperationStatus {
-	operation_id: string;
-	state: FileManagerOperationState;
-	phase: FileManagerOperationPhase;
-	description: string;
-	completed_entries: U64;
-	total_entries: U64;
-	completed_bytes: U64;
-	total_bytes: U64;
-	error?: string;
 }
 
 export interface FileManagerPreflight {
@@ -8170,7 +8203,7 @@ export interface GetBuildActionState {
 /**
  * Gets summary and timeseries breakdown of the last months build count / time for charting.
  * Response: [GetBuildMonthlyStatsResponse].
- * 
+ *
  * Note. This method is paginated. One page is 30 days of data.
  * Query for older pages by incrementing the page, starting at 0.
  */
@@ -8232,7 +8265,7 @@ export interface GetBuildsSummaryResponse {
 /**
  * Get the container log's tail, split by stdout/stderr.
  * Response: [Log].
- * 
+ *
  * Note. This call will hit the underlying server directly for most up to date log.
  */
 export interface GetContainerLog {
@@ -8253,7 +8286,7 @@ export interface GetContainerLog {
 /**
  * Gets a summary of data relating to all containers.
  * Response: [GetContainersSummaryResponse].
- * 
+ *
  * Pre v2.3.0, called `GetDockerContainersSummary`
  */
 export interface GetContainersSummary {
@@ -8326,7 +8359,7 @@ export interface GetDeploymentActionState {
 /**
  * Get the container, including image / status, of the target deployment.
  * Response: [GetDeploymentContainerResponse].
- * 
+ *
  * Note. This does not hit the server directly. The status comes from an
  * in memory cache on the core, which hits the server periodically
  * to keep it up to date.
@@ -8345,7 +8378,7 @@ export interface GetDeploymentContainerResponse {
 /**
  * Get the deployment log's tail, split by stdout/stderr.
  * Response: [Log].
- * 
+ *
  * Note. This call will hit the underlying server directly for most up to date log.
  */
 export interface GetDeploymentLog {
@@ -8364,7 +8397,7 @@ export interface GetDeploymentLog {
 /**
  * Get the deployment container's stats using `docker stats`.
  * Response: [GetDeploymentStatsResponse].
- * 
+ *
  * Note. This call will hit the underlying server directly for most up to date stats.
  */
 export interface GetDeploymentStats {
@@ -8489,7 +8522,7 @@ export interface GetHistoricalServerStatsResponse {
 /**
  * Get a specific image registry account.
  * Response: [GetImageRegistryAccountResponse].
- * 
+ *
  * Pre v2.3.0, called `GetDockerRegistryAccount`
  */
 export interface GetImageRegistryAccount {
@@ -8693,7 +8726,7 @@ export interface GetStackActionState {
 
 /**
  * Get a stack's logs. Filter down included services. Response: [GetStackLogResponse].
- * 
+ *
  * Note. This call will hit the underlying server directly for most up to date log.
  */
 export interface GetStackLog {
@@ -8751,7 +8784,7 @@ export interface GetSwarmActionState {
 
 /**
  * Get a swarm service's logs. Response: [GetSwarmServiceLogResponse].
- * 
+ *
  * Note. This call will hit the underlying server directly for most up to date log.
  */
 export interface GetSwarmServiceLog {
@@ -8807,7 +8840,7 @@ export interface GetSystemInformation {
 
 /**
  * Get the system stats on the target server. Response: [SystemStats].
- * 
+ *
  * Note. This does not hit the server directly. The stats come from an
  * in memory cache on the core, which hits the server periodically
  * to keep it up to date.
@@ -8861,7 +8894,7 @@ export interface GetUsernameResponse {
 /**
  * List all available global variables.
  * Response: [Variable]
- * 
+ *
  * Note. For non admin users making this call,
  * secret variables will have their values obscured.
  */
@@ -8887,7 +8920,7 @@ export interface GetVersionResponse {
  * **Admin only.** Trigger a global poll for image updates on Stacks and Deployments
  * with `poll_for_updates` or `auto_update` enabled.
  * Response: [Update]. Alias: `auto-update`.
- * 
+ *
  * 1. Run CheckStackForUpdate / CheckDeploymentForUpdate any Stacks / Deployments with `poll_for_updates` or `auto_update` enabled.
  * This will pick up any available updates.
  * 2. Redeploy Stacks / Deployments that have updates found and 'auto_update' enabled.
@@ -8904,7 +8937,7 @@ export interface GlobalAutoUpdate {
 
 /**
  * Inspect a container on the server. Response: [Container].
- * 
+ *
  * Pre v2.3.0, called `InspectDockerContainer`
  */
 export interface InspectContainer {
@@ -8934,7 +8967,7 @@ export interface InspectDeploymentSwarmService {
 
 /**
  * Inspect a container image on the server. Response: [Image].
- * 
+ *
  * Pre v2.3.0, called `InspectDockerImage`
  */
 export interface InspectImage {
@@ -8946,7 +8979,7 @@ export interface InspectImage {
 
 /**
  * Inspect a container network on the server. Response: [InspectNetworkResponse].
- * 
+ *
  * Pre v2.3.0, called `InspectDockerNetwork`
  */
 export interface InspectNetwork {
@@ -9064,7 +9097,7 @@ export interface InspectSwarmTask {
 
 /**
  * Inspect a container volume on the server. Response: [Volume].
- * 
+ *
  * Pre v2.3.0, called `InspectDockerVolume`
  */
 export interface InspectVolume {
@@ -9101,9 +9134,9 @@ export interface ListActions {
 	 * Set the limit for number of resources per-page.
 	 * If not provided, uses the Core config
 	 * `default_pagination_limit` (default: 30).
-	 * 
+	 *
 	 * Passing `limit: 0` returns all results (unlimited).
-	 * 
+	 *
 	 * Note: the page logic relies on this being consistent
 	 * across queries for more pages.
 	 */
@@ -9116,6 +9149,10 @@ export interface ListActions {
 	sort_by?: ActionSortBy;
 	/** Reverse the sort direction. */
 	sort_desc?: boolean;
+}
+
+export interface ListActiveFileManagerOperations {
+	target: FileManagerTarget;
 }
 
 export enum AlerterSortBy {
@@ -9140,9 +9177,9 @@ export interface ListAlerters {
 	 * Set the limit for number of resources per-page.
 	 * If not provided, uses the Core config
 	 * `default_pagination_limit` (default: 30).
-	 * 
+	 *
 	 * Passing `limit: 0` returns all results (unlimited).
-	 * 
+	 *
 	 * Note: the page logic relies on this being consistent
 	 * across queries for more pages.
 	 */
@@ -9164,7 +9201,7 @@ export interface ListAlerters {
 export interface ListAlerts {
 	/**
 	 * Pass a custom mongo query to filter the alerts.
-	 * 
+	 *
 	 * ## Example JSON
 	 * ```json
 	 * {
@@ -9226,7 +9263,7 @@ export enum ContainerSortBy {
 /**
  * List all containers on the target servers.
  * Response: [ListAllContainersResponse].
- * 
+ *
  * Pre v2.3.0, called `ListAllDockerContainers`
  */
 export interface ListAllContainers {
@@ -9250,9 +9287,9 @@ export interface ListAllContainers {
 	 * Set the limit for number of containers per-page.
 	 * If not provided, uses the Core config
 	 * `default_pagination_limit` (default: 30).
-	 * 
+	 *
 	 * Passing `limit: 0` returns all results (unlimited).
-	 * 
+	 *
 	 * Note: the page logic relies on this being consistent
 	 * across queries for more pages.
 	 */
@@ -9291,9 +9328,9 @@ export interface ListAllStackServices {
 	 * Set the limit for number of services per-page.
 	 * If not provided, uses the Core config
 	 * `default_pagination_limit` (default: 30).
-	 * 
+	 *
 	 * Passing `limit: 0` returns all results (unlimited).
-	 * 
+	 *
 	 * Note: the page logic relies on this being consistent
 	 * across queries for more pages.
 	 */
@@ -9357,9 +9394,9 @@ export interface ListBuilders {
 	 * Set the limit for number of resources per-page.
 	 * If not provided, uses the Core config
 	 * `default_pagination_limit` (default: 30).
-	 * 
+	 *
 	 * Passing `limit: 0` returns all results (unlimited).
-	 * 
+	 *
 	 * Note: the page logic relies on this being consistent
 	 * across queries for more pages.
 	 */
@@ -9396,9 +9433,9 @@ export interface ListBuilds {
 	 * Set the limit for number of resources per-page.
 	 * If not provided, uses the Core config
 	 * `default_pagination_limit` (default: 30).
-	 * 
+	 *
 	 * Passing `limit: 0` returns all results (unlimited).
-	 * 
+	 *
 	 * Note: the page logic relies on this being consistent
 	 * across queries for more pages.
 	 */
@@ -9461,7 +9498,7 @@ export interface ListComposeProjects {
 /**
  * List all containers on the target server.
  * Response: [ListContainersResponse].
- * 
+ *
  * Pre v2.3.0, called `ListDockerContainers`
  */
 export interface ListContainers {
@@ -9496,9 +9533,9 @@ export interface ListDeployments {
 	 * Set the limit for number of resources per-page.
 	 * If not provided, uses the Core config
 	 * `default_pagination_limit` (default: 30).
-	 * 
+	 *
 	 * Passing `limit: 0` returns all results (unlimited).
-	 * 
+	 *
 	 * Note: the page logic relies on this being consistent
 	 * across queries for more pages.
 	 */
@@ -9531,9 +9568,9 @@ export interface ListFullActions {
 	 * Set the limit for number of resources per-page.
 	 * If not provided, uses the Core config
 	 * `default_pagination_limit` (default: 30).
-	 * 
+	 *
 	 * Passing `limit: 0` returns all results (unlimited).
-	 * 
+	 *
 	 * Note: the page logic relies on this being consistent
 	 * across queries for more pages.
 	 */
@@ -9553,9 +9590,9 @@ export interface ListFullAlerters {
 	 * Set the limit for number of resources per-page.
 	 * If not provided, uses the Core config
 	 * `default_pagination_limit` (default: 30).
-	 * 
+	 *
 	 * Passing `limit: 0` returns all results (unlimited).
-	 * 
+	 *
 	 * Note: the page logic relies on this being consistent
 	 * across queries for more pages.
 	 */
@@ -9574,9 +9611,9 @@ export interface ListFullBuilders {
 	 * Set the limit for number of resources per-page.
 	 * If not provided, uses the Core config
 	 * `default_pagination_limit` (default: 30).
-	 * 
+	 *
 	 * Passing `limit: 0` returns all results (unlimited).
-	 * 
+	 *
 	 * Note: the page logic relies on this being consistent
 	 * across queries for more pages.
 	 */
@@ -9596,9 +9633,9 @@ export interface ListFullBuilds {
 	 * Set the limit for number of resources per-page.
 	 * If not provided, uses the Core config
 	 * `default_pagination_limit` (default: 30).
-	 * 
+	 *
 	 * Passing `limit: 0` returns all results (unlimited).
-	 * 
+	 *
 	 * Note: the page logic relies on this being consistent
 	 * across queries for more pages.
 	 */
@@ -9621,9 +9658,9 @@ export interface ListFullDeployments {
 	 * Set the limit for number of resources per-page.
 	 * If not provided, uses the Core config
 	 * `default_pagination_limit` (default: 30).
-	 * 
+	 *
 	 * Passing `limit: 0` returns all results (unlimited).
-	 * 
+	 *
 	 * Note: the page logic relies on this being consistent
 	 * across queries for more pages.
 	 */
@@ -9643,9 +9680,9 @@ export interface ListFullProcedures {
 	 * Set the limit for number of resources per-page.
 	 * If not provided, uses the Core config
 	 * `default_pagination_limit` (default: 30).
-	 * 
+	 *
 	 * Passing `limit: 0` returns all results (unlimited).
-	 * 
+	 *
 	 * Note: the page logic relies on this being consistent
 	 * across queries for more pages.
 	 */
@@ -9665,9 +9702,9 @@ export interface ListFullRepos {
 	 * Set the limit for number of resources per-page.
 	 * If not provided, uses the Core config
 	 * `default_pagination_limit` (default: 30).
-	 * 
+	 *
 	 * Passing `limit: 0` returns all results (unlimited).
-	 * 
+	 *
 	 * Note: the page logic relies on this being consistent
 	 * across queries for more pages.
 	 */
@@ -9687,9 +9724,9 @@ export interface ListFullResourceSyncs {
 	 * Set the limit for number of resources per-page.
 	 * If not provided, uses the Core config
 	 * `default_pagination_limit` (default: 30).
-	 * 
+	 *
 	 * Passing `limit: 0` returns all results (unlimited).
-	 * 
+	 *
 	 * Note: the page logic relies on this being consistent
 	 * across queries for more pages.
 	 */
@@ -9709,9 +9746,9 @@ export interface ListFullServers {
 	 * Set the limit for number of resources per-page.
 	 * If not provided, uses the Core config
 	 * `default_pagination_limit` (default: 30).
-	 * 
+	 *
 	 * Passing `limit: 0` returns all results (unlimited).
-	 * 
+	 *
 	 * Note: the page logic relies on this being consistent
 	 * across queries for more pages.
 	 */
@@ -9731,9 +9768,9 @@ export interface ListFullStacks {
 	 * Set the limit for number of resources per-page.
 	 * If not provided, uses the Core config
 	 * `default_pagination_limit` (default: 30).
-	 * 
+	 *
 	 * Passing `limit: 0` returns all results (unlimited).
-	 * 
+	 *
 	 * Note: the page logic relies on this being consistent
 	 * across queries for more pages.
 	 */
@@ -9753,9 +9790,9 @@ export interface ListFullSwarms {
 	 * Set the limit for number of resources per-page.
 	 * If not provided, uses the Core config
 	 * `default_pagination_limit` (default: 30).
-	 * 
+	 *
 	 * Passing `limit: 0` returns all results (unlimited).
-	 * 
+	 *
 	 * Note: the page logic relies on this being consistent
 	 * across queries for more pages.
 	 */
@@ -9776,7 +9813,7 @@ export interface ListGitProviderAccounts {
 /**
  * List the git providers available in Core / Periphery config files.
  * Response: [ListGitProvidersFromConfigResponse].
- * 
+ *
  * Includes:
  * - providers in core config
  * - providers configured on builds, repos, syncs
@@ -9792,7 +9829,7 @@ export interface ListGitProvidersFromConfig {
 
 /**
  * Get image history from the server. Response: [ListImageHistoryResponse].
- * 
+ *
  * Pre v2.3.0, called `ListDockerImageHistory`
  */
 export interface ListImageHistory {
@@ -9805,12 +9842,12 @@ export interface ListImageHistory {
 /**
  * List the image registry providers available in Core / Periphery config files.
  * Response: [ListImageRegistriesFromConfigResponse].
- * 
+ *
  * Includes:
  * - registries in core config
  * - registries configured on builds, deployments
  * - registries on the optional Server or Builder
- * 
+ *
  * Pre v2.3.0, called `ListDockerRegistriesFromConfig`
  */
 export interface ListImageRegistriesFromConfig {
@@ -9824,7 +9861,7 @@ export interface ListImageRegistriesFromConfig {
 /**
  * List image registry accounts matching optional query.
  * Response: [ListImageRegistryAccountsResponse].
- * 
+ *
  * Pre v2.3.0, called `ListDockerRegistryAccounts`
  */
 export interface ListImageRegistryAccounts {
@@ -9837,7 +9874,7 @@ export interface ListImageRegistryAccounts {
 /**
  * List the container images locally cached on the target server.
  * Response: [ListImagesResponse].
- * 
+ *
  * Pre v2.3.0, called `ListDockerImages`
  */
 export interface ListImages {
@@ -9847,7 +9884,7 @@ export interface ListImages {
 
 /**
  * List the container networks on the server. Response: [ListNetworksResponse].
- * 
+ *
  * Pre v2.3.0, called `ListDockerNetworks`
  */
 export interface ListNetworks {
@@ -9892,9 +9929,9 @@ export interface ListProcedures {
 	 * Set the limit for number of resources per-page.
 	 * If not provided, uses the Core config
 	 * `default_pagination_limit` (default: 30).
-	 * 
+	 *
 	 * Passing `limit: 0` returns all results (unlimited).
-	 * 
+	 *
 	 * Note: the page logic relies on this being consistent
 	 * across queries for more pages.
 	 */
@@ -9933,9 +9970,9 @@ export interface ListRepos {
 	 * Set the limit for number of resources per-page.
 	 * If not provided, uses the Core config
 	 * `default_pagination_limit` (default: 30).
-	 * 
+	 *
 	 * Passing `limit: 0` returns all results (unlimited).
-	 * 
+	 *
 	 * Note: the page logic relies on this being consistent
 	 * across queries for more pages.
 	 */
@@ -9974,9 +10011,9 @@ export interface ListResourceSyncs {
 	 * Set the limit for number of resources per-page.
 	 * If not provided, uses the Core config
 	 * `default_pagination_limit` (default: 30).
-	 * 
+	 *
 	 * Passing `limit: 0` returns all results (unlimited).
-	 * 
+	 *
 	 * Note: the page logic relies on this being consistent
 	 * across queries for more pages.
 	 */
@@ -10025,9 +10062,9 @@ export interface ListSchedules {
 	 * Set the limit for number of schedules per-page.
 	 * If not provided, uses the Core config
 	 * `default_pagination_limit` (default: 30).
-	 * 
+	 *
 	 * Passing `limit: 0` returns all results (unlimited).
-	 * 
+	 *
 	 * Note: the page logic relies on this being consistent
 	 * across queries for more pages.
 	 */
@@ -10087,9 +10124,9 @@ export interface ListServers {
 	 * Set the limit for number of resources per-page.
 	 * If not provided, uses the Core config
 	 * `default_pagination_limit` (default: 30).
-	 * 
+	 *
 	 * Passing `limit: 0` returns all results (unlimited).
-	 * 
+	 *
 	 * Note: the page logic relies on this being consistent
 	 * across queries for more pages.
 	 */
@@ -10134,9 +10171,9 @@ export interface ListStacks {
 	 * Set the limit for number of resources per-page.
 	 * If not provided, uses the Core config
 	 * `default_pagination_limit` (default: 30).
-	 * 
+	 *
 	 * Passing `limit: 0` returns all results (unlimited).
-	 * 
+	 *
 	 * Note: the page logic relies on this being consistent
 	 * across queries for more pages.
 	 */
@@ -10162,7 +10199,7 @@ export interface ListSwarmConfigs {
 
 /**
  * List the networks on the swarm. Response: [ListSwarmNetworksResponse].
- * 
+ *
  * This only includes the overlay networks.
  * They will be the same across all nodes in the swarm.
  */
@@ -10236,9 +10273,9 @@ export interface ListSwarms {
 	 * Set the limit for number of resources per-page.
 	 * If not provided, uses the Core config
 	 * `default_pagination_limit` (default: 30).
-	 * 
+	 *
 	 * Passing `limit: 0` returns all results (unlimited).
-	 * 
+	 *
 	 * Note: the page logic relies on this being consistent
 	 * across queries for more pages.
 	 */
@@ -10256,7 +10293,7 @@ export interface ListSwarms {
 /**
  * List the processes running on the target server.
  * Response: [ListSystemProcessesResponse].
- * 
+ *
  * Note. This does not hit the server directly. The procedures come from an
  * in memory cache on the core, which hits the server periodically
  * to keep it up to date.
@@ -10310,9 +10347,9 @@ export interface ListTerminals {
 	 * Set the limit for number of terminals per-page.
 	 * If not provided, uses the Core config
 	 * `default_pagination_limit` (default: 30).
-	 * 
+	 *
 	 * Passing `limit: 0` returns all results (unlimited).
-	 * 
+	 *
 	 * Note: the page logic relies on this being consistent
 	 * across queries for more pages.
 	 */
@@ -10354,7 +10391,7 @@ export interface UpdateListItem {
 	username: string;
 	/**
 	 * The user id that triggered the update.
-	 * 
+	 *
 	 * Also can take these values for operations triggered automatically:
 	 * - `Procedure`: The operation was triggered as part of a procedure run
 	 * - `Github`: The operation was triggered by a github webhook
@@ -10386,7 +10423,7 @@ export interface ListUpdatesResponse {
 
 /**
  * List all user groups which user can see. Response: [ListUserGroupsResponse].
- * 
+ *
  * Admins can see all user groups,
  * and users can see user groups to which they belong.
  */
@@ -10429,7 +10466,7 @@ export interface ListUsers {
 /**
  * List all available global variables.
  * Response: [ListVariablesResponse]
- * 
+ *
  * Note. For non admin users making this call,
  * secret variables will have their values obscured.
  */
@@ -10439,7 +10476,7 @@ export interface ListVariables {
 /**
  * List all container volumes on the target server.
  * Response: [ListVolumesResponse].
- * 
+ *
  * Pre v2.3.0, called `ListDockerVolumes`
  */
 export interface ListVolumes {
@@ -10471,7 +10508,7 @@ export interface PauseAllContainers {
 
 /**
  * Pauses the container on the target server. Response: [Update]
- * 
+ *
  * 1. Runs `docker pause ${container_name}`.
  */
 export interface PauseContainer {
@@ -10483,7 +10520,7 @@ export interface PauseContainer {
 
 /**
  * Pauses the container for the target deployment. Response: [Update]
- * 
+ *
  * 1. Runs `docker pause ${container_name}`.
  */
 export interface PauseDeployment {
@@ -10561,7 +10598,7 @@ export interface PrepareFileManagerUpload {
 
 /**
  * Prunes the docker buildx cache on the target server. Response: [Update].
- * 
+ *
  * 1. Runs `docker buildx prune -a -f`.
  */
 export interface PruneBuildx {
@@ -10571,7 +10608,7 @@ export interface PruneBuildx {
 
 /**
  * Prunes the docker containers on the target server. Response: [Update].
- * 
+ *
  * 1. Runs `docker container prune -f`.
  */
 export interface PruneContainers {
@@ -10581,7 +10618,7 @@ export interface PruneContainers {
 
 /**
  * Prunes the docker builders on the target server. Response: [Update].
- * 
+ *
  * 1. Runs `docker builder prune -a -f`.
  */
 export interface PruneDockerBuilders {
@@ -10591,7 +10628,7 @@ export interface PruneDockerBuilders {
 
 /**
  * Prunes the docker images on the target server. Response: [Update].
- * 
+ *
  * 1. Runs `docker image prune -a -f`.
  */
 export interface PruneImages {
@@ -10601,7 +10638,7 @@ export interface PruneImages {
 
 /**
  * Prunes the docker networks on the target server. Response: [Update].
- * 
+ *
  * 1. Runs `docker network prune -f`.
  */
 export interface PruneNetworks {
@@ -10611,7 +10648,7 @@ export interface PruneNetworks {
 
 /**
  * Prunes the docker system on the target server, including volumes. Response: [Update].
- * 
+ *
  * 1. Runs `docker system prune -a -f --volumes`.
  */
 export interface PruneSystem {
@@ -10621,7 +10658,7 @@ export interface PruneSystem {
 
 /**
  * Prunes the docker volumes on the target server. Response: [Update].
- * 
+ *
  * 1. Runs `docker volume prune -a -f`.
  */
 export interface PruneVolumes {
@@ -10637,9 +10674,9 @@ export interface PullDeployment {
 
 /**
  * Pulls the target repo. Response: [Update].
- * 
+ *
  * Note. Repo must have server attached at `server_id`.
- * 
+ *
  * 1. Pulls the repo on the target server using `git pull`.
  * 2. If `on_pull` is specified, it will be executed after the pull is complete.
  */
@@ -10715,7 +10752,7 @@ export interface RefreshStackCache {
 
 /**
  * `docker config rm CONFIG [CONFIG...]`
- * 
+ *
  * https://docs.docker.com/reference/cli/docker/config/rm/
  */
 export interface RemoveSwarmConfigs {
@@ -10727,7 +10764,7 @@ export interface RemoveSwarmConfigs {
 
 /**
  * `docker node rm [OPTIONS] NODE [NODE...]`
- * 
+ *
  * https://docs.docker.com/reference/cli/docker/node/rm/
  */
 export interface RemoveSwarmNodes {
@@ -10741,7 +10778,7 @@ export interface RemoveSwarmNodes {
 
 /**
  * `docker secret rm SECRET [SECRET...]`
- * 
+ *
  * https://docs.docker.com/reference/cli/docker/secret/rm/
  */
 export interface RemoveSwarmSecrets {
@@ -10753,7 +10790,7 @@ export interface RemoveSwarmSecrets {
 
 /**
  * `docker service rm SERVICE [SERVICE...]`
- * 
+ *
  * https://docs.docker.com/reference/cli/docker/service/rm/
  */
 export interface RemoveSwarmServices {
@@ -10765,7 +10802,7 @@ export interface RemoveSwarmServices {
 
 /**
  * `docker stack rm [OPTIONS] STACK [STACK...]`
- * 
+ *
  * https://docs.docker.com/reference/cli/docker/stack/rm/
  */
 export interface RemoveSwarmStacks {
@@ -10831,7 +10868,7 @@ export interface RenameBuilder {
 
 /**
  * Rename the deployment at id to the given name. Response: [Update].
- * 
+ *
  * Note. If a container is created for the deployment, it will be renamed using
  * `docker rename ...`.
  */
@@ -10974,6 +11011,14 @@ export interface RepoExecutionResponse {
 	commit_message?: string;
 }
 
+export interface ResolveFileManagerOperationConflict {
+	target: FileManagerTarget;
+	operation_id: string;
+	decision_id: string;
+	action: FileManagerConflictAction;
+	apply_to_all?: boolean;
+}
+
 /** Restarts all containers on the target server. Response: [Update] */
 export interface RestartAllContainers {
 	/** Name or id */
@@ -10982,7 +11027,7 @@ export interface RestartAllContainers {
 
 /**
  * Restarts the container on the target server. Response: [Update]
- * 
+ *
  * 1. Runs `docker restart ${container_name}`.
  */
 export interface RestartContainer {
@@ -10994,7 +11039,7 @@ export interface RestartContainer {
 
 /**
  * Restarts the container for the target deployment. Response: [Update]
- * 
+ *
  * 1. Runs `docker restart ${container_name}`.
  */
 export interface RestartDeployment {
@@ -11024,7 +11069,7 @@ export interface RotateAllServerKeys {
  * **Admin only.** Rotates the Core private key,
  * and all Server public keys.
  * Response: [Update].
- * 
+ *
  * If any Server is `NotOk`, this will fail.
  * To proceed anyways, pass `force: true`.
  */
@@ -11048,11 +11093,11 @@ export interface RotateServerKeys {
 
 /**
  * https://docs.docker.com/engine/swarm/configs/#example-rotate-a-config
- * 
+ *
  * Swarm configs / secrets are immutable after creation.
  * This making updating values awkward when you have services actively using them.
  * The following steps allows for config rotation while minimizing downtime.
- * 
+ *
  * 1. Query for all services using the config
  * - If not in use by any services, can simply `remove` and `create` the config.
  * - Otherwise, continue with following steps
@@ -11072,11 +11117,11 @@ export interface RotateSwarmConfig {
 
 /**
  * https://docs.docker.com/engine/swarm/secrets/#example-rotate-a-secret
- * 
+ *
  * Swarm configs / secrets are immutable after creation.
  * This making updating values awkward when you have services actively using them.
  * The following steps allows for secret rotation while minimizing downtime.
- * 
+ *
  * 1. Query for all services using the secret
  * - If not in use by any services, can simply `remove` and `create` the secret.
  * - Otherwise, continue with following steps
@@ -11101,7 +11146,7 @@ export interface RunAction {
 	/**
 	 * Custom arguments which are merged on top of the default arguments.
 	 * CLI Format: `"VAR1=val1&VAR2=val2"`
-	 * 
+	 *
 	 * Webhook-triggered actions use this to pass WEBHOOK_BRANCH and WEBHOOK_BODY.
 	 */
 	args?: JsonObject;
@@ -11109,17 +11154,17 @@ export interface RunAction {
 
 /**
  * Runs the target build. Response: [Update].
- * 
+ *
  * 1. Get a handle to the builder. If using AWS builder, this means starting a builder ec2 instance.
- * 
+ *
  * 2. Clone the repo on the builder. If an `on_clone` commmand is given, it will be executed.
- * 
+ *
  * 3. Execute `docker build {...params}`, where params are determined using the builds configuration.
- * 
+ *
  * 4. If a docker registry is configured, the build will be pushed to the registry.
- * 
+ *
  * 5. If using AWS builder, destroy the builder ec2 instance.
- * 
+ *
  * 6. Deploy any Deployments with *Redeploy on Build* enabled.
  */
 export interface RunBuild {
@@ -11186,7 +11231,7 @@ export enum SearchCombinator {
 /**
  * Search the container log's tail using `grep`. All lines go to stdout.
  * Response: [Log].
- * 
+ *
  * Note. This call will hit the underlying server directly for most up to date log.
  */
 export interface SearchContainerLog {
@@ -11198,7 +11243,7 @@ export interface SearchContainerLog {
 	terms: string[];
 	/**
 	 * When searching for multiple terms, can use `AND` or `OR` combinator.
-	 * 
+	 *
 	 * - `AND`: Only include lines with **all** terms present in that line.
 	 * - `OR`: Include lines that have one or more matches in the terms.
 	 */
@@ -11212,7 +11257,7 @@ export interface SearchContainerLog {
 /**
  * Search the deployment log's tail using `grep`. All lines go to stdout.
  * Response: [Log].
- * 
+ *
  * Note. This call will hit the underlying server directly for most up to date log.
  */
 export interface SearchDeploymentLog {
@@ -11222,7 +11267,7 @@ export interface SearchDeploymentLog {
 	terms: string[];
 	/**
 	 * When searching for multiple terms, can use `AND` or `OR` combinator.
-	 * 
+	 *
 	 * - `AND`: Only include lines with **all** terms present in that line.
 	 * - `OR`: Include lines that have one or more matches in the terms.
 	 */
@@ -11236,7 +11281,7 @@ export interface SearchDeploymentLog {
 /**
  * Search the stack log's tail using `grep`. All lines go to stdout.
  * Response: [SearchStackLogResponse].
- * 
+ *
  * Note. This call will hit the underlying server directly for most up to date log.
  */
 export interface SearchStackLog {
@@ -11251,7 +11296,7 @@ export interface SearchStackLog {
 	terms: string[];
 	/**
 	 * When searching for multiple terms, can use `AND` or `OR` combinator.
-	 * 
+	 *
 	 * - `AND`: Only include lines with **all** terms present in that line.
 	 * - `OR`: Include lines that have one or more matches in the terms.
 	 */
@@ -11265,7 +11310,7 @@ export interface SearchStackLog {
 /**
  * Search the swarm service log's tail using `grep`. All lines go to stdout.
  * Response: [SearchSwarmServiceLogResponse].
- * 
+ *
  * Note. This call will hit the underlying server directly for most up to date log.
  */
 export interface SearchSwarmServiceLog {
@@ -11277,7 +11322,7 @@ export interface SearchSwarmServiceLog {
 	terms: string[];
 	/**
 	 * When searching for multiple terms, can use `AND` or `OR` combinator.
-	 * 
+	 *
 	 * - `AND`: Only include lines with **all** terms present in that line.
 	 * - `OR`: Include lines that have one or more matches in the terms.
 	 */
@@ -11396,7 +11441,7 @@ export interface StartAllContainers {
 
 /**
  * Starts the container on the target server. Response: [Update]
- * 
+ *
  * 1. Runs `docker start ${container_name}`.
  */
 export interface StartContainer {
@@ -11408,7 +11453,7 @@ export interface StartContainer {
 
 /**
  * Starts the container for the target deployment. Response: [Update]
- * 
+ *
  * 1. Runs `docker start ${container_name}`.
  */
 export interface StartDeployment {
@@ -11435,7 +11480,7 @@ export interface StopAllContainers {
 
 /**
  * Stops the container on the target server. Response: [Update]
- * 
+ *
  * 1. Runs `docker stop ${container_name}`.
  */
 export interface StopContainer {
@@ -11451,7 +11496,7 @@ export interface StopContainer {
 
 /**
  * Stops the container for the target deployment. Response: [Update]
- * 
+ *
  * 1. Runs `docker stop ${container_name}`.
  */
 export interface StopDeployment {
@@ -11479,7 +11524,7 @@ export interface StopStack {
 /**
  * Swarm stack service list item.
  * Returned by `docker stack services --format json <NAME>`
- * 
+ *
  * https://docs.docker.com/reference/cli/docker/stack/services/#format
  */
 export interface SwarmStackServiceListItem {
@@ -11490,7 +11535,7 @@ export interface SwarmStackServiceListItem {
 /**
  * Swarm stack task list item.
  * Returned by `docker stack ps --format json <NAME>`
- * 
+ *
  * https://docs.docker.com/reference/cli/docker/stack/ps/#format
  */
 export interface SwarmStackTaskListItem {
@@ -11540,9 +11585,9 @@ export interface UnpauseAllContainers {
 
 /**
  * Unpauses the container on the target server. Response: [Update]
- * 
+ *
  * 1. Runs `docker unpause ${container_name}`.
- * 
+ *
  * Note. This is the only way to restart a paused container.
  */
 export interface UnpauseContainer {
@@ -11554,9 +11599,9 @@ export interface UnpauseContainer {
 
 /**
  * Unpauses the container for the target deployment. Response: [Update]
- * 
+ *
  * 1. Runs `docker unpause ${container_name}`.
- * 
+ *
  * Note. This is the only way to restart a paused container.
  */
 export interface UnpauseDeployment {
@@ -11566,7 +11611,7 @@ export interface UnpauseDeployment {
 
 /**
  * Unpauses the target stack. `docker compose unpause`. Response: [Update].
- * 
+ *
  * Note. This is the only way to restart a paused container.
  */
 export interface UnpauseStack {
@@ -11582,7 +11627,7 @@ export interface UnpauseStack {
 /**
  * Update the action at the given id, and return the updated action.
  * Response: [Action].
- * 
+ *
  * Note. This method updates only the fields which are set in the [_PartialActionConfig],
  * effectively merging diffs into the final document.
  * This is helpful when multiple users are using
@@ -11598,7 +11643,7 @@ export interface UpdateAction {
 
 /**
  * Update the alerter at the given id, and return the updated alerter. Response: [Alerter].
- * 
+ *
  * Note. This method updates only the fields which are set in the [PartialAlerterConfig][crate::entities::alerter::PartialAlerterConfig],
  * effectively merging diffs into the final document. This is helpful when multiple users are using
  * the same resources concurrently by ensuring no unintentional
@@ -11614,7 +11659,7 @@ export interface UpdateAlerter {
 /**
  * Update the build at the given id, and return the updated build.
  * Response: [Build].
- * 
+ *
  * Note. This method updates only the fields which are set in the [_PartialBuildConfig],
  * effectively merging diffs into the final document.
  * This is helpful when multiple users are using
@@ -11631,7 +11676,7 @@ export interface UpdateBuild {
 /**
  * Update the builder at the given id, and return the updated builder.
  * Response: [Builder].
- * 
+ *
  * Note. This method updates only the fields which are set in the [PartialBuilderConfig],
  * effectively merging diffs into the final document.
  * This is helpful when multiple users are using
@@ -11648,10 +11693,10 @@ export interface UpdateBuilder {
 /**
  * Update the deployment at the given id, and return the updated deployment.
  * Response: [Deployment].
- * 
+ *
  * Note. If the attached server for the deployment changes,
  * the deployment will be deleted / cleaned up on the old server.
- * 
+ *
  * Note. This method updates only the fields which are set in the [_PartialDeploymentConfig],
  * effectively merging diffs into the final document.
  * This is helpful when multiple users are using
@@ -11679,7 +11724,7 @@ export interface UpdateGitProviderAccount {
 /**
  * **Admin only.** Update a image registry account.
  * Response: [ImageRegistryAccount].
- * 
+ *
  * Pre v2.3.0, called `UpdateDockerRegistryAccount`
  */
 export interface UpdateImageRegistryAccount {
@@ -11706,7 +11751,7 @@ export interface UpdateOnboardingKey {
 	tags?: string[];
 	/**
 	 * Allows the Onboarding Key to be used to:
-	 * 
+	 *
 	 * 1. Enable a disabled Server
 	 * 2. Remove Server 'address' configuration, allowing Periphery -> Core connection.
 	 * 3. Update existing Server's public keys.
@@ -11747,7 +11792,7 @@ export interface UpdatePermissionOnTarget {
 /**
  * Update the procedure at the given id, and return the updated procedure.
  * Response: [Procedure].
- * 
+ *
  * Note. This method updates only the fields which are set in the [_PartialProcedureConfig],
  * effectively merging diffs into the final document.
  * This is helpful when multiple users are using
@@ -11764,10 +11809,10 @@ export interface UpdateProcedure {
 /**
  * Update the repo at the given id, and return the updated repo.
  * Response: [Repo].
- * 
+ *
  * Note. If the attached server for the repo changes,
  * the repo will be deleted / cleaned up on the old server.
- * 
+ *
  * Note. This method updates only the fields which are set in the [_PartialRepoConfig],
  * effectively merging diffs into the final document.
  * This is helpful when multiple users are using
@@ -11811,7 +11856,7 @@ export interface UpdateResourceMeta {
 /**
  * Update the sync at the given id, and return the updated sync.
  * Response: [ResourceSync].
- * 
+ *
  * Note. This method updates only the fields which are set in the [_PartialResourceSyncConfig],
  * effectively merging diffs into the final document.
  * This is helpful when multiple users are using
@@ -11828,7 +11873,7 @@ export interface UpdateResourceSync {
 /**
  * Update the server at the given id, and return the updated server.
  * Response: [Server].
- * 
+ *
  * Note. This method updates only the fields which are set in the [_PartialServerConfig],
  * effectively merging diffs into the final document.
  * This is helpful when multiple users are using
@@ -11867,10 +11912,10 @@ export interface UpdateServiceUserDescription {
 /**
  * Update the stack at the given id, and return the updated stack.
  * Response: [Stack].
- * 
+ *
  * Note. If the attached server for the stack changes,
  * the stack will be deleted / cleaned up on the old server.
- * 
+ *
  * Note. This method updates only the fields which are set in the [_PartialStackConfig],
  * merging diffs into the final document.
  * This is helpful when multiple users are using
@@ -11887,10 +11932,10 @@ export interface UpdateStack {
 /**
  * Update the Swarm at the given id, and return the updated Swarm.
  * Response: [Swarm].
- * 
+ *
  * Note. If the attached server for the Swarm changes,
  * the Swarm will be deleted / cleaned up on the old server.
- * 
+ *
  * Note. This method updates only the fields which are set in the [_PartialSwarmConfig],
  * effectively merging diffs into the final document.
  * This is helpful when multiple users are using
@@ -11906,7 +11951,7 @@ export interface UpdateSwarm {
 
 /**
  * `docker node update [OPTIONS] NODE`
- * 
+ *
  * https://docs.docker.com/reference/cli/docker/node/update/
  */
 export interface UpdateSwarmNode {
@@ -12049,7 +12094,7 @@ export enum DayOfWeek {
 	Sunday = "Sunday",
 }
 
-export type ExecuteRequest = 
+export type ExecuteRequest =
 	| { type: "DeployStack", params: DeployStack }
 	| { type: "BatchDeployStack", params: BatchDeployStack }
 	| { type: "DeployStackIfChanged", params: DeployStackIfChanged }
@@ -12140,7 +12185,7 @@ export enum FileManagerArchiveFormat {
 /**
  * One representative IANA zone for each distinct base UTC offset in the tz database.
  * https://en.wikipedia.org/wiki/List_of_tz_database_time_zones.
- * 
+ *
  * The `serde`/`strum` renames ensure the canonical identifier is used
  * when serializing or parsing from a string such as `"Etc/UTC"`.
  */
@@ -12223,7 +12268,7 @@ export enum IanaTimezone {
 	PacificKiritimati = "Pacific/Kiritimati",
 }
 
-export type ReadRequest = 
+export type ReadRequest =
 	| { type: "GetVersion", params: GetVersion }
 	| { type: "GetCoreInfo", params: GetCoreInfo }
 	| { type: "ListSecrets", params: ListSecrets }
@@ -12294,6 +12339,7 @@ export type ReadRequest =
 	| { type: "ListFileManagerDirectory", params: ListFileManagerDirectory }
 	| { type: "ReadFileManagerText", params: ReadFileManagerText }
 	| { type: "GetFileManagerOperationStatus", params: GetFileManagerOperationStatus }
+	| { type: "ListActiveFileManagerOperations", params: ListActiveFileManagerOperations }
 	| { type: "GetFileManagerJournalStatus", params: GetFileManagerJournalStatus }
 	| { type: "GetDeploymentsSummary", params: GetDeploymentsSummary }
 	| { type: "GetDeployment", params: GetDeployment }
@@ -12425,7 +12471,7 @@ export enum SyncWebhookAction {
 	Sync = "Sync",
 }
 
-export type WriteRequest = 
+export type WriteRequest =
 	| { type: "UpdateResourceMeta", params: UpdateResourceMeta }
 	| { type: "CreateSwarm", params: CreateSwarm }
 	| { type: "CopySwarm", params: CopySwarm }
@@ -12455,6 +12501,8 @@ export type WriteRequest =
 	| { type: "BatchCheckStackForUpdate", params: BatchCheckStackForUpdate }
 	| { type: "PreflightFileManagerOperation", params: PreflightFileManagerOperation }
 	| { type: "CommitFileManagerOperation", params: CommitFileManagerOperation }
+	| { type: "ResolveFileManagerOperationConflict", params: ResolveFileManagerOperationConflict }
+	| { type: "CancelFileManagerOperation", params: CancelFileManagerOperation }
 	| { type: "PrepareFileManagerUpload", params: PrepareFileManagerUpload }
 	| { type: "PrepareFileManagerDownload", params: PrepareFileManagerDownload }
 	| { type: "UndoFileManagerOperation", params: UndoFileManagerOperation }
@@ -12547,7 +12595,7 @@ export type WriteRequest =
 	| { type: "DeleteImageRegistryAccount", params: DeleteImageRegistryAccount }
 	| { type: "CloseAlert", params: CloseAlert };
 
-export type WsLoginMessage = 
+export type WsLoginMessage =
 	| { type: "Jwt", params: {
 	jwt: string;
 }}

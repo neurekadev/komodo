@@ -1,6 +1,7 @@
 use komodo_client::entities::{
   file_manager::{
-    FileManagerCapabilities, FileManagerConflictDecision,
+    FileManagerActiveOperations, FileManagerCapabilities,
+    FileManagerConflictAction, FileManagerConflictDecision,
     FileManagerDirectory, FileManagerJournalStatus,
     FileManagerOperation, FileManagerOperationStatus,
     FileManagerPreflight, FileManagerRevision, FileManagerTextFile,
@@ -72,12 +73,44 @@ pub struct CommitFileManagerOperation {
 pub struct FileManagerCommitResponse {
   pub operation_id: String,
   pub affected_paths: Vec<String>,
+  #[serde(default)]
+  pub undoable: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Resolve)]
 #[response(FileManagerOperationStatus)]
 #[error(anyhow::Error)]
 pub struct GetFileManagerOperationStatus {
+  pub target: PeripheryFileManagerTarget,
+  pub actor: String,
+  pub operation_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Resolve)]
+#[response(FileManagerActiveOperations)]
+#[error(anyhow::Error)]
+pub struct ListActiveFileManagerOperations {
+  pub target: PeripheryFileManagerTarget,
+  pub actor: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Resolve)]
+#[response(FileManagerOperationStatus)]
+#[error(anyhow::Error)]
+pub struct ResolveFileManagerOperationConflict {
+  pub target: PeripheryFileManagerTarget,
+  pub actor: String,
+  pub operation_id: String,
+  pub decision_id: String,
+  pub action: FileManagerConflictAction,
+  #[serde(default)]
+  pub apply_to_all: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Resolve)]
+#[response(FileManagerOperationStatus)]
+#[error(anyhow::Error)]
+pub struct CancelFileManagerOperation {
   pub target: PeripheryFileManagerTarget,
   pub actor: String,
   pub operation_id: String,
@@ -99,6 +132,9 @@ pub struct UndoFileManagerOperation {
   pub actor: String,
   pub operation_id: String,
   pub confirmed: bool,
+  /// Internal source operation to roll back. Public undo leaves this empty.
+  #[serde(default)]
+  pub rollback_operation_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Resolve)]

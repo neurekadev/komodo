@@ -5,7 +5,8 @@ use typeshare::typeshare;
 use crate::entities::{
   U64,
   file_manager::{
-    FileManagerConflictDecision, FileManagerOperation,
+    FileManagerConflictAction, FileManagerConflictDecision,
+    FileManagerOperation, FileManagerOperationStatus,
     FileManagerOperationTicket, FileManagerPreflight,
     FileManagerRevision, FileManagerTarget,
     FileManagerTransferTicket,
@@ -38,6 +39,32 @@ pub struct CommitFileManagerOperation {
   pub decisions: Vec<FileManagerConflictDecision>,
   #[serde(default)]
   pub confirmed: bool,
+}
+
+#[typeshare]
+#[derive(Serialize, Deserialize, Debug, Clone, Resolve)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[empty_traits(KomodoWriteRequest)]
+#[response(FileManagerOperationStatus)]
+#[error(mogh_error::Error)]
+pub struct ResolveFileManagerOperationConflict {
+  pub target: FileManagerTarget,
+  pub operation_id: String,
+  pub decision_id: String,
+  pub action: FileManagerConflictAction,
+  #[serde(default)]
+  pub apply_to_all: bool,
+}
+
+#[typeshare]
+#[derive(Serialize, Deserialize, Debug, Clone, Resolve)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[empty_traits(KomodoWriteRequest)]
+#[response(FileManagerOperationStatus)]
+#[error(mogh_error::Error)]
+pub struct CancelFileManagerOperation {
+  pub target: FileManagerTarget,
+  pub operation_id: String,
 }
 
 #[typeshare]

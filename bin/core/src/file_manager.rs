@@ -7,10 +7,10 @@ use anyhow::{Context as _, anyhow};
 use komodo_client::entities::{
   ResourceTarget,
   file_manager::{
-    FileManagerEntry, FileManagerEntryKind,
-    FileManagerOperationPhase, FileManagerOperationState,
-    FileManagerOperationStatus, FileManagerRevision,
-    FileManagerTarget, FileManagerTextFile,
+    FileManagerActiveOperations, FileManagerEntry,
+    FileManagerEntryKind, FileManagerOperationPhase,
+    FileManagerOperationState, FileManagerOperationStatus,
+    FileManagerRevision, FileManagerTarget, FileManagerTextFile,
   },
   permission::PermissionLevel,
   repo::Repo,
@@ -80,6 +80,10 @@ fn insert_operation_status(
         state: FileManagerOperationState::Pending,
         phase: FileManagerOperationPhase::Queued,
         description: description.into(),
+        started_at: now,
+        updated_at: now,
+        phase_started_at: now,
+        cancellable: true,
         ..Default::default()
       },
     },
@@ -92,6 +96,7 @@ pub fn set_operation_finalizing(operation_id: &str) {
   {
     record.status.state = FileManagerOperationState::Running;
     record.status.phase = FileManagerOperationPhase::Finalizing;
+    record.status.updated_at = komodo_timestamp();
   }
 }
 
@@ -104,6 +109,10 @@ pub fn complete_operation(operation_id: &str) {
     record.status.completed_entries = record.status.total_entries;
     record.status.completed_bytes = record.status.total_bytes;
     record.status.error = None;
+    record.status.cancellable = false;
+    record.status.pending_conflict = None;
+    record.status.temporary_storage_bytes = 0;
+    record.status.updated_at = komodo_timestamp();
   }
 }
 
@@ -113,6 +122,9 @@ pub fn fail_operation(operation_id: &str, error: impl Into<String>) {
   {
     record.status.state = FileManagerOperationState::Failed;
     record.status.error = Some(error.into());
+    record.status.cancellable = false;
+    record.status.pending_conflict = None;
+    record.status.updated_at = komodo_timestamp();
   }
 }
 
@@ -125,7 +137,47 @@ pub fn cancel_operation(
   {
     record.status.state = FileManagerOperationState::Cancelled;
     record.status.error = Some(message.into());
+    record.status.cancellable = false;
+    record.status.pending_conflict = None;
+    record.status.updated_at = komodo_timestamp();
   }
+}
+
+pub fn update_operation_status(
+  operation_id: &str,
+  status: FileManagerOperationStatus,
+) {
+  if let Some(record) =
+    operation_statuses().write().unwrap().get_mut(operation_id)
+  {
+    record.status = status;
+  }
+}
+
+pub fn list_core_active_operations(
+  actor: &str,
+  target: &FileManagerTarget,
+) -> FileManagerActiveOperations {
+  let now = komodo_timestamp();
+  let mut statuses = operation_statuses().write().unwrap();
+  statuses.retain(|_, status| status.expires_at > now);
+  let mut operations = statuses
+    .values()
+    .filter(|record| {
+      record.actor == actor && &record.target == target
+    })
+    .map(|record| record.status.clone())
+    .filter(|status| {
+      !matches!(
+        status.state,
+        FileManagerOperationState::Complete
+          | FileManagerOperationState::Failed
+          | FileManagerOperationState::Cancelled
+      )
+    })
+    .collect::<Vec<_>>();
+  operations.sort_by_key(|status| status.started_at);
+  FileManagerActiveOperations { operations }
 }
 
 pub fn get_core_operation_status(

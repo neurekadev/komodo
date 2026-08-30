@@ -3,10 +3,11 @@ use komodo_client::{
   api::read::*,
   entities::{
     file_manager::{
-      FileManagerCapabilities, FileManagerDirectory,
-      FileManagerEntryKind, FileManagerJournalStatus,
-      FileManagerOperationPhase, FileManagerOperationState,
-      FileManagerOperationStatus, FileManagerTextFile,
+      FileManagerActiveOperations, FileManagerCapabilities,
+      FileManagerDirectory, FileManagerEntryKind,
+      FileManagerJournalStatus, FileManagerOperationPhase,
+      FileManagerOperationState, FileManagerOperationStatus,
+      FileManagerTextFile,
     },
     permission::PermissionLevel,
   },
@@ -17,8 +18,9 @@ use periphery_client::api::file_manager as periphery;
 use crate::{
   config::core_config,
   file_manager::{
-    can_write, get_core_operation_status, managed_entry,
-    managed_text, resolve_target,
+    can_write, get_core_operation_status,
+    list_core_active_operations, managed_entry, managed_text,
+    resolve_target,
   },
   helpers::periphery_client,
 };
@@ -167,6 +169,41 @@ impl Resolve<ReadArgs> for GetFileManagerOperationStatus {
       Err(_) if core_status.is_some() => Ok(core_status.unwrap()),
       Err(error) => Err(error.into()),
     }
+  }
+}
+
+impl Resolve<ReadArgs> for ListActiveFileManagerOperations {
+  async fn resolve(
+    self,
+    ReadArgs { user }: &ReadArgs,
+  ) -> mogh_error::Result<FileManagerActiveOperations> {
+    let resolved =
+      resolve_target(&self.target, user, PermissionLevel::Read)
+        .await?;
+    let mut active =
+      list_core_active_operations(&user.id, &self.target);
+    if let Ok(periphery_active) = periphery_client(&resolved.server)
+      .await?
+      .request(periphery::ListActiveFileManagerOperations {
+        target: resolved.periphery,
+        actor: user.id.clone(),
+      })
+      .await
+    {
+      for status in periphery_active.operations {
+        if let Some(existing) =
+          active.operations.iter_mut().find(|existing| {
+            existing.operation_id == status.operation_id
+          })
+        {
+          *existing = status;
+        } else {
+          active.operations.push(status);
+        }
+      }
+      active.operations.sort_by_key(|status| status.started_at);
+    }
+    Ok(active)
   }
 }
 

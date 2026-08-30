@@ -12,7 +12,8 @@ use komodo_client::{
   entities::{
     Operation, ResourceTarget,
     file_manager::{
-      FileManagerOperation, FileManagerOperationTicket,
+      FileManagerOperation, FileManagerOperationState,
+      FileManagerOperationStatus, FileManagerOperationTicket,
       FileManagerPreflight, FileManagerRevision, FileManagerTarget,
       FileManagerTransferTicket,
     },
@@ -31,8 +32,9 @@ use crate::{
   file_manager::{
     ResolvedFileManagerTarget, TransferSessionKind,
     complete_operation, create_operation_status,
-    create_transfer_session, fail_operation, managed_revision,
-    resolve_target, set_operation_finalizing,
+    create_transfer_session, fail_operation,
+    get_core_operation_status, managed_revision, resolve_target,
+    set_operation_finalizing, update_operation_status,
   },
   helpers::{
     periphery_client,
@@ -164,44 +166,84 @@ impl Resolve<WriteArgs> for CommitFileManagerOperation {
           confirmed: self.confirmed,
         })
         .await?;
+      let status = monitor_periphery_operation(
+        &resolved,
+        &actor.id,
+        &operation_id,
+      )
+      .await?;
+      match status.state {
+        FileManagerOperationState::Complete => {}
+        FileManagerOperationState::Cancelled => {
+          return Err(anyhow!(
+            status.error.unwrap_or_else(|| "File operation was cancelled".into())
+          ));
+        }
+        FileManagerOperationState::Failed => {
+          return Err(anyhow!(
+            status.error.unwrap_or_else(|| "File operation failed".into())
+          ));
+        }
+        _ => return Err(anyhow!("File operation ended in an invalid state")),
+      }
       set_operation_finalizing(&operation_id);
       if let Some(plan) = &managed
         && let Err(error) = update_managed_source(
           &plan.stack_name,
           &plan.before,
           &plan.after,
-        )
-        .await
+      )
+      .await
       {
-        let _ = periphery_client(&resolved.server)
+        let rollback_id = Uuid::new_v4().to_string();
+        periphery_client(&resolved.server)
           .await?
           .request(periphery::UndoFileManagerOperation {
             target: resolved.periphery.clone(),
             actor: actor.id.clone(),
-            operation_id: Uuid::new_v4().to_string(),
+            operation_id: rollback_id.clone(),
             confirmed: true,
+            rollback_operation_id: Some(operation_id.clone()),
           })
-          .await;
+          .await
+          .context("Failed to accept managed-file rollback")?;
+        let rollback = monitor_periphery_operation(
+          &resolved,
+          &actor.id,
+          &rollback_id,
+        )
+        .await
+        .context("Managed-file rollback status was lost")?;
+        if rollback.state != FileManagerOperationState::Complete {
+          return Err(anyhow!(
+            "Managed source update failed and host rollback also failed: {}",
+            rollback
+              .error
+              .unwrap_or_else(|| "unknown rollback failure".into())
+          ));
+        }
         return Err(error.context(
           "Host write was rolled back after the managed source changed",
         ));
       }
-      push_history(
-        &target,
-        &actor.id,
-        HistoryEntry {
-          managed: managed.map(|plan| ManagedHistory {
-            stack_name: plan.stack_name,
-            before: plan.before,
-            after: plan.after,
-          }),
-        },
-      );
+      if response.undoable {
+        push_history(
+          &target,
+          &actor.id,
+          HistoryEntry {
+            managed: managed.map(|plan| ManagedHistory {
+              stack_name: plan.stack_name,
+              before: plan.before,
+              after: plan.after,
+            }),
+          },
+        );
+      }
       anyhow::Ok(response.affected_paths)
     }
     .await;
       let operation_error =
-        result.as_ref().err().map(ToString::to_string);
+        result.as_ref().err().map(|error| format!("{error:#}"));
       let audit = audit_result(
         resolved.resource,
         "File operation",
@@ -209,7 +251,14 @@ impl Resolve<WriteArgs> for CommitFileManagerOperation {
         &actor,
       )
       .await;
-      if let Some(error) = operation_error {
+      let cancelled =
+        get_core_operation_status(&operation_id, &actor.id, &target)
+          .is_some_and(|status| {
+            status.state == FileManagerOperationState::Cancelled
+          });
+      if cancelled {
+        // The authoritative Periphery terminal state is already cached.
+      } else if let Some(error) = operation_error {
         fail_operation(&operation_id, error);
       } else if let Err(error) = audit {
         fail_operation(&operation_id, error.error.to_string());
@@ -218,6 +267,53 @@ impl Resolve<WriteArgs> for CommitFileManagerOperation {
       }
     });
     Ok(ticket)
+  }
+}
+
+impl Resolve<WriteArgs> for ResolveFileManagerOperationConflict {
+  async fn resolve(
+    self,
+    WriteArgs { user }: &WriteArgs,
+  ) -> mogh_error::Result<FileManagerOperationStatus> {
+    ensure_writes_enabled()?;
+    let resolved =
+      resolve_target(&self.target, user, PermissionLevel::Write)
+        .await?;
+    let status = periphery_client(&resolved.server)
+      .await?
+      .request(periphery::ResolveFileManagerOperationConflict {
+        target: resolved.periphery,
+        actor: user.id.clone(),
+        operation_id: self.operation_id.clone(),
+        decision_id: self.decision_id,
+        action: self.action,
+        apply_to_all: self.apply_to_all,
+      })
+      .await?;
+    update_operation_status(&self.operation_id, status.clone());
+    Ok(status)
+  }
+}
+
+impl Resolve<WriteArgs> for CancelFileManagerOperation {
+  async fn resolve(
+    self,
+    WriteArgs { user }: &WriteArgs,
+  ) -> mogh_error::Result<FileManagerOperationStatus> {
+    ensure_writes_enabled()?;
+    let resolved =
+      resolve_target(&self.target, user, PermissionLevel::Write)
+        .await?;
+    let status = periphery_client(&resolved.server)
+      .await?
+      .request(periphery::CancelFileManagerOperation {
+        target: resolved.periphery,
+        actor: user.id.clone(),
+        operation_id: self.operation_id.clone(),
+      })
+      .await?;
+    update_operation_status(&self.operation_id, status.clone());
+    Ok(status)
   }
 }
 
@@ -250,6 +346,7 @@ impl Resolve<WriteArgs> for UndoFileManagerOperation {
           actor: actor.id.clone(),
           operation_id: operation_id.clone(),
           confirmed: self.confirmed,
+          rollback_operation_id: None,
         })
         .await;
       let response = match response {
@@ -261,6 +358,30 @@ impl Resolve<WriteArgs> for UndoFileManagerOperation {
           return Err(error);
         }
       };
+      let terminal = monitor_periphery_operation(
+        &resolved,
+        &actor.id,
+        &operation_id,
+      )
+      .await;
+      match terminal {
+        Ok(status)
+          if status.state == FileManagerOperationState::Complete => {}
+        Ok(status) => {
+          if let Some(entry) = entry.clone() {
+            restore_undo(&target, &actor.id, entry);
+          }
+          return Err(anyhow!(status.error.unwrap_or_else(|| {
+            "Undo operation did not complete".into()
+          })));
+        }
+        Err(error) => {
+          if let Some(entry) = entry.clone() {
+            restore_undo(&target, &actor.id, entry);
+          }
+          return Err(error);
+        }
+      }
       set_operation_finalizing(&operation_id);
       if let Some(ManagedHistory {
         stack_name,
@@ -291,7 +412,7 @@ impl Resolve<WriteArgs> for UndoFileManagerOperation {
     }
     .await;
       let operation_error =
-        result.as_ref().err().map(ToString::to_string);
+        result.as_ref().err().map(|error| format!("{error:#}"));
       let audit = audit_result(
         resolved.resource,
         "Undo file operation",
@@ -351,6 +472,30 @@ impl Resolve<WriteArgs> for RedoFileManagerOperation {
           return Err(error);
         }
       };
+      let terminal = monitor_periphery_operation(
+        &resolved,
+        &actor.id,
+        &operation_id,
+      )
+      .await;
+      match terminal {
+        Ok(status)
+          if status.state == FileManagerOperationState::Complete => {}
+        Ok(status) => {
+          if let Some(entry) = entry.clone() {
+            restore_redo(&target, &actor.id, entry);
+          }
+          return Err(anyhow!(status.error.unwrap_or_else(|| {
+            "Redo operation did not complete".into()
+          })));
+        }
+        Err(error) => {
+          if let Some(entry) = entry.clone() {
+            restore_redo(&target, &actor.id, entry);
+          }
+          return Err(error);
+        }
+      }
       set_operation_finalizing(&operation_id);
       if let Some(ManagedHistory {
         stack_name,
@@ -367,6 +512,7 @@ impl Resolve<WriteArgs> for RedoFileManagerOperation {
             actor: actor.id.clone(),
             operation_id: Uuid::new_v4().to_string(),
             confirmed: true,
+            rollback_operation_id: None,
           })
           .await;
         restore_redo(&target, &actor.id, entry.clone().unwrap());
@@ -381,7 +527,7 @@ impl Resolve<WriteArgs> for RedoFileManagerOperation {
     }
     .await;
       let operation_error =
-        result.as_ref().err().map(ToString::to_string);
+        result.as_ref().err().map(|error| format!("{error:#}"));
       let audit = audit_result(
         resolved.resource,
         "Redo file operation",
@@ -577,6 +723,65 @@ async fn update_managed_source(
     ));
   }
   Ok(())
+}
+
+async fn monitor_periphery_operation(
+  resolved: &ResolvedFileManagerTarget,
+  actor: &str,
+  operation_id: &str,
+) -> anyhow::Result<FileManagerOperationStatus> {
+  let mut failures = 0_u32;
+  loop {
+    match periphery_client(&resolved.server).await {
+      Ok(client) => match client
+        .request(periphery::GetFileManagerOperationStatus {
+          target: resolved.periphery.clone(),
+          actor: actor.to_string(),
+          operation_id: operation_id.to_string(),
+        })
+        .await
+      {
+        Ok(status) => {
+          failures = 0;
+          if status.state == FileManagerOperationState::Complete {
+            let mut finalizing = status.clone();
+            finalizing.state = FileManagerOperationState::Running;
+            finalizing.phase =
+              komodo_client::entities::file_manager::FileManagerOperationPhase::Finalizing;
+            finalizing.cancellable = false;
+            update_operation_status(operation_id, finalizing);
+            return Ok(status);
+          }
+          update_operation_status(operation_id, status.clone());
+          if matches!(
+            status.state,
+            FileManagerOperationState::Failed
+              | FileManagerOperationState::Cancelled
+          ) {
+            return Ok(status);
+          }
+        }
+        Err(error) => {
+          failures = failures.saturating_add(1);
+          if failures >= 12 {
+            return Err(anyhow!(
+              "Periphery operation status became unavailable; Periphery may have restarted: {error:#}"
+            ));
+          }
+        }
+      },
+      Err(error) => {
+        failures = failures.saturating_add(1);
+        if failures >= 12 {
+          return Err(anyhow!(
+            "Periphery operation status became unavailable; Periphery may have restarted: {error:#}"
+          ));
+        }
+      }
+    }
+    let delay = 1_u64 << failures.min(3);
+    tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+  }
 }
 
 async fn audit_result(
