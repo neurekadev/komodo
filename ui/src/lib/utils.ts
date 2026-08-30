@@ -157,14 +157,22 @@ export function sanitizeOnlySpan(log: string) {
 /** Converts formatted update output into safe text for compact UI surfaces. */
 export function updateLogToText(log: string) {
   if (!log) return "No log.";
-  const text = sanitizeHtml(log, {
-    allowedTags: [],
-    allowedAttributes: {},
-  });
-  return sanitizeHtml(convert_ansi.toHtml(text), {
-    allowedTags: [],
-    allowedAttributes: {},
-  });
+  const sanitizedText = sanitizeHtml(
+    convert_ansi.toHtml(
+      sanitizeHtml(log, {
+        allowedTags: [],
+        allowedAttributes: {},
+      }),
+    ),
+    {
+      allowedTags: [],
+      allowedAttributes: {},
+    },
+  );
+  return (
+    new DOMParser().parseFromString(sanitizedText, "text/html").body
+      .textContent ?? ""
+  );
 }
 
 const convert_ansi = new ConvertAnsiToHtml();

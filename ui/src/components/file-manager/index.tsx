@@ -584,8 +584,9 @@ export default function FileManager({
     }
   };
 
+  const selectedPathSet = useMemo(() => new Set(selected), [selected]);
   const selectedEntries = entries.filter((entry) =>
-    selected.includes(entry.path),
+    selectedPathSet.has(entry.path),
   );
   const selectionContainsManaged = selectedEntries.some((entry) => entry.managed);
   const canChangeSelection =
@@ -890,17 +891,14 @@ export default function FileManager({
     paths,
     destination,
     archiveDestination,
+    containsManaged = !!entry?.managed,
   }: {
     entry?: Types.FileManagerEntry;
     paths: string[];
     destination?: string;
     archiveDestination: string;
+    containsManaged?: boolean;
   }) => {
-    const menuEntries = entries.filter((candidate) =>
-      paths.includes(candidate.path),
-    );
-    const containsManaged =
-      entry?.managed || menuEntries.some((candidate) => candidate.managed);
     const canMutate =
       !readOnly && paths.length > 0 && !containsManaged && !busy;
     const canOpen =
@@ -1315,20 +1313,21 @@ export default function FileManager({
                     </Table.Thead>
                     <Table.Tbody>
                       {entries.map((entry) => {
-                        const contextPaths = selected.includes(entry.path)
+                        const entryIsSelected = selectedPathSet.has(entry.path);
+                        const contextPaths = entryIsSelected
                           ? selected
                           : [entry.path];
                         return (
                           <Menu key={entry.path} shadow="md">
                             <Menu.ContextMenu>
                               <Table.Tr
-                          bg={selected.includes(entry.path) ? "accent.1" : undefined}
+                          bg={entryIsSelected ? "accent.1" : undefined}
                           draggable={!readOnly && !entry.managed}
                           onDragStart={(event) =>
                             event.dataTransfer.setData(
                               "application/x-komodo-file-paths",
                               JSON.stringify(
-                                selected.includes(entry.path) ? selected : [entry.path],
+                                entryIsSelected ? selected : [entry.path],
                               ),
                             )
                           }
@@ -1342,7 +1341,7 @@ export default function FileManager({
                           }}
                           onClick={(event) => selectEntry(entry, event)}
                           onContextMenu={() => {
-                            if (!selected.includes(entry.path)) {
+                            if (!entryIsSelected) {
                               setSelected([entry.path]);
                               setSelectionAnchor(entry.path);
                             }
@@ -1353,7 +1352,7 @@ export default function FileManager({
                           <Table.Td>
                             <Checkbox
                               aria-label={`Select ${entry.name}`}
-                              checked={selected.includes(entry.path)}
+                              checked={entryIsSelected}
                               onChange={() =>
                                 setSelected((current) =>
                                   current.includes(entry.path)
@@ -1401,6 +1400,9 @@ export default function FileManager({
                                     ? entry.path
                                     : undefined,
                                 archiveDestination: path,
+                                containsManaged: entryIsSelected
+                                  ? selectionContainsManaged
+                                  : entry.managed,
                               })}
                             </Menu.Dropdown>
                           </Menu>
