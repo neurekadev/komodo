@@ -1,6 +1,7 @@
 import { KOMODO_BASE_URL } from "@/main";
 import { useRead, useWrite } from "@/lib/hooks";
 import { ICONS } from "@/lib/icons";
+import { updateLogToText } from "@/lib/utils";
 import {
   ActionIcon,
   Alert,
@@ -27,7 +28,6 @@ import { notifications } from "@mantine/notifications";
 import { useQueryClient } from "@tanstack/react-query";
 import { MoghAuth, Types } from "komodo_client";
 import {
-  Archive,
   ArrowDownAZ,
   ArrowUpAZ,
   Check,
@@ -35,8 +35,19 @@ import {
   ChevronRight,
   Clipboard,
   Copy,
-  File,
+  EllipsisVertical,
+  File as FileIcon,
   FileArchive,
+  FileCode,
+  FileCog,
+  FileImage,
+  FileMusic,
+  FileSpreadsheet,
+  FileSymlink,
+  FileTerminal,
+  FileText,
+  FileType,
+  FileVideoCamera,
   Folder,
   FolderOpen,
   FolderPlus,
@@ -46,6 +57,7 @@ import {
   Undo2,
   Upload,
 } from "lucide-react";
+import type { LucideIcon } from "lucide-react";
 import { languageFromPath, MonacoEditor, Section } from "mogh_ui";
 import {
   KeyboardEvent as ReactKeyboardEvent,
@@ -73,6 +85,11 @@ type PendingCommit = {
   preflight: Types.FileManagerPreflight;
   clearClipboardOnSuccess?: boolean;
 };
+type FileVisual = {
+  icon: LucideIcon;
+  color: string;
+  opacity?: number;
+};
 
 const joinPath = (...parts: string[]) =>
   parts
@@ -88,6 +105,247 @@ const parentPath = (path: string) => {
 };
 
 const fileName = (path: string) => path.split("/").at(-1) ?? path;
+
+const ARCHIVE_EXTENSIONS = [
+  ".tar.gz",
+  ".tar.bz2",
+  ".tar.xz",
+  ".tar.zst",
+  ".zip",
+  ".tar",
+  ".tgz",
+  ".7z",
+  ".rar",
+  ".gz",
+  ".bz2",
+  ".xz",
+  ".zst",
+];
+const IMAGE_EXTENSIONS = [
+  ".png",
+  ".jpg",
+  ".jpeg",
+  ".gif",
+  ".webp",
+  ".svg",
+  ".bmp",
+  ".ico",
+  ".tif",
+  ".tiff",
+  ".avif",
+  ".heic",
+];
+const VIDEO_EXTENSIONS = [
+  ".mp4",
+  ".mkv",
+  ".mov",
+  ".avi",
+  ".webm",
+  ".m4v",
+];
+const AUDIO_EXTENSIONS = [
+  ".mp3",
+  ".wav",
+  ".flac",
+  ".ogg",
+  ".m4a",
+  ".aac",
+  ".opus",
+];
+const SPREADSHEET_EXTENSIONS = [
+  ".csv",
+  ".tsv",
+  ".xls",
+  ".xlsx",
+  ".ods",
+];
+const DOCUMENT_EXTENSIONS = [".pdf", ".doc", ".docx", ".odt", ".rtf"];
+const SCRIPT_EXTENSIONS = [
+  ".sh",
+  ".bash",
+  ".zsh",
+  ".fish",
+  ".ps1",
+  ".bat",
+  ".cmd",
+];
+const CONFIG_EXTENSIONS = [
+  ".yaml",
+  ".yml",
+  ".toml",
+  ".ini",
+  ".conf",
+  ".cfg",
+  ".properties",
+  ".xml",
+  ".json",
+];
+const CODE_EXTENSIONS = [
+  ".c",
+  ".h",
+  ".cc",
+  ".cpp",
+  ".hpp",
+  ".cs",
+  ".fs",
+  ".fsx",
+  ".go",
+  ".rs",
+  ".py",
+  ".rb",
+  ".java",
+  ".kt",
+  ".kts",
+  ".php",
+  ".swift",
+  ".dart",
+  ".lua",
+  ".ex",
+  ".exs",
+  ".erl",
+  ".clj",
+  ".cljs",
+  ".scala",
+  ".sql",
+  ".html",
+  ".htm",
+  ".css",
+  ".scss",
+  ".sass",
+  ".less",
+  ".js",
+  ".jsx",
+  ".mjs",
+  ".cjs",
+  ".ts",
+  ".tsx",
+  ".vue",
+  ".svelte",
+  ".astro",
+];
+const TEXT_EXTENSIONS = [
+  ".txt",
+  ".md",
+  ".mdx",
+  ".rst",
+  ".adoc",
+  ".log",
+  ".nfo",
+  ".text",
+];
+const TEXT_BASENAMES = ["readme", "license", "changelog", "notice"];
+const CONFIG_BASENAMES = [
+  "dockerfile",
+  "containerfile",
+  "makefile",
+  "cmakelists.txt",
+  ".dockerignore",
+  ".editorconfig",
+  ".gitattributes",
+  ".gitignore",
+  ".npmrc",
+  ".yarnrc",
+];
+
+const hasExtension = (name: string, extensions: string[]) =>
+  extensions.some((extension) => name.endsWith(extension));
+
+const fileVisual = (entry: Types.FileManagerEntry): FileVisual => {
+  if (entry.kind === Types.FileManagerEntryKind.Directory) {
+    return {
+      icon: Folder,
+      color: "var(--mantine-color-yellow-text)",
+      opacity: 0.9,
+    };
+  }
+  if (entry.kind === Types.FileManagerEntryKind.Symlink) {
+    return { icon: FileSymlink, color: "var(--mantine-color-gray-text)" };
+  }
+  if (entry.kind !== Types.FileManagerEntryKind.File) {
+    return { icon: FileIcon, color: "var(--mantine-color-dimmed)" };
+  }
+
+  const name = entry.name.toLowerCase();
+  if (hasExtension(name, ARCHIVE_EXTENSIONS))
+    return { icon: FileArchive, color: "var(--mantine-color-green-text)" };
+  if (hasExtension(name, IMAGE_EXTENSIONS))
+    return { icon: FileImage, color: "var(--mantine-color-grape-text)" };
+  if (hasExtension(name, VIDEO_EXTENSIONS))
+    return { icon: FileVideoCamera, color: "var(--mantine-color-red-text)" };
+  if (hasExtension(name, AUDIO_EXTENSIONS))
+    return { icon: FileMusic, color: "var(--mantine-color-pink-text)" };
+  if (hasExtension(name, SPREADSHEET_EXTENSIONS))
+    return { icon: FileSpreadsheet, color: "var(--mantine-color-teal-text)" };
+  if (hasExtension(name, DOCUMENT_EXTENSIONS))
+    return { icon: FileType, color: "var(--mantine-color-indigo-text)" };
+  if (hasExtension(name, SCRIPT_EXTENSIONS))
+    return { icon: FileTerminal, color: "var(--mantine-color-cyan-text)" };
+  if (
+    CONFIG_BASENAMES.includes(name) ||
+    name === ".env" ||
+    name.startsWith(".env.") ||
+    hasExtension(name, CONFIG_EXTENSIONS)
+  )
+    return { icon: FileCog, color: "var(--mantine-color-orange-text)" };
+  if (hasExtension(name, CODE_EXTENSIONS))
+    return { icon: FileCode, color: "var(--mantine-color-blue-text)" };
+  if (
+    TEXT_BASENAMES.includes(name) ||
+    TEXT_BASENAMES.some((basename) => name.startsWith(`${basename}.`)) ||
+    TEXT_BASENAMES.some((basename) => name.startsWith(`${basename}-`)) ||
+    hasExtension(name, TEXT_EXTENSIONS)
+  )
+    return {
+      icon: FileText,
+      color: "var(--mantine-color-text)",
+      opacity: 1,
+    };
+  return { icon: FileIcon, color: "var(--mantine-color-dimmed)" };
+};
+
+function EntryIcon({
+  entry,
+  size = 18,
+}: {
+  entry: Types.FileManagerEntry;
+  size?: number;
+}) {
+  const visual = fileVisual(entry);
+  const Icon = visual.icon;
+  return (
+    <Icon size={size} color={visual.color} opacity={visual.opacity ?? 0.85} />
+  );
+}
+
+const archiveExtension = (format: Types.FileManagerArchiveFormat) => {
+  switch (format) {
+    case Types.FileManagerArchiveFormat.Tar:
+      return ".tar";
+    case Types.FileManagerArchiveFormat.TarGz:
+      return ".tar.gz";
+    case Types.FileManagerArchiveFormat.SevenZip:
+      return ".7z";
+    default:
+      return ".zip";
+  }
+};
+
+const ensureArchiveExtension = (
+  name: string,
+  format: Types.FileManagerArchiveFormat,
+) => {
+  const extension = archiveExtension(format);
+  return name.toLowerCase().endsWith(extension) ? name : `${name}${extension}`;
+};
+
+const archiveBaseName = (path: string) => {
+  const name = fileName(path);
+  const lower = name.toLowerCase();
+  const extension = ARCHIVE_EXTENSIONS.find((candidate) =>
+    lower.endsWith(candidate),
+  );
+  return extension ? name.slice(0, -extension.length) || "extracted" : name;
+};
 
 const formatBytes = (bytes: number) => {
   if (bytes < 1024) return `${bytes} B`;
@@ -111,7 +369,11 @@ const reportUpdateFailure = (update: Types.Update) => {
   const message =
     update.logs.findLast((log) => !log.success)?.stderr ||
     "The file operation failed. Open its update for details.";
-  notifications.show({ title: "File operation failed", message, color: "red" });
+  notifications.show({
+    title: "File operation failed",
+    message: updateLogToText(message),
+    color: "red",
+  });
   return true;
 };
 
@@ -125,6 +387,7 @@ export default function FileManager({
   const queryClient = useQueryClient();
   const desktop = useMediaQuery("(min-width: 62em)");
   const inputRef = useRef<HTMLInputElement>(null);
+  const uploadDestinationRef = useRef<string | undefined>(undefined);
   const explorerRef = useRef<HTMLDivElement>(null);
   const [path, setPath] = useState("");
   const [selected, setSelected] = useState<string[]>([]);
@@ -136,6 +399,8 @@ export default function FileManager({
   const [draft, setDraft] = useState("");
   const [action, setAction] = useState<ActionDialog>(null);
   const [actionValue, setActionValue] = useState("");
+  const [actionPaths, setActionPaths] = useState<string[]>([]);
+  const [actionDestination, setActionDestination] = useState("");
   const [archiveFormat, setArchiveFormat] =
     useState<Types.FileManagerArchiveFormat>(Types.FileManagerArchiveFormat.Zip);
   const [pendingCommit, setPendingCommit] = useState<PendingCommit>();
@@ -404,8 +669,14 @@ export default function FileManager({
     }
   };
 
-  const openAction = (next: Exclude<ActionDialog, null>) => {
-    setActionValue(next === "rename" ? fileName(selected[0] ?? "") : "");
+  const openAction = (
+    next: Exclude<ActionDialog, null>,
+    options: { paths?: string[]; destination?: string } = {},
+  ) => {
+    const paths = options.paths ?? selected;
+    setActionPaths(paths);
+    setActionDestination(options.destination ?? path);
+    setActionValue(next === "rename" ? fileName(paths[0] ?? "") : "");
     setAction(next);
   };
 
@@ -415,24 +686,27 @@ export default function FileManager({
     if (action === "create-file") {
       await runOperation({
         type: "CreateFile",
-        params: { path: joinPath(path, value) },
+        params: { path: joinPath(actionDestination, value) },
       });
     } else if (action === "create-directory") {
       await runOperation({
         type: "CreateDirectory",
-        params: { path: joinPath(path, value) },
+        params: { path: joinPath(actionDestination, value) },
       });
     } else if (action === "rename") {
       await runOperation({
         type: "Rename",
-        params: { path: selected[0], new_name: value },
+        params: { path: actionPaths[0], new_name: value },
       });
     } else {
       await runOperation({
         type: "CreateArchive",
         params: {
-          paths: selected,
-          destination: joinPath(path, value),
+          paths: actionPaths,
+          destination: joinPath(
+            actionDestination,
+            ensureArchiveExtension(value, archiveFormat),
+          ),
           format: archiveFormat,
         },
       });
@@ -524,15 +798,20 @@ export default function FileManager({
     }
   };
 
-  const download = async () => {
-    if (!selected.length) return;
+  const openUpload = (destination = path) => {
+    uploadDestinationRef.current = destination;
+    inputRef.current?.click();
+  };
+
+  const download = async (paths = selected) => {
+    if (!paths.length) return;
     const controller = new AbortController();
     try {
       setTransfer({
         label: "Preparing download",
         cancel: () => controller.abort(),
       });
-      const ticket = await prepareDownload({ target, paths: selected });
+      const ticket = await prepareDownload({ target, paths });
       const jwt = MoghAuth.LOGIN_TOKENS.jwt();
       const response = await fetch(KOMODO_BASE_URL + ticket.url, {
         headers: jwt ? { authorization: jwt } : {},
@@ -543,7 +822,7 @@ export default function FileManager({
       const disposition = response.headers.get("content-disposition") ?? "";
       const downloadName =
         disposition.match(/filename="?([^";]+)"?/i)?.[1] ??
-        (selected.length === 1 ? fileName(selected[0]) : "komodo-files.zip");
+        (paths.length === 1 ? fileName(paths[0]) : "komodo-files.zip");
       const pickerWindow = window as Window & {
         showSaveFilePicker?: (options: unknown) => Promise<{
           createWritable: () => Promise<WritableStream>;
@@ -589,6 +868,185 @@ export default function FileManager({
     if (paths.length && !readOnly) {
       await runOperation({ type: "Move", params: { paths, destination } });
     }
+  };
+
+  const extractArchive = (
+    archivePath: string,
+    destinationDirectory: string,
+  ) =>
+    runOperation({
+      type: "ExtractArchive",
+      params: {
+        path: archivePath,
+        destination: joinPath(
+          destinationDirectory,
+          archiveBaseName(archivePath),
+        ),
+      },
+    });
+
+  const contextMenuItems = ({
+    entry,
+    paths,
+    destination,
+    archiveDestination,
+  }: {
+    entry?: Types.FileManagerEntry;
+    paths: string[];
+    destination?: string;
+    archiveDestination: string;
+  }) => {
+    const menuEntries = entries.filter((candidate) =>
+      paths.includes(candidate.path),
+    );
+    const containsManaged =
+      entry?.managed || menuEntries.some((candidate) => candidate.managed);
+    const canMutate =
+      !readOnly && paths.length > 0 && !containsManaged && !busy;
+    const canOpen =
+      paths.length <= 1 &&
+      (!entry ||
+        entry.kind === Types.FileManagerEntryKind.Directory ||
+        entry.kind === Types.FileManagerEntryKind.File);
+
+    return (
+      <>
+        <Menu.Item
+          leftSection={<FolderOpen size={15} />}
+          disabled={!canOpen}
+          onClick={() => (entry ? openEntry(entry) : setPath(destination ?? ""))}
+        >
+          Open
+        </Menu.Item>
+        {paths.length > 0 && (
+          <Menu.Item
+            leftSection={<ICONS.Download size={15} />}
+            disabled={!!containsManaged || busy}
+            onClick={() => void download(paths)}
+          >
+            Download
+          </Menu.Item>
+        )}
+        {destination !== undefined && (
+          <>
+            <Menu.Sub>
+              <Menu.Sub.Target>
+                <Menu.Sub.Item
+                  leftSection={<FolderPlus size={15} />}
+                  disabled={readOnly || busy}
+                >
+                  New
+                </Menu.Sub.Item>
+              </Menu.Sub.Target>
+              <Menu.Sub.Dropdown>
+                <Menu.Item
+                  leftSection={<FileIcon size={15} />}
+                  onClick={() =>
+                    openAction("create-file", { destination })
+                  }
+                >
+                  File
+                </Menu.Item>
+                <Menu.Item
+                  leftSection={<FolderPlus size={15} />}
+                  onClick={() =>
+                    openAction("create-directory", { destination })
+                  }
+                >
+                  Folder
+                </Menu.Item>
+              </Menu.Sub.Dropdown>
+            </Menu.Sub>
+            <Menu.Item
+              leftSection={<Upload size={15} />}
+              disabled={readOnly || busy}
+              onClick={() => openUpload(destination)}
+            >
+              Upload here
+            </Menu.Item>
+            <Menu.Item
+              leftSection={<Clipboard size={15} />}
+              disabled={!clipboard || readOnly || busy}
+              onClick={() => void paste(destination)}
+            >
+              Paste here
+            </Menu.Item>
+          </>
+        )}
+        {paths.length > 0 && (
+          <>
+            <Menu.Divider />
+            <Menu.Item
+              leftSection={<Scissors size={15} />}
+              disabled={!canMutate}
+              onClick={() => setClipboard({ mode: "move", paths })}
+            >
+              Cut
+            </Menu.Item>
+            <Menu.Item
+              leftSection={<Copy size={15} />}
+              disabled={!canMutate}
+              onClick={() => setClipboard({ mode: "copy", paths })}
+            >
+              Copy
+            </Menu.Item>
+            <Menu.Item
+              leftSection={<Pencil size={15} />}
+              disabled={!canMutate || paths.length !== 1}
+              onClick={() => openAction("rename", { paths })}
+            >
+              Rename
+            </Menu.Item>
+            <Menu.Sub>
+              <Menu.Sub.Target>
+                <Menu.Sub.Item
+                  leftSection={<FileArchive size={15} />}
+                  disabled={!canMutate}
+                >
+                  Archive
+                </Menu.Sub.Item>
+              </Menu.Sub.Target>
+              <Menu.Sub.Dropdown>
+                <Menu.Item
+                  leftSection={<FileArchive size={15} />}
+                  onClick={() =>
+                    openAction("archive", {
+                      paths,
+                      destination: archiveDestination,
+                    })
+                  }
+                >
+                  Create archive
+                </Menu.Item>
+                <Menu.Item
+                  leftSection={<FolderOpen size={15} />}
+                  disabled={
+                    paths.length !== 1 ||
+                    entry?.kind !== Types.FileManagerEntryKind.File
+                  }
+                  onClick={() =>
+                    void extractArchive(paths[0], archiveDestination)
+                  }
+                >
+                  Extract here
+                </Menu.Item>
+              </Menu.Sub.Dropdown>
+            </Menu.Sub>
+            <Menu.Divider />
+            <Menu.Item
+              color="red"
+              leftSection={<ICONS.Delete size={15} />}
+              disabled={!canMutate}
+              onClick={() =>
+                void runOperation({ type: "Delete", params: { paths } })
+              }
+            >
+              Delete
+            </Menu.Item>
+          </>
+        )}
+      </>
+    );
   };
 
   const sortHeader = (label: string, key: SortKey) => (
@@ -658,7 +1116,7 @@ export default function FileManager({
             <Group gap={4}>
               <ToolbarButton
                 label="New file"
-                icon={<File size={17} />}
+                icon={<FileIcon size={17} />}
                 disabled={readOnly || busy}
                 onClick={() => openAction("create-file")}
               />
@@ -672,13 +1130,13 @@ export default function FileManager({
                 label="Upload"
                 icon={<Upload size={17} />}
                 disabled={readOnly || busy}
-                onClick={() => inputRef.current?.click()}
+                onClick={() => openUpload()}
               />
               <ToolbarButton
                 label="Download"
                 icon={<ICONS.Download size={17} />}
                 disabled={!selected.length || selectionContainsManaged || busy}
-                onClick={download}
+                onClick={() => void download()}
               />
               <Divider orientation="vertical" />
               <ToolbarButton
@@ -706,7 +1164,7 @@ export default function FileManager({
                     aria-label="More file actions"
                     disabled={busy}
                   >
-                    <Archive size={17} />
+                    <EllipsisVertical size={17} />
                   </ActionIcon>
                 </Menu.Target>
                 <Menu.Dropdown>
@@ -732,18 +1190,7 @@ export default function FileManager({
                       selectedEntries[0]?.kind !== Types.FileManagerEntryKind.File
                     }
                     onClick={() =>
-                      runOperation({
-                        type: "ExtractArchive",
-                        params: {
-                          path: selected[0],
-                          destination: joinPath(
-                            path,
-                            fileName(selected[0])
-                              .replace(/\.tar\.gz$/i, "")
-                              .replace(/\.(zip|tar|7z|rar)$/i, "") || "extracted",
-                          ),
-                        },
-                      })
+                      void extractArchive(selected[0], path)
                     }
                   >
                     Extract here
@@ -818,6 +1265,16 @@ export default function FileManager({
                     target={target}
                     currentPath={path}
                     onSelect={setPath}
+                    contextMenu={(entry) =>
+                      contextMenuItems({
+                        entry,
+                        paths: entry ? [entry.path] : [],
+                        destination: entry?.path ?? "",
+                        archiveDestination: entry
+                          ? parentPath(entry.path)
+                          : "",
+                      })
+                    }
                   />
                 </ScrollArea>
               )}
@@ -857,9 +1314,14 @@ export default function FileManager({
                       </Table.Tr>
                     </Table.Thead>
                     <Table.Tbody>
-                      {entries.map((entry) => (
-                        <Table.Tr
-                          key={entry.path}
+                      {entries.map((entry) => {
+                        const contextPaths = selected.includes(entry.path)
+                          ? selected
+                          : [entry.path];
+                        return (
+                          <Menu key={entry.path} shadow="md">
+                            <Menu.ContextMenu>
+                              <Table.Tr
                           bg={selected.includes(entry.path) ? "accent.1" : undefined}
                           draggable={!readOnly && !entry.managed}
                           onDragStart={(event) =>
@@ -879,6 +1341,12 @@ export default function FileManager({
                               void onDrop(event, entry.path);
                           }}
                           onClick={(event) => selectEntry(entry, event)}
+                          onContextMenu={() => {
+                            if (!selected.includes(entry.path)) {
+                              setSelected([entry.path]);
+                              setSelectionAnchor(entry.path);
+                            }
+                          }}
                           onDoubleClick={() => openEntry(entry)}
                           style={{ cursor: "default" }}
                         >
@@ -898,15 +1366,7 @@ export default function FileManager({
                           </Table.Td>
                           <Table.Td>
                             <Group gap="xs" wrap="nowrap">
-                              {entry.kind === Types.FileManagerEntryKind.Directory ? (
-                                <Folder size={18} />
-                              ) : entry.kind === Types.FileManagerEntryKind.File ? (
-                                <File size={18} />
-                              ) : (
-                                <Badge size="xs" color="gray">
-                                  {entry.kind}
-                                </Badge>
-                              )}
+                              <EntryIcon entry={entry} />
                               <Text size="sm" ff="monospace" truncate>
                                 {entry.name}
                               </Text>
@@ -929,8 +1389,23 @@ export default function FileManager({
                               {new Date(entry.modified_at).toLocaleString()}
                             </Text>
                           </Table.Td>
-                        </Table.Tr>
-                      ))}
+                              </Table.Tr>
+                            </Menu.ContextMenu>
+                            <Menu.Dropdown>
+                              {contextMenuItems({
+                                entry,
+                                paths: contextPaths,
+                                destination:
+                                  entry.kind ===
+                                  Types.FileManagerEntryKind.Directory
+                                    ? entry.path
+                                    : undefined,
+                                archiveDestination: path,
+                              })}
+                            </Menu.Dropdown>
+                          </Menu>
+                        );
+                      })}
                       {entries.length === 0 && (
                         <Table.Tr>
                           <Table.Td colSpan={4}>
@@ -954,7 +1429,12 @@ export default function FileManager({
         type="file"
         multiple
         hidden
-        onChange={(event) => void uploadFiles(Array.from(event.target.files ?? []))}
+        onChange={(event) =>
+          void uploadFiles(
+            Array.from(event.target.files ?? []),
+            uploadDestinationRef.current ?? path,
+          )
+        }
       />
 
       <Modal
@@ -1157,41 +1637,60 @@ function DirectoryTree({
   target,
   currentPath,
   onSelect,
+  contextMenu,
 }: {
   target: Types.FileManagerTarget;
   currentPath: string;
   onSelect: (path: string) => void;
+  contextMenu: (entry?: Types.FileManagerEntry) => ReactNode;
 }) {
   const [expanded, setExpanded] = useState(true);
   return (
     <Stack gap={2}>
-      <Button
-        variant={currentPath === "" ? "light" : "subtle"}
-        justify="start"
-        size="compact-sm"
-        leftSection={
-          <ActionIcon
-            component="span"
-            variant="transparent"
-            size="xs"
-            onClick={(event) => {
-              event.stopPropagation();
-              setExpanded((value) => !value);
-            }}
+      <Menu shadow="md">
+        <Menu.ContextMenu>
+          <Button
+            variant={currentPath === "" ? "light" : "subtle"}
+            justify="start"
+            size="compact-sm"
+            leftSection={
+              <ActionIcon
+                component="span"
+                variant="transparent"
+                size="xs"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  setExpanded((value) => !value);
+                }}
+              >
+                {expanded ? (
+                  <ChevronDown size={14} />
+                ) : (
+                  <ChevronRight size={14} />
+                )}
+              </ActionIcon>
+            }
+            onClick={() => onSelect("")}
           >
-            {expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-          </ActionIcon>
-        }
-        onClick={() => onSelect("")}
-      >
-        Root
-      </Button>
+            <Group gap="xs" wrap="nowrap">
+              <Folder
+                size={16}
+                color="var(--mantine-color-yellow-text)"
+                opacity={0.9}
+              />
+              <Text size="sm">Root</Text>
+            </Group>
+          </Button>
+        </Menu.ContextMenu>
+        <Menu.Dropdown>{contextMenu()}</Menu.Dropdown>
+      </Menu>
       {expanded && (
         <TreeChildren
           target={target}
           path=""
           currentPath={currentPath}
           onSelect={onSelect}
+          contextMenu={contextMenu}
           depth={1}
         />
       )}
@@ -1204,12 +1703,14 @@ function TreeChildren({
   path,
   currentPath,
   onSelect,
+  contextMenu,
   depth,
 }: {
   target: Types.FileManagerTarget;
   path: string;
   currentPath: string;
   onSelect: (path: string) => void;
+  contextMenu: (entry?: Types.FileManagerEntry) => ReactNode;
   depth: number;
 }) {
   const directory = useRead("ListFileManagerDirectory", { target, path });
@@ -1225,6 +1726,7 @@ function TreeChildren({
             entry={entry}
             currentPath={currentPath}
             onSelect={onSelect}
+            contextMenu={contextMenu}
             depth={depth}
           />
         ))}
@@ -1237,47 +1739,66 @@ function TreeDirectory({
   entry,
   currentPath,
   onSelect,
+  contextMenu,
   depth,
 }: {
   target: Types.FileManagerTarget;
   entry: Types.FileManagerEntry;
   currentPath: string;
   onSelect: (path: string) => void;
+  contextMenu: (entry?: Types.FileManagerEntry) => ReactNode;
   depth: number;
 }) {
   const [expanded, setExpanded] = useState(currentPath.startsWith(`${entry.path}/`));
   return (
     <>
-      <Button
-        variant={currentPath === entry.path ? "light" : "subtle"}
-        justify="start"
-        size="compact-sm"
-        pl={`calc(${depth} * 0.65rem)`}
-        leftSection={
-          <ActionIcon
-            component="span"
-            variant="transparent"
-            size="xs"
-            onClick={(event) => {
-              event.stopPropagation();
-              setExpanded((value) => !value);
-            }}
+      <Menu shadow="md">
+        <Menu.ContextMenu>
+          <Button
+            variant={currentPath === entry.path ? "light" : "subtle"}
+            justify="start"
+            size="compact-sm"
+            pl={`calc(${depth} * 0.65rem)`}
+            leftSection={
+              <ActionIcon
+                component="span"
+                variant="transparent"
+                size="xs"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  setExpanded((value) => !value);
+                }}
+              >
+                {expanded ? (
+                  <ChevronDown size={14} />
+                ) : (
+                  <ChevronRight size={14} />
+                )}
+              </ActionIcon>
+            }
+            onClick={() => onSelect(entry.path)}
           >
-            {expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-          </ActionIcon>
-        }
-        onClick={() => onSelect(entry.path)}
-      >
-        <Text size="sm" truncate>
-          {entry.name}
-        </Text>
-      </Button>
+            <Group gap="xs" wrap="nowrap" style={{ minWidth: 0 }}>
+              <Folder
+                size={16}
+                color="var(--mantine-color-yellow-text)"
+                opacity={0.9}
+              />
+              <Text size="sm" truncate>
+                {entry.name}
+              </Text>
+            </Group>
+          </Button>
+        </Menu.ContextMenu>
+        <Menu.Dropdown>{contextMenu(entry)}</Menu.Dropdown>
+      </Menu>
       {expanded && (
         <TreeChildren
           target={target}
           path={entry.path}
           currentPath={currentPath}
           onSelect={onSelect}
+          contextMenu={contextMenu}
           depth={depth + 1}
         />
       )}

@@ -154,6 +154,19 @@ export function sanitizeOnlySpan(log: string) {
   });
 }
 
+/** Converts formatted update output into safe text for compact UI surfaces. */
+export function updateLogToText(log: string) {
+  if (!log) return "No log.";
+  const text = sanitizeHtml(log, {
+    allowedTags: [],
+    allowedAttributes: {},
+  });
+  return sanitizeHtml(convert_ansi.toHtml(text), {
+    allowedTags: [],
+    allowedAttributes: {},
+  });
+}
+
 const convert_ansi = new ConvertAnsiToHtml();
 
 /**

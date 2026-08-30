@@ -1,5 +1,5 @@
 use std::{
-  collections::HashMap,
+  collections::{HashMap, HashSet},
   fs,
   io::{Read as _, Write as _},
   path::{Component, Path, PathBuf},
@@ -19,13 +19,13 @@ use cap_std::{
 use encoding::{Decode as _, WithChannel};
 use komodo_client::entities::{
   file_manager::{
-    FileManagerCapabilities, FileManagerConflict,
-    FileManagerConflictAction, FileManagerConflictDecision,
-    FileManagerDirectory, FileManagerEntry, FileManagerEntryKind,
-    FileManagerJournalStatus, FileManagerLimits,
-    FileManagerOperation, FileManagerOperationState,
-    FileManagerOperationStatus, FileManagerPreflight,
-    FileManagerRevision, FileManagerTextFile,
+    FileManagerArchiveFormat, FileManagerCapabilities,
+    FileManagerConflict, FileManagerConflictAction,
+    FileManagerConflictDecision, FileManagerDirectory,
+    FileManagerEntry, FileManagerEntryKind, FileManagerJournalStatus,
+    FileManagerLimits, FileManagerOperation,
+    FileManagerOperationState, FileManagerOperationStatus,
+    FileManagerPreflight, FileManagerRevision, FileManagerTextFile,
   },
   komodo_timestamp, to_path_compatible_name,
 };
@@ -79,6 +79,13 @@ struct OperationPlan {
   conflicts: Vec<FileManagerConflict>,
   confirmation_required: bool,
   revisions: Vec<(String, Option<FileManagerRevision>)>,
+  copy_targets: Vec<CopyTarget>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CopyTarget {
+  source: String,
+  destination: String,
 }
 
 #[derive(Debug, Clone)]
@@ -522,6 +529,7 @@ pub async fn preflight(
   if root.read_only {
     return Err(anyhow!("This File Manager root is read-only"));
   }
+  let operation = normalize_operation(operation);
   validate_operation(&root, &operation)?;
   let lock = root_lock(&root.key).await;
   let _guard = lock.lock().await;
@@ -531,8 +539,11 @@ pub async fn preflight(
     Err(error) => return Err(error),
   };
   let root_dir = root_dir.as_ref();
-  let conflicts = find_conflicts(root_dir, &operation)?;
-  let mut watched = revision_paths(&operation)?;
+  let copy_targets = resolve_copy_targets(root_dir, &operation)?;
+  let conflicts =
+    find_conflicts_planned(root_dir, &operation, &copy_targets)?;
+  let mut watched =
+    revision_paths_planned(&operation, &copy_targets)?;
   watched.sort();
   watched.dedup();
   let revisions = watched
@@ -561,6 +572,7 @@ pub async fn preflight(
       conflicts: conflicts.clone(),
       confirmation_required,
       revisions,
+      copy_targets,
     },
   );
   Ok(FileManagerPreflight {
@@ -631,9 +643,19 @@ pub async fn commit(
   );
   drop(operation_statuses);
 
-  let journal =
-    create_journal(&root, actor, &operation_id, &plan.operation)?;
-  let result = apply_operation(&root_dir, &plan.operation, decisions);
+  let journal = create_journal(
+    &root,
+    actor,
+    &operation_id,
+    &plan.operation,
+    &plan.copy_targets,
+  )?;
+  let result = apply_operation_planned(
+    &root_dir,
+    &plan.operation,
+    &plan.copy_targets,
+    decisions,
+  );
   match result {
     Ok(()) => {
       let journal = match finish_journal(&root_dir, journal.clone()) {
@@ -660,12 +682,10 @@ pub async fn commit(
       Ok(
         periphery_client::api::file_manager::FileManagerCommitResponse {
           operation_id,
-          affected_paths: plan
-            .operation
-            .affected_paths()
-            .into_iter()
-            .map(str::to_string)
-            .collect(),
+          affected_paths: affected_paths_planned(
+            &plan.operation,
+            &plan.copy_targets,
+          ),
         },
       )
     }
@@ -740,7 +760,7 @@ pub async fn undo(
     return Err(anyhow!("This File Manager root is read-only"));
   }
   let key = history_key(&root.key, actor);
-  let record = {
+  let mut record = {
     let mut histories = histories().lock().await;
     let history = histories.entry(key.clone()).or_default();
     prune_history(history);
@@ -750,8 +770,15 @@ pub async fn undo(
   let _guard = lock.lock().await;
   let result = (|| {
     let root_dir = open_root(&root, true)?;
-    verify_revisions(&root_dir, &record.after_revisions)?;
-    restore_journal(&root_dir, &record)
+    verify_revisions(
+      &root_dir,
+      &record.after_revisions,
+      "Undo is unsafe because files changed after the operation",
+    )?;
+    restore_journal(&root_dir, &record)?;
+    record.before_revisions =
+      capture_snapshot_revisions(&root_dir, &record.snapshots)?;
+    Ok(())
   })();
   if let Err(error) = result {
     histories()
@@ -797,7 +824,7 @@ pub async fn redo(
     return Err(anyhow!("This File Manager root is read-only"));
   }
   let key = history_key(&root.key, actor);
-  let record = histories()
+  let mut record = histories()
     .lock()
     .await
     .entry(key.clone())
@@ -809,8 +836,15 @@ pub async fn redo(
   let _guard = lock.lock().await;
   let result = (|| {
     let root_dir = open_root(&root, true)?;
-    verify_revisions(&root_dir, &record.before_revisions)?;
-    restore_after_journal(&root_dir, &record)
+    verify_revisions(
+      &root_dir,
+      &record.before_revisions,
+      "Redo is unsafe because files changed after undo",
+    )?;
+    restore_after_journal(&root_dir, &record)?;
+    record.after_revisions =
+      capture_snapshot_revisions(&root_dir, &record.snapshots)?;
+    Ok(())
   })();
   if let Err(error) = result {
     histories()
@@ -985,6 +1019,7 @@ pub async fn start_upload(
               &actor,
               &Uuid::new_v4().to_string(),
               &operation,
+              &[],
             )?;
             let commit = (|| {
               if tree_revision(&root_dir, &path)? != initial_revision
@@ -1223,6 +1258,157 @@ fn hash_host_file(path: &Path) -> anyhow::Result<[u8; 32]> {
   Ok(hasher.finalize().into())
 }
 
+fn archive_extension(
+  format: FileManagerArchiveFormat,
+) -> &'static str {
+  match format {
+    FileManagerArchiveFormat::Zip => ".zip",
+    FileManagerArchiveFormat::Tar => ".tar",
+    FileManagerArchiveFormat::TarGz => ".tar.gz",
+    FileManagerArchiveFormat::SevenZip => ".7z",
+  }
+}
+
+fn ensure_archive_extension(
+  destination: &str,
+  format: FileManagerArchiveFormat,
+) -> String {
+  let extension = archive_extension(format);
+  if destination.to_lowercase().ends_with(extension) {
+    destination.to_string()
+  } else {
+    format!("{destination}{extension}")
+  }
+}
+
+fn normalize_operation(
+  mut operation: FileManagerOperation,
+) -> FileManagerOperation {
+  if let FileManagerOperation::CreateArchive {
+    destination,
+    format,
+    ..
+  } = &mut operation
+  {
+    *destination = ensure_archive_extension(destination, *format);
+  }
+  operation
+}
+
+fn duplicate_name(
+  name: &str,
+  index: usize,
+  preserve_extension: bool,
+) -> String {
+  const COMPOUND_EXTENSIONS: [&str; 4] =
+    [".tar.gz", ".tar.bz2", ".tar.xz", ".tar.zst"];
+  let lower = name.to_lowercase();
+  let split = if preserve_extension {
+    COMPOUND_EXTENSIONS
+      .iter()
+      .find(|extension| lower.ends_with(**extension))
+      .map(|extension| name.len() - extension.len())
+      .or_else(|| name.rfind('.').filter(|position| *position > 0))
+      .unwrap_or(name.len())
+  } else {
+    name.len()
+  };
+  let (stem, extension) = name.split_at(split);
+  format!("{stem} ({index}){extension}")
+}
+
+#[cfg(test)]
+fn direct_copy_targets(
+  operation: &FileManagerOperation,
+) -> anyhow::Result<Vec<CopyTarget>> {
+  let FileManagerOperation::Copy { paths, destination } = operation
+  else {
+    return Ok(Vec::new());
+  };
+  let destination = relative_path(destination, true)?;
+  paths
+    .iter()
+    .map(|source| {
+      let source = relative_path(source, false)?;
+      let destination = destination.join(
+        source.file_name().context("Source path has no filename")?,
+      );
+      Ok(CopyTarget {
+        source: path_string(&source)?,
+        destination: path_string(&destination)?,
+      })
+    })
+    .collect()
+}
+
+fn resolve_copy_targets(
+  root: Option<&Dir>,
+  operation: &FileManagerOperation,
+) -> anyhow::Result<Vec<CopyTarget>> {
+  let FileManagerOperation::Copy { paths, destination } = operation
+  else {
+    return Ok(Vec::new());
+  };
+  let destination = relative_path(destination, true)?;
+  let mut pending = Vec::with_capacity(paths.len());
+  for source in paths {
+    let source = relative_path(source, false)?;
+    let source_parent =
+      source.parent().unwrap_or_else(|| Path::new(""));
+    let target = destination.join(
+      source.file_name().context("Source path has no filename")?,
+    );
+    let same_parent = source_parent == destination;
+    pending.push((source, target, same_parent));
+  }
+
+  let mut reserved = pending
+    .iter()
+    .filter(|(_, _, same_parent)| !same_parent)
+    .map(|(_, target, _)| path_string(target))
+    .collect::<anyhow::Result<HashSet<_>>>()?;
+  let mut targets = Vec::with_capacity(pending.len());
+  for (source, default_target, same_parent) in pending {
+    let target = if same_parent {
+      let root = root.context(
+        "The source directory is unavailable for duplicate-name planning",
+      )?;
+      let name = source
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("Source path is not valid UTF-8")?;
+      let source_string = path_string(&source)?;
+      let metadata = entry_metadata(root, &source_string)?
+        .context("Source path does not exist")?;
+      let preserve_extension =
+        !metadata.is_dir() || metadata.file_type().is_symlink();
+      let mut index = 1;
+      loop {
+        let candidate = destination.join(duplicate_name(
+          name,
+          index,
+          preserve_extension,
+        ));
+        let candidate_string = path_string(&candidate)?;
+        if !reserved.contains(&candidate_string)
+          && entry_metadata(root, &candidate_string)?.is_none()
+        {
+          reserved.insert(candidate_string);
+          break candidate;
+        }
+        index += 1;
+      }
+    } else {
+      default_target
+    };
+    targets.push(CopyTarget {
+      source: path_string(&source)?,
+      destination: path_string(&target)?,
+    });
+  }
+  Ok(targets)
+}
+
 fn validate_operation(
   root: &ResolvedRoot,
   operation: &FileManagerOperation,
@@ -1236,6 +1422,8 @@ fn validate_operation(
     }
     FileManagerOperation::Move { paths, destination }
     | FileManagerOperation::Copy { paths, destination } => {
+      let moving =
+        matches!(operation, FileManagerOperation::Move { .. });
       if paths.is_empty() {
         return Err(anyhow!("Select at least one entry"));
       }
@@ -1251,7 +1439,7 @@ fn validate_operation(
             "Multiple selected entries have the same destination name"
           ));
         }
-        if destination.join(source_name) == source {
+        if moving && destination.join(source_name) == source {
           return Err(anyhow!("Source and destination are the same"));
         }
         if destination.starts_with(&source) {
@@ -1324,9 +1512,19 @@ fn validate_operation(
   Ok(())
 }
 
+#[cfg(test)]
 fn find_conflicts(
   root: Option<&Dir>,
   operation: &FileManagerOperation,
+) -> anyhow::Result<Vec<FileManagerConflict>> {
+  let copy_targets = direct_copy_targets(operation)?;
+  find_conflicts_planned(root, operation, &copy_targets)
+}
+
+fn find_conflicts_planned(
+  root: Option<&Dir>,
+  operation: &FileManagerOperation,
+  copy_targets: &[CopyTarget],
 ) -> anyhow::Result<Vec<FileManagerConflict>> {
   let Some(root) = root else {
     return Ok(Vec::new());
@@ -1357,10 +1555,6 @@ fn find_conflicts(
     FileManagerOperation::Move {
       paths: sources,
       destination,
-    }
-    | FileManagerOperation::Copy {
-      paths: sources,
-      destination,
     } => {
       let destination = relative_path(destination, true)?;
       for source in sources {
@@ -1374,6 +1568,16 @@ fn find_conflicts(
           root,
           &source_path,
           &target,
+          &mut conflicts,
+        )?;
+      }
+    }
+    FileManagerOperation::Copy { .. } => {
+      for target in copy_targets {
+        collect_merge_conflicts(
+          root,
+          &relative_path(&target.source, false)?,
+          &relative_path(&target.destination, false)?,
           &mut conflicts,
         )?;
       }
@@ -1488,9 +1692,20 @@ fn decision_for(
     .map(|decision| decision.action)
 }
 
+#[cfg(test)]
 fn apply_operation(
   root: &Dir,
   operation: &FileManagerOperation,
+  decisions: &[FileManagerConflictDecision],
+) -> anyhow::Result<()> {
+  let copy_targets = direct_copy_targets(operation)?;
+  apply_operation_planned(root, operation, &copy_targets, decisions)
+}
+
+fn apply_operation_planned(
+  root: &Dir,
+  operation: &FileManagerOperation,
+  copy_targets: &[CopyTarget],
   decisions: &[FileManagerConflictDecision],
 ) -> anyhow::Result<()> {
   match operation {
@@ -1549,12 +1764,9 @@ fn apply_operation(
       }
       parent.rename(old_name, &parent, new_name)?;
     }
-    FileManagerOperation::Move { paths, destination }
-    | FileManagerOperation::Copy { paths, destination } => {
+    FileManagerOperation::Move { paths, destination } => {
       let destination = relative_path(destination, true)?;
       let destination_dir = open_dir_nofollow(root, &destination)?;
-      let move_entry =
-        matches!(operation, FileManagerOperation::Move { .. });
       for source in paths {
         let source = relative_path(source, false)?;
         let (source_parent, source_name) =
@@ -1566,7 +1778,26 @@ fn apply_operation(
           &destination_dir,
           &source_name,
           &path_string(&target)?,
-          move_entry,
+          true,
+          decisions,
+        )?;
+      }
+    }
+    FileManagerOperation::Copy { .. } => {
+      for target in copy_targets {
+        let source = relative_path(&target.source, false)?;
+        let destination = relative_path(&target.destination, false)?;
+        let (source_parent, source_name) =
+          open_parent_nofollow(root, &source)?;
+        let (destination_parent, destination_name) =
+          open_parent_nofollow(root, &destination)?;
+        merge_entry(
+          &source_parent,
+          &source_name,
+          &destination_parent,
+          &destination_name,
+          &target.destination,
+          false,
           decisions,
         )?;
       }
@@ -1880,10 +2111,27 @@ fn watched_paths(
   Ok(paths)
 }
 
-fn revision_paths(
+fn watched_paths_planned(
   operation: &FileManagerOperation,
+  copy_targets: &[CopyTarget],
 ) -> anyhow::Result<Vec<String>> {
-  let mut paths = watched_paths(operation)?;
+  if matches!(operation, FileManagerOperation::Copy { .. }) {
+    Ok(
+      copy_targets
+        .iter()
+        .map(|target| target.destination.clone())
+        .collect(),
+    )
+  } else {
+    watched_paths(operation)
+  }
+}
+
+fn revision_paths_planned(
+  operation: &FileManagerOperation,
+  copy_targets: &[CopyTarget],
+) -> anyhow::Result<Vec<String>> {
+  let mut paths = watched_paths_planned(operation, copy_targets)?;
   match operation {
     FileManagerOperation::Copy { paths: sources, .. }
     | FileManagerOperation::CreateArchive {
@@ -1897,18 +2145,37 @@ fn revision_paths(
   Ok(paths)
 }
 
+fn affected_paths_planned(
+  operation: &FileManagerOperation,
+  copy_targets: &[CopyTarget],
+) -> Vec<String> {
+  if matches!(operation, FileManagerOperation::Copy { .. }) {
+    copy_targets
+      .iter()
+      .map(|target| target.destination.clone())
+      .collect()
+  } else {
+    operation
+      .affected_paths()
+      .into_iter()
+      .map(str::to_string)
+      .collect()
+  }
+}
+
 fn create_journal(
   root: &ResolvedRoot,
   actor: &str,
   id: &str,
   operation: &FileManagerOperation,
+  copy_targets: &[CopyTarget],
 ) -> anyhow::Result<JournalRecord> {
   let directory = journal_root().join(id).join("before");
   fs::create_dir_all(&directory)?;
   let root_dir = open_root(root, true)?;
   let mut snapshots = Vec::new();
   let mut before_revisions = Vec::new();
-  let mut watched = watched_paths(operation)?;
+  let mut watched = watched_paths_planned(operation, copy_targets)?;
   watched.sort();
   watched.dedup();
   for (index, path) in watched.into_iter().enumerate() {
@@ -2034,15 +2301,29 @@ fn restore_after_journal(
 fn verify_revisions(
   root: &Dir,
   revisions: &[(String, Option<FileManagerRevision>)],
+  unsafe_message: &str,
 ) -> anyhow::Result<()> {
   for (path, expected) in revisions {
     if &tree_revision(root, path)? != expected {
-      return Err(anyhow!(
-        "Undo is unsafe because files changed after the operation"
-      ));
+      return Err(anyhow!("{unsafe_message}"));
     }
   }
   Ok(())
+}
+
+fn capture_snapshot_revisions(
+  root: &Dir,
+  snapshots: &[JournalSnapshot],
+) -> anyhow::Result<Vec<(String, Option<FileManagerRevision>)>> {
+  snapshots
+    .iter()
+    .map(|snapshot| {
+      Ok((
+        snapshot.path.clone(),
+        tree_revision(root, &snapshot.path)?,
+      ))
+    })
+    .collect()
 }
 
 fn backup_from_capability(
@@ -2449,6 +2730,154 @@ mod tests {
     let after = tree_revision(&root, "nested").unwrap();
 
     assert_ne!(before, after);
+    fs::remove_dir_all(directory).unwrap();
+  }
+
+  #[test]
+  fn archive_names_receive_the_selected_extension() {
+    assert_eq!(
+      ensure_archive_extension(
+        "backup",
+        FileManagerArchiveFormat::Zip
+      ),
+      "backup.zip"
+    );
+    assert_eq!(
+      ensure_archive_extension(
+        "backup.ZIP",
+        FileManagerArchiveFormat::Zip
+      ),
+      "backup.ZIP"
+    );
+    assert_eq!(
+      ensure_archive_extension(
+        "backup.tar",
+        FileManagerArchiveFormat::Zip
+      ),
+      "backup.tar.zip"
+    );
+    assert_eq!(
+      ensure_archive_extension(
+        "backup",
+        FileManagerArchiveFormat::TarGz
+      ),
+      "backup.tar.gz"
+    );
+  }
+
+  #[test]
+  fn duplicate_names_preserve_extensions() {
+    assert_eq!(
+      duplicate_name("report.txt", 1, true),
+      "report (1).txt"
+    );
+    assert_eq!(
+      duplicate_name("archive.tar.gz", 2, true),
+      "archive (2).tar.gz"
+    );
+    assert_eq!(duplicate_name("folder", 1, false), "folder (1)");
+    assert_eq!(
+      duplicate_name("folder.name", 1, false),
+      "folder.name (1)"
+    );
+    assert_eq!(duplicate_name(".env", 1, true), ".env (1)");
+  }
+
+  #[test]
+  fn same_parent_copies_receive_the_first_available_name() {
+    let directory =
+      std::env::temp_dir().join(Uuid::new_v4().to_string());
+    fs::create_dir_all(directory.join("folder")).unwrap();
+    fs::create_dir_all(directory.join("folder.name")).unwrap();
+    fs::write(directory.join("report.txt"), "source").unwrap();
+    fs::write(directory.join("report (1).txt"), "existing").unwrap();
+    fs::write(directory.join("archive.tar.gz"), "archive").unwrap();
+    fs::write(directory.join(".env"), "VALUE=1").unwrap();
+    let root =
+      Dir::open_ambient_dir(&directory, ambient_authority()).unwrap();
+
+    for (source, expected) in [
+      ("report.txt", "report (2).txt"),
+      ("archive.tar.gz", "archive (1).tar.gz"),
+      (".env", ".env (1)"),
+      ("folder", "folder (1)"),
+      ("folder.name", "folder.name (1)"),
+    ] {
+      let operation = FileManagerOperation::Copy {
+        paths: vec![source.into()],
+        destination: String::new(),
+      };
+      let targets =
+        resolve_copy_targets(Some(&root), &operation).unwrap();
+      assert_eq!(targets[0].destination, expected);
+      assert!(
+        find_conflicts_planned(Some(&root), &operation, &targets)
+          .unwrap()
+          .is_empty()
+      );
+      apply_operation_planned(&root, &operation, &targets, &[])
+        .unwrap();
+      assert!(directory.join(expected).exists());
+    }
+
+    assert_eq!(
+      fs::read_to_string(directory.join("report (2).txt")).unwrap(),
+      "source"
+    );
+    fs::remove_dir_all(directory).unwrap();
+  }
+
+  #[test]
+  fn duplicate_planning_reserves_other_batch_destinations() {
+    let directory =
+      std::env::temp_dir().join(Uuid::new_v4().to_string());
+    fs::create_dir_all(directory.join("other")).unwrap();
+    fs::write(directory.join("foo.txt"), "same parent").unwrap();
+    fs::write(directory.join("other/foo (1).txt"), "incoming")
+      .unwrap();
+    let root =
+      Dir::open_ambient_dir(&directory, ambient_authority()).unwrap();
+    let operation = FileManagerOperation::Copy {
+      paths: vec!["foo.txt".into(), "other/foo (1).txt".into()],
+      destination: String::new(),
+    };
+
+    let targets =
+      resolve_copy_targets(Some(&root), &operation).unwrap();
+    assert_eq!(targets[0].destination, "foo (2).txt");
+    assert_eq!(targets[1].destination, "foo (1).txt");
+    fs::remove_dir_all(directory).unwrap();
+  }
+
+  #[test]
+  fn refreshed_redo_revisions_still_reject_external_changes() {
+    let directory =
+      std::env::temp_dir().join(Uuid::new_v4().to_string());
+    fs::create_dir(&directory).unwrap();
+    fs::write(directory.join("config.txt"), "restored").unwrap();
+    let root =
+      Dir::open_ambient_dir(&directory, ambient_authority()).unwrap();
+    let snapshots = vec![JournalSnapshot {
+      path: "config.txt".into(),
+      existed: true,
+      backup_name: "0".into(),
+    }];
+    let refreshed =
+      capture_snapshot_revisions(&root, &snapshots).unwrap();
+
+    verify_revisions(&root, &refreshed, "Redo is unsafe").unwrap();
+    fs::write(directory.join("config.txt"), "changed externally")
+      .unwrap();
+    let error = verify_revisions(
+      &root,
+      &refreshed,
+      "Redo is unsafe because files changed after undo",
+    )
+    .unwrap_err();
+    assert_eq!(
+      error.to_string(),
+      "Redo is unsafe because files changed after undo"
+    );
     fs::remove_dir_all(directory).unwrap();
   }
 

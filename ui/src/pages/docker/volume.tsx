@@ -14,9 +14,13 @@ import { Center, Group, Loader, Stack, Tabs, Text } from "@mantine/core";
 import { useLocalStorage } from "@mantine/hooks";
 import { Types } from "komodo_client";
 import { useNavigate, useParams } from "react-router-dom";
-import { useMemo } from "react";
 
 type VolumeView = "Info" | "Files";
+
+const VOLUME_TABS: TabNoContent[] = [
+  { value: "Info", icon: ICONS.Info },
+  { value: "Files", icon: ICONS.FileManager },
+];
 
 export default function Volume() {
   const { type, id, volume } = useParams() as {
@@ -106,16 +110,9 @@ function VolumeInner({
 
   const intention = unused ? "Critical" : "Good";
 
-  const tabs = useMemo<TabNoContent[]>(
-    () => [
-      { value: "Info", icon: ICONS.Info },
-      { value: "Files", icon: ICONS.FileManager },
-    ],
-    [],
-  );
   const selector = (
     <MobileFriendlyTabsSelector
-      tabs={tabs}
+      tabs={VOLUME_TABS}
       value={view}
       onValueChange={setView as any}
     />
