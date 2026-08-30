@@ -32,6 +32,7 @@ type TrackedOperation = {
 type OperationContextValue = {
   begin: (label: string) => string;
   waiting: (notificationId: string, label: string) => void;
+  submitting: (notificationId: string, label: string) => void;
   cancelPending: (notificationId: string, label: string) => void;
   failPending: (notificationId: string, label: string, error: unknown) => void;
   setCancel: (notificationId: string, cancel?: () => void) => void;
@@ -407,6 +408,18 @@ export function FileOperationProvider({ children }: { children: ReactNode }) {
     });
   }, []);
 
+  const submitting = useCallback((notificationId: string, label: string) => {
+    notifications.update({
+      id: notificationId,
+      title: label,
+      message: "Submitting operation…",
+      color: "blue",
+      loading: true,
+      autoClose: false,
+      withCloseButton: false,
+    });
+  }, []);
+
   const cancelPending = useCallback((notificationId: string, label: string) => {
     notifications.update({
       id: notificationId,
@@ -497,6 +510,7 @@ export function FileOperationProvider({ children }: { children: ReactNode }) {
     () => ({
       begin,
       waiting,
+      submitting,
       cancelPending,
       failPending,
       setCancel,
@@ -510,6 +524,7 @@ export function FileOperationProvider({ children }: { children: ReactNode }) {
       failPending,
       isWriteActive,
       setCancel,
+      submitting,
       track,
       untrack,
       waiting,

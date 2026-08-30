@@ -1,5 +1,6 @@
 use std::{
   collections::{HashMap, HashSet},
+  ffi::OsString,
   fs,
   io::{Read as _, Write as _},
   path::{Component, Path, PathBuf},
@@ -39,7 +40,7 @@ use periphery_client::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 use uuid::Uuid;
 
 use crate::{
@@ -61,6 +62,7 @@ pub const MAX_ARCHIVE_EXPANSION_RATIO: u64 = 1_000;
 pub const MINIMUM_FREE_BYTES: u64 = 256 * 1024 * 1024;
 const PLAN_TTL_MS: i64 = 5 * 60 * 1_000;
 const JOURNAL_TTL_MS: i64 = 24 * 60 * 60 * 1_000;
+const MAX_HEAVY_JOBS: usize = 2;
 
 #[derive(Debug, Clone)]
 pub struct ResolvedRoot {
@@ -108,6 +110,58 @@ impl WorkTotal {
     self.entries = self.entries.saturating_add(other.entries);
     self.bytes = self.bytes.saturating_add(other.bytes);
   }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SpaceRequirements {
+  journal_bytes: u64,
+  target_bytes: u64,
+}
+
+fn heavy_job_permits() -> &'static Arc<Semaphore> {
+  static PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+  PERMITS.get_or_init(|| {
+    let permits = std::thread::available_parallelism()
+      .map(|parallelism| parallelism.get())
+      .unwrap_or(1)
+      .clamp(1, MAX_HEAVY_JOBS);
+    Arc::new(Semaphore::new(permits))
+  })
+}
+
+async fn run_heavy_blocking<T, F>(task: F) -> anyhow::Result<T>
+where
+  T: Send + 'static,
+  F: FnOnce() -> anyhow::Result<T> + Send + 'static,
+{
+  let permit = heavy_job_permits()
+    .clone()
+    .acquire_owned()
+    .await
+    .context("File Manager job queue is unavailable")?;
+  tokio::task::spawn_blocking(move || {
+    let _permit = permit;
+    task()
+  })
+  .await
+  .context("File Manager blocking job stopped unexpectedly")?
+}
+
+async fn run_root_blocking<T, F>(
+  root_key: &str,
+  task: F,
+) -> anyhow::Result<T>
+where
+  T: Send + 'static,
+  F: FnOnce() -> anyhow::Result<T> + Send + 'static,
+{
+  let lock = root_lock(root_key).await;
+  let guard = lock.lock_owned().await;
+  run_heavy_blocking(move || {
+    let _guard = guard;
+    task()
+  })
+  .await
 }
 
 #[derive(Debug, Clone)]
@@ -217,6 +271,24 @@ struct TemporaryUpload<'a> {
   committed: bool,
 }
 
+struct StreamingUpload {
+  parent: Dir,
+  destination_name: OsString,
+  temporary_name: String,
+  file: Option<tokio::fs::File>,
+  initial_revision: Option<FileManagerRevision>,
+  committed: bool,
+}
+
+impl Drop for StreamingUpload {
+  fn drop(&mut self) {
+    self.file.take();
+    if !self.committed {
+      let _ = self.parent.remove_file(&self.temporary_name);
+    }
+  }
+}
+
 impl Drop for TemporaryUpload<'_> {
   fn drop(&mut self) {
     self.file.take();
@@ -285,30 +357,34 @@ async fn root_lock(key: &str) -> Arc<Mutex<()>> {
 
 pub async fn initialize() -> anyhow::Result<()> {
   let root = journal_root();
-  fs::create_dir_all(&root)?;
-  let _ = fs::remove_dir_all(root.join("transfers"));
-  let mut records = Vec::new();
-  for entry in fs::read_dir(&root)? {
-    let entry = entry?;
-    if !entry.file_type()?.is_dir() {
-      continue;
-    }
-    let manifest = entry.path().join("manifest.json");
-    let record = fs::read(&manifest).ok().and_then(|manifest| {
-      serde_json::from_slice::<JournalRecord>(&manifest).ok()
-    });
-    match record {
-      Some(record)
-        if !record.managed
-          && record.expires_at > komodo_timestamp() =>
-      {
-        records.push(record);
+  let mut records = run_heavy_blocking(move || {
+    fs::create_dir_all(&root)?;
+    let _ = fs::remove_dir_all(root.join("transfers"));
+    let mut records = Vec::new();
+    for entry in fs::read_dir(&root)? {
+      let entry = entry?;
+      if !entry.file_type()?.is_dir() {
+        continue;
       }
-      _ => {
-        let _ = fs::remove_dir_all(entry.path());
+      let manifest = entry.path().join("manifest.json");
+      let record = fs::read(&manifest).ok().and_then(|manifest| {
+        serde_json::from_slice::<JournalRecord>(&manifest).ok()
+      });
+      match record {
+        Some(record)
+          if !record.managed
+            && record.expires_at > komodo_timestamp() =>
+        {
+          records.push(record);
+        }
+        _ => {
+          let _ = fs::remove_dir_all(entry.path());
+        }
       }
     }
-  }
+    Ok(records)
+  })
+  .await?;
   records.sort_by_key(|record| record.created_at);
   let mut loaded = histories().lock().await;
   for record in records {
@@ -326,10 +402,11 @@ pub async fn initialize() -> anyhow::Result<()> {
     interval.tick().await;
     loop {
       interval.tick().await;
-      let mut histories = histories().lock().await;
-      for history in histories.values_mut() {
-        prune_history(history);
-      }
+      let expired = {
+        let mut histories = histories().lock().await;
+        histories.values_mut().flat_map(prune_history).collect()
+      };
+      schedule_journal_cleanup(expired);
     }
   });
   Ok(())
@@ -539,59 +616,58 @@ pub async fn list_directory(
   path: &str,
 ) -> anyhow::Result<FileManagerDirectory> {
   let root = resolve_root(target).await?;
-  let relative = relative_path(path, true)?;
-  let lock = root_lock(&root.key).await;
-  let _guard = lock.lock().await;
-  if root.create_if_missing && !root.path.exists() {
-    return Ok(FileManagerDirectory {
-      path: path.to_string(),
-      entries: Vec::new(),
-    });
-  }
-  let root_dir = open_root(&root, false)?;
-  let dir = open_dir_nofollow(&root_dir, &relative)?;
-  let mut entries = Vec::new();
-  for entry in dir.entries()? {
-    if entries.len() as u64 >= MAX_ENTRIES {
-      return Err(anyhow!("Directory exceeds the entry limit"));
+  let root_key = root.key.clone();
+  let path = path.to_string();
+  run_root_blocking(&root_key, move || {
+    let relative = relative_path(&path, true)?;
+    if root.create_if_missing && !root.path.exists() {
+      return Ok(FileManagerDirectory {
+        path,
+        entries: Vec::new(),
+      });
     }
-    let entry = entry?;
-    let name = entry
-      .file_name()
-      .into_string()
-      .map_err(|_| anyhow!("Non-UTF-8 filenames are unsupported"))?;
-    let metadata = dir.symlink_metadata(&name)?;
-    let kind = entry_kind(&metadata);
-    let entry_path = if path.is_empty() {
-      name.clone()
-    } else {
-      format!("{path}/{name}")
-    };
-    entries.push(FileManagerEntry {
-      managed: root.managed_file.as_deref()
-        == Some(entry_path.as_str()),
-      path: entry_path,
-      name,
-      kind,
-      size: metadata.len(),
-      modified_at: modified_at(&metadata),
-      revision: revision(&metadata),
+    let root_dir = open_root(&root, false)?;
+    let dir = open_dir_nofollow(&root_dir, &relative)?;
+    let mut entries = Vec::new();
+    for entry in dir.entries()? {
+      if entries.len() as u64 >= MAX_ENTRIES {
+        return Err(anyhow!("Directory exceeds the entry limit"));
+      }
+      let entry = entry?;
+      let name = entry.file_name().into_string().map_err(|_| {
+        anyhow!("Non-UTF-8 filenames are unsupported")
+      })?;
+      let metadata = dir.symlink_metadata(&name)?;
+      let kind = entry_kind(&metadata);
+      let entry_path = if path.is_empty() {
+        name.clone()
+      } else {
+        format!("{path}/{name}")
+      };
+      entries.push(FileManagerEntry {
+        managed: root.managed_file.as_deref()
+          == Some(entry_path.as_str()),
+        path: entry_path,
+        name,
+        kind,
+        size: metadata.len(),
+        modified_at: modified_at(&metadata),
+        revision: revision(&metadata),
+      });
+    }
+    entries.sort_by(|a, b| {
+      (
+        a.kind != FileManagerEntryKind::Directory,
+        a.name.to_lowercase(),
+      )
+        .cmp(&(
+          b.kind != FileManagerEntryKind::Directory,
+          b.name.to_lowercase(),
+        ))
     });
-  }
-  entries.sort_by(|a, b| {
-    (
-      a.kind != FileManagerEntryKind::Directory,
-      a.name.to_lowercase(),
-    )
-      .cmp(&(
-        b.kind != FileManagerEntryKind::Directory,
-        b.name.to_lowercase(),
-      ))
-  });
-  Ok(FileManagerDirectory {
-    path: path.to_string(),
-    entries,
+    Ok(FileManagerDirectory { path, entries })
   })
+  .await
 }
 
 pub async fn read_text(
@@ -599,37 +675,40 @@ pub async fn read_text(
   path: &str,
 ) -> anyhow::Result<FileManagerTextFile> {
   let root = resolve_root(target).await?;
-  let relative = relative_path(path, false)?;
-  let lock = root_lock(&root.key).await;
-  let _guard = lock.lock().await;
-  let root_dir = open_root(&root, false)?;
-  let (parent, name) = open_parent_nofollow(&root_dir, &relative)?;
-  let metadata = parent.symlink_metadata(&name)?;
-  if !metadata.is_file() {
-    return Err(anyhow!("Path is not a regular file"));
-  }
-  if metadata.len() > MAX_TEXT_BYTES {
-    return Err(anyhow!(
-      "File is too large for the editor; download it instead"
-    ));
-  }
-  let mut options = OpenOptions::new();
-  options.read(true).follow(FollowSymlinks::No);
-  let mut file = parent.open_with(&name, &options)?;
-  let mut bytes = Vec::with_capacity(metadata.len() as usize);
-  file.read_to_end(&mut bytes)?;
-  if bytes.contains(&0) {
-    return Err(anyhow!(
-      "Binary files cannot be opened in the editor"
-    ));
-  }
-  let contents = String::from_utf8(bytes)
-    .context("File is not valid UTF-8; download it instead")?;
-  Ok(FileManagerTextFile {
-    path: path.to_string(),
-    revision: content_revision(&metadata, contents.as_bytes()),
-    contents,
+  let root_key = root.key.clone();
+  let path = path.to_string();
+  run_root_blocking(&root_key, move || {
+    let relative = relative_path(&path, false)?;
+    let root_dir = open_root(&root, false)?;
+    let (parent, name) = open_parent_nofollow(&root_dir, &relative)?;
+    let metadata = parent.symlink_metadata(&name)?;
+    if !metadata.is_file() {
+      return Err(anyhow!("Path is not a regular file"));
+    }
+    if metadata.len() > MAX_TEXT_BYTES {
+      return Err(anyhow!(
+        "File is too large for the editor; download it instead"
+      ));
+    }
+    let mut options = OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    let mut file = parent.open_with(&name, &options)?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.read_to_end(&mut bytes)?;
+    if bytes.contains(&0) {
+      return Err(anyhow!(
+        "Binary files cannot be opened in the editor"
+      ));
+    }
+    let contents = String::from_utf8(bytes)
+      .context("File is not valid UTF-8; download it instead")?;
+    Ok(FileManagerTextFile {
+      path,
+      revision: content_revision(&metadata, contents.as_bytes()),
+      contents,
+    })
   })
+  .await
 }
 
 pub async fn preflight(
@@ -643,31 +722,36 @@ pub async fn preflight(
   }
   let operation = normalize_operation(operation);
   validate_operation(&root, &operation)?;
-  let lock = root_lock(&root.key).await;
-  let _guard = lock.lock().await;
-  let root_dir = match open_root(&root, false) {
-    Ok(root) => Some(root),
-    Err(_) if root.create_if_missing => None,
-    Err(error) => return Err(error),
-  };
-  let root_dir = root_dir.as_ref();
-  let copy_targets = resolve_copy_targets(root_dir, &operation)?;
-  let conflicts =
-    find_conflicts_planned(root_dir, &operation, &copy_targets)?;
-  let mut watched =
-    revision_paths_planned(&operation, &copy_targets)?;
-  watched.sort();
-  watched.dedup();
-  let revisions = watched
-    .into_iter()
-    .map(|path| {
-      let rev = root_dir
-        .map(|root| tree_revision(root, &path))
-        .transpose()?
-        .flatten();
-      anyhow::Ok((path, rev))
+  let root_key = root.key.clone();
+  let plan_root_key = root.key.clone();
+  let (operation, conflicts, revisions, copy_targets) =
+    run_root_blocking(&root_key, move || {
+      let root_dir = match open_root(&root, false) {
+        Ok(root) => Some(root),
+        Err(_) if root.create_if_missing => None,
+        Err(error) => return Err(error),
+      };
+      let root_dir = root_dir.as_ref();
+      let copy_targets = resolve_copy_targets(root_dir, &operation)?;
+      let conflicts =
+        find_conflicts_planned(root_dir, &operation, &copy_targets)?;
+      let mut watched =
+        revision_paths_planned(&operation, &copy_targets)?;
+      watched.sort();
+      watched.dedup();
+      let revisions = watched
+        .into_iter()
+        .map(|path| {
+          let rev = root_dir
+            .map(|root| metadata_tree_revision(root, &path))
+            .transpose()?
+            .flatten();
+          anyhow::Ok((path, rev))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+      Ok((operation, conflicts, revisions, copy_targets))
     })
-    .collect::<anyhow::Result<Vec<_>>>()?;
+    .await?;
   let plan_id = Uuid::new_v4().to_string();
   let expires_at = komodo_timestamp() + PLAN_TTL_MS;
   let confirmation_required =
@@ -678,7 +762,7 @@ pub async fn preflight(
     plan_id.clone(),
     OperationPlan {
       actor,
-      root_key: root.key,
+      root_key: plan_root_key,
       operation,
       expires_at,
       conflicts: conflicts.clone(),
@@ -732,106 +816,125 @@ pub async fn commit(
     operation_description(&plan.operation),
   )
   .await;
-  let result = async {
-  let lock = root_lock(&root.key).await;
-  let _guard = lock.lock().await;
-  progress.phase(
-    FileManagerOperationPhase::Preparing,
-    WorkTotal::default(),
-  );
-  let root_dir = open_root(&root, true)?;
-  for (path, expected) in &plan.revisions {
-    let actual = tree_revision(&root_dir, path)?;
-    if &actual != expected {
-      return Err(anyhow!(
-        "File Manager contents changed after preflight; retry the operation"
-      ));
+  let root_key = root.key.clone();
+  let actor = actor.to_string();
+  let operation_id = operation_id.to_string();
+  let decisions = decisions.to_vec();
+  let job_progress = progress.clone();
+  let lock = root_lock(&root_key).await;
+  let guard = lock.lock_owned().await;
+  let result = run_heavy_blocking(move || {
+    job_progress.phase(
+      FileManagerOperationPhase::Preparing,
+      WorkTotal::default(),
+    );
+    let root_dir = open_root(&root, true)?;
+    for (path, expected) in &plan.revisions {
+      let actual = metadata_tree_revision(&root_dir, path)?;
+      if &actual != expected {
+        return Err(anyhow!(
+          "File Manager contents changed after preflight; retry the operation"
+        ));
+      }
     }
-  }
-
-  let snapshot_total = work_for_paths(
-    &root_dir,
-    &watched_paths_planned(&plan.operation, &plan.copy_targets)?,
-  )?;
-  progress.phase(
-    FileManagerOperationPhase::Snapshotting,
-    snapshot_total,
-  );
-  let journal = create_journal(
-    &root,
-    actor,
-    operation_id,
-    &plan.operation,
-    &plan.copy_targets,
-    Some(&progress),
-  )?;
-  progress.phase(
-    FileManagerOperationPhase::Applying,
-    operation_work(
+    ensure_operation_capacity(
+      &root,
       &root_dir,
       &plan.operation,
       &plan.copy_targets,
-    )?,
-  );
-  let apply_result = apply_operation_planned(
-    &root_dir,
-    &plan.operation,
-    &plan.copy_targets,
-    decisions,
-    Some(&progress),
-  );
-  match apply_result {
-    Ok(()) => {
-      progress.phase(
-        FileManagerOperationPhase::Finalizing,
-        work_for_paths(
-          &root_dir,
-          &watched_paths_planned(
-            &plan.operation,
-            &plan.copy_targets,
-          )?,
-        )?,
-      );
-      let journal = match finish_journal(
+    )?;
+
+    let snapshot_total = work_for_paths(
+      &root_dir,
+      &watched_paths_planned(&plan.operation, &plan.copy_targets)?,
+    )?;
+    job_progress.phase(
+      FileManagerOperationPhase::Snapshotting,
+      snapshot_total,
+    );
+    let journal = create_journal(
+      &root,
+      &actor,
+      &operation_id,
+      &plan.operation,
+      &plan.copy_targets,
+      Some(&job_progress),
+    )?;
+    job_progress.phase(
+      FileManagerOperationPhase::Applying,
+      operation_work(
         &root_dir,
-        journal.clone(),
-        Some(&progress),
-      ) {
-        Ok(journal) => journal,
-        Err(error) => {
-          progress.phase(
-            FileManagerOperationPhase::RollingBack,
-            WorkTotal::default(),
-          );
-          let _ = restore_journal(&root_dir, &journal, None);
-          let _ =
-            fs::remove_dir_all(journal_root().join(&journal.id));
-          return Err(error);
-        }
-      };
-      push_journal(journal).await?;
-      Ok(
-        periphery_client::api::file_manager::FileManagerCommitResponse {
-          operation_id: operation_id.to_string(),
-          affected_paths: affected_paths_planned(
-            &plan.operation,
-            &plan.copy_targets,
-          ),
-        },
-      )
+        &plan.operation,
+        &plan.copy_targets,
+      )?,
+    );
+    let apply_result = apply_operation_planned(
+      &root_dir,
+      &plan.operation,
+      &plan.copy_targets,
+      &decisions,
+      Some(&job_progress),
+    );
+    match apply_result {
+      Ok(()) => {
+        job_progress.phase(
+          FileManagerOperationPhase::Finalizing,
+          work_for_paths(
+            &root_dir,
+            &watched_paths_planned(
+              &plan.operation,
+              &plan.copy_targets,
+            )?,
+          )?,
+        );
+        let journal = match finish_journal(
+          &root_dir,
+          journal.clone(),
+          Some(&job_progress),
+        ) {
+          Ok(journal) => journal,
+          Err(error) => {
+            job_progress.phase(
+              FileManagerOperationPhase::RollingBack,
+              WorkTotal::default(),
+            );
+            let _ = restore_journal(&root_dir, &journal, None);
+            let _ =
+              fs::remove_dir_all(journal_root().join(&journal.id));
+            return Err(error);
+          }
+        };
+        Ok((
+          periphery_client::api::file_manager::FileManagerCommitResponse {
+            operation_id,
+            affected_paths: affected_paths_planned(
+              &plan.operation,
+              &plan.copy_targets,
+            ),
+          },
+          journal,
+          guard,
+        ))
+      }
+      Err(error) => {
+        job_progress.phase(
+          FileManagerOperationPhase::RollingBack,
+          snapshot_total,
+        );
+        let _ =
+          restore_journal(&root_dir, &journal, Some(&job_progress));
+        let _ = fs::remove_dir_all(journal_root().join(&journal.id));
+        Err(error)
+      }
     }
-    Err(error) => {
-      progress.phase(
-        FileManagerOperationPhase::RollingBack,
-        snapshot_total,
-      );
-      let _ = restore_journal(&root_dir, &journal, Some(&progress));
-      let _ = fs::remove_dir_all(journal_root().join(&journal.id));
-      Err(error)
-    }
-  }
-  }
+  })
   .await;
+  let result = match result {
+    Ok((response, journal, _guard)) => {
+      push_journal(journal).await.map(|_| response)
+    }
+    Err(error) => Err(error),
+  };
   match &result {
     Ok(_) => progress.complete(),
     Err(error) => progress.fail(error),
@@ -863,22 +966,27 @@ pub async fn journal_status(
 ) -> anyhow::Result<FileManagerJournalStatus> {
   let root = resolve_root(target).await?;
   let key = history_key(&root.key, actor);
-  let mut histories = histories().lock().await;
-  let history = histories.entry(key).or_default();
-  prune_history(history);
-  Ok(FileManagerJournalStatus {
-    can_undo: !history.undo.is_empty(),
-    can_redo: !history.redo.is_empty(),
-    undo_description: history
-      .undo
-      .last()
-      .map(|r| r.description.clone()),
-    redo_description: history
-      .redo
-      .last()
-      .map(|record| record.description.clone()),
-    expires_at: history.undo.last().map(|r| r.expires_at),
-  })
+  let (status, expired) = {
+    let mut histories = histories().lock().await;
+    let history = histories.entry(key).or_default();
+    let expired = prune_history(history);
+    let status = FileManagerJournalStatus {
+      can_undo: !history.undo.is_empty(),
+      can_redo: !history.redo.is_empty(),
+      undo_description: history
+        .undo
+        .last()
+        .map(|r| r.description.clone()),
+      redo_description: history
+        .redo
+        .last()
+        .map(|record| record.description.clone()),
+      expires_at: history.undo.last().map(|r| r.expires_at),
+    };
+    (status, expired)
+  };
+  schedule_journal_cleanup(expired);
+  Ok(status)
 }
 
 pub async fn undo(
@@ -904,12 +1012,16 @@ pub async fn undo(
   )
   .await;
   let key = history_key(&root.key, actor);
-  let record = {
+  let (record, expired) = {
     let mut histories = histories().lock().await;
     let history = histories.entry(key.clone()).or_default();
-    prune_history(history);
-    history.undo.pop().context("Nothing is available to undo")
+    let expired = prune_history(history);
+    (
+      history.undo.pop().context("Nothing is available to undo"),
+      expired,
+    )
   };
+  schedule_journal_cleanup(expired);
   let mut record = match record {
     Ok(record) => record,
     Err(error) => {
@@ -917,25 +1029,49 @@ pub async fn undo(
       return Err(error);
     }
   };
-  let lock = root_lock(&root.key).await;
-  let _guard = lock.lock().await;
-  progress.phase(
-    FileManagerOperationPhase::Applying,
-    host_work(&journal_root().join(&record.id).join("before"))
-      .unwrap_or_default(),
-  );
-  let result = (|| {
-    let root_dir = open_root(&root, true)?;
-    verify_revisions(
-      &root_dir,
-      &record.after_revisions,
-      "Undo is unsafe because files changed after the operation",
-    )?;
-    restore_journal(&root_dir, &record, Some(&progress))?;
-    record.before_revisions =
-      capture_snapshot_revisions(&root_dir, &record.snapshots)?;
-    Ok(())
-  })();
+  let root_key = root.key.clone();
+  let fallback_record = record.clone();
+  let job_progress = progress.clone();
+  let lock = root_lock(&root_key).await;
+  let guard = lock.lock_owned().await;
+  let outcome = run_heavy_blocking(move || {
+    let total =
+      host_work(&journal_root().join(&record.id).join("before"))
+        .unwrap_or_default();
+    job_progress.phase(FileManagerOperationPhase::Applying, total);
+    let result = (|| {
+      ensure_free_space(
+        &root.path,
+        total.bytes.saturating_add(MINIMUM_FREE_BYTES),
+      )?;
+      let root_dir = open_root(&root, true)?;
+      verify_revisions(
+        &root_dir,
+        &record.after_revisions,
+        "Undo is unsafe because files changed after the operation",
+      )?;
+      restore_journal(&root_dir, &record, Some(&job_progress))?;
+      record.before_revisions =
+        capture_snapshot_revisions(&root_dir, &record.snapshots)?;
+      Ok(())
+    })();
+    Ok((record, result, guard))
+  })
+  .await;
+  let (record, result, _guard) = match outcome {
+    Ok(outcome) => outcome,
+    Err(error) => {
+      histories()
+        .lock()
+        .await
+        .entry(key)
+        .or_default()
+        .undo
+        .push(fallback_record);
+      progress.fail(&error);
+      return Err(error);
+    }
+  };
   if let Err(error) = result {
     histories()
       .lock()
@@ -990,14 +1126,16 @@ pub async fn redo(
   )
   .await;
   let key = history_key(&root.key, actor);
-  let record = histories()
-    .lock()
-    .await
-    .entry(key.clone())
-    .or_default()
-    .redo
-    .pop()
-    .context("Nothing is available to redo");
+  let (record, expired) = {
+    let mut histories = histories().lock().await;
+    let history = histories.entry(key.clone()).or_default();
+    let expired = prune_history(history);
+    (
+      history.redo.pop().context("Nothing is available to redo"),
+      expired,
+    )
+  };
+  schedule_journal_cleanup(expired);
   let mut record = match record {
     Ok(record) => record,
     Err(error) => {
@@ -1005,25 +1143,49 @@ pub async fn redo(
       return Err(error);
     }
   };
-  let lock = root_lock(&root.key).await;
-  let _guard = lock.lock().await;
-  progress.phase(
-    FileManagerOperationPhase::Applying,
-    host_work(&journal_root().join(&record.id).join("after"))
-      .unwrap_or_default(),
-  );
-  let result = (|| {
-    let root_dir = open_root(&root, true)?;
-    verify_revisions(
-      &root_dir,
-      &record.before_revisions,
-      "Redo is unsafe because files changed after undo",
-    )?;
-    restore_after_journal(&root_dir, &record, Some(&progress))?;
-    record.after_revisions =
-      capture_snapshot_revisions(&root_dir, &record.snapshots)?;
-    Ok(())
-  })();
+  let root_key = root.key.clone();
+  let fallback_record = record.clone();
+  let job_progress = progress.clone();
+  let lock = root_lock(&root_key).await;
+  let guard = lock.lock_owned().await;
+  let outcome = run_heavy_blocking(move || {
+    let total =
+      host_work(&journal_root().join(&record.id).join("after"))
+        .unwrap_or_default();
+    job_progress.phase(FileManagerOperationPhase::Applying, total);
+    let result = (|| {
+      ensure_free_space(
+        &root.path,
+        total.bytes.saturating_add(MINIMUM_FREE_BYTES),
+      )?;
+      let root_dir = open_root(&root, true)?;
+      verify_revisions(
+        &root_dir,
+        &record.before_revisions,
+        "Redo is unsafe because files changed after undo",
+      )?;
+      restore_after_journal(&root_dir, &record, Some(&job_progress))?;
+      record.after_revisions =
+        capture_snapshot_revisions(&root_dir, &record.snapshots)?;
+      Ok(())
+    })();
+    Ok((record, result, guard))
+  })
+  .await;
+  let (record, result, _guard) = match outcome {
+    Ok(outcome) => outcome,
+    Err(error) => {
+      histories()
+        .lock()
+        .await
+        .entry(key)
+        .or_default()
+        .redo
+        .push(fallback_record);
+      progress.fail(&error);
+      return Err(error);
+    }
+  };
   if let Err(error) = result {
     histories()
       .lock()
@@ -1111,13 +1273,6 @@ pub async fn start_upload(
   let progress =
     register_status(operation_id, &actor, &root.key, "Upload file")
       .await;
-  progress.phase(
-    FileManagerOperationPhase::Transferring,
-    WorkTotal {
-      entries: 1,
-      bytes: total_bytes,
-    },
-  );
   let channel = Uuid::new_v4();
   let (sender, mut receiver) = tokio::sync::mpsc::channel(32);
   file_transfer_channels().insert(channel, sender).await;
@@ -1134,33 +1289,66 @@ pub async fn start_upload(
         return Err(anyhow!("Upload did not begin correctly"));
       }
       let lock = root_lock(&root.key).await;
-      let _guard = lock.lock().await;
-      let root_dir = open_root(&root, true)?;
-      let (parent, name) =
-        open_parent_nofollow(&root_dir, &relative)?;
-      let initial_revision = tree_revision(&root_dir, &path)?;
-      if overwrite && initial_revision != expected_revision {
-        return Err(anyhow!(
-          "Upload destination changed after overwrite confirmation"
-        ));
-      }
-      if !overwrite && initial_revision.is_some() {
-        return Err(anyhow!("Upload destination already exists"));
-      }
-      let temporary =
-        format!(".komodo-upload-{}.tmp", Uuid::new_v4());
-      let mut options = OpenOptions::new();
-      options
-        .write(true)
-        .create_new(true)
-        .follow(FollowSymlinks::No);
-      let file = parent.open_with(&temporary, &options)?;
-      let mut temporary_upload = TemporaryUpload {
-        parent: &parent,
-        name: temporary.clone(),
-        file: Some(file),
-        committed: false,
-      };
+      let guard = lock.lock_owned().await;
+      let prepare_root = root.clone();
+      let prepare_relative = relative.clone();
+      let prepare_path = path.clone();
+      let prepare_expected_revision = expected_revision.clone();
+      let (guard, mut upload) = run_heavy_blocking(move || {
+        let root_dir = open_root(&prepare_root, true)?;
+        let (parent, destination_name) =
+          open_parent_nofollow(&root_dir, &prepare_relative)?;
+        let initial_revision =
+          metadata_tree_revision(&root_dir, &prepare_path)?;
+        if overwrite && initial_revision != prepare_expected_revision
+        {
+          return Err(anyhow!(
+            "Upload destination changed after overwrite confirmation"
+          ));
+        }
+        if !overwrite && initial_revision.is_some() {
+          return Err(anyhow!("Upload destination already exists"));
+        }
+        let before_bytes = work_for_paths(
+          &root_dir,
+          std::slice::from_ref(&prepare_path),
+        )?
+        .bytes;
+        ensure_capacity_requirements(
+          &prepare_root,
+          SpaceRequirements {
+            journal_bytes: before_bytes.saturating_add(total_bytes),
+            target_bytes: total_bytes,
+          },
+        )?;
+        let temporary_name =
+          format!(".komodo-upload-{}.tmp", Uuid::new_v4());
+        let mut options = OpenOptions::new();
+        options
+          .write(true)
+          .create_new(true)
+          .follow(FollowSymlinks::No);
+        let file = parent.open_with(&temporary_name, &options)?;
+        Ok((
+          guard,
+          StreamingUpload {
+            parent,
+            destination_name,
+            temporary_name,
+            file: Some(tokio::fs::File::from_std(file.into_std())),
+            initial_revision,
+            committed: false,
+          },
+        ))
+      })
+      .await?;
+      progress.phase(
+        FileManagerOperationPhase::Transferring,
+        WorkTotal {
+          entries: 1,
+          bytes: total_bytes,
+        },
+      );
       let mut received = 0_u64;
       let mut hasher = Sha256::new();
       loop {
@@ -1182,11 +1370,13 @@ pub async fn start_upload(
               ));
             }
             hasher.update(&bytes);
-            temporary_upload
+            use tokio::io::AsyncWriteExt as _;
+            upload
               .file
               .as_mut()
               .context("Upload staging file is unavailable")?
-              .write_all(&bytes)?;
+              .write_all(&bytes)
+              .await?;
             progress.add_bytes(bytes.len() as u64);
           }
           FileTransferMessage::Complete { bytes, sha256 } => {
@@ -1199,21 +1389,14 @@ pub async fn start_upload(
                 "Upload byte count or checksum verification failed"
               ));
             }
-            temporary_upload
+            use tokio::io::AsyncWriteExt as _;
+            let mut file = upload
               .file
               .take()
-              .context("Upload staging file is unavailable")?
-              .sync_all()?;
-            let operation =
-              FileManagerOperation::CreateFile { path: path.clone() };
-            let journal = create_journal(
-              &root,
-              &actor,
-              &Uuid::new_v4().to_string(),
-              &operation,
-              &[],
-              None,
-            )?;
+              .context("Upload staging file is unavailable")?;
+            file.flush().await?;
+            file.sync_all().await?;
+            drop(file);
             progress.phase(
               FileManagerOperationPhase::Finalizing,
               WorkTotal {
@@ -1221,27 +1404,61 @@ pub async fn start_upload(
                 bytes: 0,
               },
             );
-            let commit = (|| {
-              if tree_revision(&root_dir, &path)? != initial_revision
-              {
-                return Err(anyhow!(
-                  "Upload destination changed while streaming"
-                ));
-              }
-              if parent.symlink_metadata(&name).is_ok() {
-                if !overwrite {
+            let finalize_root = root.clone();
+            let finalize_actor = actor.clone();
+            let finalize_path = path.clone();
+            let (message, journal, _guard) =
+              run_heavy_blocking(move || {
+                let root_dir = open_root(&finalize_root, true)?;
+                if metadata_tree_revision(&root_dir, &finalize_path)?
+                  != upload.initial_revision
+                {
                   return Err(anyhow!(
                     "Upload destination changed while streaming"
                   ));
                 }
-                remove_entry(&parent, &name)?;
-              }
-              parent.rename(&temporary, &parent, &name)?;
-              anyhow::Ok(())
-            })();
-            match commit {
-              Ok(()) => {
-                temporary_upload.committed = true;
+                let operation = FileManagerOperation::CreateFile {
+                  path: finalize_path.clone(),
+                };
+                let journal = create_journal(
+                  &finalize_root,
+                  &finalize_actor,
+                  &Uuid::new_v4().to_string(),
+                  &operation,
+                  &[],
+                  None,
+                )?;
+                let commit = (|| {
+                  if upload
+                    .parent
+                    .symlink_metadata(&upload.destination_name)
+                    .is_ok()
+                  {
+                    if !overwrite {
+                      return Err(anyhow!(
+                        "Upload destination changed while streaming"
+                      ));
+                    }
+                    remove_entry(
+                      &upload.parent,
+                      &upload.destination_name,
+                    )?;
+                  }
+                  upload.parent.rename(
+                    &upload.temporary_name,
+                    &upload.parent,
+                    &upload.destination_name,
+                  )?;
+                  upload.committed = true;
+                  anyhow::Ok(())
+                })();
+                if let Err(error) = commit {
+                  let _ = restore_journal(&root_dir, &journal, None);
+                  let _ = fs::remove_dir_all(
+                    journal_root().join(&journal.id),
+                  );
+                  return Err(error);
+                }
                 let journal = match finish_journal(
                   &root_dir,
                   journal.clone(),
@@ -1257,18 +1474,19 @@ pub async fn start_upload(
                     return Err(error);
                   }
                 };
-                push_journal(journal).await?;
-                progress.add_entry();
-                return Ok(FileTransferMessage::Complete {
-                  bytes: received,
-                  sha256: actual,
-                });
-              }
-              Err(error) => {
-                let _ = restore_journal(&root_dir, &journal, None);
-                return Err(error);
-              }
-            }
+                Ok((
+                  FileTransferMessage::Complete {
+                    bytes: received,
+                    sha256: actual,
+                  },
+                  journal,
+                  guard,
+                ))
+              })
+              .await?;
+            push_journal(journal).await?;
+            progress.add_entry();
+            return Ok(message);
           }
           FileTransferMessage::Cancel => {
             return Err(anyhow!("Upload was cancelled"));
@@ -1331,69 +1549,83 @@ pub async fn start_download(
     "Download files",
   )
   .await;
-  let lock = root_lock(&root.key).await;
-  let _guard = lock.lock().await;
-  let root_dir = open_root(&root, false)?;
-  progress.phase(
-    FileManagerOperationPhase::Preparing,
-    work_for_paths(&root_dir, &paths)?,
-  );
-  let staging = journal_root()
-    .join("transfers")
-    .join(Uuid::new_v4().to_string());
-  fs::create_dir_all(&staging)?;
-  let prepared = (|| {
-    let (file_name, staged) = if paths.len() == 1 {
-      let relative = relative_path(&paths[0], false)?;
-      let (parent, name) =
-        open_parent_nofollow(&root_dir, &relative)?;
-      let metadata = parent.symlink_metadata(&name)?;
-      if metadata.is_file() && !metadata.file_type().is_symlink() {
-        let download_name = name
-          .to_str()
-          .context("Download filename is not UTF-8")?
-          .to_string();
-        let staged = staging.join("download");
-        copy_capability_to_host(
-          &parent,
-          &name,
-          &staged,
-          Some(&progress),
-        )?;
-        (download_name, staged)
+  let root_key = root.key.clone();
+  let job_progress = progress.clone();
+  let prepared = run_root_blocking(&root_key, move || {
+    let root_dir = open_root(&root, false)?;
+    let total = work_for_paths(&root_dir, &paths)?;
+    job_progress.phase(FileManagerOperationPhase::Preparing, total);
+    let staging = journal_root()
+      .join("transfers")
+      .join(Uuid::new_v4().to_string());
+    fs::create_dir_all(&staging)?;
+    let result = (|| {
+      ensure_free_space(
+        &staging,
+        total.bytes.saturating_add(MINIMUM_FREE_BYTES),
+      )?;
+      let (file_name, staged) = if paths.len() == 1 {
+        let relative = relative_path(&paths[0], false)?;
+        let (parent, name) =
+          open_parent_nofollow(&root_dir, &relative)?;
+        let metadata = parent.symlink_metadata(&name)?;
+        if metadata.is_file() && !metadata.file_type().is_symlink() {
+          let download_name = name
+            .to_str()
+            .context("Download filename is not UTF-8")?
+            .to_string();
+          let staged = staging.join("download");
+          copy_capability_to_host(
+            &parent,
+            &name,
+            &staged,
+            Some(&job_progress),
+          )?;
+          (download_name, staged)
+        } else {
+          let staged = staging.join("download.zip");
+          archive::create_download_zip(
+            &root_dir,
+            &paths,
+            &staged,
+            Some(&job_progress),
+          )?;
+          (format!("{}.zip", name.to_string_lossy()), staged)
+        }
       } else {
         let staged = staging.join("download.zip");
         archive::create_download_zip(
           &root_dir,
           &paths,
           &staged,
-          Some(&progress),
+          Some(&job_progress),
         )?;
-        (format!("{}.zip", name.to_string_lossy()), staged)
-      }
-    } else {
-      let staged = staging.join("download.zip");
-      archive::create_download_zip(
-        &root_dir,
-        &paths,
-        &staged,
-        Some(&progress),
-      )?;
-      ("komodo-download.zip".to_string(), staged)
-    };
-    let total_bytes = fs::metadata(&staged)?.len();
-    let sha256 = hash_host_file(&staged)?;
-    anyhow::Ok((file_name, staged, total_bytes, sha256))
-  })();
-  let (file_name, staged, total_bytes, sha256) = match prepared {
-    Ok(prepared) => prepared,
-    Err(error) => {
-      progress.fail(&error);
+        ("komodo-download.zip".to_string(), staged)
+      };
+      let total_bytes = fs::metadata(&staged)?.len();
+      let sha256 = hash_host_file(&staged)?;
+      anyhow::Ok((
+        file_name,
+        staged,
+        staging.clone(),
+        total_bytes,
+        sha256,
+      ))
+    })();
+    if result.is_err() {
       let _ = fs::remove_dir_all(&staging);
-      return Err(error);
     }
-  };
-  drop(_guard);
+    result
+  })
+  .await;
+  let (file_name, staged, staging, total_bytes, sha256) =
+    match prepared {
+      Ok(prepared) => prepared,
+      Err(error) => {
+        progress.fail(&error);
+        return Err(error);
+      }
+    };
   progress.phase(
     FileManagerOperationPhase::Transferring,
     WorkTotal {
@@ -1490,7 +1722,11 @@ pub async fn start_download(
         .await;
     }
     file_transfer_channels().remove(&channel).await;
-    let _ = fs::remove_dir_all(staging);
+    let _ = run_heavy_blocking(move || {
+      let _ = fs::remove_dir_all(staging);
+      Ok(())
+    })
+    .await;
   });
   Ok(StartFileManagerDownloadResponse {
     channel,
@@ -2501,6 +2737,101 @@ fn operation_work(
   }
 }
 
+fn operation_space_requirements(
+  root: &Dir,
+  operation: &FileManagerOperation,
+  copy_targets: &[CopyTarget],
+) -> anyhow::Result<SpaceRequirements> {
+  let watched = watched_paths_planned(operation, copy_targets)?;
+  let before = work_for_paths(root, &watched)?.bytes;
+  let operation_bytes =
+    operation_work(root, operation, copy_targets)?.bytes;
+
+  let (after, staging, target) = match operation {
+    FileManagerOperation::Delete { .. } => (0, 0, 0),
+    FileManagerOperation::Rename { .. }
+    | FileManagerOperation::Move { .. } => (before, 0, 0),
+    FileManagerOperation::Copy { .. } => {
+      (before.saturating_add(operation_bytes), 0, operation_bytes)
+    }
+    FileManagerOperation::CreateArchive { .. } => {
+      let output = operation_bytes
+        .saturating_add(operation_bytes / 10)
+        .saturating_add(1024 * 1024);
+      (output, 0, output)
+    }
+    FileManagerOperation::ExtractArchive { path, .. } => {
+      let archive_bytes =
+        work_for_paths(root, std::slice::from_ref(path))?.bytes;
+      let expanded = archive_bytes
+        .saturating_mul(MAX_ARCHIVE_EXPANSION_RATIO)
+        .min(MAX_ARCHIVE_EXPANDED_BYTES);
+      (expanded, archive_bytes.saturating_add(expanded), expanded)
+    }
+    FileManagerOperation::WriteText { contents, .. } => {
+      let bytes = contents.len() as u64;
+      (bytes, 0, bytes)
+    }
+    FileManagerOperation::CreateFile { .. }
+    | FileManagerOperation::CreateDirectory { .. } => (0, 0, 0),
+  };
+
+  Ok(SpaceRequirements {
+    journal_bytes: before.saturating_add(after.max(staging)),
+    target_bytes: target,
+  })
+}
+
+fn capacity_thresholds(
+  requirements: SpaceRequirements,
+  shared_filesystem: bool,
+) -> (u64, Option<u64>) {
+  if shared_filesystem {
+    (
+      requirements
+        .journal_bytes
+        .saturating_add(requirements.target_bytes)
+        .saturating_add(MINIMUM_FREE_BYTES),
+      None,
+    )
+  } else {
+    (
+      requirements
+        .journal_bytes
+        .saturating_add(MINIMUM_FREE_BYTES),
+      (requirements.target_bytes > 0).then(|| {
+        requirements.target_bytes.saturating_add(MINIMUM_FREE_BYTES)
+      }),
+    )
+  }
+}
+
+fn ensure_operation_capacity(
+  root: &ResolvedRoot,
+  root_dir: &Dir,
+  operation: &FileManagerOperation,
+  copy_targets: &[CopyTarget],
+) -> anyhow::Result<()> {
+  let requirements =
+    operation_space_requirements(root_dir, operation, copy_targets)?;
+  ensure_capacity_requirements(root, requirements)
+}
+
+fn ensure_capacity_requirements(
+  root: &ResolvedRoot,
+  requirements: SpaceRequirements,
+) -> anyhow::Result<()> {
+  let journal = journal_root();
+  let shared_filesystem = same_filesystem(&journal, &root.path)?;
+  let (journal_required, target_required) =
+    capacity_thresholds(requirements, shared_filesystem);
+  ensure_free_space(&journal, journal_required)?;
+  if let Some(target_required) = target_required {
+    ensure_free_space(&root.path, target_required)?;
+  }
+  Ok(())
+}
+
 fn work_for_paths(
   root: &Dir,
   paths: &[String],
@@ -2700,13 +3031,19 @@ fn finish_journal(
 
 async fn push_journal(record: JournalRecord) -> anyhow::Result<()> {
   let key = history_key(&record.root_key, &record.actor);
-  let mut histories = histories().lock().await;
-  let history = histories.entry(key).or_default();
-  for redo in history.redo.drain(..) {
-    let _ = fs::remove_dir_all(journal_root().join(redo.id));
-  }
-  history.undo.push(record);
-  prune_history(history);
+  let expired = {
+    let mut histories = histories().lock().await;
+    let history = histories.entry(key).or_default();
+    let mut expired = history
+      .redo
+      .drain(..)
+      .map(|record| record.id)
+      .collect::<Vec<_>>();
+    history.undo.push(record);
+    expired.extend(prune_history(history));
+    expired
+  };
+  schedule_journal_cleanup(expired);
   Ok(())
 }
 
@@ -2942,21 +3279,41 @@ fn history_key(root: &str, actor: &str) -> String {
   format!("{root}:{actor}")
 }
 
-fn prune_history(history: &mut JournalHistory) {
+fn prune_history(history: &mut JournalHistory) -> Vec<String> {
   let now = komodo_timestamp();
+  let mut expired = Vec::new();
   history.undo.retain(|record| {
     let keep = record.expires_at > now;
     if !keep {
-      let _ = fs::remove_dir_all(journal_root().join(&record.id));
+      expired.push(record.id.clone());
     }
     keep
   });
   history.redo.retain(|record| {
     let keep = record.expires_at > now;
     if !keep {
-      let _ = fs::remove_dir_all(journal_root().join(&record.id));
+      expired.push(record.id.clone());
     }
     keep
+  });
+  expired
+}
+
+fn schedule_journal_cleanup(ids: Vec<String>) {
+  if ids.is_empty() {
+    return;
+  }
+  tokio::spawn(async move {
+    let result = run_heavy_blocking(move || {
+      for id in ids {
+        let _ = fs::remove_dir_all(journal_root().join(id));
+      }
+      Ok(())
+    })
+    .await;
+    if let Err(error) = result {
+      warn!("Failed to clean up File Manager journals: {error:#}");
+    }
   });
 }
 
@@ -3016,6 +3373,68 @@ fn tree_revision(
   Ok(Some(FileManagerRevision {
     id: hex::encode(hasher.finalize()),
   }))
+}
+
+fn metadata_tree_revision(
+  root: &Dir,
+  path: &str,
+) -> anyhow::Result<Option<FileManagerRevision>> {
+  let relative = relative_path(path, false)?;
+  let (parent, name) = open_parent_nofollow(root, &relative)?;
+  let metadata = match parent.symlink_metadata(&name) {
+    Ok(metadata) => metadata,
+    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+      return Ok(None);
+    }
+    Err(error) => return Err(error.into()),
+  };
+  let mut entries = 0;
+  metadata_tree_entry(&parent, &name, &metadata, &mut entries, 0)
+    .map(Some)
+}
+
+fn metadata_tree_entry(
+  parent: &Dir,
+  name: &std::ffi::OsStr,
+  metadata: &Metadata,
+  entries: &mut u64,
+  depth: usize,
+) -> anyhow::Result<FileManagerRevision> {
+  *entries = entries.saturating_add(1);
+  if *entries > MAX_ENTRIES || depth > path::MAX_DEPTH {
+    return Err(anyhow!("Entry exceeds File Manager tree limits"));
+  }
+  if !metadata.is_dir() || metadata.file_type().is_symlink() {
+    return Ok(revision(metadata));
+  }
+
+  let directory = parent.open_dir_nofollow(name)?;
+  let mut children = directory
+    .entries()?
+    .map(|entry| entry.map(|entry| entry.file_name()))
+    .collect::<std::io::Result<Vec<_>>>()?;
+  children.sort();
+
+  let mut hasher = Sha256::new();
+  hasher.update(revision(metadata).id.as_bytes());
+  for child in children {
+    let metadata = directory.symlink_metadata(&child)?;
+    hasher.update(child.as_encoded_bytes());
+    hasher.update(
+      metadata_tree_entry(
+        &directory,
+        &child,
+        &metadata,
+        entries,
+        depth + 1,
+      )?
+      .id
+      .as_bytes(),
+    );
+  }
+  Ok(FileManagerRevision {
+    id: hex::encode(hasher.finalize()),
+  })
 }
 
 fn hash_tree_entry(
@@ -3092,7 +3511,18 @@ fn revision(metadata: &Metadata) -> FileManagerRevision {
   hash.update(metadata.dev().to_le_bytes());
   hash.update(metadata.ino().to_le_bytes());
   hash.update(metadata.len().to_le_bytes());
-  hash.update(modified_at(metadata).to_le_bytes());
+  match metadata
+    .modified()
+    .ok()
+    .and_then(|time| time.into_std().duration_since(UNIX_EPOCH).ok())
+  {
+    Some(modified) => {
+      hash.update([1]);
+      hash.update(modified.as_secs().to_le_bytes());
+      hash.update(modified.subsec_nanos().to_le_bytes());
+    }
+    None => hash.update([0]),
+  }
   hash.update([entry_kind(metadata) as u8]);
   FileManagerRevision {
     id: hex::encode(hash.finalize()),
@@ -3109,6 +3539,58 @@ fn content_revision(
   FileManagerRevision {
     id: hex::encode(hash.finalize()),
   }
+}
+
+fn same_filesystem(
+  left: &Path,
+  right: &Path,
+) -> anyhow::Result<bool> {
+  Ok(
+    cap_fs_ext::MetadataExt::dev(&fs::metadata(left)?)
+      == cap_fs_ext::MetadataExt::dev(&fs::metadata(right)?),
+  )
+}
+
+#[cfg(unix)]
+pub(super) fn ensure_free_space(
+  path: &Path,
+  required: u64,
+) -> anyhow::Result<()> {
+  use std::{
+    ffi::CString, mem::MaybeUninit, os::unix::ffi::OsStrExt as _,
+  };
+  let path = CString::new(path.as_os_str().as_bytes())?;
+  let mut stats = MaybeUninit::<libc::statvfs>::uninit();
+  // SAFETY: `path` is NUL terminated and `stats` points to writable memory.
+  let result =
+    unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) };
+  if result != 0 {
+    return Err(std::io::Error::last_os_error().into());
+  }
+  // SAFETY: statvfs initialized the structure after returning success.
+  let stats = unsafe { stats.assume_init() };
+  let available = stats.f_bavail.saturating_mul(stats.f_frsize);
+  validate_free_space(available, required)
+}
+
+fn validate_free_space(
+  available: u64,
+  required: u64,
+) -> anyhow::Result<()> {
+  if available < required {
+    return Err(anyhow!(
+      "Insufficient free space for File Manager operation (required {required} bytes, available {available} bytes)"
+    ));
+  }
+  Ok(())
+}
+
+#[cfg(not(unix))]
+pub(super) fn ensure_free_space(
+  _path: &Path,
+  _required: u64,
+) -> anyhow::Result<()> {
+  Ok(())
 }
 
 fn path_string(path: &Path) -> anyhow::Result<String> {
@@ -3292,6 +3774,111 @@ mod tests {
     let after = tree_revision(&root, "nested").unwrap();
 
     assert_ne!(before, after);
+    fs::remove_dir_all(directory).unwrap();
+  }
+
+  #[test]
+  fn metadata_file_revision_is_content_independent() {
+    let directory =
+      std::env::temp_dir().join(Uuid::new_v4().to_string());
+    fs::create_dir(&directory).unwrap();
+    fs::write(directory.join("config.txt"), "contents").unwrap();
+    let root =
+      Dir::open_ambient_dir(&directory, ambient_authority()).unwrap();
+    let metadata = root.symlink_metadata("config.txt").unwrap();
+
+    assert_eq!(
+      metadata_tree_revision(&root, "config.txt").unwrap(),
+      Some(revision(&metadata))
+    );
+    fs::remove_dir_all(directory).unwrap();
+  }
+
+  #[test]
+  fn metadata_tree_revision_detects_nested_metadata_changes() {
+    let directory =
+      std::env::temp_dir().join(Uuid::new_v4().to_string());
+    fs::create_dir_all(directory.join("nested/child")).unwrap();
+    let child = directory.join("nested/child/file.txt");
+    fs::write(&child, "one").unwrap();
+    let root =
+      Dir::open_ambient_dir(&directory, ambient_authority()).unwrap();
+    let before = metadata_tree_revision(&root, "nested").unwrap();
+
+    fs::write(&child, "longer contents").unwrap();
+    let changed_file =
+      metadata_tree_revision(&root, "nested").unwrap();
+    fs::write(directory.join("nested/added.txt"), "added").unwrap();
+    let changed_structure =
+      metadata_tree_revision(&root, "nested").unwrap();
+
+    assert_ne!(before, changed_file);
+    assert_ne!(changed_file, changed_structure);
+    fs::remove_dir_all(directory).unwrap();
+  }
+
+  #[test]
+  fn capacity_thresholds_cover_shared_and_separate_filesystems() {
+    let requirements = SpaceRequirements {
+      journal_bytes: 10,
+      target_bytes: 20,
+    };
+
+    assert_eq!(
+      capacity_thresholds(requirements, true),
+      (MINIMUM_FREE_BYTES + 30, None)
+    );
+    assert_eq!(
+      capacity_thresholds(requirements, false),
+      (MINIMUM_FREE_BYTES + 10, Some(MINIMUM_FREE_BYTES + 20))
+    );
+  }
+
+  #[test]
+  fn capacity_calculations_saturate_and_preserve_the_reserve() {
+    let requirements = SpaceRequirements {
+      journal_bytes: u64::MAX - 1,
+      target_bytes: u64::MAX - 1,
+    };
+
+    assert_eq!(
+      capacity_thresholds(requirements, true),
+      (u64::MAX, None)
+    );
+    assert_eq!(
+      capacity_thresholds(requirements, false),
+      (u64::MAX, Some(u64::MAX))
+    );
+    assert!(
+      validate_free_space(MINIMUM_FREE_BYTES, MINIMUM_FREE_BYTES)
+        .is_ok()
+    );
+    assert!(
+      validate_free_space(MINIMUM_FREE_BYTES - 1, MINIMUM_FREE_BYTES)
+        .is_err()
+    );
+  }
+
+  #[test]
+  fn extraction_capacity_includes_staging_and_target_growth() {
+    let directory =
+      std::env::temp_dir().join(Uuid::new_v4().to_string());
+    fs::create_dir(&directory).unwrap();
+    fs::write(directory.join("archive.zip"), [0_u8; 2]).unwrap();
+    let root =
+      Dir::open_ambient_dir(&directory, ambient_authority()).unwrap();
+    let operation = FileManagerOperation::ExtractArchive {
+      path: "archive.zip".into(),
+      destination: "output".into(),
+    };
+
+    assert_eq!(
+      operation_space_requirements(&root, &operation, &[]).unwrap(),
+      SpaceRequirements {
+        journal_bytes: 2_002,
+        target_bytes: 2_000,
+      }
+    );
     fs::remove_dir_all(directory).unwrap();
   }
 

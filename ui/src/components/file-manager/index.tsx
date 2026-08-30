@@ -576,6 +576,9 @@ export default function FileManager({
       plan: PendingCommit,
       conflictDecisions: Types.FileManagerConflictDecision[] = [],
     ) => {
+      setPendingCommit(undefined);
+      setDecisions({});
+      operations.submitting(plan.notificationId, plan.label);
       try {
         const ticket = await commit({
           target,
@@ -583,8 +586,6 @@ export default function FileManager({
           decisions: conflictDecisions,
           confirmed: true,
         });
-        setPendingCommit(undefined);
-        setDecisions({});
         const status = await operations.track(
           ticket.operation_id,
           target,
@@ -1856,7 +1857,6 @@ export default function FileManager({
             </Button>
             <Button
               color="red"
-              loading={commitPending}
               onClick={() =>
                 pendingCommit &&
                 void completeCommit(

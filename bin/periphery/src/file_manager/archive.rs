@@ -29,8 +29,9 @@ use super::{
   MAX_ARCHIVE_EXPANDED_BYTES, MAX_ARCHIVE_EXPANSION_RATIO,
   MAX_ENTRIES, MINIMUM_FREE_BYTES, OperationProgress,
   copy_host_to_capability, copy_with_progress, decision_for,
-  journal_root, path::MAX_DEPTH, path::open_parent_nofollow,
-  path::relative_path, path_string, remove_entry,
+  ensure_free_space, journal_root, path::MAX_DEPTH,
+  path::open_parent_nofollow, path::relative_path, path_string,
+  remove_entry,
 };
 
 struct TemporaryDirectory(PathBuf);
@@ -167,7 +168,10 @@ pub fn extract(
     .min(MAX_ARCHIVE_EXPANDED_BYTES);
   ensure_free_space(
     &staging,
-    conservative_expanded_bytes.saturating_add(MINIMUM_FREE_BYTES),
+    archive_metadata
+      .len()
+      .saturating_add(conservative_expanded_bytes)
+      .saturating_add(MINIMUM_FREE_BYTES),
   )?;
   let staged_archive = staging.join("archive");
   let mut read_options = OpenOptions::new();
@@ -864,41 +868,6 @@ fn create_safe_file(path: &Path) -> anyhow::Result<fs::File> {
     options.mode(0o600);
   }
   options.open(path).map_err(Into::into)
-}
-
-#[cfg(unix)]
-fn ensure_free_space(
-  path: &Path,
-  required: u64,
-) -> anyhow::Result<()> {
-  use std::{
-    ffi::CString, mem::MaybeUninit, os::unix::ffi::OsStrExt as _,
-  };
-  let path = CString::new(path.as_os_str().as_bytes())?;
-  let mut stats = MaybeUninit::<libc::statvfs>::uninit();
-  // SAFETY: `path` is NUL terminated and `stats` points to writable memory.
-  let result =
-    unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) };
-  if result != 0 {
-    return Err(std::io::Error::last_os_error().into());
-  }
-  // SAFETY: statvfs initialized the structure after returning success.
-  let stats = unsafe { stats.assume_init() };
-  let available = stats.f_bavail.saturating_mul(stats.f_frsize);
-  if available < required {
-    return Err(anyhow!(
-      "Insufficient free space for archive staging"
-    ));
-  }
-  Ok(())
-}
-
-#[cfg(not(unix))]
-fn ensure_free_space(
-  _path: &Path,
-  _required: u64,
-) -> anyhow::Result<()> {
-  Ok(())
 }
 
 #[cfg(test)]
