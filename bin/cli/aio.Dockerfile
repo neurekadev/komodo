@@ -1,4 +1,6 @@
 FROM rust:1.97.1-trixie AS builder
+ENV CARGO_HTTP_TIMEOUT=600 \
+  CARGO_NET_RETRY=10
 RUN cargo install cargo-strip
 
 WORKDIR /builder
@@ -7,6 +9,7 @@ COPY ./lib ./lib
 COPY ./client/core/rs ./client/core/rs
 COPY ./client/periphery ./client/periphery
 COPY ./bin/cli ./bin/cli
+COPY ./xtask ./xtask
 
 # Compile bin
 RUN cargo build -p komodo_cli --release && cargo strip
