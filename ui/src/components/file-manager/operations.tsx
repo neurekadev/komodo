@@ -18,7 +18,7 @@ import {
 
 const STORAGE_KEY = "komodo-file-manager-operations-v1";
 const STATUS_REQUEST_TIMEOUT_MS = 10_000;
-const STATUS_TIMEOUT_FAILURE_THRESHOLD = 30;
+const STATUS_TIMEOUT_WARNING_THRESHOLD = 30;
 
 type TrackedOperation = {
   operationId: string;
@@ -311,6 +311,7 @@ export function FileOperationProvider({ children }: { children: ReactNode }) {
                   cancel={cancellations.current.get(operation.notificationId)}
                 />
               ),
+              color: "blue",
               loading: true,
               autoClose: false,
               withCloseButton: false,
@@ -320,18 +321,16 @@ export function FileOperationProvider({ children }: { children: ReactNode }) {
               const count =
                 (timeouts.current.get(operation.operationId) ?? 0) + 1;
               timeouts.current.set(operation.operationId, count);
-              if (count >= STATUS_TIMEOUT_FAILURE_THRESHOLD) {
-                settle(operation, {
-                  operation_id: operation.operationId,
-                  state: Types.FileManagerOperationState.Failed,
-                  phase: Types.FileManagerOperationPhase.Finalizing,
-                  description: operation.label,
-                  completed_entries: 0,
-                  total_entries: 0,
-                  completed_bytes: 0,
-                  total_bytes: 0,
-                  error:
-                    "Operation status was unavailable for five minutes. The operation may still be running on the server.",
+              if (count === STATUS_TIMEOUT_WARNING_THRESHOLD) {
+                notifications.update({
+                  id: operation.notificationId,
+                  title: operation.label,
+                  message:
+                    "Operation status is unavailable. The operation may still be running on the server; retrying…",
+                  color: "yellow",
+                  loading: true,
+                  autoClose: false,
+                  withCloseButton: false,
                 });
               }
               return;
