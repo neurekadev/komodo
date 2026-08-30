@@ -18,6 +18,7 @@ import {
 
 const STORAGE_KEY = "komodo-file-manager-operations-v1";
 const STATUS_REQUEST_TIMEOUT_MS = 10_000;
+const STATUS_TIMEOUT_FAILURE_THRESHOLD = 30;
 
 type TrackedOperation = {
   operationId: string;
@@ -213,6 +214,7 @@ export function FileOperationProvider({ children }: { children: ReactNode }) {
   const polling = useRef(false);
   const restoredNotifications = useRef(new Set<string>());
   const failures = useRef(new Map<string, number>());
+  const timeouts = useRef(new Map<string, number>());
   const cancellations = useRef(new Map<string, () => void>());
   const waiters = useRef(
     new Map<
@@ -258,6 +260,7 @@ export function FileOperationProvider({ children }: { children: ReactNode }) {
       });
       removeOperation(operation.operationId);
       failures.current.delete(operation.operationId);
+      timeouts.current.delete(operation.operationId);
       cancellations.current.delete(operation.notificationId);
       for (const resolve of waiters.current.get(operation.operationId) ?? []) {
         resolve(status);
@@ -290,6 +293,7 @@ export function FileOperationProvider({ children }: { children: ReactNode }) {
               STATUS_REQUEST_TIMEOUT_MS,
             );
             failures.current.delete(operation.operationId);
+            timeouts.current.delete(operation.operationId);
             if (
               status.state === Types.FileManagerOperationState.Complete ||
               status.state === Types.FileManagerOperationState.Failed ||
@@ -312,7 +316,27 @@ export function FileOperationProvider({ children }: { children: ReactNode }) {
               withCloseButton: false,
             });
           } catch (error) {
-            if (error instanceof FileOperationStatusTimeoutError) return;
+            if (error instanceof FileOperationStatusTimeoutError) {
+              const count =
+                (timeouts.current.get(operation.operationId) ?? 0) + 1;
+              timeouts.current.set(operation.operationId, count);
+              if (count >= STATUS_TIMEOUT_FAILURE_THRESHOLD) {
+                settle(operation, {
+                  operation_id: operation.operationId,
+                  state: Types.FileManagerOperationState.Failed,
+                  phase: Types.FileManagerOperationPhase.Finalizing,
+                  description: operation.label,
+                  completed_entries: 0,
+                  total_entries: 0,
+                  completed_bytes: 0,
+                  total_bytes: 0,
+                  error:
+                    "Operation status was unavailable for five minutes. The operation may still be running on the server.",
+                });
+              }
+              return;
+            }
+            timeouts.current.delete(operation.operationId);
             const count =
               (failures.current.get(operation.operationId) ?? 0) + 1;
             failures.current.set(operation.operationId, count);
@@ -453,6 +477,7 @@ export function FileOperationProvider({ children }: { children: ReactNode }) {
     (operationId: string) => {
       removeOperation(operationId);
       failures.current.delete(operationId);
+      timeouts.current.delete(operationId);
       waiters.current.delete(operationId);
     },
     [removeOperation],
