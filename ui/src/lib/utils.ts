@@ -2,6 +2,7 @@ import { UsableResource } from "@/resources";
 import { Types } from "komodo_client";
 import sanitizeHtml from "sanitize-html";
 import ConvertAnsiToHtml from "ansi-to-html";
+import { decodeHTML } from "entities";
 import { RowSelectionState } from "@tanstack/react-table";
 
 export const EXECUTION_ACTION_STATE_REQUERY_MS = 500;
@@ -169,10 +170,7 @@ export function updateLogToText(log: string) {
       allowedAttributes: {},
     },
   );
-  return (
-    new DOMParser().parseFromString(sanitizedText, "text/html").body
-      .textContent ?? ""
-  );
+  return decodeHTML(sanitizedText);
 }
 
 const convert_ansi = new ConvertAnsiToHtml();
