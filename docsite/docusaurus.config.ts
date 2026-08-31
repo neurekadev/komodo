@@ -68,6 +68,11 @@ const config: Config = {
 
   themeConfig: {
     image: "img/monitor-lizard.png",
+    colorMode: {
+      defaultMode: "dark",
+      disableSwitch: false,
+      respectPrefersColorScheme: false,
+    },
     docs: {
       sidebar: {
         autoCollapseCategories: true,
