@@ -14,6 +14,7 @@ Komodo is a self-hosted system for building, deploying, and automating software 
 
 </div>
 
+> [!NOTE]
 > This repository is a hard fork of [Komodo](https://github.com/moghtech/komodo), initially created to add a File Manager and now maintained to deliver additional features.
 
 ## Quickstart
