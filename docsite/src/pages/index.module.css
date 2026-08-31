@@ -10,6 +10,19 @@
   overflow: hidden;
 }
 
+.heroBrand {
+  align-items: center;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  justify-content: center;
+}
+
+.heroBrand h1 {
+  letter-spacing: 0.1rem;
+  margin: 0;
+}
+
 @media screen and (max-width: 996px) {
   .heroBanner {
     padding: 2rem;

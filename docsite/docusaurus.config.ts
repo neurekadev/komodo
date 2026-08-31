@@ -67,7 +67,7 @@ const config: Config = {
   ],
 
   themeConfig: {
-    image: "img/monitor-lizard.png",
+    image: "img/logo.png",
     colorMode: {
       defaultMode: "dark",
       disableSwitch: false,
@@ -82,9 +82,10 @@ const config: Config = {
       title: "KOMODO",
       hideOnScroll: true,
       logo: {
-        alt: "monitor lizard",
-        src: "img/komodo-512x512.png",
+        alt: "Komodo",
+        src: "img/logo.png",
         width: "32px",
+        height: "32px",
       },
       items: [
         {

@@ -1,0 +1,49 @@
+<div align="center">
+
+<img src="./ui/public/logo.png" alt="Komodo" height="128px" />
+
+# Komodo
+
+[![Release](https://img.shields.io/github/v/release/neurekadev/komodo?style=flat-square&label=Release&color=F43F5E&logo=github&logoColor=F43F5E)](https://github.com/neurekadev/komodo/releases)
+[![CI](https://img.shields.io/github/actions/workflow/status/neurekadev/komodo/CI.yaml?branch=main&style=flat-square&label=CI&color=8B5CF6&logo=githubactions&logoColor=8B5CF6)](https://github.com/neurekadev/komodo/actions/workflows/CI.yaml)
+[![License](https://img.shields.io/github/license/neurekadev/komodo?style=flat-square&label=License&color=14B8A6&logo=opensourceinitiative&logoColor=14B8A6)](./LICENSE)
+[![AI](https://img.shields.io/badge/AI-assisted-5786FE?style=flat-square&logo=deepseek&logoColor=5786FE)](https://github.com/neurekadev/komodo)
+[![Stars](https://img.shields.io/github/stars/neurekadev/komodo?style=flat-square&label=Stars&color=EAB308&logo=googlegemini&logoColor=EAB308)](https://github.com/neurekadev/komodo)
+
+Komodo is a self-hosted system for building, deploying, and automating software across multiple servers.
+
+</div>
+
+> This repository is a hard fork of [Komodo](https://github.com/moghtech/komodo), initially created to add a File Manager and now maintained to deliver additional features.
+
+## Quickstart
+
+Download the latest binaries from [Releases](https://github.com/neurekadev/komodo/releases).
+
+## Usage
+
+Run Core to host the API and browser interface, then connect Periphery agents on the servers you want to manage. Follow the [setup guide](https://komo.do/docs/setup) for supported deployment options and configuration.
+
+- Read the [documentation](https://komo.do/docs/intro).
+- Explore the [demo](https://demo.komo.do).
+- Use the [CLI and API](https://komo.do/docs/ecosystem) for automation.
+
+## Features
+
+- Deploy, inspect, and operate Docker containers and Compose stacks.
+- Build container images from Dockerfiles or Git repositories.
+- Automate multi-step workflows with procedures, actions, schedules, and webhooks.
+- Monitor server health, resource usage, container logs, and application activity.
+- Manage multiple servers, users, permissions, secrets, and resource configuration from one interface.
+
+## Components
+
+| Component | Purpose |
+| --- | --- |
+| Core | Hosts the browser interface and API, stores configuration, and coordinates operations. |
+| Periphery | Runs on connected servers to execute actions and report system and container state. |
+| CLI | Provides terminal access to Komodo resources and automation. |
+
+## Why Use Komodo?
+
+Komodo brings deployment, builds, observability, and automation into one self-hosted interface. It scales from one Docker host to a fleet of servers while keeping infrastructure control in your environment.

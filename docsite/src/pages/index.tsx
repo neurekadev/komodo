@@ -12,25 +12,9 @@ function HomepageHeader() {
   return (
     <header className={clsx("hero hero--primary", styles.heroBanner)}>
       <div className="container">
-        <div style={{ display: "flex", gap: "1rem", justifyContent: "center" }}>
-          <div style={{ position: "relative" }}>
-            <KomodoLogo width="600px" />
-            <h1
-              className="hero__title"
-              style={{
-                margin: 0,
-                position: "absolute",
-                top: "40%",
-                left: "50%",
-                transform: "translate(-50%, -50%)",
-                color: "white",
-                fontWeight: 600,
-                letterSpacing: "0.1rem",
-              }}
-            >
-              Komodo
-            </h1>
-          </div>
+        <div className={styles.heroBrand}>
+          <KomodoLogo width="min(20rem, 72vw)" />
+          <h1 className="hero__title">Komodo</h1>
         </div>
         <p className="hero__subtitle">{siteConfig.tagline}</p>
         <div className={styles.buttons}>
