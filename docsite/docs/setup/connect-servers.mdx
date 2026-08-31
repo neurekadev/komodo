@@ -104,7 +104,9 @@ docker compose config
 docker compose up -d
 ```
 
-Periphery stores its keys, repositories, stacks, builds, SSL material, and File Manager journal beneath `/data` in the `komodo_data` named volume. Docker's host volume root remains mounted separately at the same absolute path so the File Manager can access named volumes.
+Periphery stores its keys, repositories, stacks, builds, SSL material, and File Manager journal in the `komodo_data` named volume mounted at `/data`. The template exposes the repository, stack, and build directories through aliases beneath Docker's host volume root so relative Compose bind mounts resolve in the host daemon's path namespace. `PERIPHERY_DOCKER_VOLUME_ROOT` is mounted at that same absolute path inside Periphery, which also enables File Manager access to named volumes.
+
+With the default project name and Docker volume root, `docker compose config` resolves `PERIPHERY_STACK_DIR` to `/var/lib/docker/volumes/komodo_data/_data/stacks`. Rootless or customized Docker installations use the corresponding path beneath their configured `PERIPHERY_DOCKER_VOLUME_ROOT`.
 
 ```mdx-code-block
 <ComposeAndEnv file_name="periphery.compose.yaml" />

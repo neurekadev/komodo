@@ -29,9 +29,13 @@ services:
       ## File will be auto written if doesn't exist to match first Core it connects to.
       PERIPHERY_CORE_PUBLIC_KEYS: ${PERIPHERY_CORE_PUBLIC_KEYS:-file:/data/keys/core.pub}
       ## Specify the root directory used by Periphery agent.
-      ## All your compose files and repos need to be inside this directory
-      ## for Periphery to interact with them.
+      ## Persistent keys, SSL files, and File Manager state remain here.
       PERIPHERY_ROOT_DIRECTORY: ${PERIPHERY_ROOT_DIRECTORY:-/data}
+      ## Keep Docker-managed workspaces in the host daemon's path namespace.
+      ## These paths are aliases of the same data volume mounted at /data.
+      PERIPHERY_REPO_DIR: ${PERIPHERY_REPO_DIR:-${PERIPHERY_DOCKER_VOLUME_ROOT:-/var/lib/docker/volumes}/${COMPOSE_PROJECT_NAME:-komodo}_data/_data/repos}
+      PERIPHERY_STACK_DIR: ${PERIPHERY_STACK_DIR:-${PERIPHERY_DOCKER_VOLUME_ROOT:-/var/lib/docker/volumes}/${COMPOSE_PROJECT_NAME:-komodo}_data/_data/stacks}
+      PERIPHERY_BUILD_DIR: ${PERIPHERY_BUILD_DIR:-${PERIPHERY_DOCKER_VOLUME_ROOT:-/var/lib/docker/volumes}/${COMPOSE_PROJECT_NAME:-komodo}_data/_data/builds}
       ## Specify whether to disable the terminals feature
       ## and disallow remote shell access (inside the Periphery container).
       PERIPHERY_DISABLE_TERMINALS: ${PERIPHERY_DISABLE_TERMINALS:-false}
