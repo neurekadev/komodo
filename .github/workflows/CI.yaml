@@ -112,6 +112,7 @@ jobs:
         include:
           - name: Core AMD64
             component: core
+            cache: true
             context: .
             dockerfile: bin/core/aio.Dockerfile
             arch: amd64
@@ -119,6 +120,7 @@ jobs:
             platform: linux/amd64
           - name: Core ARM64
             component: core
+            cache: true
             context: .
             dockerfile: bin/core/aio.Dockerfile
             arch: arm64
@@ -126,6 +128,7 @@ jobs:
             platform: linux/arm64
           - name: Periphery AMD64
             component: periphery
+            cache: false
             context: .
             dockerfile: bin/periphery/aio.Dockerfile
             arch: amd64
@@ -133,6 +136,7 @@ jobs:
             platform: linux/amd64
           - name: Periphery ARM64
             component: periphery
+            cache: false
             context: .
             dockerfile: bin/periphery/aio.Dockerfile
             arch: arm64
@@ -140,6 +144,7 @@ jobs:
             platform: linux/arm64
           - name: CLI AMD64
             component: cli
+            cache: false
             context: .
             dockerfile: bin/cli/aio.Dockerfile
             arch: amd64
@@ -147,6 +152,7 @@ jobs:
             platform: linux/amd64
           - name: CLI ARM64
             component: cli
+            cache: false
             context: .
             dockerfile: bin/cli/aio.Dockerfile
             arch: arm64
@@ -154,6 +160,7 @@ jobs:
             platform: linux/arm64
           - name: Docs AMD64
             component: docs
+            cache: false
             context: docsite
             dockerfile: docsite/Dockerfile
             arch: amd64
@@ -161,6 +168,7 @@ jobs:
             platform: linux/amd64
           - name: Docs ARM64
             component: docs
+            cache: false
             context: docsite
             dockerfile: docsite/Dockerfile
             arch: arm64
@@ -186,9 +194,9 @@ jobs:
           provenance: false
           sbom: false
           cache-from: |
-            type=gha,scope=ci-${{ matrix.component }}-${{ matrix.arch }}
-            type=gha,scope=publish-${{ matrix.component }}-${{ matrix.arch }}
-          cache-to: type=gha,scope=ci-${{ matrix.component }}-${{ matrix.arch }},mode=max,ignore-error=true
+            ${{ matrix.cache && format('type=gha,scope=ci-{0}-{1}', matrix.component, matrix.arch) || '' }}
+            ${{ matrix.cache && format('type=gha,scope=publish-{0}-{1}', matrix.component, matrix.arch) || '' }}
+          cache-to: ${{ matrix.cache && format('type=gha,scope=ci-{0}-{1},mode=max,ignore-error=true', matrix.component, matrix.arch) || '' }}
 
   publish-platforms:
     name: Publish ${{ matrix.name }}
@@ -212,6 +220,7 @@ jobs:
         include:
           - name: Core AMD64
             component: core
+            cache: true
             description: Komodo Core
             context: .
             dockerfile: bin/core/aio.Dockerfile
@@ -220,6 +229,7 @@ jobs:
             platform: linux/amd64
           - name: Core ARM64
             component: core
+            cache: true
             description: Komodo Core
             context: .
             dockerfile: bin/core/aio.Dockerfile
@@ -228,6 +238,7 @@ jobs:
             platform: linux/arm64
           - name: Periphery AMD64
             component: periphery
+            cache: false
             description: Komodo Periphery
             context: .
             dockerfile: bin/periphery/aio.Dockerfile
@@ -236,6 +247,7 @@ jobs:
             platform: linux/amd64
           - name: Periphery ARM64
             component: periphery
+            cache: false
             description: Komodo Periphery
             context: .
             dockerfile: bin/periphery/aio.Dockerfile
@@ -244,6 +256,7 @@ jobs:
             platform: linux/arm64
           - name: CLI AMD64
             component: cli
+            cache: false
             description: Komodo CLI
             context: .
             dockerfile: bin/cli/aio.Dockerfile
@@ -252,6 +265,7 @@ jobs:
             platform: linux/amd64
           - name: CLI ARM64
             component: cli
+            cache: false
             description: Komodo CLI
             context: .
             dockerfile: bin/cli/aio.Dockerfile
@@ -260,6 +274,7 @@ jobs:
             platform: linux/arm64
           - name: Docs AMD64
             component: docs
+            cache: false
             description: Komodo Documentation
             context: docsite
             dockerfile: docsite/Dockerfile
@@ -268,6 +283,7 @@ jobs:
             platform: linux/amd64
           - name: Docs ARM64
             component: docs
+            cache: false
             description: Komodo Documentation
             context: docsite
             dockerfile: docsite/Dockerfile
@@ -326,9 +342,9 @@ jobs:
           provenance: mode=max
           sbom: true
           cache-from: |
-            type=gha,scope=${{ env.CACHE_PREFIX }}-${{ matrix.component }}-${{ matrix.arch }}
-            type=gha,scope=publish-${{ matrix.component }}-${{ matrix.arch }}
-          cache-to: type=gha,scope=${{ env.CACHE_PREFIX }}-${{ matrix.component }}-${{ matrix.arch }},mode=max,ignore-error=true
+            ${{ matrix.cache && format('type=gha,scope={0}-{1}-{2}', env.CACHE_PREFIX, matrix.component, matrix.arch) || '' }}
+            ${{ matrix.cache && github.event_name == 'pull_request' && format('type=gha,scope=publish-{0}-{1}', matrix.component, matrix.arch) || '' }}
+          cache-to: ${{ matrix.cache && format('type=gha,scope={0}-{1}-{2},mode=max,ignore-error=true', env.CACHE_PREFIX, matrix.component, matrix.arch) || '' }}
 
       - name: Export Digest
         env:
