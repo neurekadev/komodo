@@ -12,25 +12,9 @@ function HomepageHeader() {
   return (
     <header className={clsx("hero hero--primary", styles.heroBanner)}>
       <div className="container">
-        <div style={{ display: "flex", gap: "1rem", justifyContent: "center" }}>
-          <div style={{ position: "relative" }}>
-            <KomodoLogo width="600px" />
-            <h1
-              className="hero__title"
-              style={{
-                margin: 0,
-                position: "absolute",
-                top: "40%",
-                left: "50%",
-                transform: "translate(-50%, -50%)",
-                color: "white",
-                fontWeight: 600,
-                letterSpacing: "0.1rem",
-              }}
-            >
-              Komodo
-            </h1>
-          </div>
+        <div className={styles.heroBrand}>
+          <KomodoLogo width="min(20rem, 72vw)" />
+          <h1 className="hero__title">Komodo</h1>
         </div>
         <p className="hero__subtitle">{siteConfig.tagline}</p>
         <div className={styles.buttons}>
@@ -42,19 +26,13 @@ function HomepageHeader() {
           </Link>
           <Link
             className="button button--secondary button--lg"
-            to="https://demo.komo.do"
-          >
-            Demo
-          </Link>
-          <Link
-            className={"button button--secondary button--lg " + styles["mobile-full-grid"]}
-            to="https://github.com/moghtech/komodo"
+            to="https://github.com/neurekadev/komodo"
           >
             GitHub
           </Link>
           <Link
             className={"button button--secondary button--lg " + styles["mobile-full-grid"]}
-            to="https://github.com/moghtech/komodo#screenshots"
+            to="https://github.com/neurekadev/komodo#screenshots"
           >
             Screenshots
           </Link>
@@ -72,9 +50,9 @@ export default function Home(): JSX.Element {
       <main>
         <div className={styles.upgradeBanner}>
           <div className="container">
-            Running <b>Komodo v1</b>? See the{" "}
-            <Link to="/docs/releases/v2.0.0#upgrading-to-komodo-v2">
-              v2 upgrade guide
+            Running <b>Komodo v2</b>? See the{" "}
+            <Link to="/docs/releases/v3.0.0#upgrading-to-komodo-v3">
+              v3 upgrade guide
             </Link>
             .
           </div>

@@ -138,7 +138,7 @@ exclude_disk_mounts = []
 ## If provided, Periphery will operate in outbound mode.
 ## Env: PERIPHERY_CORE_ADDRESS
 ## Default: None
-# core_address = "demo.komo.do"
+# core_address = "komodo.example.com"
 
 ## The Server this Periphery agent should connect as.
 ## Must match an existing Server name or id.

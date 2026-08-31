@@ -11,14 +11,14 @@ const config: Config = {
   favicon: "img/favicon.ico",
 
   // Set the production url of your site here
-  url: process.env.DOCSITE_URL || "https://komo.do",
+  url: process.env.DOCSITE_URL || "https://komodo.docs.neureka.dev",
   // Set the /<baseUrl>/ pathname under which your site is served
   // For GitHub pages deployment, it is often '/<projectName>/'
   baseUrl: process.env.DOCSITE_BASE_URL || "/",
 
   // GitHub pages deployment config.
   // If you aren't using GitHub pages, you don't need these.
-  organizationName: "moghtech", // Usually your GitHub org/user name.
+  organizationName: "neurekadev", // Usually your GitHub org/user name.
   projectName: "komodo", // Usually your repo name.
   trailingSlash: false,
   deploymentBranch: "gh-pages-docs",
@@ -45,7 +45,7 @@ const config: Config = {
       {
         docs: {
           sidebarPath: "./sidebars.ts",
-          editUrl: "https://github.com/moghtech/komodo/tree/main/docsite",
+          editUrl: "https://github.com/neurekadev/komodo/tree/main/docsite",
         },
         blog: false,
         theme: {
@@ -67,7 +67,12 @@ const config: Config = {
   ],
 
   themeConfig: {
-    image: "img/monitor-lizard.png",
+    image: "img/logo.png",
+    colorMode: {
+      defaultMode: "dark",
+      disableSwitch: false,
+      respectPrefersColorScheme: false,
+    },
     docs: {
       sidebar: {
         autoCollapseCategories: true,
@@ -77,9 +82,10 @@ const config: Config = {
       title: "KOMODO",
       hideOnScroll: true,
       logo: {
-        alt: "monitor lizard",
-        src: "img/komodo-512x512.png",
+        alt: "Komodo",
+        src: "img/logo.png",
         width: "32px",
+        height: "32px",
       },
       items: [
         {
@@ -99,7 +105,7 @@ const config: Config = {
           position: "right",
         },
         {
-          href: "https://github.com/moghtech/komodo",
+          href: "https://github.com/neurekadev/komodo",
           label: "GitHub",
           position: "right",
         },
@@ -127,9 +133,8 @@ const config: Config = {
         {
           title: "Project",
           items: [
-            { label: "GitHub", href: "https://github.com/moghtech/komodo" },
+            { label: "GitHub", href: "https://github.com/neurekadev/komodo" },
             { label: "Donate", href: "https://opencollective.com/komodo" },
-            { label: "Demo", href: "https://demo.komo.do" },
           ],
         },
       ],

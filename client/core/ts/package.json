@@ -2,7 +2,7 @@
   "name": "komodo_client",
   "version": "2.3.2",
   "description": "Komodo client package",
-  "homepage": "https://komo.do",
+  "homepage": "https://komodo.docs.neureka.dev/",
   "main": "dist/lib.js",
   "type": "module",
   "license": "GPL-3.0",

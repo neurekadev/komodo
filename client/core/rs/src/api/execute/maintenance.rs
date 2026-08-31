@@ -55,7 +55,7 @@ pub fn backup_core_database() {}
 /// timestamped database dumps, which can be restored using
 /// the Komodo CLI.
 ///
-/// https://komo.do/docs/setup/backup
+/// https://komodo.docs.neureka.dev/docs/setup/backup
 #[typeshare]
 #[derive(
   Debug, Clone, PartialEq, Serialize, Deserialize, Resolve, Parser,

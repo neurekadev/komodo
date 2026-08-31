@@ -124,7 +124,7 @@ pub struct Execute {
   #[command(subcommand)]
   pub execution: Execution,
   /// Top priority Komodo host.
-  /// Eg. "https://demo.komo.do"
+  /// Eg. "https://komodo.example.com"
   #[arg(long, short = 'a')]
   pub host: Option<String>,
   /// Top priority api key.

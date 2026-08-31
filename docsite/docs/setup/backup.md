@@ -33,7 +33,7 @@ it's just created by default for guidance / convenience.
 
 When Komodo takes a database backup, it creates a **folder named for the time the backup was taken**,
 and dumps the gzip-compressed documents to files in this folder. 
-In order to store the backups to disk, **mount a host path to `/backups`** in the Komodo Core container.
+The v3 Compose templates set `KOMODO_CLI_BACKUPS_FOLDER=/data/backups`. Backups are therefore stored in the shared `data:/data` volume, which Docker names `komodo_data` because `.env` sets `COMPOSE_PROJECT_NAME=komodo`.
 
 Due to its larger size and relative unimportance, the `Stats` collection (containing historical server cpu / mem / disk usage)
 is not included in dated backups. Just latest Stats are maintained at the top level of the backup folder.
@@ -44,7 +44,7 @@ in `core.config.toml`, `komodo.cli.toml`, or in the Core container environment.
 
 ```
 # Folder structure
-/backups
+/data/backups
 | 2025-08-12_03-00-01
 | | Action.gz
 | | Alerter.gz
@@ -60,19 +60,35 @@ Currently no built-in encryption is supported,
 so you may want to encrypt the files before backing up remotely if your backup solution doesn't support that natively.
 :::
 
+### Export from the named volume
+
+The named volume protects backups across container replacement, but it is still local to the Docker host. Export the backup directory to a host archive and then copy that archive to your off-host backup destination:
+
+```bash
+mkdir -p backup-export
+docker run --rm \
+  --mount type=volume,src=komodo_data,dst=/source,readonly \
+  --mount type=bind,src="$(pwd)/backup-export",dst=/export \
+  alpine:3.22 \
+  tar -czf /export/komodo-backups.tar.gz -C /source backups
+```
+
+The helper mounts `komodo_data` read-only and does not modify the running deployment. Verify and transfer `backup-export/komodo-backups.tar.gz` using your normal off-host backup tooling.
+
 ## Remote Backups
 
 Since database backup is actually a function of the [Komodo CLI](../ecosystem/cli), you can also backup directly to
-a remote server using the `ghcr.io/moghtech/komodo-cli` image. This service will backup once and then exit, so the scheduled deployment should still happen using a Procedure or Action:
+a remote server using the `ghcr.io/neurekadev/komodo-cli:3` image. This service will backup once and then exit, so the scheduled deployment should still happen using a Procedure or Action:
 
 ```yaml
 services:
   cli:
-    image: ghcr.io/moghtech/komodo-cli
+    image: ghcr.io/neurekadev/komodo-cli:3
     command: km database backup -y
     volumes:
-      - /path/to/komodo/backups:/backups
+      - /path/to/komodo/backups:/data/backups
     environment:
+      KOMODO_CLI_BACKUPS_FOLDER: /data/backups
       ## Database port must be reachable.
       KOMODO_DATABASE_ADDRESS: komodo.example.com:27017
       KOMODO_DATABASE_USERNAME: <db username>
@@ -88,14 +104,15 @@ The Komodo CLI handles database restores as well.
 ```yaml
 services:
   cli:
-    image: ghcr.io/moghtech/komodo-cli
+    image: ghcr.io/neurekadev/komodo-cli:3
     ## Optionally specify a specific folder with `--restore-folder`,
     ## otherwise restores the most recent backup.
     command: km database restore -y # --restore-folder 2025-08-14_03-00-01
     volumes:
       # Same mount to backup files as above
-      - /path/to/komodo/backups:/backups
+      - /path/to/komodo/backups:/data/backups
     environment:
+      KOMODO_CLI_BACKUPS_FOLDER: /data/backups
       ## Database port must be reachable.
       ## Note the different env vars needed compared to backup.
       ## This is to prevent any accidental restores.

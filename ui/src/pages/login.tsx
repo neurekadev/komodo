@@ -10,8 +10,8 @@ export default function Login(props: {
     <LoginPage
       {...props}
       appName="KOMODO"
-      iconLink="/mogh-512x512.png"
-      iconLinkAlt="moghtech"
+      iconLink="/logo-512x512.png"
+      iconLinkAlt="Komodo"
       exampleConfigLink="https://github.com/moghtech/komodo/blob/main/config/core.config.toml"
       onLogin={userInvalidate}
     />

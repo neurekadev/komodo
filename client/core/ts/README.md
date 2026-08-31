@@ -1,6 +1,6 @@
 # Komodo
 
-_A system to build and deploy software across many servers_. [https://komo.do](https://komo.do)
+_A system to build and deploy software across many servers_. [https://komodo.docs.neureka.dev/](https://komodo.docs.neureka.dev/)
 
 ```sh
 npm install komodo_client
@@ -15,7 +15,7 @@ yarn add komodo_client
 ```ts
 import { KomodoClient, Types } from "komodo_client";
 
-const komodo = KomodoClient("https://demo.komo.do", {
+const komodo = KomodoClient("https://komodo.example.com", {
   type: "api-key",
   params: {
     key: "your_key",

@@ -66,6 +66,12 @@ export type ReadResponses = {
     ListAllStackServices: Types.ListAllStackServicesResponse;
     ListCommonStackExtraArgs: Types.ListCommonStackExtraArgsResponse;
     ListCommonStackBuildExtraArgs: Types.ListCommonStackBuildExtraArgsResponse;
+    GetFileManagerCapabilities: Types.FileManagerCapabilities;
+    ListFileManagerDirectory: Types.FileManagerDirectory;
+    ReadFileManagerText: Types.FileManagerTextFile;
+    GetFileManagerOperationStatus: Types.FileManagerOperationStatus;
+    ListActiveFileManagerOperations: Types.FileManagerActiveOperations;
+    GetFileManagerJournalStatus: Types.FileManagerJournalStatus;
     GetDeploymentsSummary: Types.GetDeploymentsSummaryResponse;
     GetDeployment: Types.GetDeploymentResponse;
     GetDeploymentContainer: Types.GetDeploymentContainerResponse;
@@ -169,6 +175,14 @@ export type WriteResponses = {
     RefreshStackCache: Types.NoData;
     CheckStackForUpdate: Types.CheckStackForUpdateResponse;
     BatchCheckStackForUpdate: Types.BatchCheckStackForUpdateResponse;
+    PreflightFileManagerOperation: Types.FileManagerPreflight;
+    CommitFileManagerOperation: Types.FileManagerOperationTicket;
+    ResolveFileManagerOperationConflict: Types.FileManagerOperationStatus;
+    CancelFileManagerOperation: Types.FileManagerOperationStatus;
+    PrepareFileManagerUpload: Types.FileManagerTransferTicket;
+    PrepareFileManagerDownload: Types.FileManagerTransferTicket;
+    UndoFileManagerOperation: Types.FileManagerOperationTicket;
+    RedoFileManagerOperation: Types.FileManagerOperationTicket;
     CreateDeployment: Types.Deployment;
     CopyDeployment: Types.Deployment;
     CreateDeploymentFromContainer: Types.Deployment;

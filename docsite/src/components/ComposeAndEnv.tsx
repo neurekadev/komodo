@@ -10,17 +10,17 @@ export default function ComposeAndEnv({
 }) {
   return (
     <Tabs>
-      <TabItem value={file_name}>
+      <TabItem value="compose.yaml" label="compose.yaml">
         <RemoteCodeFile
-          title={`https://github.com/moghtech/komodo/blob/main/compose/${file_name}`}
-          url={`https://raw.githubusercontent.com/moghtech/komodo/main/compose/${file_name}`}
+          title={`https://github.com/neurekadev/komodo/blob/main/compose/${file_name}`}
+          url={`https://raw.githubusercontent.com/neurekadev/komodo/main/compose/${file_name}`}
           language="yaml"
         />
       </TabItem>
-      <TabItem value="compose.env">
+      <TabItem value=".env" label=".env">
         <RemoteCodeFile
-          title="https://github.com/moghtech/komodo/blob/main/compose/compose.env"
-          url="https://raw.githubusercontent.com/moghtech/komodo/main/compose/compose.env"
+          title="https://github.com/neurekadev/komodo/blob/main/compose/compose.env"
+          url="https://raw.githubusercontent.com/neurekadev/komodo/main/compose/compose.env"
           language="bash"
         />
       </TabItem>

@@ -52,14 +52,24 @@ const Topbar = ({
           size="lg"
           hiddenFrom="md"
         >
-          <img src="/mogh-512x512.png" width={32} alt="moghtech" />
+          <img
+            src="/logo-512x512.png"
+            width={32}
+            height={32}
+            alt="Komodo"
+          />
         </ActionIcon>
 
         <Button
           variant="subtle"
           renderRoot={(props) => <Link to="/" {...props} />}
           leftSection={
-            <img src="/mogh-512x512.png" width={32} alt="moghtech" />
+            <img
+              src="/logo-512x512.png"
+              width={32}
+              height={32}
+              alt="Komodo"
+            />
           }
           size="lg"
           visibleFrom="md"
@@ -81,7 +91,9 @@ const Topbar = ({
           <OmniSearch />
         </Box>
         <TopbarLink to="/docs">API</TopbarLink>
-        <TopbarLink to="https://komo.do/docs/intro">Docs</TopbarLink>
+        <TopbarLink to="https://komodo.docs.neureka.dev/docs/intro">
+          Docs
+        </TopbarLink>
         {version && (
           <TopbarLink to="https://github.com/moghtech/komodo/releases">
             v{version}

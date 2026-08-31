@@ -16,9 +16,9 @@ cd ../../../ui && yarn link komodo_client && yarn
 
 You can make a new file `.env.development` (gitignored) which holds:
 ```sh
-VITE_KOMODO_HOST=https://demo.komo.do
+VITE_KOMODO_HOST=https://komodo.example.com
 ```
-You can point it to any Komodo host you like, including the demo.
+You can point it to any Komodo host you like.
 
 Now you can start the dev ui server:
 ```sh

@@ -23,7 +23,7 @@ pub mod terminal;
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct CoreConnectionQuery {
-  /// Core host (eg demo.komo.do)
+  /// Core host (eg komodo.example.com)
   pub core: String,
 }
 

@@ -13,7 +13,7 @@ version = "2.3.2"
 edition = "2024"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/moghtech/komodo"
-homepage = "https://komo.do"
+homepage = "https://komodo.docs.neureka.dev/"
 
 [workspace.dependencies]
 # LOCAL

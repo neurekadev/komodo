@@ -1,11 +1,16 @@
-import React from "react";
+import useBaseUrl from "@docusaurus/useBaseUrl";
+import type { CSSProperties } from "react";
 
-export default function KomodoLogo({ width = "4rem" }) {
+export default function KomodoLogo({
+  width = "4rem",
+}: {
+  width?: CSSProperties["width"];
+}) {
   return (
     <img
-      style={{ width, height: "auto", mixBlendMode: "multiply" }}
-      src="img/monitor-lizard.png"
-      alt="monitor-lizard"
+      style={{ width, maxWidth: "100%", height: "auto" }}
+      src={useBaseUrl("img/logo.png")}
+      alt="Komodo"
     />
   );
 }
