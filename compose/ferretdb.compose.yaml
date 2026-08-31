@@ -12,6 +12,7 @@ services:
     # 🚨 Pin to a specific version. Updates can be breaking.
     # https://github.com/FerretDB/documentdb/pkgs/container/postgres-documentdb
     image: ghcr.io/ferretdb/postgres-documentdb
+    container_name: komodo-postgres
     labels:
       komodo.skip: # Prevent Komodo from stopping with StopAllContainers
     restart: unless-stopped
@@ -28,6 +29,7 @@ services:
     # 🚨 Pin to a specific version. Updates can be breaking.
     # https://github.com/FerretDB/FerretDB/pkgs/container/ferretdb
     image: ghcr.io/ferretdb/ferretdb
+    container_name: komodo-ferretdb
     labels:
       komodo.skip: # Prevent Komodo from stopping with StopAllContainers
     restart: unless-stopped
@@ -42,6 +44,7 @@ services:
   
   core:
     image: ghcr.io/neurekadev/komodo-core:${COMPOSE_KOMODO_IMAGE_TAG:-3}
+    container_name: komodo-core
     init: true
     restart: unless-stopped
     depends_on:
@@ -64,6 +67,7 @@ services:
   ## https://github.com/neurekadev/komodo/tree/main/scripts
   periphery:
     image: ghcr.io/neurekadev/komodo-periphery:${COMPOSE_KOMODO_IMAGE_TAG:-3}
+    container_name: komodo-periphery
     init: true
     restart: unless-stopped
     depends_on:
