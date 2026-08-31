@@ -50,9 +50,9 @@ export default function Home(): JSX.Element {
       <main>
         <div className={styles.upgradeBanner}>
           <div className="container">
-            Running <b>Komodo v1</b>? See the{" "}
-            <Link to="/docs/releases/v2.0.0#upgrading-to-komodo-v2">
-              v2 upgrade guide
+            Running <b>Komodo v2</b>? See the{" "}
+            <Link to="/docs/releases/v3.0.0#upgrading-to-komodo-v3">
+              v3 upgrade guide
             </Link>
             .
           </div>
