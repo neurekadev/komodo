@@ -14,6 +14,7 @@ All resources which depend on git repos / docker registries are able to use thes
 
 - Configure the connection to periphery agents.
 - Set alerting thresholds.
+- Browse Docker named volumes with the [File Manager](file-manager).
 - Can be attached to by **Deployments**, **Stacks**, **Repos**, and **Builders**.
 
 ## [Swarm](swarm)
@@ -33,6 +34,7 @@ All resources which depend on git repos / docker registries are able to use thes
 - Provide the compose file in UI, or move the files to a git repo and use a webhook for auto redeploy on push.
 - Supports composing multiple compose files using `docker compose -f ... -f ...`.
 - Pass environment variables usable within the compose file. Interpolate in app-wide variables / secrets.
+- Browse and manage the Stack's resolved file root with the [File Manager](file-manager).
 
 ## Repo
 

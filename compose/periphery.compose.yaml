@@ -56,6 +56,9 @@ services:
       ## Allow the File Manager to access local Docker named volumes.
       ## Keep Docker's absolute host volume root identical inside the container.
       ## Set this to Docker's absolute volume root when using a nonstandard data root.
+      ## Security: This intentionally grants Periphery read/write access to every
+      ## local named volume. Restrict Server FileManager permission accordingly;
+      ## the File Manager rejects Periphery's own protected data volume.
       - ${PERIPHERY_DOCKER_VOLUME_ROOT:-/var/lib/docker/volumes}:${PERIPHERY_DOCKER_VOLUME_ROOT:-/var/lib/docker/volumes}
       ## Allow Periphery to see processes outside of container
       - /proc:/proc

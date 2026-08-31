@@ -30,6 +30,7 @@ const sidebars: SidebarsConfig = {
     },
     "swarm",
     "terminals",
+    "file-manager",
     "build",
     {
       type: "category",

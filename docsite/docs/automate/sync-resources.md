@@ -263,8 +263,10 @@ resource_path = ["stacks.toml", "repos.toml"]
 name = "groupo"
 everyone = false # Set to true to give these permission to all users.
 users = ["mbecker20", "karamvirsingh98"]
-# Configure write access with all specific permissions
-all.Server = { level = "Write", specific = ["Attach", "Logs", "Inspect", "Terminal", "Processes"] }
+# Configure write access with all Server-specific permissions.
+# FileManager includes every eligible Docker named volume on matching Servers.
+# Volumes overlapping Periphery's private journal are excluded.
+all.Server = { level = "Write", specific = ["Attach", "FileManager", "Logs", "Inspect", "Terminal", "Processes"] }
 # Attach base level of Execute on all builds
 all.Build = "Execute"
 # Allow users to see all Builders, and attach builds to them.

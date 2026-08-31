@@ -355,7 +355,7 @@ const formatBytes = (bytes: number) => {
 const isEditingElement = (target: EventTarget | null) => {
   const element = target instanceof HTMLElement ? target : null;
   return !!element?.closest(
-    "input, textarea, [contenteditable=true], .monaco-editor",
+    'input:not([type="checkbox"]), textarea, [contenteditable=true], .monaco-editor',
   );
 };
 

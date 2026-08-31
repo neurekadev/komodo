@@ -716,14 +716,7 @@ pub async fn resolve_root(
       }
     };
 
-  let private_journal = journal_root();
-  if path.starts_with(&private_journal)
-    || private_journal.starts_with(&path)
-  {
-    return Err(anyhow!(
-      "File Manager root overlaps its private journal"
-    ));
-  }
+  ensure_outside_private_journal(&path, &journal_root())?;
 
   let mut hash = Sha256::new();
   hash.update(path.as_os_str().as_encoded_bytes());
@@ -741,6 +734,63 @@ fn journal_root() -> PathBuf {
   periphery_config()
     .root_directory
     .join("file-manager-journal")
+}
+
+const PRIVATE_JOURNAL_OVERLAP_REASON: &str = "File Manager target overlaps protected Periphery private journal data and cannot be opened";
+
+fn ensure_outside_private_journal(
+  path: &Path,
+  private_journal: &Path,
+) -> anyhow::Result<()> {
+  if paths_overlap(path, private_journal)? {
+    return Err(anyhow!(PRIVATE_JOURNAL_OVERLAP_REASON));
+  }
+  Ok(())
+}
+
+fn paths_overlap(left: &Path, right: &Path) -> anyhow::Result<bool> {
+  if left.starts_with(right) || right.starts_with(left) {
+    return Ok(true);
+  }
+
+  Ok(
+    path_matches_ancestor(left, right)?
+      || path_matches_ancestor(right, left)?,
+  )
+}
+
+fn path_matches_ancestor(
+  path: &Path,
+  other: &Path,
+) -> anyhow::Result<bool> {
+  let Some(identity) = path_identity(path)? else {
+    return Ok(false);
+  };
+  for ancestor in other.ancestors() {
+    if path_identity(ancestor)?.is_some_and(|other| other == identity)
+    {
+      return Ok(true);
+    }
+  }
+  Ok(false)
+}
+
+fn path_identity(path: &Path) -> anyhow::Result<Option<(u64, u64)>> {
+  let metadata = match fs::metadata(path) {
+    Ok(metadata) => metadata,
+    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+      return Ok(None);
+    }
+    Err(error) => {
+      return Err(error).with_context(|| {
+        format!("Failed to inspect File Manager path {path:?}")
+      });
+    }
+  };
+  Ok(Some((
+    cap_fs_ext::MetadataExt::dev(&metadata),
+    cap_fs_ext::MetadataExt::ino(&metadata),
+  )))
 }
 
 fn open_root(
@@ -4156,6 +4206,36 @@ mod tests {
       configured_path("/srv/komodo/stacks/demo", "/opt/stack"),
       PathBuf::from("/opt/stack")
     );
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn private_journal_overlap_detects_aliased_parent() {
+    use std::os::unix::fs::symlink;
+
+    let directory =
+      std::env::temp_dir().join(Uuid::new_v4().to_string());
+    let private_data = directory.join("private-data");
+    let private_journal = private_data.join("file-manager-journal");
+    let aliased_volume = directory.join("docker-volume-data");
+    let unrelated_volume = directory.join("application-volume");
+    fs::create_dir_all(&private_journal).unwrap();
+    fs::create_dir(&unrelated_volume).unwrap();
+    symlink(&private_data, &aliased_volume).unwrap();
+
+    let error = ensure_outside_private_journal(
+      &aliased_volume,
+      &private_journal,
+    )
+    .unwrap_err();
+    assert_eq!(error.to_string(), PRIVATE_JOURNAL_OVERLAP_REASON);
+    ensure_outside_private_journal(
+      &unrelated_volume,
+      &private_journal,
+    )
+    .unwrap();
+
+    fs::remove_dir_all(directory).unwrap();
   }
 
   #[test]

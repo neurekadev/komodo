@@ -9,6 +9,7 @@ Komodo is a web application for managing servers, builds, deployments, and autom
 - **Connect servers**. Monitor CPU, memory, and disk usage with alerts. Connect to shell sessions.
 - **Deploy containers**. Create, start, stop, and redeploy Docker containers. View status, logs, and exec into shells.
 - **Deploy compose stacks**. Define compose files in the UI, on the host, or in a git repo with auto-deploy on push.
+- **Manage files**. Browse Stack directories and Docker named volumes, edit text, transfer files, work with archives, and recover supported changes with undo and redo.
 - **Manage Docker Swarms**. Connect swarm managers and deploy services and stacks across your cluster.
 - **Build images**. Define the dockerfile in UI or clone a git repo. Supports AWS EC2 spot instances for scalable build capacity.
 - **Run automation**. Orchestrate multi-step workflows with Procedures and Actions. Schedule automations to run regularly.
