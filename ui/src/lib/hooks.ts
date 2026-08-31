@@ -660,12 +660,13 @@ export function useFilterByUpdateAvailable(): [boolean, () => void] {
 
 export function usePermissions({ type, id }: Types.ResourceTarget) {
   const user = useUser().data;
-  const perms = useRead(
+  const permissionQuery = useRead(
     "GetPermission",
     { target: { type, id } },
     // skip call for admins
     { enabled: user ? !user?.admin : false },
-  ).data as
+  );
+  const perms = permissionQuery.data as
     | Types.PermissionLevelAndSpecifics
     | Types.PermissionLevel
     | undefined;
@@ -680,10 +681,12 @@ export function usePermissions({ type, id }: Types.ResourceTarget) {
       canCreate: true,
       specific: Object.values(Types.SpecificPermission),
       specificLogs: true,
+      specificFileManager: true,
       specificInspect: true,
       specificTerminal: true,
       specificAttach: true,
       specificProcesses: true,
+      permissionsLoaded: true,
     };
   }
 
@@ -706,12 +709,14 @@ export function usePermissions({ type, id }: Types.ResourceTarget) {
 
   const [
     specificLogs,
+    specificFileManager,
     specificInspect,
     specificTerminal,
     specificAttach,
     specificProcesses,
   ] = [
     specific.includes(Types.SpecificPermission.Logs),
+    specific.includes(Types.SpecificPermission.FileManager),
     specific.includes(Types.SpecificPermission.Inspect),
     specific.includes(Types.SpecificPermission.Terminal),
     specific.includes(Types.SpecificPermission.Attach),
@@ -738,10 +743,12 @@ export function usePermissions({ type, id }: Types.ResourceTarget) {
     canCreate,
     specific,
     specificLogs,
+    specificFileManager,
     specificInspect,
     specificTerminal,
     specificAttach,
     specificProcesses,
+    permissionsLoaded: !permissionQuery.isPending,
   };
 }
 

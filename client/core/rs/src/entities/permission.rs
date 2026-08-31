@@ -159,6 +159,9 @@ impl Default for &PermissionLevel {
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub enum SpecificPermission {
+  /// On **Server / Stack**
+  ///   - Access File Manager APIs for the resource
+  FileManager,
   /// On **Server**
   ///   - Access the terminal apis
   /// On **Stack / Deployment**
@@ -252,6 +255,11 @@ impl PermissionLevel {
   /// Operation requires Terminal permission
   pub fn terminal(self) -> PermissionLevelAndSpecifics {
     self.specific(SpecificPermission::Terminal)
+  }
+
+  /// Operation requires File Manager permission
+  pub fn file_manager(self) -> PermissionLevelAndSpecifics {
+    self.specific(SpecificPermission::FileManager)
   }
 
   /// Operation requires Attach permission
@@ -383,6 +391,11 @@ impl PermissionLevelAndSpecifics {
     self.specific(SpecificPermission::Terminal)
   }
 
+  /// Operation requires File Manager permission
+  pub fn file_manager(self) -> PermissionLevelAndSpecifics {
+    self.specific(SpecificPermission::FileManager)
+  }
+
   /// Operation requires Attach permission
   pub fn attach(self) -> PermissionLevelAndSpecifics {
     self.specific(SpecificPermission::Attach)
@@ -424,5 +437,26 @@ impl HasLevelAndSpecific for PermissionLevelAndSpecifics {
   }
   fn specific(&self) -> &IndexSet<SpecificPermission> {
     &self.specific
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn file_manager_requires_level_and_specific_permission() {
+    let read = PermissionLevel::Read.file_manager();
+    let write = PermissionLevel::Write.file_manager();
+
+    assert!(
+      !PermissionLevelAndSpecifics::from(PermissionLevel::Write)
+        .fulfills(&read)
+    );
+    assert!(PermissionLevel::Read.file_manager().fulfills(&read));
+    assert!(PermissionLevel::Execute.file_manager().fulfills(&read));
+    assert!(!PermissionLevel::Read.file_manager().fulfills(&write));
+    assert!(PermissionLevel::Write.file_manager().fulfills(&write));
+    assert!(PermissionLevel::Write.all().fulfills(&write));
   }
 }

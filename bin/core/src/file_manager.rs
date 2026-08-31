@@ -291,7 +291,7 @@ pub async fn resolve_target(
       let stack = get_check_permissions::<Stack>(
         stack,
         user,
-        permission.into(),
+        permission.file_manager(),
       )
       .await?;
       if !stack.config.swarm_id.is_empty() {
@@ -336,7 +336,7 @@ pub async fn resolve_target(
       let server = get_check_permissions::<Server>(
         server,
         user,
-        permission.into(),
+        permission.file_manager(),
       )
       .await?;
       Ok(ResolvedFileManagerTarget {

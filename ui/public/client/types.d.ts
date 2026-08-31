@@ -12247,6 +12247,11 @@ export declare enum RepoWebhookAction {
 /** The specific types of permission that a User or UserGroup can have on a resource. */
 export declare enum SpecificPermission {
     /**
+     * On **Server / Stack**
+     * - Access File Manager APIs for the resource
+     */
+    FileManager = "FileManager",
+    /**
      * On **Server**
      * - Access the terminal apis
      * On **Stack / Deployment**

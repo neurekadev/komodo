@@ -50,6 +50,7 @@ impl super::KomodoResource for Server {
   fn creator_specific_permissions() -> IndexSet<SpecificPermission> {
     [
       SpecificPermission::Terminal,
+      SpecificPermission::FileManager,
       SpecificPermission::Inspect,
       SpecificPermission::Attach,
       SpecificPermission::Logs,

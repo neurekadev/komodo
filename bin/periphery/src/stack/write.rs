@@ -1,10 +1,13 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, anyhow};
 use formatting::format_serror;
 use komodo_client::entities::{
-  FileContents, RepoExecutionArgs, all_logs_success, repo::Repo,
-  stack::Stack, to_path_compatible_name, update::Log,
+  FileContents, RepoExecutionArgs, all_logs_success,
+  repo::Repo,
+  stack::{Stack, validate_stack_file_paths},
+  to_path_compatible_name,
+  update::Log,
 };
 use mogh_resolver::Resolve;
 use periphery_client::api::{
@@ -74,6 +77,18 @@ pub async fn write_stack<'a>(
   // env_file_path
   Option<&'a str>,
 )> {
+  validate_stack_file_paths(
+    &stack.config.file_paths,
+    &stack.config.env_file_path,
+    Path::new(""),
+  )?;
+  let resolved_run_directory = resolved_run_directory(stack, repo);
+  validate_stack_file_paths(
+    &stack.config.file_paths,
+    &stack.config.env_file_path,
+    &resolved_run_directory,
+  )?;
+
   if stack.config.files_on_host {
     write_stack_files_on_host(stack, res).await
   } else if let Some(repo) = repo {
@@ -86,6 +101,37 @@ pub async fn write_stack<'a>(
   } else {
     write_stack_ui_defined(stack, res).await
   }
+}
+
+fn resolved_run_directory(
+  stack: &Stack,
+  repo: Option<&Repo>,
+) -> PathBuf {
+  let base = if stack.config.files_on_host {
+    periphery_config()
+      .stack_dir()
+      .join(to_path_compatible_name(&stack.name))
+  } else if let Some(repo) = repo {
+    periphery_config()
+      .repo_dir()
+      .join(to_path_compatible_name(&repo.name))
+      .join(&repo.config.path)
+  } else if !stack.config.repo.is_empty() {
+    periphery_config()
+      .stack_dir()
+      .join(to_path_compatible_name(&stack.name))
+      .join(&stack.config.clone_path)
+  } else {
+    return periphery_config()
+      .stack_dir()
+      .join(to_path_compatible_name(&stack.name))
+      .components()
+      .collect();
+  };
+  base
+    .join(&stack.config.run_directory)
+    .components()
+    .collect()
 }
 
 #[instrument("WriteStackFilesOnHost", skip_all)]
@@ -312,24 +358,36 @@ async fn write_stack_inline_repo<'a>(
 #[instrument("WriteStackUiDefined", skip_all)]
 async fn write_stack_ui_defined(
   stack: &Stack,
-  mut res: impl WriteStackRes,
+  res: impl WriteStackRes,
 ) -> anyhow::Result<(
   // run_directory
   PathBuf,
   // env_file_path
   Option<&str>,
 )> {
-  if stack.config.file_contents.trim().is_empty() {
-    return Err(anyhow!(
-      "Must either input compose file contents directly, or use files on host / git repo options."
-    ));
-  }
-
   let run_directory = periphery_config()
     .stack_dir()
     .join(to_path_compatible_name(&stack.name))
     .components()
     .collect::<PathBuf>();
+  write_stack_ui_defined_at(stack, run_directory, res).await
+}
+
+async fn write_stack_ui_defined_at(
+  stack: &Stack,
+  run_directory: PathBuf,
+  mut res: impl WriteStackRes,
+) -> anyhow::Result<(PathBuf, Option<&str>)> {
+  validate_stack_file_paths(
+    &stack.config.file_paths,
+    &stack.config.env_file_path,
+    &run_directory,
+  )?;
+  if stack.config.file_contents.trim().is_empty() {
+    return Err(anyhow!(
+      "Must either input compose file contents directly, or use files on host / git repo options."
+    ));
+  }
 
   // Ensure run directory exists
   fs::create_dir_all(&run_directory).await.with_context(|| {
@@ -394,4 +452,53 @@ fn stack_git_token<R: WriteStackRes>(
     });
     anyhow!("failed to find required git token, stopping run")
   })
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[derive(Default)]
+  struct TestWriteResponse {
+    logs: Vec<Log>,
+  }
+
+  impl WriteStackRes for TestWriteResponse {
+    fn logs(&mut self) -> &mut Vec<Log> {
+      &mut self.logs
+    }
+  }
+
+  #[tokio::test]
+  async fn compose_env_collision_is_rejected_before_any_write() {
+    let directory = std::env::temp_dir().join(format!(
+      "komodo-compose-env-collision-{}",
+      uuid::Uuid::new_v4()
+    ));
+    fs::create_dir_all(&directory).await.unwrap();
+    let env_path = directory.join(".env");
+    fs::write(&env_path, "authoritative=value\n").await.unwrap();
+
+    let mut stack = Stack::default();
+    stack.config.file_paths = vec!["./.env".into()];
+    stack.config.env_file_path = ".env".into();
+    stack.config.file_contents = "services: {}\n".into();
+    stack.config.environment = "NEW=value\n".into();
+
+    let error = write_stack_ui_defined_at(
+      &stack,
+      directory.clone(),
+      TestWriteResponse::default(),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("./.env"));
+    assert!(error.to_string().contains(".env"));
+    assert_eq!(
+      fs::read_to_string(&env_path).await.unwrap(),
+      "authoritative=value\n"
+    );
+
+    fs::remove_dir_all(directory).await.unwrap();
+  }
 }

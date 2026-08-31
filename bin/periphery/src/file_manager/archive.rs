@@ -28,9 +28,9 @@ use zip::{
 };
 
 use super::{
-  MAX_ARCHIVE_EXPANSION_RATIO, MAX_ENTRIES, MINIMUM_FREE_BYTES,
-  OperationProgress, WorkTotal, collect_merge_conflicts,
-  copy_with_progress, decision_for, ensure_free_space,
+  MAX_ARCHIVE_EXPANSION_RATIO, MINIMUM_FREE_BYTES, OperationProgress,
+  WorkTotal, collect_merge_conflicts, copy_with_progress,
+  decision_for, ensure_entry_limit, ensure_free_space,
   path::MAX_DEPTH, path::open_parent_nofollow, path::relative_path,
   path_string, remove_entry,
 };
@@ -477,9 +477,7 @@ pub(super) fn extraction_work(
   match detect_format(&source)? {
     DetectedArchive::Zip => {
       let mut archive = ZipArchive::new(source)?;
-      if archive.len() as u64 > MAX_ENTRIES {
-        return Err(anyhow!("Archive exceeds the entry limit"));
-      }
+      ensure_entry_limit(archive.len() as u64)?;
       let mut bytes = 0_u64;
       for index in 0..archive.len() {
         bytes = bytes
@@ -498,9 +496,7 @@ pub(super) fn extraction_work(
     }),
     DetectedArchive::SevenZip => {
       let reader = ArchiveReader::new(source, Password::empty())?;
-      if reader.archive().files.len() as u64 > MAX_ENTRIES {
-        return Err(anyhow!("Archive exceeds the entry limit"));
-      }
+      ensure_entry_limit(reader.archive().files.len() as u64)?;
       let bytes = reader.archive().files.iter().try_fold(
         0_u64,
         |total, entry| {
@@ -596,9 +592,7 @@ fn add_zip_entry<W: Write + std::io::Seek>(
   progress: Option<&OperationProgress>,
 ) -> anyhow::Result<()> {
   *count += 1;
-  if *count > MAX_ENTRIES {
-    return Err(anyhow!("Archive exceeds the entry limit"));
-  }
+  ensure_entry_limit(*count)?;
   let metadata = parent.symlink_metadata(name)?;
   if metadata.file_type().is_symlink() {
     return Err(anyhow!("Archives cannot contain symbolic links"));
@@ -699,9 +693,7 @@ fn append_tar_entry<W: Write>(
   progress: Option<&OperationProgress>,
 ) -> anyhow::Result<()> {
   *count += 1;
-  if *count > MAX_ENTRIES {
-    return Err(anyhow!("Archive exceeds the entry limit"));
-  }
+  ensure_entry_limit(*count)?;
   let metadata = parent.symlink_metadata(name)?;
   if metadata.file_type().is_symlink() {
     return Err(anyhow!("Archives cannot contain symbolic links"));
@@ -790,9 +782,7 @@ fn add_seven_zip_entry<W: Write + std::io::Seek>(
   progress: Option<&OperationProgress>,
 ) -> anyhow::Result<()> {
   *count += 1;
-  if *count > MAX_ENTRIES {
-    return Err(anyhow!("Archive exceeds the entry limit"));
-  }
+  ensure_entry_limit(*count)?;
   let metadata = parent.symlink_metadata(name)?;
   if metadata.file_type().is_symlink() {
     return Err(anyhow!("Archives cannot contain symbolic links"));
@@ -914,9 +904,7 @@ fn extract_zip(
   let compressed_size = source.metadata()?.len().max(1);
   let mut archive = ZipArchive::new(source)?;
   let mut expanded = 0_u64;
-  if archive.len() as u64 > MAX_ENTRIES {
-    return Err(anyhow!("Archive exceeds the entry limit"));
-  }
+  ensure_entry_limit(archive.len() as u64)?;
   for index in 0..archive.len() {
     let mut entry = archive.by_index(index)?;
     if entry.encrypted() {
@@ -1009,9 +997,7 @@ fn extract_tar_reader<R: Read>(
   let mut expanded = 0_u64;
   for entry in archive.entries()? {
     count += 1;
-    if count > MAX_ENTRIES {
-      return Err(anyhow!("Archive exceeds the entry limit"));
-    }
+    ensure_entry_limit(count)?;
     let mut entry = entry?;
     let entry_type = entry.header().entry_type();
     if !entry_type.is_file() && !entry_type.is_dir() {
@@ -1077,11 +1063,9 @@ fn extract_seven_zip(
   );
   archive.for_each_entries(|entry, reader| {
     count += 1;
-    if count > MAX_ENTRIES {
-      return Err(sevenz_rust2::Error::Other(Cow::Borrowed(
-        "Archive exceeds the entry limit",
-      )));
-    }
+    ensure_entry_limit(count).map_err(|error| {
+      sevenz_rust2::Error::Other(Cow::Owned(error.to_string()))
+    })?;
     validate_archive_name(entry.name()).map_err(|error| {
       sevenz_rust2::Error::Other(Cow::Owned(error.to_string()))
     })?;
@@ -1285,9 +1269,7 @@ fn validate_staged_tree(root: &Path) -> anyhow::Result<()> {
   fn visit(path: &Path, count: &mut u64) -> anyhow::Result<()> {
     for entry in fs::read_dir(path)? {
       *count += 1;
-      if *count > MAX_ENTRIES {
-        return Err(anyhow!("Archive exceeds the entry limit"));
-      }
+      ensure_entry_limit(*count)?;
       let entry = entry?;
       let metadata = fs::symlink_metadata(entry.path())?;
       if metadata.file_type().is_symlink()

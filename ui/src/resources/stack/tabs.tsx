@@ -2,7 +2,7 @@ import { useLocalStorage } from "@mantine/hooks";
 import { useStack } from ".";
 import { usePermissions, useRead } from "@/lib/hooks";
 import { Types } from "komodo_client";
-import { useMemo } from "react";
+import { useEffect, useMemo } from "react";
 import { MobileFriendlyTabsSelector, TabNoContent } from "mogh_ui";
 import { Tabs } from "@mantine/core";
 import { ICONS } from "@/lib/icons";
@@ -29,10 +29,12 @@ export default function StackTabs({ id }: { id: string }) {
     defaultValue: "Config",
   });
   const info = useStack(id)?.info;
-  const { specificLogs, specificTerminal } = usePermissions({
-    type: "Stack",
-    id,
-  });
+  const {
+    specificLogs,
+    specificTerminal,
+    specificFileManager,
+    permissionsLoaded,
+  } = usePermissions({ type: "Stack", id });
 
   const services = useRead("ListStackServices", { stack: id }).data;
 
@@ -46,6 +48,7 @@ export default function StackTabs({ id }: { id: string }) {
     state === Types.StackState.Unknown ||
     state === Types.StackState.Down ||
     !specificLogs;
+  const hideFiles = !specificFileManager;
   const terminalDisabled =
     !specificTerminal ||
     containerTerminalsDisabled ||
@@ -61,6 +64,7 @@ export default function StackTabs({ id }: { id: string }) {
   const view =
     (_view === "Info" && hideInfo) ||
     (_view === "Terminals" && terminalDisabled) ||
+    (_view === "Files" && hideFiles) ||
     (_view === "Log" && hideLogs)
       ? "Config"
       : _view;
@@ -82,6 +86,7 @@ export default function StackTabs({ id }: { id: string }) {
       },
       {
         value: "Files",
+        hidden: hideFiles,
         icon: ICONS.FileManager,
       },
       {
@@ -98,12 +103,19 @@ export default function StackTabs({ id }: { id: string }) {
     ],
     [
       hideInfo,
+      hideFiles,
       specificLogs,
       hideLogs,
       specificTerminal,
       terminalDisabled,
     ],
   );
+
+  useEffect(() => {
+    if (permissionsLoaded && _view === "Files" && hideFiles) {
+      setView("Config");
+    }
+  }, [_view, hideFiles, permissionsLoaded, setView]);
 
   const Selector = (
     <MobileFriendlyTabsSelector

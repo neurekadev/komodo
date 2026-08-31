@@ -60,7 +60,6 @@ use path::{
 };
 
 pub const MAX_TEXT_BYTES: u64 = 4 * 1024 * 1024;
-pub const MAX_ENTRIES: u64 = 100_000;
 /// Kept in the public limits response for wire compatibility. A value of zero
 /// means archive expansion is capacity-limited instead of fixed-size-limited.
 pub const MAX_ARCHIVE_EXPANDED_BYTES: u64 = 0;
@@ -580,12 +579,32 @@ pub async fn initialize() -> anyhow::Result<()> {
 pub fn limits() -> FileManagerLimits {
   FileManagerLimits {
     max_text_bytes: MAX_TEXT_BYTES,
-    max_entries: MAX_ENTRIES,
+    max_entries: max_entries(),
     max_depth: path::MAX_DEPTH as u64,
     max_archive_expanded_bytes: MAX_ARCHIVE_EXPANDED_BYTES,
     max_archive_expansion_ratio: MAX_ARCHIVE_EXPANSION_RATIO,
     minimum_free_bytes: MINIMUM_FREE_BYTES,
   }
+}
+
+pub(super) fn max_entries() -> u64 {
+  periphery_config().file_manager_max_entries.get()
+}
+
+pub(super) fn ensure_entry_limit(entries: u64) -> anyhow::Result<()> {
+  ensure_entry_limit_with_max(entries, max_entries())
+}
+
+fn ensure_entry_limit_with_max(
+  entries: u64,
+  maximum: u64,
+) -> anyhow::Result<()> {
+  if entries > maximum {
+    return Err(anyhow!(
+      "File Manager entry limit exceeded (maximum {maximum})"
+    ));
+  }
+  Ok(())
 }
 
 fn configured_path(base: impl AsRef<Path>, value: &str) -> PathBuf {
@@ -794,9 +813,6 @@ pub async fn list_directory(
     let dir = open_dir_nofollow(&root_dir, &relative)?;
     let mut entries = Vec::new();
     for entry in dir.entries()? {
-      if entries.len() as u64 >= MAX_ENTRIES {
-        return Err(anyhow!("Directory exceeds the entry limit"));
-      }
       let entry = entry?;
       let name = entry.file_name().into_string().map_err(|_| {
         anyhow!("Non-UTF-8 filenames are unsupported")
@@ -804,6 +820,7 @@ pub async fn list_directory(
       if name.starts_with(".komodo-file-manager-staging-") {
         continue;
       }
+      ensure_entry_limit(entries.len() as u64 + 1)?;
       let metadata = dir.symlink_metadata(&name)?;
       let kind = entry_kind(&metadata);
       let entry_path = if path.is_empty() {
@@ -2501,9 +2518,7 @@ fn collect_merge_conflicts(
       )?;
     }
   } else {
-    if conflicts.len() as u64 >= MAX_ENTRIES {
-      return Err(anyhow!("Conflict list exceeds the entry limit"));
-    }
+    ensure_entry_limit(conflicts.len() as u64 + 1)?;
     conflicts.push(FileManagerConflict {
       path: path_string(target)?,
       existing_kind: entry_kind(&target_metadata),
@@ -3255,11 +3270,7 @@ fn work_for_entry(
         &metadata,
         depth + 1,
       )?);
-      if total.entries > MAX_ENTRIES {
-        return Err(anyhow!(
-          "Entry exceeds File Manager tree limits"
-        ));
-      }
+      ensure_entry_limit(total.entries)?;
     }
   }
   Ok(total)
@@ -3278,11 +3289,7 @@ fn host_work(path: &Path) -> anyhow::Result<WorkTotal> {
   if metadata.is_dir() && !metadata.file_type().is_symlink() {
     for entry in fs::read_dir(path)? {
       total.add(host_work(&entry?.path())?);
-      if total.entries > MAX_ENTRIES {
-        return Err(anyhow!(
-          "Entry exceeds File Manager tree limits"
-        ));
-      }
+      ensure_entry_limit(total.entries)?;
     }
   }
   Ok(total)
@@ -3802,7 +3809,8 @@ fn metadata_tree_entry(
   depth: usize,
 ) -> anyhow::Result<FileManagerRevision> {
   *entries = entries.saturating_add(1);
-  if *entries > MAX_ENTRIES || depth > path::MAX_DEPTH {
+  ensure_entry_limit(*entries)?;
+  if depth > path::MAX_DEPTH {
     return Err(anyhow!("Entry exceeds File Manager tree limits"));
   }
   if !metadata.is_dir() || metadata.file_type().is_symlink() {
@@ -3847,7 +3855,8 @@ fn hash_tree_entry(
   depth: usize,
 ) -> anyhow::Result<()> {
   *entries += 1;
-  if *entries > MAX_ENTRIES || depth > path::MAX_DEPTH {
+  ensure_entry_limit(*entries)?;
+  if depth > path::MAX_DEPTH {
     return Err(anyhow!("Entry exceeds File Manager tree limits"));
   }
   hasher.update(name.as_encoded_bytes());
@@ -4004,6 +4013,12 @@ fn path_string(path: &Path) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn file_manager_entry_limit_accepts_exact_boundary() {
+    assert!(ensure_entry_limit_with_max(5, 5).is_ok());
+    assert!(ensure_entry_limit_with_max(6, 5).is_err());
+  }
 
   #[test]
   fn operation_progress_tracks_phase_work_and_completion() {

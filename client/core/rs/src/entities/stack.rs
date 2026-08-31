@@ -1,6 +1,10 @@
-use std::{collections::HashMap, sync::OnceLock};
+use std::{
+  collections::HashMap,
+  path::{Component, Path, PathBuf},
+  sync::OnceLock,
+};
 
-use anyhow::Context;
+use anyhow::{Context, anyhow};
 use bson::{Document, doc};
 use derive_builder::Builder;
 use derive_default_builder::DefaultBuilder;
@@ -140,6 +144,110 @@ fn default_stack_file_paths() -> &'static [String] {
   static DEFAULT_FILE_PATHS: OnceLock<Vec<String>> = OnceLock::new();
   DEFAULT_FILE_PATHS
     .get_or_init(|| vec![String::from("compose.yaml")])
+}
+
+/// Rejects compose and environment paths that refer to the same lexical
+/// location. The configured strings are left unchanged.
+pub fn validate_stack_file_paths(
+  file_paths: &[String],
+  env_file_path: &str,
+  base: &Path,
+) -> anyhow::Result<()> {
+  let compose_paths = if file_paths.is_empty() {
+    default_stack_file_paths()
+  } else {
+    file_paths
+  };
+  let resolved_env = lexical_normalize(base, env_file_path);
+  for compose_path in compose_paths {
+    if lexical_normalize(base, compose_path) == resolved_env {
+      return Err(anyhow!(
+        "Stack compose path '{compose_path}' conflicts with environment file path '{env_file_path}' after path resolution; configure distinct paths"
+      ));
+    }
+  }
+  Ok(())
+}
+
+fn lexical_normalize(base: &Path, path: &str) -> PathBuf {
+  let path = Path::new(path);
+  let joined = if path.is_absolute() {
+    path.to_path_buf()
+  } else {
+    base.join(path)
+  };
+  let mut normalized = PathBuf::new();
+  for component in joined.components() {
+    match component {
+      Component::Prefix(prefix) => {
+        normalized.push(prefix.as_os_str())
+      }
+      Component::RootDir => normalized.push(component.as_os_str()),
+      Component::CurDir => {}
+      Component::ParentDir => {
+        match normalized.components().next_back() {
+          Some(Component::Normal(_)) => {
+            normalized.pop();
+          }
+          Some(Component::RootDir | Component::Prefix(_)) => {}
+          _ => normalized.push(".."),
+        }
+      }
+      Component::Normal(value) => normalized.push(value),
+    }
+  }
+  normalized
+}
+
+#[cfg(test)]
+mod file_path_tests {
+  use super::*;
+
+  fn paths(values: &[&str]) -> Vec<String> {
+    values.iter().map(|value| (*value).to_string()).collect()
+  }
+
+  #[test]
+  fn rejects_exact_and_normalized_collisions_in_any_position() {
+    assert!(
+      validate_stack_file_paths(
+        &paths(&["compose.yaml", ".env"]),
+        ".env",
+        Path::new("/run")
+      )
+      .is_err()
+    );
+    assert!(
+      validate_stack_file_paths(
+        &paths(&["config/../.env"]),
+        "./.env",
+        Path::new("/run")
+      )
+      .is_err()
+    );
+  }
+
+  #[test]
+  fn rejects_collision_with_implicit_compose_path() {
+    assert!(
+      validate_stack_file_paths(
+        &[],
+        "nested/../compose.yaml",
+        Path::new("/run")
+      )
+      .is_err()
+    );
+  }
+
+  #[test]
+  fn accepts_distinct_paths() {
+    validate_stack_file_paths(
+      &paths(&["compose.yaml", "compose.prod.yaml"]),
+      ".env",
+      Path::new("/run"),
+    )
+    .unwrap();
+  }
 }
 
 #[typeshare]

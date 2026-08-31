@@ -18,6 +18,7 @@ import { Center, Group, Loader, Stack, Tabs, Text } from "@mantine/core";
 import { useLocalStorage } from "@mantine/hooks";
 import { Types } from "komodo_client";
 import { useNavigate, useParams } from "react-router-dom";
+import { useEffect } from "react";
 
 type VolumeView = "Info" | "Files";
 
@@ -49,7 +50,7 @@ function VolumeInner({
   serverId: string;
   volumeName: string;
 }) {
-  const [view, setView] = useLocalStorage<VolumeView>({
+  const [storedView, setView] = useLocalStorage<VolumeView>({
     key: `volume-${serverId}-${volumeName}-tab-v1`,
     defaultValue: "Info",
   });
@@ -57,7 +58,7 @@ function VolumeInner({
   useSetTitle(`${server?.name} | Volume | ${volumeName}`);
   const nav = useNavigate();
 
-  const { specific } = usePermissions({
+  const { specific, specificFileManager, permissionsLoaded } = usePermissions({
     type: "Server",
     id: serverId,
   });
@@ -85,6 +86,18 @@ function VolumeInner({
     },
     { refetchInterval: 10_000 },
   ).data?.filter((container) => container.volumes?.includes(volumeName));
+
+  const view =
+    storedView === "Files" && !specificFileManager ? "Info" : storedView;
+  useEffect(() => {
+    if (
+      permissionsLoaded &&
+      storedView === "Files" &&
+      !specificFileManager
+    ) {
+      setView("Info");
+    }
+  }, [permissionsLoaded, setView, specificFileManager, storedView]);
 
   if (isPending) {
     return (
@@ -116,7 +129,11 @@ function VolumeInner({
 
   const selector = (
     <MobileFriendlyTabsSelector
-      tabs={VOLUME_TABS}
+      tabs={VOLUME_TABS.map((tab) =>
+        tab.value === "Files"
+          ? { ...tab, hidden: !specificFileManager }
+          : tab,
+      )}
       value={view}
       onValueChange={setView as any}
     />

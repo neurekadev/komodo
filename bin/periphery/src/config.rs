@@ -111,6 +111,9 @@ pub fn periphery_config() -> &'static PeripheryConfig {
       default_terminal_command: env
         .periphery_default_terminal_command
         .unwrap_or(config.default_terminal_command),
+      file_manager_max_entries: env
+        .periphery_file_manager_max_entries
+        .unwrap_or(config.file_manager_max_entries),
       disable_terminals: env
         .periphery_disable_terminals
         .unwrap_or(config.disable_terminals),
@@ -183,4 +186,38 @@ pub fn periphery_config() -> &'static PeripheryConfig {
       image_registries: config.image_registries,
     }
   })
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn environment_file_manager_limit_overrides_config() {
+    let env: Env = envy::from_iter([(
+      "PERIPHERY_FILE_MANAGER_MAX_ENTRIES".to_string(),
+      "23".to_string(),
+    )])
+    .unwrap();
+    let config = PeripheryConfig::default();
+
+    assert_eq!(
+      env
+        .periphery_file_manager_max_entries
+        .unwrap_or(config.file_manager_max_entries)
+        .get(),
+      23
+    );
+  }
+
+  #[test]
+  fn environment_file_manager_limit_rejects_zero() {
+    assert!(
+      envy::from_iter::<_, Env>([(
+        "PERIPHERY_FILE_MANAGER_MAX_ENTRIES".to_string(),
+        "0".to_string(),
+      )])
+      .is_err()
+    );
+  }
 }

@@ -6422,6 +6422,11 @@
       "description": "The specific types of permission that a User or UserGroup can have on a resource.",
       "oneOf": [
         {
+          "description": "On **Server / Stack**\n  - Access File Manager APIs for the resource",
+          "type": "string",
+          "const": "FileManager"
+        },
+        {
           "description": "On **Server**\n  - Access the terminal apis\nOn **Stack / Deployment**\n  - Access the container exec Apis",
           "type": "string",
           "const": "Terminal"

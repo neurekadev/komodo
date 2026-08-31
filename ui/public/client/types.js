@@ -1153,6 +1153,11 @@ export var RepoWebhookAction;
 export var SpecificPermission;
 (function (SpecificPermission) {
     /**
+     * On **Server / Stack**
+     * - Access File Manager APIs for the resource
+     */
+    SpecificPermission["FileManager"] = "FileManager";
+    /**
      * On **Server**
      * - Access the terminal apis
      * On **Stack / Deployment**
