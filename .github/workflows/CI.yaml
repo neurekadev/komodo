@@ -61,82 +61,11 @@ jobs:
         run: cargo test --lib --bins
 
   build:
-    name: Build ${{ matrix.name }}
-    runs-on: ${{ matrix.runner }}
+    name: Build
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
       contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: Workspace
-            kind: workspace
-            runner: ubuntu-24.04
-          - name: Core AMD64
-            kind: container
-            component: core
-            context: .
-            dockerfile: bin/core/aio.Dockerfile
-            arch: amd64
-            runner: ubuntu-24.04
-            platform: linux/amd64
-          - name: Core ARM64
-            kind: container
-            component: core
-            context: .
-            dockerfile: bin/core/aio.Dockerfile
-            arch: arm64
-            runner: ubuntu-24.04-arm
-            platform: linux/arm64
-          - name: Periphery AMD64
-            kind: container
-            component: periphery
-            context: .
-            dockerfile: bin/periphery/aio.Dockerfile
-            arch: amd64
-            runner: ubuntu-24.04
-            platform: linux/amd64
-          - name: Periphery ARM64
-            kind: container
-            component: periphery
-            context: .
-            dockerfile: bin/periphery/aio.Dockerfile
-            arch: arm64
-            runner: ubuntu-24.04-arm
-            platform: linux/arm64
-          - name: CLI AMD64
-            kind: container
-            component: cli
-            context: .
-            dockerfile: bin/cli/aio.Dockerfile
-            arch: amd64
-            runner: ubuntu-24.04
-            platform: linux/amd64
-          - name: CLI ARM64
-            kind: container
-            component: cli
-            context: .
-            dockerfile: bin/cli/aio.Dockerfile
-            arch: arm64
-            runner: ubuntu-24.04-arm
-            platform: linux/arm64
-          - name: Docs AMD64
-            kind: container
-            component: docs
-            context: docsite
-            dockerfile: docsite/Dockerfile
-            arch: amd64
-            runner: ubuntu-24.04
-            platform: linux/amd64
-          - name: Docs ARM64
-            kind: container
-            component: docs
-            context: docsite
-            dockerfile: docsite/Dockerfile
-            arch: arm64
-            runner: ubuntu-24.04-arm
-            platform: linux/arm64
 
     steps:
       - name: Check Out Repository
@@ -145,15 +74,12 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust
-        if: matrix.kind == 'workspace'
         uses: dtolnay/rust-toolchain@stable
 
       - name: Build Workspace
-        if: matrix.kind == 'workspace'
         run: cargo build
 
       - name: Validate Compose Models
-        if: matrix.kind == 'workspace'
         run: |
           set -euo pipefail
           docker compose -f dev.compose.yaml config --quiet
@@ -167,12 +93,90 @@ jobs:
             docker compose --project-directory "$directory" config --quiet
           done
 
+  verify-platforms:
+    name: Build ${{ matrix.name }}
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name != github.repository
+    needs:
+      - lint
+      - unit-tests
+      - build
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Core AMD64
+            component: core
+            context: .
+            dockerfile: bin/core/aio.Dockerfile
+            arch: amd64
+            runner: ubuntu-24.04
+            platform: linux/amd64
+          - name: Core ARM64
+            component: core
+            context: .
+            dockerfile: bin/core/aio.Dockerfile
+            arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+          - name: Periphery AMD64
+            component: periphery
+            context: .
+            dockerfile: bin/periphery/aio.Dockerfile
+            arch: amd64
+            runner: ubuntu-24.04
+            platform: linux/amd64
+          - name: Periphery ARM64
+            component: periphery
+            context: .
+            dockerfile: bin/periphery/aio.Dockerfile
+            arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+          - name: CLI AMD64
+            component: cli
+            context: .
+            dockerfile: bin/cli/aio.Dockerfile
+            arch: amd64
+            runner: ubuntu-24.04
+            platform: linux/amd64
+          - name: CLI ARM64
+            component: cli
+            context: .
+            dockerfile: bin/cli/aio.Dockerfile
+            arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+          - name: Docs AMD64
+            component: docs
+            context: docsite
+            dockerfile: docsite/Dockerfile
+            arch: amd64
+            runner: ubuntu-24.04
+            platform: linux/amd64
+          - name: Docs ARM64
+            component: docs
+            context: docsite
+            dockerfile: docsite/Dockerfile
+            arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+
+    steps:
+      - name: Check Out Repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
       - name: Set Up Docker Buildx
-        if: matrix.kind == 'container'
         uses: docker/setup-buildx-action@v4
 
       - name: Build Image
-        if: matrix.kind == 'container'
         uses: docker/build-push-action@v7
         with:
           context: ${{ matrix.context }}
@@ -181,7 +185,9 @@ jobs:
           push: false
           provenance: false
           sbom: false
-          cache-from: type=gha,scope=ci-${{ matrix.component }}-${{ matrix.arch }}
+          cache-from: |
+            type=gha,scope=ci-${{ matrix.component }}-${{ matrix.arch }}
+            type=gha,scope=publish-${{ matrix.component }}-${{ matrix.arch }}
           cache-to: type=gha,scope=ci-${{ matrix.component }}-${{ matrix.arch }},mode=max,ignore-error=true
 
   publish-platforms:
@@ -319,7 +325,9 @@ jobs:
           annotations: ${{ steps.metadata.outputs.annotations }}
           provenance: mode=max
           sbom: true
-          cache-from: type=gha,scope=${{ env.CACHE_PREFIX }}-${{ matrix.component }}-${{ matrix.arch }}
+          cache-from: |
+            type=gha,scope=${{ env.CACHE_PREFIX }}-${{ matrix.component }}-${{ matrix.arch }}
+            type=gha,scope=publish-${{ matrix.component }}-${{ matrix.arch }}
           cache-to: type=gha,scope=${{ env.CACHE_PREFIX }}-${{ matrix.component }}-${{ matrix.arch }},mode=max,ignore-error=true
 
       - name: Export Digest
