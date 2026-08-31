@@ -4872,7 +4872,7 @@
       "type": "object"
     },
     "BackupCoreDatabase": {
-      "description": "**Admin only.** Backs up the Komodo Core database to compressed jsonl files.\nResponse: [Update]. Aliases: `backup-database`, `backup-db`, `backup`.\n\nMount a folder to `/backups`, and Core will use it to create\ntimestamped database dumps, which can be restored using\nthe Komodo CLI.\n\nhttps://komo.do/docs/setup/backup",
+      "description": "**Admin only.** Backs up the Komodo Core database to compressed jsonl files.\nResponse: [Update]. Aliases: `backup-database`, `backup-db`, `backup`.\n\nMount a folder to `/backups`, and Core will use it to create\ntimestamped database dumps, which can be restored using\nthe Komodo CLI.\n\nhttps://komodo.docs.neureka.dev/docs/setup/backup",
       "type": "object"
     },
     "GlobalAutoUpdate": {
@@ -6124,7 +6124,7 @@
           ]
         },
         "resource_path": {
-          "description": "The path of the resource file(s) to sync.\n - If Files on Host, this is relative to the configured `sync_directory` in core config.\n - If Git Repo based, this is relative to the root of the repo.\nCan be a specific file, or a directory containing multiple files / folders.\nSee [https://komo.do/docs/sync-resources](https://komo.do/docs/sync-resources) for more information.",
+          "description": "The path of the resource file(s) to sync.\n - If Files on Host, this is relative to the configured `sync_directory` in core config.\n - If Git Repo based, this is relative to the root of the repo.\nCan be a specific file, or a directory containing multiple files / folders.\nSee [https://komodo.docs.neureka.dev/docs/sync-resources](https://komodo.docs.neureka.dev/docs/sync-resources) for more information.",
           "type": [
             "array",
             "null"

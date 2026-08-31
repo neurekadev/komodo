@@ -26,12 +26,6 @@ function HomepageHeader() {
           </Link>
           <Link
             className="button button--secondary button--lg"
-            to="https://demo.komo.do"
-          >
-            Demo
-          </Link>
-          <Link
-            className={"button button--secondary button--lg " + styles["mobile-full-grid"]}
             to="https://github.com/neurekadev/komodo"
           >
             GitHub

@@ -262,7 +262,7 @@ pub struct ResourceSyncConfig {
   ///  - If Files on Host, this is relative to the configured `sync_directory` in core config.
   ///  - If Git Repo based, this is relative to the root of the repo.
   /// Can be a specific file, or a directory containing multiple files / folders.
-  /// See [https://komo.do/docs/sync-resources](https://komo.do/docs/sync-resources) for more information.
+  /// See [https://komodo.docs.neureka.dev/docs/sync-resources](https://komodo.docs.neureka.dev/docs/sync-resources) for more information.
   #[serde(default, deserialize_with = "string_list_deserializer")]
   #[partial_attr(serde(
     default,

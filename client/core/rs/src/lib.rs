@@ -1,5 +1,5 @@
 //! # Komodo
-//! *A system to build and deploy software across many servers*. [**https://komo.do**](https://komo.do)
+//! *A system to build and deploy software across many servers*. [**https://komodo.docs.neureka.dev/**](https://komodo.docs.neureka.dev/)
 //!
 //! This is a client library for the Komodo Core API.
 //! It contains:
@@ -71,7 +71,7 @@ pub struct KomodoEnv {
   pub komodo_api_secret: String,
 }
 
-/// Client to interface with [Komodo](https://komo.do/docs/api#rust-client)
+/// Client to interface with [Komodo](https://komodo.docs.neureka.dev/docs/api#rust-client)
 #[derive(Clone)]
 pub struct KomodoClient {
   #[cfg(not(feature = "blocking"))]

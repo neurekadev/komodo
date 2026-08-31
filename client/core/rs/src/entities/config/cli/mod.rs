@@ -188,7 +188,7 @@ pub struct CliConfig {
   pub config_aliases: Vec<String>,
   // Same as Core
   /// The host Komodo url.
-  /// Eg. "https://demo.komo.do"
+  /// Eg. "https://komodo.example.com"
   #[serde(default, skip_serializing_if = "String::is_empty")]
   pub host: String,
   /// The api key for the CLI to use

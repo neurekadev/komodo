@@ -11,7 +11,7 @@ const config: Config = {
   favicon: "img/favicon.ico",
 
   // Set the production url of your site here
-  url: process.env.DOCSITE_URL || "https://komo.do",
+  url: process.env.DOCSITE_URL || "https://komodo.docs.neureka.dev",
   // Set the /<baseUrl>/ pathname under which your site is served
   // For GitHub pages deployment, it is often '/<projectName>/'
   baseUrl: process.env.DOCSITE_BASE_URL || "/",
@@ -135,7 +135,6 @@ const config: Config = {
           items: [
             { label: "GitHub", href: "https://github.com/neurekadev/komodo" },
             { label: "Donate", href: "https://opencollective.com/komodo" },
-            { label: "Demo", href: "https://demo.komo.do" },
           ],
         },
       ],

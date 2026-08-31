@@ -23,11 +23,10 @@ Download the latest binaries from [Releases](https://github.com/neurekadev/komod
 
 ## Usage
 
-Run Core to host the API and browser interface, then connect Periphery agents on the servers you want to manage. Follow the [setup guide](https://komo.do/docs/setup) for supported deployment options and configuration.
+Run Core to host the API and browser interface, then connect Periphery agents on the servers you want to manage. Follow the [setup guide](https://komodo.docs.neureka.dev/docs/setup) for supported deployment options and configuration.
 
-- Read the [documentation](https://komo.do/docs/intro).
-- Explore the [demo](https://demo.komo.do).
-- Use the [CLI and API](https://komo.do/docs/ecosystem) for automation.
+- Read the [documentation](https://komodo.docs.neureka.dev/docs/intro).
+- Use the [CLI and API](https://komodo.docs.neureka.dev/docs/ecosystem) for automation.
 
 ## Features
 

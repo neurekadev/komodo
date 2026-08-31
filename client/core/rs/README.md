@@ -1,5 +1,5 @@
 # Komodo
-*A system to build and deploy software across many servers*. [https://komo.do](https://komo.do)
+*A system to build and deploy software across many servers*. [https://komodo.docs.neureka.dev/](https://komodo.docs.neureka.dev/)
 
 Docs: [https://docs.rs/komodo_client/latest/komodo_client](https://docs.rs/komodo_client/latest/komodo_client).
 

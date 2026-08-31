@@ -11,7 +11,7 @@ The full API documentation is [**available here**](https://docs.rs/komodo_client
 The Rust client is published to crates.io at [komodo_client](https://crates.io/crates/komodo_client).
 
 ```rust
-let komodo = KomodoClient::new("https://demo.komo.do", "your_key", "your_secret")
+let komodo = KomodoClient::new("https://komodo.example.com", "your_key", "your_secret")
   .with_healthcheck()
   .await?;
 
@@ -32,7 +32,7 @@ The Typescript client is published to NPM at [komodo_client](https://www.npmjs.c
 ```ts
 import { KomodoClient, Types } from "komodo_client";
 
-const komodo = KomodoClient("https://demo.komo.do", {
+const komodo = KomodoClient("https://komodo.example.com", {
   type: "api-key",
   params: {
     key: "your_key",

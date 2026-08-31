@@ -2184,7 +2184,7 @@ export interface ResourceSyncConfig {
 	 * - If Files on Host, this is relative to the configured `sync_directory` in core config.
 	 * - If Git Repo based, this is relative to the root of the repo.
 	 * Can be a specific file, or a directory containing multiple files / folders.
-	 * See [https://komo.do/docs/sync-resources](https://komo.do/docs/sync-resources) for more information.
+	 * See [https://komodo.docs.neureka.dev/docs/sync-resources](https://komodo.docs.neureka.dev/docs/sync-resources) for more information.
 	 */
 	resource_path?: string[];
 	/**
@@ -6145,7 +6145,7 @@ export interface AwsBuilderConfig {
  * timestamped database dumps, which can be restored using
  * the Komodo CLI.
  * 
- * https://komo.do/docs/setup/backup
+ * https://komodo.docs.neureka.dev/docs/setup/backup
  */
 export interface BackupCoreDatabase {
 }
