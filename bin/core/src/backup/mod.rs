@@ -202,6 +202,7 @@ pub async fn save_settings(
     .with_options(UpdateOptions::builder().upsert(true).build())
     .await
     .context("Failed to persist sealed backup settings")?;
+  invalidate_fleet_retries();
   notify_scheduler();
   let mut redacted = proposed;
   redacted.redact();
@@ -739,17 +740,22 @@ pub async fn status() -> anyhow::Result<BackupStatus> {
     core_repository(&primary_repository, &primary_settings)?
       .list_snapshots()
       .map(|inventory| {
-        inventory
-          .snapshots
-          .into_iter()
-          .map(|snapshot| snapshot.name)
-          .collect::<HashSet<_>>()
+        (
+          inventory
+            .snapshots
+            .into_iter()
+            .map(|snapshot| snapshot.name)
+            .collect::<HashSet<_>>(),
+          inventory.hidden == 0,
+        )
       })
   })
   .await
   .context("Primary health worker failed")?;
-  let primary_healthy = primary.is_ok();
-  let primary_names = primary.unwrap_or_default();
+  let primary_healthy =
+    primary.as_ref().is_ok_and(|(_, healthy)| *healthy);
+  let primary_names =
+    primary.map(|(names, _)| names).unwrap_or_default();
   let (mirror_healthy, mirror_lagging_snapshots) =
     if let Some(mirror) = settings.mirror.clone() {
       let mirror_settings = settings.clone();
@@ -757,18 +763,21 @@ pub async fn status() -> anyhow::Result<BackupStatus> {
         core_repository(&mirror, &mirror_settings)?
           .list_snapshots()
           .map(|inventory| {
-            inventory
-              .snapshots
-              .into_iter()
-              .map(|snapshot| snapshot.name)
-              .collect::<HashSet<_>>()
+            (
+              inventory
+                .snapshots
+                .into_iter()
+                .map(|snapshot| snapshot.name)
+                .collect::<HashSet<_>>(),
+              inventory.hidden == 0,
+            )
           })
       })
       .await
       .context("Mirror health worker failed")?;
       match mirror {
-        Ok(mirror_names) => (
-          Some(true),
+        Ok((mirror_names, healthy)) => (
+          Some(healthy),
           primary_names.difference(&mirror_names).count() as u64,
         ),
         Err(_) => (Some(false), primary_names.len() as u64),
@@ -840,6 +849,11 @@ fn repository_role_barrier() -> &'static Arc<tokio::sync::RwLock<()>>
   BARRIER.get_or_init(|| Arc::new(tokio::sync::RwLock::new(())))
 }
 
+fn backup_operation_lock() -> &'static tokio::sync::Mutex<()> {
+  static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+  LOCK.get_or_init(Default::default)
+}
+
 pub async fn list_snapshots()
 -> anyhow::Result<(Vec<BackupSnapshot>, u64)> {
   let settings = get_settings().await?;
@@ -871,10 +885,18 @@ pub async fn list_directory(
 pub async fn run_backup(
   target: Option<BackupTarget>,
 ) -> anyhow::Result<BackupRun> {
+  let _operation = backup_operation_lock().lock().await;
   let _repository_roles =
     repository_role_barrier().clone().read_owned().await;
   let run = new_run(target.clone(), "Backup running").await?;
-  let settings = get_settings().await?;
+  let settings = match get_settings().await {
+    Ok(settings) => settings,
+    Err(error) => {
+      let message = format!("{error:#}");
+      let _ = finish_run(run, BackupRunState::Failed, message).await;
+      return Err(error);
+    }
+  };
   let result = match target {
     Some(target) => run_target(&settings, &run, target).await,
     None => run_fleet(&settings, &run).await,
@@ -1169,30 +1191,41 @@ async fn run_fleet(
       let refreshed =
         refresh_node_targets(&settings, &server_id, targets.clone())
           .await;
-      let (targets, result) = match refreshed {
+      let (targets, tasks, result) = match refreshed {
         Ok(targets) => {
-          let result =
-            run_node_batch(&settings, &run, &server_id, &targets)
+          match build_node_backup_tasks(&targets).await {
+            Ok(tasks) => {
+              let result = run_node_batch(
+                &settings,
+                &run,
+                &server_id,
+                tasks.clone(),
+              )
               .await;
-          (targets, result)
+              (targets, tasks, result)
+            }
+            Err(error) => (targets, Vec::new(), Err(error)),
+          }
         }
-        Err(error) => (targets, Err(error)),
+        Err(error) => (targets, Vec::new(), Err(error)),
       };
-      anyhow::Ok((server_id, targets, result))
+      anyhow::Ok((server_id, targets, tasks, result))
     });
   }
   while let Some(result) = batches.next().await {
-    let (server_id, targets, result) = result?;
+    let (server_id, targets, tasks, result) = result?;
     match result {
-      Ok(false) => {}
-      Ok(true) => {
-        partial = true;
-        spawn_node_retry(
-          settings.clone(),
-          run.clone(),
-          server_id,
-          targets,
-        );
+      Ok(outcome) => {
+        partial |= outcome.partial;
+        if !outcome.retry_tasks.is_empty() {
+          spawn_node_retry(
+            settings.clone(),
+            run.clone(),
+            server_id,
+            targets,
+            outcome.retry_tasks,
+          );
+        }
       }
       Err(error) => {
         warn!("Backup node {server_id} failed: {error:#}");
@@ -1202,6 +1235,7 @@ async fn run_fleet(
           run.clone(),
           server_id,
           targets,
+          tasks,
         );
       }
     }
@@ -1219,6 +1253,7 @@ fn spawn_node_retry(
   run: BackupRun,
   server_id: String,
   targets: Vec<BackupTarget>,
+  mut tasks: Vec<VykarBackupTask>,
 ) {
   tokio::spawn(async move {
     let mut retry = 0_u64;
@@ -1240,33 +1275,63 @@ fn spawn_node_retry(
           doc! { "$set": { "retry_count": retry as i64 } },
         )
         .await;
-      let targets = match refresh_node_targets(
-        &settings,
-        &server_id,
-        targets.clone(),
-      )
-      .await
-      {
-        Ok(targets) => targets,
-        Err(error) => {
-          warn!(
-            "Backup retry {retry} could not rediscover node {server_id}: {error:#}"
-          );
-          continue;
-        }
-      };
-      let _repository_roles =
-        repository_role_barrier().clone().read_owned().await;
-      match run_node_batch(&settings, &run, &server_id, &targets)
+      let _operation = backup_operation_lock().lock().await;
+      if *fleet_generation().read().unwrap() != run.id {
+        return;
+      }
+      if tasks.is_empty() {
+        let refreshed = match refresh_node_targets(
+          &settings,
+          &server_id,
+          targets.clone(),
+        )
         .await
-      {
-        Ok(false) => {
+        {
+          Ok(targets) => targets,
+          Err(error) => {
+            warn!(
+              "Backup retry {retry} could not rediscover node {server_id}: {error:#}"
+            );
+            continue;
+          }
+        };
+        tasks = match build_node_backup_tasks(&refreshed).await {
+          Ok(tasks) => tasks,
+          Err(error) => {
+            warn!(
+              "Backup retry {retry} could not prepare node {server_id}: {error:#}"
+            );
+            continue;
+          }
+        };
+        if tasks.is_empty() {
           queue_maintenance();
           return;
         }
-        Ok(true) => warn!(
-          "Backup retry {retry} for node {server_id} remained partial"
-        ),
+      }
+      if *fleet_generation().read().unwrap() != run.id {
+        return;
+      }
+      let _repository_roles =
+        repository_role_barrier().clone().read_owned().await;
+      if *fleet_generation().read().unwrap() != run.id {
+        return;
+      }
+      match run_node_batch(&settings, &run, &server_id, tasks.clone())
+        .await
+      {
+        Ok(outcome) if outcome.retry_tasks.is_empty() => {
+          if !outcome.partial {
+            queue_maintenance();
+          }
+          return;
+        }
+        Ok(outcome) => {
+          tasks = outcome.retry_tasks;
+          warn!(
+            "Backup retry {retry} for node {server_id} remained partial"
+          );
+        }
         Err(error) => warn!(
           "Backup retry {retry} for node {server_id} failed: {error:#}"
         ),
@@ -1299,8 +1364,20 @@ fn spawn_core_retry(settings: BackupSettings, run: BackupRun) {
         return;
       }
       retry = retry.saturating_add(1);
+      let _operation = backup_operation_lock().lock().await;
+      if *fleet_generation().read().unwrap() != run.id {
+        continue;
+      }
       let _repository_roles =
         repository_role_barrier().clone().read_owned().await;
+      if *fleet_generation().read().unwrap() != run.id {
+        let retry =
+          { core_mirror_retries().lock().unwrap().remove(&run.id) };
+        if let Some(retry) = retry {
+          let _ = tokio::fs::remove_dir_all(retry.staging).await;
+        }
+        return;
+      }
       match backup_core(&settings, &run).await {
         Ok(false) => {
           queue_maintenance();
@@ -1376,13 +1453,9 @@ async fn refresh_node_targets(
   Ok(targets.into_iter().collect())
 }
 
-async fn run_node_batch(
-  settings: &BackupSettings,
-  run: &BackupRun,
-  server_id: &str,
+async fn build_node_backup_tasks(
   targets: &[BackupTarget],
-) -> anyhow::Result<bool> {
-  let server = resource::get::<Server>(server_id).await?;
+) -> anyhow::Result<Vec<VykarBackupTask>> {
   let mut tasks = Vec::new();
   for target in targets {
     let periphery_target = match target {
@@ -1415,13 +1488,29 @@ async fn run_node_batch(
         BackupTarget::Volume { .. } => "volume",
         _ => "backup",
       }),
+      mirror_only: false,
     });
   }
+  Ok(tasks)
+}
+
+struct NodeBatchOutcome {
+  partial: bool,
+  retry_tasks: Vec<VykarBackupTask>,
+}
+
+async fn run_node_batch(
+  settings: &BackupSettings,
+  run: &BackupRun,
+  server_id: &str,
+  tasks: Vec<VykarBackupTask>,
+) -> anyhow::Result<NodeBatchOutcome> {
+  let server = resource::get::<Server>(server_id).await?;
   let expected = tasks.len();
   let response = periphery_client(&server)
     .await?
     .request(RunVykarBackupBatch {
-      tasks,
+      tasks: tasks.clone(),
       primary: repository_for_periphery(&settings.primary, false)?,
       mirror: settings
         .mirror
@@ -1442,21 +1531,49 @@ async fn run_node_batch(
       response.restart_errors.join("; ")
     ));
   }
-  let repositories_partial = response.results.iter().any(|task| {
-    !task.result.primary.complete
-      || settings.mirror.is_some()
-        && !task
-          .result
-          .mirror
-          .as_ref()
-          .is_some_and(|mirror| mirror.complete)
-  });
-  Ok(
-    response.results.len() != expected
-      || !response.discovery_errors.is_empty()
-      || !response.restart_errors.is_empty()
-      || repositories_partial,
-  )
+  let result_count = response.results.len();
+  let mut results = response
+    .results
+    .into_iter()
+    .map(|result| (result.source_label, result.result))
+    .collect::<HashMap<_, _>>();
+  let mut retry_tasks = Vec::new();
+  for mut task in tasks {
+    let Some(result) = results.remove(&task.source_label) else {
+      retry_tasks.push(task);
+      continue;
+    };
+    let primary_complete = task.mirror_only
+      || result.primary.complete && result.primary.error.is_none();
+    let mirror_complete = settings.mirror.is_none()
+      || result.mirror.as_ref().is_some_and(|mirror| {
+        mirror.complete && mirror.error.is_none()
+      });
+    if !primary_complete || !mirror_complete {
+      task.mirror_only =
+        primary_complete && settings.mirror.is_some();
+      if !primary_complete {
+        task.snapshot_name = snapshot_name(match &task.target {
+          PeripheryBackupTarget::Stack { .. } => "stack",
+          PeripheryBackupTarget::Volume { .. } => "volume",
+        });
+      }
+      retry_tasks.push(task);
+    }
+  }
+  let partial = result_count != expected
+    || !response.discovery_errors.is_empty()
+    || !response.restart_errors.is_empty()
+    || !retry_tasks.is_empty();
+  if !response.restart_errors.is_empty() {
+    // A stranded container requires operator recovery. Retrying would no
+    // longer know that it was running before this batch.
+    retry_tasks.clear();
+  }
+  Ok(NodeBatchOutcome {
+    partial,
+    retry_tasks,
+  })
 }
 
 async fn run_target(
@@ -1492,6 +1609,10 @@ fn core_mirror_retries()
   static RETRIES: OnceLock<Mutex<HashMap<String, CoreMirrorRetry>>> =
     OnceLock::new();
   RETRIES.get_or_init(Default::default)
+}
+
+fn invalidate_fleet_retries() {
+  fleet_generation().write().unwrap().clear();
 }
 
 async fn retry_core_mirror(
@@ -1720,6 +1841,7 @@ async fn backup_stack(
       run_id: run.id.clone(),
       komodo_version: env!("CARGO_PKG_VERSION").into(),
       stop_containers: settings.stop_containers,
+      mirror_only: false,
     })
     .await?;
   if !response.restart_errors.is_empty() {
@@ -1770,6 +1892,7 @@ async fn backup_volume(
       run_id: run.id.clone(),
       komodo_version: env!("CARGO_PKG_VERSION").into(),
       stop_containers: settings.stop_containers,
+      mirror_only: false,
     })
     .await?;
   if !response.restart_errors.is_empty() {
@@ -1930,6 +2053,13 @@ pub async fn plan_restore(
           "Cross-node stack restore requires explicit bind path mappings"
         ));
       }
+      if destination != stack.config.server_id
+        && !selected_paths.is_empty()
+      {
+        return Err(anyhow!(
+          "Cross-node Stack recovery requires the complete snapshot"
+        ));
+      }
       let source_paths = snapshot
         .source_paths
         .iter()
@@ -2042,6 +2172,7 @@ pub async fn plan_restore(
       ));
     }
   }
+  validate_non_overlapping_destinations(&publish)?;
   let create_volume_if_missing = matches!(
     &snapshot.target,
     BackupTarget::Volume {
@@ -2153,6 +2284,41 @@ fn selected_publish_paths(
   Ok(publish)
 }
 
+fn validate_non_overlapping_destinations(
+  publish: &[periphery_client::api::backup::RestorePublishPath],
+) -> anyhow::Result<()> {
+  let mut destinations = Vec::with_capacity(publish.len());
+  for item in publish {
+    let path = Path::new(&item.destination);
+    if !path.is_absolute()
+      || path.components().any(|component| {
+        matches!(component, std::path::Component::ParentDir)
+      })
+    {
+      return Err(anyhow!(
+        "Restore destination must be an absolute normalized path: {}",
+        item.destination
+      ));
+    }
+    destinations.push(path.components().collect::<PathBuf>());
+  }
+  for (index, left) in destinations.iter().enumerate() {
+    for right in destinations.iter().skip(index + 1) {
+      if left == right
+        || left.starts_with(right)
+        || right.starts_with(left)
+      {
+        return Err(anyhow!(
+          "Restore destinations overlap: '{}' and '{}'",
+          left.display(),
+          right.display()
+        ));
+      }
+    }
+  }
+  Ok(())
+}
+
 async fn restore_periphery_target(
   source: &BackupTarget,
   destination_server: &str,
@@ -2214,15 +2380,17 @@ pub async fn execute_restore(
   plan_id: &str,
   user: &User,
 ) -> anyhow::Result<BackupRun> {
+  let _operation = backup_operation_lock().lock().await;
   let _repository_roles =
     repository_role_barrier().clone().read_owned().await;
   let stored = plans_collection()
-    .find_one_and_delete(
-      doc! { "_id": plan_id, "created_by": &user.id },
-    )
+    .find_one(doc! { "_id": plan_id, "created_by": &user.id })
     .await?
     .context("Restore plan does not exist")?;
   if stored.plan.expires_at < komodo_timestamp() {
+    plans_collection()
+      .delete_one(doc! { "_id": &stored.id })
+      .await?;
     return Err(anyhow!("Restore plan has expired"));
   }
   authorize_target(
@@ -2304,59 +2472,104 @@ pub async fn execute_restore(
   let run =
     new_run(Some(stored.plan.source.clone()), "Restore running")
       .await?;
-  let settings = get_settings().await?;
-  let recovered_run_directory =
-    stored.recovered_stack_run_directory.clone().or_else(|| {
-      stored.publish.first().map(|path| path.destination.clone())
-    });
-  let response = periphery_client(&server)
-    .await?
-    .request(TransactionalVykarRestore {
-      target,
-      repository: repository_for_periphery(&settings.primary, false)?,
-      advanced: settings.advanced,
-      hostname: format!("komodo-periphery-{}", server.id),
-      snapshot_name: stored.plan.snapshot,
-      selected_paths: stored.plan.selected_paths,
-      publish: stored.publish,
-      journal_id: run.id.clone(),
-      create_volume_if_missing: stored.create_volume_if_missing,
-    })
-    .await?;
-  if let Some(error) = response.critical_error {
-    *critical_alert().write().unwrap() = Some(error.clone());
-    return finish_run(run, BackupRunState::Failed, error).await;
-  }
-  if !response.complete {
-    return finish_run(
-      run,
-      BackupRunState::Failed,
-      if response.rolled_back {
-        "Restore failed and was rolled back"
-      } else {
-        "Restore did not complete"
-      },
-    )
-    .await;
-  }
-  if let Some(stack) = cross_node_stack {
-    let name = stored
-      .recovered_stack_name
-      .context("Recovered stack name is missing")?;
-    let mut config: komodo_client::entities::stack::PartialStackConfig =
-      stack.config.into();
-    config.server_id = Some(server_id);
-    config.swarm_id = Some(String::new());
-    config.project_name = Some(name.clone());
-    config.files_on_host = Some(true);
-    config.run_directory = recovered_run_directory;
-    config.repo = Some(String::new());
-    config.linked_repo = Some(String::new());
-    resource::create::<Stack>(&name, config, None, user)
+  let operation = async {
+    let settings = get_settings().await?;
+    let recovered_run_directory =
+      stored.recovered_stack_run_directory.clone().or_else(|| {
+        stored.publish.first().map(|path| path.destination.clone())
+      });
+    let response = periphery_client(&server)
+      .await?
+      .request(TransactionalVykarRestore {
+        target,
+        repository: repository_for_periphery(
+          &settings.primary,
+          false,
+        )?,
+        advanced: settings.advanced,
+        hostname: format!("komodo-periphery-{}", server.id),
+        snapshot_name: stored.plan.snapshot,
+        selected_paths: stored.plan.selected_paths,
+        publish: stored.publish,
+        journal_id: run.id.clone(),
+        create_volume_if_missing: stored.create_volume_if_missing,
+      })
+      .await?;
+    if let Some(error) = response.critical_error {
+      *critical_alert().write().unwrap() = Some(error.clone());
+      return finish_run(
+        run.clone(),
+        BackupRunState::Failed,
+        error,
+      )
+      .await;
+    }
+    if !response.complete {
+      return finish_run(
+        run.clone(),
+        BackupRunState::Failed,
+        if response.rolled_back {
+          "Restore failed and was rolled back"
+        } else {
+          "Restore did not complete"
+        },
+      )
+      .await;
+    }
+    if let Some(stack) = cross_node_stack {
+      let name = stored
+        .recovered_stack_name
+        .context("Recovered stack name is missing")?;
+      let mut config:
+        komodo_client::entities::stack::PartialStackConfig =
+        stack.config.into();
+      config.server_id = Some(server_id);
+      config.swarm_id = Some(String::new());
+      config.project_name = Some(name.clone());
+      config.files_on_host = Some(true);
+      config.run_directory = recovered_run_directory;
+      config.repo = Some(String::new());
+      config.linked_repo = Some(String::new());
+      if let Err(error) =
+        resource::create::<Stack>(&name, config, None, user).await
+      {
+        if Stack::coll()
+          .find_one(doc! { "name": &name })
+          .await?
+          .is_none()
+        {
+          return Err(error.error);
+        }
+        warn!(
+          "Recovered Stack '{name}' was inserted but post-create bookkeeping failed: {:#}",
+          error.error
+        );
+      }
+    }
+    if let Err(error) = plans_collection()
+      .delete_one(doc! { "_id": &stored.id })
       .await
-      .map_err(|error| error.error)?;
+    {
+      warn!(
+        "Restore completed but its consumed plan could not be deleted: {error:#}"
+      );
+    }
+    finish_run(
+      run.clone(),
+      BackupRunState::Complete,
+      "Restore complete",
+    )
+    .await
   }
-  finish_run(run, BackupRunState::Complete, "Restore complete").await
+  .await;
+  match operation {
+    Ok(run) => Ok(run),
+    Err(error) => {
+      let message = format!("{error:#}");
+      let _ = finish_run(run, BackupRunState::Failed, message).await;
+      Err(error)
+    }
+  }
 }
 
 pub async fn restore_plan(
@@ -3065,6 +3278,21 @@ mod tests {
     assert_eq!(publish.len(), 2);
     assert_eq!(publish[0].destination, "/restore/app/config");
     assert_eq!(publish[1].destination, "/restore/app/data/file.db");
+  }
+
+  #[test]
+  fn restore_destinations_must_not_overlap() {
+    let publish = vec![
+      periphery_client::api::backup::RestorePublishPath {
+        snapshot_path: "source/one".into(),
+        destination: "/restore/app".into(),
+      },
+      periphery_client::api::backup::RestorePublishPath {
+        snapshot_path: "source/two".into(),
+        destination: "/restore/app/data".into(),
+      },
+    ];
+    assert!(validate_non_overlapping_destinations(&publish).is_err());
   }
 
   #[test]

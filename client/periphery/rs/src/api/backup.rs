@@ -46,6 +46,9 @@ pub struct RunVykarBackup {
   pub komodo_version: String,
   #[serde(default)]
   pub stop_containers: bool,
+  /// Retry only the mirror for a snapshot already committed to primary.
+  #[serde(default)]
+  pub mirror_only: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -72,6 +75,9 @@ pub struct VykarBackupTask {
   pub target: PeripheryBackupTarget,
   pub source_label: String,
   pub snapshot_name: String,
+  /// Retry only the mirror for a snapshot already committed to primary.
+  #[serde(default)]
+  pub mirror_only: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Resolve)]

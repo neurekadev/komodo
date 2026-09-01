@@ -1,5 +1,5 @@
 use std::{
-  collections::{BTreeSet, HashSet},
+  collections::{BTreeSet, HashMap, HashSet},
   fs::OpenOptions,
   io::{Read, Write},
   os::unix::fs::{MetadataExt, PermissionsExt},
@@ -29,6 +29,29 @@ use super::Args;
 
 const COMPOSE_PROJECT_LABEL: &str = "com.docker.compose.project";
 
+#[derive(Deserialize)]
+struct BackupComposeConfig {
+  #[serde(default)]
+  services: HashMap<String, BackupComposeService>,
+}
+
+#[derive(Default, Deserialize)]
+struct BackupComposeService {
+  #[serde(default)]
+  volumes: Vec<BackupComposeMount>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum BackupComposeMount {
+  Short(String),
+  Long {
+    #[serde(rename = "type")]
+    mount_type: Option<String>,
+    source: Option<String>,
+  },
+}
+
 fn cancelled_operations() -> &'static Mutex<HashSet<String>> {
   static CANCELLED: OnceLock<Mutex<HashSet<String>>> =
     OnceLock::new();
@@ -40,6 +63,11 @@ fn operation_cancelled(operation_id: &str) -> bool {
     .lock()
     .unwrap()
     .contains(operation_id)
+}
+
+fn backup_operation_lock() -> &'static tokio::sync::Mutex<()> {
+  static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+  LOCK.get_or_init(Default::default)
 }
 
 impl Resolve<Args> for DiscoverBackupSource {
@@ -56,6 +84,7 @@ impl Resolve<Args> for RunVykarBackup {
     self,
     _: &Args,
   ) -> anyhow::Result<RunVykarBackupResponse> {
+    let _operation = backup_operation_lock().lock().await;
     let discovered = discover_source(&self.target).await?;
     let mut stopped: Vec<String> = Vec::new();
     if self.stop_containers {
@@ -63,9 +92,21 @@ impl Resolve<Args> for RunVykarBackup {
         if let Err(error) =
           run_container_command("stop", container).await
         {
-          for stopped_container in &stopped {
-            let _ =
-              run_container_command("start", stopped_container).await;
+          let (restarted, restart_errors) =
+            restart_containers(&stopped).await;
+          if !restart_errors.is_empty() {
+            return Ok(RunVykarBackupResponse {
+              primary: VykarBackupRepositoryResult {
+                error: Some(format!(
+                  "Failed to quiesce every affected container: {error:#}"
+                )),
+                ..Default::default()
+              },
+              stopped_containers: stopped,
+              restarted_containers: restarted,
+              restart_errors,
+              ..Default::default()
+            });
           }
           return Err(error.context(
             "Failed to quiesce every affected container; already stopped containers were restarted",
@@ -81,19 +122,26 @@ impl Resolve<Args> for RunVykarBackup {
       run_backup_repositories(&self, &discovered.paths).await
     };
 
-    let mut restarted = Vec::new();
-    let mut restart_errors = Vec::new();
-    for container in &stopped {
-      match run_container_command("start", container).await {
-        Ok(()) => restarted.push(container.clone()),
-        Err(error) => {
-          restart_errors.push(format!("{container}: {error:#}"))
-        }
-      }
-    }
+    let (restarted, restart_errors) =
+      restart_containers(&stopped).await;
 
     cancelled_operations().lock().unwrap().remove(&self.run_id);
-    let (primary, mirror) = result?;
+    let (primary, mirror) = match result {
+      Ok(result) => result,
+      Err(error) if !restart_errors.is_empty() => {
+        return Ok(RunVykarBackupResponse {
+          primary: VykarBackupRepositoryResult {
+            error: Some(format!("{error:#}")),
+            ..Default::default()
+          },
+          stopped_containers: stopped,
+          restarted_containers: restarted,
+          restart_errors,
+          ..Default::default()
+        });
+      }
+      Err(error) => return Err(error),
+    };
     Ok(RunVykarBackupResponse {
       primary,
       mirror,
@@ -109,6 +157,7 @@ impl Resolve<Args> for RunVykarBackupBatch {
     self,
     _: &Args,
   ) -> anyhow::Result<RunVykarBackupBatchResponse> {
+    let _operation = backup_operation_lock().lock().await;
     let mut discovered = Vec::new();
     let mut discovery_errors = Vec::new();
     let mut running = BTreeSet::new();
@@ -128,9 +177,16 @@ impl Resolve<Args> for RunVykarBackupBatch {
         if let Err(error) =
           run_container_command("stop", &container).await
         {
-          for stopped_container in &stopped {
-            let _ =
-              run_container_command("start", stopped_container).await;
+          let (_, restart_errors) =
+            restart_containers(&stopped).await;
+          if !restart_errors.is_empty() {
+            return Ok(RunVykarBackupBatchResponse {
+              discovery_errors: vec![format!(
+                "Failed to quiesce every affected container on the node: {error:#}"
+              )],
+              restart_errors,
+              ..Default::default()
+            });
           }
           return Err(error.context(
             "Failed to quiesce every affected container on the node",
@@ -156,6 +212,7 @@ impl Resolve<Args> for RunVykarBackupBatch {
         run_id: self.run_id.clone(),
         komodo_version: self.komodo_version.clone(),
         stop_containers: false,
+        mirror_only: task.mirror_only,
       };
       match run_backup_repositories(&request, &paths).await {
         Ok((primary, mirror)) => {
@@ -173,14 +230,7 @@ impl Resolve<Args> for RunVykarBackupBatch {
       }
     }
 
-    let mut restart_errors = Vec::new();
-    for container in &stopped {
-      if let Err(error) =
-        run_container_command("start", container).await
-      {
-        restart_errors.push(format!("{container}: {error:#}"));
-      }
-    }
+    let (_, restart_errors) = restart_containers(&stopped).await;
     cancelled_operations().lock().unwrap().remove(&self.run_id);
     Ok(RunVykarBackupBatchResponse {
       results,
@@ -205,15 +255,22 @@ async fn run_backup_repositories(
   let mut paths = source_paths.to_vec();
   paths.push(manifest_dir.path().to_string_lossy().into_owned());
 
-  let primary = run_repository_backup(
-    request.primary.clone(),
-    request.advanced.clone(),
-    request.hostname.clone(),
-    request.snapshot_name.clone(),
-    request.source_label.clone(),
-    paths.clone(),
-  )
-  .await;
+  let primary = if request.mirror_only {
+    VykarBackupRepositoryResult {
+      complete: true,
+      ..Default::default()
+    }
+  } else {
+    run_repository_backup(
+      request.primary.clone(),
+      request.advanced.clone(),
+      request.hostname.clone(),
+      request.snapshot_name.clone(),
+      request.source_label.clone(),
+      paths.clone(),
+    )
+    .await
+  };
   if operation_cancelled(&request.run_id) {
     return Err(anyhow!("Backup cancelled before mirror write"));
   }
@@ -230,6 +287,11 @@ async fn run_backup_repositories(
       .await,
     )
   } else {
+    if request.mirror_only {
+      return Err(anyhow!(
+        "Mirror-only retry requested without a configured mirror"
+      ));
+    }
     None
   };
   Ok((primary, mirror))
@@ -325,6 +387,116 @@ fn write_manifest(
   Ok(())
 }
 
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+  left == right || left.starts_with(right) || right.starts_with(left)
+}
+
+fn insert_bind_backup_root(
+  bind_paths: &mut BTreeSet<PathBuf>,
+  run_directory: &Path,
+  path: &Path,
+) -> anyhow::Result<()> {
+  let bind = validate_source_path(path)?;
+  if bind == run_directory || bind.starts_with(run_directory) {
+    // Vykar traverses mounts, so the Stack root already captures a bind below
+    // it.
+    return Ok(());
+  }
+  if run_directory.starts_with(&bind) {
+    return Err(anyhow!(
+      "Bind source '{}' contains the Stack run directory '{}'; overlapping backup roots cannot be restored atomically",
+      bind.display(),
+      run_directory.display()
+    ));
+  }
+  bind_paths.insert(bind);
+  Ok(())
+}
+
+fn compose_bind_paths(
+  stack: &komodo_client::entities::stack::Stack,
+  run_directory: &Path,
+) -> anyhow::Result<BTreeSet<PathBuf>> {
+  let Some(config) = stack.info.deployed_config.as_deref() else {
+    return Ok(BTreeSet::new());
+  };
+  let config: BackupComposeConfig =
+    serde_yaml_ng::from_str(config)
+      .context("Failed to parse deployed Compose configuration")?;
+  let mut paths = BTreeSet::new();
+  for mount in config
+    .services
+    .into_values()
+    .flat_map(|service| service.volumes)
+  {
+    let source = match mount {
+      BackupComposeMount::Long { mount_type, source } => source
+        .filter(|source| {
+          mount_type.as_deref() == Some("bind")
+            || mount_type.is_none() && Path::new(source).is_absolute()
+        }),
+      BackupComposeMount::Short(value) => {
+        value.split_once(':').and_then(|(source, _)| {
+          (Path::new(source).is_absolute() || source.starts_with('.'))
+            .then(|| source.to_string())
+        })
+      }
+    };
+    let Some(source) = source else {
+      continue;
+    };
+    let source = Path::new(&source);
+    let source = if source.is_absolute() {
+      source.to_path_buf()
+    } else {
+      run_directory.join(source)
+    };
+    insert_bind_backup_root(&mut paths, run_directory, &source)?;
+  }
+  Ok(paths)
+}
+
+async fn affected_running_containers(
+  docker: &crate::docker::DockerClient,
+  containers: &[ContainerListItem],
+  project_name: Option<&str>,
+  paths: &BTreeSet<PathBuf>,
+) -> anyhow::Result<Vec<String>> {
+  let mut affected = BTreeSet::new();
+  for container in containers.iter().filter(|container| {
+    container.state == ContainerStateStatusEnum::Running
+  }) {
+    let same_project = project_name.is_some_and(|project| {
+      container
+        .labels
+        .get(COMPOSE_PROJECT_LABEL)
+        .map(String::as_str)
+        == Some(project)
+    });
+    if same_project {
+      affected.insert(container.name.clone());
+      continue;
+    }
+    let inspected = docker.inspect_container(&container.name).await?;
+    if inspected
+      .mounts
+      .into_iter()
+      .filter(|mount| mount.typ.as_deref() == Some("bind"))
+      .filter_map(|mount| mount.source)
+      .map(|source| {
+        let source = PathBuf::from(source);
+        source.canonicalize().unwrap_or(source)
+      })
+      .any(|source| {
+        paths.iter().any(|path| paths_overlap(&source, path))
+      })
+    {
+      affected.insert(container.name.clone());
+    }
+  }
+  Ok(affected.into_iter().collect())
+}
+
 async fn discover_source(
   target: &PeripheryBackupTarget,
 ) -> anyhow::Result<DiscoverBackupSourceResponse> {
@@ -347,16 +519,12 @@ async fn discover_source(
           repo.as_deref(),
         ),
       )?;
-      let mut bind_paths = BTreeSet::new();
-      let mut running = Vec::new();
+      let mut bind_paths = compose_bind_paths(stack, &run_directory)?;
       let project_name = stack.project_name(false);
       for container in containers.iter().filter(|container| {
         container.labels.get(COMPOSE_PROJECT_LABEL)
           == Some(&project_name)
       }) {
-        if container.state == ContainerStateStatusEnum::Running {
-          running.push(container.name.clone());
-        }
         let inspected =
           docker.inspect_container(&container.name).await?;
         for mount in inspected
@@ -367,23 +535,22 @@ async fn discover_source(
           let source = mount
             .source
             .context("Bind mount did not report a source path")?;
-          let bind = validate_source_path(Path::new(&source))?;
-          if bind == run_directory || bind.starts_with(&run_directory)
-          {
-            // Vykar traverses mounts, so the Stack root already captures a
-            // bind located below it.
-            continue;
-          }
-          if run_directory.starts_with(&bind) {
-            return Err(anyhow!(
-              "Bind source '{}' contains the Stack run directory '{}'; overlapping backup roots cannot be restored atomically",
-              bind.display(),
-              run_directory.display()
-            ));
-          }
-          bind_paths.insert(bind);
+          insert_bind_backup_root(
+            &mut bind_paths,
+            &run_directory,
+            Path::new(&source),
+          )?;
         }
       }
+      let mut affected_paths = bind_paths.clone();
+      affected_paths.insert(run_directory.clone());
+      let running = affected_running_containers(
+        docker,
+        &containers,
+        Some(&project_name),
+        &affected_paths,
+      )
+      .await?;
       let mut paths =
         vec![run_directory.to_string_lossy().into_owned()];
       paths.extend(
@@ -433,6 +600,7 @@ async fn discover_source(
 
 async fn discover_running_containers(
   target: &PeripheryBackupTarget,
+  publish: &[RestorePublishPath],
 ) -> anyhow::Result<Vec<String>> {
   let docker_guard = docker_client().load();
   let docker = docker_guard
@@ -440,7 +608,28 @@ async fn discover_running_containers(
     .as_ref()
     .context("Docker is unavailable")?;
   let containers = docker.list_containers().await?;
-  Ok(running_containers_for_target(&containers, target))
+  match target {
+    PeripheryBackupTarget::Stack { stack, .. } => {
+      let paths = publish
+        .iter()
+        .map(|item| {
+          let path = PathBuf::from(&item.destination);
+          path.canonicalize().unwrap_or(path)
+        })
+        .collect::<BTreeSet<_>>();
+      let project_name = stack.project_name(false);
+      affected_running_containers(
+        docker,
+        &containers,
+        Some(&project_name),
+        &paths,
+      )
+      .await
+    }
+    PeripheryBackupTarget::Volume { .. } => {
+      Ok(running_containers_for_target(&containers, target))
+    }
+  }
 }
 
 fn running_containers_for_target(
@@ -500,6 +689,20 @@ async fn run_container_command(
   }
 }
 
+async fn restart_containers(
+  containers: &[String],
+) -> (Vec<String>, Vec<String>) {
+  let mut restarted = Vec::new();
+  let mut errors = Vec::new();
+  for container in containers {
+    match run_container_command("start", container).await {
+      Ok(()) => restarted.push(container.clone()),
+      Err(error) => errors.push(format!("{container}: {error:#}")),
+    }
+  }
+  (restarted, errors)
+}
+
 fn vykar_cache_dir(hostname: &str) -> anyhow::Result<PathBuf> {
   let directory = periphery_config()
     .stack_dir()
@@ -511,11 +714,42 @@ fn vykar_cache_dir(hostname: &str) -> anyhow::Result<PathBuf> {
   Ok(directory)
 }
 
+fn resolve_volume_publish_destinations(
+  publish: &mut [RestorePublishPath],
+  volume_name: &str,
+  mountpoint: &str,
+  full_restore: bool,
+) -> anyhow::Result<()> {
+  let mountpoint = Path::new(mountpoint);
+  let logical_root = Path::new("/var/lib/docker/volumes")
+    .join(volume_name)
+    .join("_data");
+  for item in publish {
+    let destination = if full_restore {
+      mountpoint.to_path_buf()
+    } else {
+      let relative = Path::new(&item.destination)
+        .strip_prefix(&logical_root)
+        .with_context(|| {
+          format!(
+            "Selected Volume destination '{}' is outside logical root '{}'",
+            item.destination,
+            logical_root.display()
+          )
+        })?;
+      mountpoint.join(relative)
+    };
+    item.destination = destination.to_string_lossy().into_owned();
+  }
+  Ok(())
+}
+
 impl Resolve<Args> for TransactionalVykarRestore {
   async fn resolve(
     mut self,
     _: &Args,
   ) -> anyhow::Result<TransactionalVykarRestoreResponse> {
+    let _operation = backup_operation_lock().lock().await;
     if self.create_volume_if_missing
       && let PeripheryBackupTarget::Volume { volume_name } =
         &self.target
@@ -524,9 +758,10 @@ impl Resolve<Args> for TransactionalVykarRestore {
       run_container_command("volume create", volume_name).await?;
     }
     let running_containers =
-      discover_running_containers(&self.target).await?;
-    if self.selected_paths.is_empty()
-      && matches!(self.target, PeripheryBackupTarget::Volume { .. })
+      discover_running_containers(&self.target, &self.publish)
+        .await?;
+    if let PeripheryBackupTarget::Volume { volume_name } =
+      &self.target
     {
       let mountpoint = discover_source(&self.target)
         .await?
@@ -534,9 +769,12 @@ impl Resolve<Args> for TransactionalVykarRestore {
         .into_iter()
         .next()
         .context("Destination volume has no mountpoint")?;
-      for publish in &mut self.publish {
-        publish.destination = mountpoint.clone();
-      }
+      resolve_volume_publish_destinations(
+        &mut self.publish,
+        volume_name,
+        &mountpoint,
+        self.selected_paths.is_empty(),
+      )?;
     }
     let mut stopped_containers: Vec<String> = Vec::new();
     for container in &running_containers {
@@ -660,19 +898,21 @@ impl Resolve<Args> for PreflightVykarRestore {
     _: &Args,
   ) -> anyhow::Result<PreflightVykarRestoreResponse> {
     let running_containers =
-      discover_running_containers(&self.target)
-        .await
-        .unwrap_or_default();
+      discover_running_containers(&self.target, &self.publish)
+        .await?;
     let discovered = discover_source(&self.target).await.ok();
     let destination_exists = discovered.is_some();
-    if self.selected_paths.is_empty()
-      && matches!(self.target, PeripheryBackupTarget::Volume { .. })
+    if let PeripheryBackupTarget::Volume { volume_name } =
+      &self.target
       && let Some(mountpoint) =
         discovered.as_ref().and_then(|source| source.paths.first())
     {
-      for publish in &mut self.publish {
-        publish.destination = mountpoint.clone();
-      }
+      resolve_volume_publish_destinations(
+        &mut self.publish,
+        volume_name,
+        mountpoint,
+        self.selected_paths.is_empty(),
+      )?;
     }
     let repository = self.repository.clone();
     let advanced = self.advanced.clone();
@@ -1396,6 +1636,47 @@ mod tests {
   fn source_validation_rejects_relative_paths() {
     assert!(
       validate_source_path(Path::new("relative/path")).is_err()
+    );
+  }
+
+  #[test]
+  fn selected_volume_destinations_use_the_inspected_mountpoint() {
+    let mut publish = vec![RestorePublishPath {
+      snapshot_path: "source/_data/config/app.toml".into(),
+      destination:
+        "/var/lib/docker/volumes/app-data/_data/config/app.toml"
+          .into(),
+    }];
+    resolve_volume_publish_destinations(
+      &mut publish,
+      "app-data",
+      "/custom/docker/volumes/app-data/data",
+      false,
+    )
+    .unwrap();
+    assert_eq!(
+      publish[0].destination,
+      "/custom/docker/volumes/app-data/data/config/app.toml"
+    );
+  }
+
+  #[test]
+  fn deployed_compose_config_discovers_bind_roots_without_containers()
+  {
+    let run_directory = tempfile::tempdir().unwrap();
+    let bind_directory = tempfile::tempdir().unwrap();
+    let mut stack = komodo_client::entities::stack::Stack::default();
+    stack.info.deployed_config = Some(format!(
+      "services:\n  app:\n    volumes:\n      - type: bind\n        source: '{}'\n        target: /data\n",
+      bind_directory.path().display()
+    ));
+    let paths =
+      compose_bind_paths(&stack, run_directory.path()).unwrap();
+    assert_eq!(
+      paths,
+      [bind_directory.path().canonicalize().unwrap()]
+        .into_iter()
+        .collect()
     );
   }
 
