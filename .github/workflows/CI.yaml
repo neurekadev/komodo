@@ -231,8 +231,8 @@ jobs:
           annotations: ${{ steps.metadata.outputs.annotations }}
           provenance: mode=max
           sbom: true
-          cache-from: ${{ matrix.cache && format('type=gha,scope=publish-{0}-{1}', matrix.component, matrix.arch) || '' }}
-          cache-to: ${{ matrix.cache && format('type=gha,scope=publish-{0}-{1},mode=max,ignore-error=true', matrix.component, matrix.arch) || '' }}
+          cache-from: ${{ matrix.cache && format('type=gha,scope={0}-{1}', matrix.component, matrix.arch) || '' }}
+          cache-to: ${{ matrix.cache && format('type=gha,scope={0}-{1},mode=max,ignore-error=true', matrix.component, matrix.arch) || '' }}
 
       - name: Export Digest
         env:
