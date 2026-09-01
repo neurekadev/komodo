@@ -649,6 +649,8 @@ function TargetFileManager({ target, titleOther }: FileManagerProps) {
         setSelected([]);
       } catch (error) {
         operations.failPending(plan.notificationId, plan.label, error);
+        setPendingCommit(undefined);
+        setDecisions({});
       }
     },
     [commit, operations, refresh, target],
