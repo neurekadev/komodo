@@ -12,14 +12,28 @@ import { ICONS } from "@/lib/icons";
 import ServerDockerResources from "./docker";
 import ServerStats from "./stats";
 import ServerHostedResourcesSection from "./resources";
+import { useUrlBackedTab } from "@/lib/navigation";
 
 type ServerTabsView = "Config" | "Stats" | "Docker" | "Resources" | "Terminals";
+const SERVER_TAB_VALUES: readonly ServerTabsView[] = [
+  "Config",
+  "Stats",
+  "Docker",
+  "Resources",
+  "Terminals",
+];
 
 export default function ServerTabs({ id }: { id: string }) {
-  const [view, setView] = useLocalStorage<ServerTabsView>({
+  const [storedView, setStoredView] = useLocalStorage<ServerTabsView>({
     key: `server-${id}-tab-v2`,
     defaultValue: "Config",
   });
+  const [view, setView] = useUrlBackedTab(
+    "tab",
+    SERVER_TAB_VALUES,
+    storedView,
+    setStoredView,
+  );
 
   const { specificTerminal } = usePermissions({ type: "Server", id });
 

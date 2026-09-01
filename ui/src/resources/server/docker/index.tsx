@@ -16,8 +16,15 @@ import { ICONS } from "@/lib/icons";
 import ServerVolumes from "./volumes";
 import ServerImages from "./images";
 import { useRead } from "@/lib/hooks";
+import { useUrlBackedTab } from "@/lib/navigation";
 
 type ServerDockerView = "Containers" | "Networks" | "Volumes" | "Images";
+const SERVER_DOCKER_VIEW_VALUES: readonly ServerDockerView[] = [
+  "Containers",
+  "Networks",
+  "Volumes",
+  "Images",
+];
 
 const searchAtom = atom("");
 export function useServerDockerSearch() {
@@ -34,10 +41,16 @@ export default function ServerDockerResources({
   const coreVersion = useRead("GetVersion", {}).data?.version;
   const info = useServer(id)?.info;
   const state = info?.state ?? Types.ServerState.NotOk;
-  const [view, setView] = useLocalStorage<ServerDockerView>({
+  const [storedView, setStoredView] = useLocalStorage<ServerDockerView>({
     key: "server-info-view-v1",
     defaultValue: "Containers",
   });
+  const [view, setView] = useUrlBackedTab(
+    "docker",
+    SERVER_DOCKER_VIEW_VALUES,
+    storedView,
+    setStoredView,
+  );
 
   if ([Types.ServerState.NotOk, Types.ServerState.Disabled].includes(state)) {
     return (

@@ -14,6 +14,7 @@ import { Types } from "komodo_client";
 import { Waypoints } from "lucide-react";
 import { useNavigate, useParams } from "react-router-dom";
 import { DockerNetworkMetric } from "@/components/docker/metrics";
+import { serverDockerPath } from "@/lib/navigation";
 
 export default function Network() {
   const { type, id, network } = useParams() as {
@@ -63,7 +64,7 @@ function NetworkInner({
   const { mutate: deleteNetwork, isPending: deletePending } = useExecute(
     "DeleteNetwork",
     {
-      onSuccess: () => nav("/servers/" + serverId),
+      onSuccess: () => nav(serverDockerPath(serverId, "networks")),
     },
   );
 
@@ -113,6 +114,7 @@ function NetworkInner({
       entityTypeName="Network"
       parentType="Server"
       parentId={serverId}
+      pageProps={{ backTo: serverDockerPath(serverId, "networks") }}
       name={networkName}
       icon={ICONS.Network}
       intent={intention}

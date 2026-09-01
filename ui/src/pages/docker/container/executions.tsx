@@ -4,6 +4,7 @@ import ConfirmModalWithDisable from "@/components/confirm-modal-with-disable";
 import { Types } from "komodo_client";
 import { Pause, Play, RefreshCcw, Square, Trash } from "lucide-react";
 import { useNavigate } from "react-router-dom";
+import { serverDockerPath } from "@/lib/navigation";
 
 const useContainer = (serverId: string, containerName: string) => {
   return useRead("ListContainers", { server: serverId }).data?.find(
@@ -21,7 +22,7 @@ const DestroyContainer = ({
   const container = useContainer(serverId, containerName);
   const nav = useNavigate();
   const { mutateAsync: destroy, isPending } = useExecute("DestroyContainer", {
-    onSuccess: () => nav("/servers/" + serverId),
+    onSuccess: () => nav(serverDockerPath(serverId, "containers")),
   });
   const destroying = useRead(
     "GetServerActionState",

@@ -20,6 +20,7 @@ import { Types } from "komodo_client";
 import { useNavigate, useParams } from "react-router-dom";
 import { useEffect } from "react";
 import { DockerDiskMetric } from "@/components/docker/metrics";
+import { serverDockerPath } from "@/lib/navigation";
 
 type VolumeView = "Info" | "Files";
 
@@ -80,7 +81,7 @@ function VolumeInner({
   const { mutate: deleteVolume, isPending: deletePending } = useExecute(
     "DeleteVolume",
     {
-      onSuccess: () => nav("/servers/" + serverId),
+      onSuccess: () => nav(serverDockerPath(serverId, "volumes")),
     },
   );
 
@@ -149,6 +150,7 @@ function VolumeInner({
       entityTypeName="Volume"
       parentType="Server"
       parentId={serverId}
+      pageProps={{ backTo: serverDockerPath(serverId, "volumes") }}
       name={volumeName}
       icon={ICONS.Volume}
       intent={intention}

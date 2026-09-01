@@ -11,6 +11,7 @@ import { LoadingScreen, useAuthState } from "mogh_ui";
 import { useUser } from "@/lib/hooks";
 import { MoghAuth } from "komodo_client";
 import App from "@/app";
+import { InAppHistoryProvider } from "@/lib/navigation";
 
 const Login = lazy(() => import("@/pages/login"));
 const UserDisabled = lazy(() => import("@/pages/user-disabled"));
@@ -56,71 +57,82 @@ export const Router = () => {
 
   return (
     <BrowserRouter>
-      <Routes>
-        <Route path="login" element={<Login />} />
-        <Route element={<RequireAuth />}>
-          <Route path="/" element={<App />}>
-            <Route path="" element={<Dashboard />} />
-            <Route path="containers" element={<Containers />} />
-            <Route path="terminals" element={<Terminals />} />
-            <Route path="stats" element={<Stats />} />
-            <Route path="schedules" element={<Schedules />} />
-            <Route path="profile" element={<Profile />} />
-            <Route path="settings" element={<Settings />} />
-            <Route path="user-groups/:id" element={<UserGroup />} />
-            <Route path="users/:id" element={<User />} />
-            <Route path="updates">
-              <Route path="" element={<Updates />} />
-              <Route path=":id" element={<Update />} />
-            </Route>
-            <Route path="alerts">
-              <Route path="" element={<Alerts />} />
-              <Route path=":id" element={<Alert />} />
-            </Route>
-            <Route path=":type">
-              <Route path="" element={<Resources />} />
-              <Route path=":id" element={<Resource />} />
+      <InAppHistoryProvider>
+        <Routes>
+          <Route path="login" element={<Login />} />
+          <Route element={<RequireAuth />}>
+            <Route path="/" element={<App />}>
+              <Route path="" element={<Dashboard />} />
+              <Route path="containers" element={<Containers />} />
+              <Route path="terminals" element={<Terminals />} />
+              <Route path="stats" element={<Stats />} />
+              <Route path="schedules" element={<Schedules />} />
+              <Route path="profile" element={<Profile />} />
+              <Route path="settings" element={<Settings />} />
+              <Route path="user-groups/:id" element={<UserGroup />} />
+              <Route path="users/:id" element={<User />} />
+              <Route path="updates">
+                <Route path="" element={<Updates />} />
+                <Route path=":id" element={<Update />} />
+              </Route>
+              <Route path="alerts">
+                <Route path="" element={<Alerts />} />
+                <Route path=":id" element={<Alert />} />
+              </Route>
+              <Route path=":type">
+                <Route path="" element={<Resources />} />
+                <Route path=":id" element={<Resource />} />
 
-              {/* Stack Service */}
-              <Route path=":id/service/:service" element={<StackService />} />
+                {/* Stack Service */}
+                <Route
+                  path=":id/service/:service"
+                  element={<StackService />}
+                />
 
-              {/* Docker Resource */}
-              <Route path=":id/container/:container" element={<Container />} />
-              <Route path=":id/network/:network" element={<Network />} />
-              <Route path=":id/image/:image" element={<Image />} />
-              <Route path=":id/volume/:volume" element={<Volume />} />
+                {/* Docker Resource */}
+                <Route
+                  path=":id/container/:container"
+                  element={<Container />}
+                />
+                <Route path=":id/network/:network" element={<Network />} />
+                <Route path=":id/image/:image" element={<Image />} />
+                <Route path=":id/volume/:volume" element={<Volume />} />
 
-              {/* Swarm Resource */}
-              <Route path=":id/swarm-node/:node" element={<SwarmNode />} />
-              <Route path=":id/swarm-stack/:stack" element={<SwarmStack />} />
-              <Route
-                path=":id/swarm-service/:service"
-                element={<SwarmService />}
-              />
-              <Route path=":id/swarm-task/:task" element={<SwarmTask />} />
-              <Route
-                path=":id/swarm-config/:config"
-                element={<SwarmConfig />}
-              />
-              <Route
-                path=":id/swarm-secret/:secret"
-                element={<SwarmSecret />}
-              />
+                {/* Swarm Resource */}
+                <Route path=":id/swarm-node/:node" element={<SwarmNode />} />
+                <Route
+                  path=":id/swarm-stack/:stack"
+                  element={<SwarmStack />}
+                />
+                <Route
+                  path=":id/swarm-service/:service"
+                  element={<SwarmService />}
+                />
+                <Route path=":id/swarm-task/:task" element={<SwarmTask />} />
+                <Route
+                  path=":id/swarm-config/:config"
+                  element={<SwarmConfig />}
+                />
+                <Route
+                  path=":id/swarm-secret/:secret"
+                  element={<SwarmSecret />}
+                />
 
-              {/* Terminal Pages */}
-              <Route path=":id/terminal/:terminal" element={<Terminal />} />
-              <Route
-                path=":id/service/:service/terminal/:terminal"
-                element={<Terminal />}
-              />
-              <Route
-                path=":id/container/:container/terminal/:terminal"
-                element={<Terminal />}
-              />
+                {/* Terminal Pages */}
+                <Route path=":id/terminal/:terminal" element={<Terminal />} />
+                <Route
+                  path=":id/service/:service/terminal/:terminal"
+                  element={<Terminal />}
+                />
+                <Route
+                  path=":id/container/:container/terminal/:terminal"
+                  element={<Terminal />}
+                />
+              </Route>
             </Route>
           </Route>
-        </Route>
-      </Routes>
+        </Routes>
+      </InAppHistoryProvider>
     </BrowserRouter>
   );
 };

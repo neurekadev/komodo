@@ -2,11 +2,10 @@ import { UsableResource } from ".";
 import {
   EntityHeader,
   EntityHeaderProps,
-  EntityPage,
   EntityPageProps,
 } from "mogh_ui";
 import { ReactNode } from "react";
-import { Group, Stack, Text } from "@mantine/core";
+import { Button, Group, Stack, Text } from "@mantine/core";
 import { DividedChildren } from "mogh_ui";
 import ResourceLink from "./link";
 import ResourceDescription from "./description";
@@ -15,6 +14,7 @@ import ResourceUpdates from "@/components/updates/resource";
 import { usePermissions } from "@/lib/hooks";
 import { Section } from "mogh_ui";
 import { ICONS } from "@/lib/icons";
+import { useHistoryAwareBack } from "@/lib/navigation";
 
 export interface ResourceSubPageProps extends EntityHeaderProps {
   parentType: UsableResource;
@@ -37,6 +37,10 @@ export default function ResourceSubPage({
   ...headerProps
 }: ResourceSubPageProps) {
   const { canExecute } = usePermissions({ type: parentType, id: parentId });
+  const { backTo, actions, ...stackProps } = pageProps ?? {};
+  const fallback =
+    backTo ?? `/${usableResourcePath(parentType)}/${parentId}`;
+  const goBack = useHistoryAwareBack(fallback);
   const Header = (
     <Stack justify="space-between">
       <Stack gap="md" pb="md" className="bordered-light" bdrs="md">
@@ -51,12 +55,16 @@ export default function ResourceSubPage({
     </Stack>
   );
   return (
-    <EntityPage
-      {...pageProps}
-      backTo={
-        pageProps?.backTo ?? `/${usableResourcePath(parentType)}/${parentId}`
-      }
-    >
+    <Stack mb="50vh" {...stackProps}>
+      <Group justify="space-between">
+        <Button
+          leftSection={<ICONS.Back size="1rem" />}
+          onClick={goBack}
+        >
+          Back
+        </Button>
+        {actions && <Group wrap="nowrap">{actions}</Group>}
+      </Group>
       <Stack hiddenFrom="lg" w="100%">
         {Header}
         <ResourceUpdates type={parentType} id={parentId} />
@@ -86,6 +94,6 @@ export default function ResourceSubPage({
 
         {children}
       </Stack>
-    </EntityPage>
+    </Stack>
   );
 }

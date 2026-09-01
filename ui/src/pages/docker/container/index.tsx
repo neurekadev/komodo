@@ -20,6 +20,7 @@ import DockerLabelsSection from "@/components/docker/labels-section";
 import ContainerTabs from "./tabs";
 import ResourceLink from "@/resources/link";
 import ResourceSubPage from "@/resources/sub-page";
+import { serverDockerPath } from "@/lib/navigation";
 
 export default function Container() {
   const {
@@ -84,6 +85,7 @@ function ContainerInner({
       entityTypeName="Container"
       parentType="Server"
       parentId={serverId}
+      pageProps={{ backTo: serverDockerPath(serverId, "containers") }}
       name={listContainer?.name}
       icon={ICONS.Container}
       intent={intention}

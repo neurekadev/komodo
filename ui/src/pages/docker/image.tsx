@@ -15,6 +15,7 @@ import { Types } from "komodo_client";
 import { useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { DockerDiskMetric } from "@/components/docker/metrics";
+import { serverDockerPath } from "@/lib/navigation";
 
 export default function Image() {
   const { type, id, image } = useParams() as {
@@ -80,7 +81,7 @@ function ImageInner({
   const { mutate: deleteImage, isPending: deletePending } = useExecute(
     "DeleteImage",
     {
-      onSuccess: () => nav("/servers/" + serverId),
+      onSuccess: () => nav(serverDockerPath(serverId, "images")),
     },
   );
 
@@ -103,6 +104,7 @@ function ImageInner({
           entityTypeName="Image"
           parentType="Server"
           parentId={serverId}
+          pageProps={{ backTo: serverDockerPath(serverId, "images") }}
           name={imageName}
           icon={ICONS.Image}
           intent={intention}
