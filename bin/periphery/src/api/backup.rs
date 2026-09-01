@@ -1130,8 +1130,14 @@ async fn transactional_restore(
   let journal_id = request.journal_id.clone();
   let publication_started = Arc::new(AtomicBool::new(false));
   let worker_started = publication_started.clone();
+  let publish_staging = staging.clone();
   let result = tokio::task::spawn_blocking(move || {
-    publish_restore(&staging, &publish, &journal_id, &worker_started)
+    publish_restore(
+      &publish_staging,
+      &publish,
+      &journal_id,
+      &worker_started,
+    )
   })
   .await;
   match result {
