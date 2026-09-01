@@ -922,7 +922,9 @@ fn managed_transaction_root() -> PathBuf {
   journal_root().join("managed-transactions")
 }
 
-fn managed_transaction_path(operation_id: &str) -> anyhow::Result<PathBuf> {
+fn managed_transaction_path(
+  operation_id: &str,
+) -> anyhow::Result<PathBuf> {
   let id = Uuid::parse_str(operation_id)
     .context("Managed transaction id is invalid")?;
   Ok(managed_transaction_root().join(format!("{id}.json")))
@@ -939,7 +941,10 @@ fn persist_managed_transaction(
     record.operation_id,
     Uuid::new_v4()
   ));
-  write_private_file(&temporary, &serde_json::to_vec_pretty(record)?)?;
+  write_private_file(
+    &temporary,
+    &serde_json::to_vec_pretty(record)?,
+  )?;
   fs::rename(&temporary, &destination)?;
   #[cfg(unix)]
   fs::File::open(&root)?.sync_all()?;
@@ -1576,7 +1581,8 @@ pub async fn finalize_managed_transaction(
 
   match action {
     FileManagerManagedTransactionFinalizeAction::Commit => {
-      if initial_state == FileManagerManagedTransactionState::Committed
+      if initial_state
+        == FileManagerManagedTransactionState::Committed
       {
         return Ok(FileManagerManagedTransactionStatus {
           operation_id: operation_id.to_string(),
@@ -1601,12 +1607,9 @@ pub async fn finalize_managed_transaction(
         )
         .await?;
       }
-      let journal = take_exact_managed_journal(
-        &root.key,
-        actor,
-        operation_id,
-      )
-      .await?;
+      let journal =
+        take_exact_managed_journal(&root.key, actor, operation_id)
+          .await?;
       match journal {
         Some(record) => {
           validate_exact_managed_journal(
@@ -1652,7 +1655,8 @@ pub async fn finalize_managed_transaction(
       .await
     }
     FileManagerManagedTransactionFinalizeAction::Rollback => {
-      if initial_state == FileManagerManagedTransactionState::RolledBack
+      if initial_state
+        == FileManagerManagedTransactionState::RolledBack
       {
         return Ok(FileManagerManagedTransactionStatus {
           operation_id: operation_id.to_string(),
@@ -1673,12 +1677,9 @@ pub async fn finalize_managed_transaction(
         FileManagerManagedTransactionState::RollbackRequested,
       )
       .await?;
-      let journal = take_exact_managed_journal(
-        &root.key,
-        actor,
-        operation_id,
-      )
-      .await?;
+      let journal =
+        take_exact_managed_journal(&root.key, actor, operation_id)
+          .await?;
       if let Some(record) = journal {
         validate_exact_managed_journal(
           &record,
@@ -1882,12 +1883,9 @@ pub async fn commit(
       Err(error) => {
         drop(plans);
         if durable_managed {
-          let _ = finish_durable_managed_apply(
-            operation_id,
-            false,
-            false,
-          )
-          .await;
+          let _ =
+            finish_durable_managed_apply(operation_id, false, false)
+              .await;
         }
         return Err(error);
       }
@@ -1908,14 +1906,12 @@ pub async fn commit(
   }
   if !durable_managed
     && operation_edits_managed_file(&root, &plan.operation)
-    && managed_transactions()
-      .lock()
-      .await
-      .values()
-      .any(|transaction| {
+    && managed_transactions().lock().await.values().any(
+      |transaction| {
         transaction.root_key == root.key
           && managed_transaction_is_open(transaction.state)
-      })
+      },
+    )
   {
     return Err(anyhow!(
       "Another managed save is still being reconciled for this stack"
@@ -2141,11 +2137,8 @@ pub async fn commit(
         Err(error)
       }
     };
-    let rollback_retained = result
-      .as_ref()
-      .err()
-      .and_then(retained_journal)
-      .is_some();
+    let rollback_retained =
+      result.as_ref().err().and_then(retained_journal).is_some();
     let result = if durable_managed {
       match finish_durable_managed_apply(
         &durable_operation_id,
@@ -3063,7 +3056,9 @@ pub async fn start_upload(
           }
           FileTransferMessage::Begin
           | FileTransferMessage::BeginWithCredit { .. }
-          | FileTransferMessage::BeginWithCreditAndHeartbeat { .. }
+          | FileTransferMessage::BeginWithCreditAndHeartbeat {
+            ..
+          }
           | FileTransferMessage::Credit { .. }
           | FileTransferMessage::Heartbeat => {
             return Err(anyhow!("Unexpected upload control message"));
@@ -3283,15 +3278,13 @@ pub async fn start_download(
         }
         sent += read as u64;
         progress.add_bytes(read as u64);
-        let send = connection
-          .sender
-          .send_file_transfer(
-            channel,
-            Ok(
-              FileTransferMessage::Chunk(buffer[..read].to_vec())
-                .into_raw(),
-            ),
-          );
+        let send = connection.sender.send_file_transfer(
+          channel,
+          Ok(
+            FileTransferMessage::Chunk(buffer[..read].to_vec())
+              .into_raw(),
+          ),
+        );
         if heartbeat_enabled {
           tokio::time::timeout(DOWNLOAD_HEARTBEAT_LEASE, send)
             .await
@@ -5171,10 +5164,8 @@ fn stage_redo_invalidation_at(
   fail_before_index: Option<usize>,
 ) -> anyhow::Result<RedoInvalidationBatch> {
   let batch = RedoInvalidationBatch {
-    path: journal_root.join(format!(
-      ".redo-invalidation-{}",
-      Uuid::new_v4()
-    )),
+    path: journal_root
+      .join(format!(".redo-invalidation-{}", Uuid::new_v4())),
   };
   create_private_directory(&batch.path)?;
   let result = (|| {
@@ -5217,8 +5208,12 @@ fn commit_redo_invalidation_batch(
   write_private_file(&batch.path.join("committed"), b"committed\n")?;
   #[cfg(unix)]
   {
+    let journal_root = batch
+      .path
+      .parent()
+      .context("Redo invalidation batch path has no parent")?;
     fs::File::open(&batch.path)?.sync_all()?;
-    fs::File::open(journal_root())?.sync_all()?;
+    fs::File::open(journal_root)?.sync_all()?;
   }
   Ok(())
 }
@@ -5258,23 +5253,21 @@ async fn push_journal(record: JournalRecord) -> anyhow::Result<()> {
         )
       })
       .await
-      .context("Redo journals could not be staged for invalidation")?,
+      .context(
+        "Redo journals could not be staged for invalidation",
+      )?,
     )
   };
   let expired = {
     let mut histories = histories().lock().await;
-    let history = histories
-      .entry(key)
-      .or_default();
+    let history = histories.entry(key).or_default();
     let current_redo_ids = history
       .redo
       .iter()
       .map(|record| record.id.as_str())
       .collect::<Vec<_>>();
-    let expected_redo_ids = redo_ids
-      .iter()
-      .map(String::as_str)
-      .collect::<Vec<_>>();
+    let expected_redo_ids =
+      redo_ids.iter().map(String::as_str).collect::<Vec<_>>();
     if current_redo_ids != expected_redo_ids {
       drop(histories);
       if let Some(batch) = &batch {
@@ -6462,15 +6455,13 @@ mod tests {
           id.as_str()
         );
       }
-      assert!(
-        fs::read_dir(&directory)
+      assert!(fs::read_dir(&directory).unwrap().all(|entry| {
+        !entry
           .unwrap()
-          .all(|entry| !entry
-            .unwrap()
-            .file_name()
-            .to_string_lossy()
-            .starts_with(".redo-invalidation-"))
-      );
+          .file_name()
+          .to_string_lossy()
+          .starts_with(".redo-invalidation-")
+      }));
       fs::remove_dir_all(directory).unwrap();
     }
   }
@@ -6713,7 +6704,9 @@ mod tests {
     );
     assert_eq!(
       download_begin_mode(
-        FileTransferMessage::BeginWithCreditAndHeartbeat { credits: 4 }
+        FileTransferMessage::BeginWithCreditAndHeartbeat {
+          credits: 4
+        }
       )
       .unwrap(),
       (Some(4), true)
