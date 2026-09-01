@@ -239,6 +239,7 @@ export type WriteResponses = {
     DeleteOnboardingKey: Types.DeleteOnboardingKeyResponse;
     PushRecentlyViewed: Types.PushRecentlyViewedResponse;
     SetLastSeenUpdate: Types.SetLastSeenUpdateResponse;
+    SetFileManagerSafeMode: Types.SetFileManagerSafeModeResponse;
     CreateLocalUser: Types.CreateLocalUserResponse;
     DeleteUser: Types.DeleteUserResponse;
     CreateServiceUser: Types.CreateServiceUserResponse;

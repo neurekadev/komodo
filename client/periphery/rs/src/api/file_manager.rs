@@ -2,9 +2,10 @@ use komodo_client::entities::{
   file_manager::{
     FileManagerActiveOperations, FileManagerCapabilities,
     FileManagerConflictAction, FileManagerConflictDecision,
-    FileManagerDirectory, FileManagerJournalStatus,
-    FileManagerOperation, FileManagerOperationStatus,
-    FileManagerPreflight, FileManagerRevision, FileManagerTextFile,
+    FileManagerDirectory, FileManagerExecutionMode,
+    FileManagerJournalStatus, FileManagerOperation,
+    FileManagerOperationStatus, FileManagerPreflight,
+    FileManagerRevision, FileManagerTextFile,
   },
   repo::Repo,
   stack::Stack,
@@ -55,6 +56,8 @@ pub struct PreflightFileManagerOperation {
   pub target: PeripheryFileManagerTarget,
   pub actor: String,
   pub operation: FileManagerOperation,
+  #[serde(default)]
+  pub execution_mode: FileManagerExecutionMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Resolve)]

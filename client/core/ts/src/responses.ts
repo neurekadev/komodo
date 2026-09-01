@@ -322,6 +322,7 @@ export type WriteResponses = {
   // ==== USER ====
   PushRecentlyViewed: Types.PushRecentlyViewedResponse;
   SetLastSeenUpdate: Types.SetLastSeenUpdateResponse;
+  SetFileManagerSafeMode: Types.SetFileManagerSafeModeResponse;
   CreateLocalUser: Types.CreateLocalUserResponse;
   DeleteUser: Types.DeleteUserResponse;
 

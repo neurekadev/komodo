@@ -125,6 +125,7 @@ use crate::api::write;
     // user
     write::push_recently_viewed,
     write::set_last_seen_update,
+    write::set_file_manager_safe_mode,
     write::delete_user,
     write::create_local_user,
     write::create_service_user,

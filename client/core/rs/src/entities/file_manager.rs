@@ -86,6 +86,11 @@ pub struct FileManagerCapabilities {
   pub reason: Option<String>,
   pub managed_file: Option<String>,
   pub limits: FileManagerLimits,
+  /// Whether this target supports explicitly selecting recoverable or
+  /// permanent execution. Older Periphery versions omit this field.
+  #[serde(default)]
+  #[typeshare(optional)]
+  pub supports_execution_modes: bool,
 }
 
 #[typeshare]
@@ -121,6 +126,20 @@ pub enum FileManagerArchiveFormat {
   Tar,
   TarGz,
   SevenZip,
+}
+
+/// Controls whether an eligible File Manager operation is retained in
+/// user-visible undo history after it commits.
+#[typeshare]
+#[derive(
+  Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize,
+)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum FileManagerExecutionMode {
+  #[default]
+  Recoverable,
+  Permanent,
 }
 
 #[typeshare]
@@ -271,6 +290,11 @@ pub struct FileManagerPreflight {
   #[serde(default)]
   #[typeshare(optional)]
   pub supports_durable_managed_transactions: bool,
+  /// The execution mode accepted for this plan. Older Periphery versions
+  /// omit this field and are recoverable-only.
+  #[serde(default)]
+  #[typeshare(optional)]
+  pub execution_mode: FileManagerExecutionMode,
 }
 
 #[typeshare]
@@ -377,6 +401,11 @@ pub struct FileManagerJournalStatus {
   /// Bytes retained for the current undo/redo history.
   #[serde(default)]
   pub retained_storage_bytes: U64,
+  /// False when retained trees were quarantined atomically and have not been
+  /// recursively measured.
+  #[serde(default)]
+  #[typeshare(optional)]
+  pub retained_storage_bytes_exact: Option<bool>,
   /// Server-safe explanation of where File Manager data is stored.
   #[serde(default)]
   pub storage_description: String,

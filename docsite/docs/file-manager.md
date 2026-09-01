@@ -42,7 +42,25 @@ Depending on the target and permission level, File Manager supports:
 - Conflict review with an explicit choice to overwrite or skip each collision.
 - Progress reporting and cancellation for long-running operations.
 
-Create, create-folder, rename, move, copy, and delete operations have per-user, per-target undo and redo history. Recovery data is stored beneath `${PERIPHERY_ROOT_DIRECTORY}/file-manager-journal` and expires after 24 hours. Text edits, uploads, and archive operations are not added to the undo history.
+Create, create-folder, rename, move, copy, and delete operations have per-user, per-target undo and redo history when Safe mode is enabled. Recovery manifests and any retained data expire after 24 hours. Text edits, uploads, and archive operations are not added to the undo history.
+
+### Safe Mode and Permanent Operations
+
+**Safe mode** is enabled by default. Its value is stored with your Komodo user, so the same choice follows you across browsers and devices:
+
+- With Safe mode enabled, eligible create, rename, move, copy, and delete operations are recoverable with **Undo**.
+- With Safe mode disabled, those operations run permanently and do not create an Undo entry. Existing Undo and Redo entries are not removed when you change the setting.
+- <kbd>Shift</kbd> + <kbd>Delete</kbd> always requests a permanent delete, even when Safe mode is enabled. The permanent-operation confirmation is still required.
+
+Permanent means the removed or replaced data is no longer available through File Manager Undo. For large trees, File Manager first makes the requested namespace change, reports the operation complete, and removes internal cleanup data asynchronously.
+
+### Large Directory Performance and Recovery Storage
+
+On a single filesystem, deleting, moving, or renaming a directory—including a directory containing very many small files—uses filesystem metadata operations instead of copying or scanning every child. Safe-mode Undo uses the same approach. A copy still has to read and write the data, but File Manager copies each file once and publishes the completed top-level item with a rename.
+
+Periphery keeps small, durable recovery manifests beneath `${PERIPHERY_ROOT_DIRECTORY}/file-manager-journal`. Data needed to undo a delete or replacement is retained beside the target in a private, hidden `.komodo-file-manager` directory. That name is reserved: it is not listed and cannot be opened or changed through File Manager. Recovery entries expire after 24 hours and are cleaned in the background.
+
+Operations that cross filesystem boundaries, merge two existing directories, or require upload, archive, or text transaction handling use the compatibility transaction path. Those cases can still require a recursive scan or snapshot because an atomic rename is not available.
 
 ### Keyboard Shortcuts
 
@@ -58,6 +76,7 @@ When focus is within the file explorer, including on a selection checkbox, these
 | <kbd>Arrow Left</kbd> | Open the parent directory. |
 | <kbd>Arrow Right</kbd> or <kbd>Enter</kbd> | Open the selected directory or text file. |
 | <kbd>Delete</kbd> | Delete the selected entries after confirmation. |
+| <kbd>Shift</kbd> + <kbd>Delete</kbd> | Permanently delete the selected entries after confirmation, bypassing Safe mode. |
 | <kbd>Escape</kbd> | Clear the selection or close the editor. |
 
 Text inputs and the text editor keep their native editing shortcuts instead of triggering explorer actions.

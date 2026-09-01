@@ -1350,6 +1350,8 @@ export interface User {
     create_build_permissions?: boolean;
     /** The primary user login. */
     config: UserConfig;
+    /** Cross-device UI preferences owned by this user. */
+    preferences?: UserPreferences;
     /**
      * Additional linked login methods.
      * May not contain 'Service' type config.
@@ -1368,6 +1370,10 @@ export interface User {
     /** Give the user elevated permissions on all resources of a certain type */
     all?: Record<ResourceTarget["type"], PermissionLevelAndSpecifics | PermissionLevel>;
     updated_at?: I64;
+}
+export interface UserPreferences {
+    /** Keep eligible File Manager operations undoable by default. */
+    file_manager_safe_mode: boolean;
 }
 export type CreateLocalUserResponse = User;
 export type CreateProcedureResponse = Procedure;
@@ -5813,6 +5819,7 @@ export interface ServerQuerySpecifics {
 /** Server-specific query */
 export type ServerQuery = ResourceQuery<ServerQuerySpecifics>;
 export type SetLastSeenUpdateResponse = NoData;
+export type SetFileManagerSafeModeResponse = NoData;
 export interface StackQuerySpecifics {
     /**
      * Query only for Stacks on these Servers.
@@ -6447,6 +6454,10 @@ export interface CloseAlert {
 export declare enum FileManagerConflictAction {
     Skip = "skip",
     Overwrite = "overwrite"
+}
+export declare enum FileManagerExecutionMode {
+    Recoverable = "recoverable",
+    Permanent = "permanent"
 }
 export interface FileManagerConflictDecision {
     path: string;
@@ -7697,6 +7708,7 @@ export interface FileManagerCapabilities {
     reason?: string;
     managed_file?: string;
     limits: FileManagerLimits;
+    supports_execution_modes?: boolean;
 }
 /** An opaque optimistic-concurrency revision. */
 export interface FileManagerRevision {
@@ -7728,16 +7740,19 @@ export interface FileManagerJournalStatus {
     retained_storage_bytes?: U64;
     /** Server-safe explanation of where File Manager data is stored. */
     storage_description?: string;
+    /** Whether retained_storage_bytes includes target-local recovery data. */
+    retained_storage_bytes_exact?: boolean;
 }
 export interface FileManagerOperationTicket {
     operation_id: string;
 }
 export interface FileManagerPreflight {
-	plan_id: string;
-	expires_at: I64;
-	conflicts: FileManagerConflict[];
-	confirmation_required: boolean;
-	supports_durable_managed_transactions?: boolean;
+    plan_id: string;
+    expires_at: I64;
+    conflicts: FileManagerConflict[];
+    confirmation_required: boolean;
+    supports_durable_managed_transactions?: boolean;
+    execution_mode?: FileManagerExecutionMode;
 }
 export interface FileManagerTextFile {
     path: string;
@@ -10080,6 +10095,7 @@ export type FileManagerOperation = {
 export interface PreflightFileManagerOperation {
     target: FileManagerTarget;
     operation: FileManagerOperation;
+    execution_mode?: FileManagerExecutionMode;
 }
 export interface PrepareFileManagerDownload {
     target: FileManagerTarget;
@@ -10838,6 +10854,10 @@ export interface SetEveryoneUserGroup {
  * Response: [NoData]
  */
 export interface SetLastSeenUpdate {
+}
+/** Update the calling user's default File Manager safety behavior. */
+export interface SetFileManagerSafeMode {
+    enabled: boolean;
 }
 /**
  * **Admin only.** Completely override the users in the group.
@@ -12575,6 +12595,9 @@ export type WriteRequest = {
 } | {
     type: "SetLastSeenUpdate";
     params: SetLastSeenUpdate;
+} | {
+    type: "SetFileManagerSafeMode";
+    params: SetFileManagerSafeMode;
 } | {
     type: "CreateLocalUser";
     params: CreateLocalUser;

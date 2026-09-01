@@ -115,6 +115,35 @@ impl Resolve<WriteArgs> for SetLastSeenUpdate {
 
 //
 
+impl Resolve<WriteArgs> for SetFileManagerSafeMode {
+  #[instrument(
+    "SetFileManagerSafeMode",
+    level = "debug",
+    skip_all,
+    fields(user_id = user.id, enabled = self.enabled)
+  )]
+  async fn resolve(
+    self,
+    WriteArgs { user, .. }: &WriteArgs,
+  ) -> mogh_error::Result<SetFileManagerSafeModeResponse> {
+    update_one_by_id(
+      &db_client().users,
+      &user.id,
+      database::mungos::update::Update::Set(doc! {
+        "preferences.file_manager_safe_mode": self.enabled,
+        "updated_at": komodo_timestamp()
+      }),
+      None,
+    )
+    .await
+    .context("Failed to update File Manager Safe mode")?;
+
+    Ok(SetFileManagerSafeModeResponse {})
+  }
+}
+
+//
+
 impl Resolve<WriteArgs> for CreateLocalUser {
   #[instrument(
     "CreateLocalUser",

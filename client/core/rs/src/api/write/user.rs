@@ -71,6 +71,35 @@ pub type SetLastSeenUpdateResponse = NoData;
 #[cfg(feature = "utoipa")]
 #[utoipa::path(
   post,
+  path = "/SetFileManagerSafeMode",
+  description = "Update the calling user's default File Manager safety behavior.",
+  request_body(content = SetFileManagerSafeMode),
+  responses(
+    (status = 200, description = "Successful", body = SetFileManagerSafeModeResponse),
+    (status = 500, description = "Failed", body = mogh_error::Serror),
+  ),
+)]
+pub fn set_file_manager_safe_mode() {}
+
+/// Update the calling user's default File Manager safety behavior.
+#[typeshare]
+#[derive(Serialize, Deserialize, Debug, Clone, Resolve)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[empty_traits(KomodoWriteRequest)]
+#[response(SetFileManagerSafeModeResponse)]
+#[error(mogh_error::Error)]
+pub struct SetFileManagerSafeMode {
+  pub enabled: bool,
+}
+
+#[typeshare]
+pub type SetFileManagerSafeModeResponse = NoData;
+
+//
+
+#[cfg(feature = "utoipa")]
+#[utoipa::path(
+  post,
   path = "/DeleteUser",
   description = "**Admin only.** Delete a user.",
   request_body(content = DeleteUser),

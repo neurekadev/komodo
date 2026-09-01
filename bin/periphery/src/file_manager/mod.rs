@@ -26,11 +26,11 @@ use komodo_client::entities::{
     FileManagerCapabilities, FileManagerConflict,
     FileManagerConflictAction, FileManagerConflictDecision,
     FileManagerDirectory, FileManagerEntry, FileManagerEntryKind,
-    FileManagerJournalStatus, FileManagerLimits,
-    FileManagerOperation, FileManagerOperationPhase,
-    FileManagerOperationState, FileManagerOperationStatus,
-    FileManagerPendingConflict, FileManagerPreflight,
-    FileManagerRevision, FileManagerTextFile,
+    FileManagerExecutionMode, FileManagerJournalStatus,
+    FileManagerLimits, FileManagerOperation,
+    FileManagerOperationPhase, FileManagerOperationState,
+    FileManagerOperationStatus, FileManagerPendingConflict,
+    FileManagerPreflight, FileManagerRevision, FileManagerTextFile,
   },
   komodo_timestamp, to_path_compatible_name,
 };
@@ -61,7 +61,8 @@ mod archive;
 mod path;
 
 use path::{
-  open_dir_nofollow, open_parent_nofollow, relative_path, single_name,
+  PRIVATE_STATE_DIRECTORY, open_dir_nofollow, open_parent_nofollow,
+  relative_path, single_name,
 };
 
 pub const MAX_TEXT_BYTES: u64 = 4 * 1024 * 1024;
@@ -80,6 +81,9 @@ const MAX_DOWNLOAD_CREDITS: u32 = 32;
 const DOWNLOAD_HEARTBEAT_LEASE: Duration = Duration::from_secs(60);
 const FILE_TRANSFER_FINAL_SEND_TIMEOUT: Duration =
   Duration::from_secs(1);
+const PRIVATE_STATE_MARKER: &str = ".komodo-owner";
+const PRIVATE_STATE_MARKER_CONTENTS: &[u8] =
+  b"Komodo File Manager state v1\n";
 
 #[derive(Debug, Clone)]
 pub struct ResolvedRoot {
@@ -100,6 +104,8 @@ struct OperationPlan {
   confirmation_required: bool,
   revisions: Vec<(String, Option<FileManagerRevision>)>,
   copy_targets: Vec<CopyTarget>,
+  execution_mode: FileManagerExecutionMode,
+  recursive_revisions: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -442,10 +448,53 @@ struct JournalRecord {
   created_at: i64,
   expires_at: i64,
   description: String,
+  #[serde(default)]
+  execution_mode: FileManagerExecutionMode,
+  /// Operation-aware journals keep only namespace actions here. Legacy
+  /// journals continue to use `snapshots` during their 24-hour lifetime.
+  #[serde(default)]
+  actions: Vec<JournalAction>,
+  #[serde(default)]
+  cleanup_only: bool,
+  #[serde(default)]
   snapshots: Vec<JournalSnapshot>,
   #[serde(default)]
   before_revisions: Vec<(String, Option<FileManagerRevision>)>,
   after_revisions: Vec<(String, Option<FileManagerRevision>)>,
+}
+
+#[derive(
+  Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+enum JournalActionState {
+  #[default]
+  Prepared,
+  Applied,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum JournalActionKind {
+  /// Move a visible entry into the operation's target-local quarantine.
+  Quarantine {
+    path: String,
+    quarantine_name: String,
+  },
+  /// Rename a visible entry within the managed root.
+  Relocate { from: String, to: String },
+  /// An entry created by the operation. Undo moves it into quarantine so
+  /// redo remains metadata-only.
+  Created {
+    path: String,
+    quarantine_name: String,
+  },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct JournalAction {
+  state: JournalActionState,
+  kind: JournalActionKind,
 }
 
 #[derive(
@@ -711,8 +760,25 @@ pub async fn initialize() -> anyhow::Result<()> {
         Some(record) if journal_is_unexpired(&record) => {
           records.push(record);
         }
-        _ => {
+        Some(record) => {
+          if !record.actions.is_empty()
+            && let Err(error) = remove_action_state(&record)
+          {
+            warn!(
+              "Expired File Manager journal {} is retaining target recovery data for retry: {error:#}",
+              record.id
+            );
+            continue;
+          }
           let _ = fs::remove_dir_all(entry.path());
+        }
+        None => {
+          // Preserve an unreadable active journal for manual recovery. A
+          // retired journal has already been filtered above.
+          warn!(
+            "Retaining unreadable File Manager journal at {}",
+            entry.path().display()
+          );
         }
       }
     }
@@ -722,6 +788,10 @@ pub async fn initialize() -> anyhow::Result<()> {
   records.sort_by_key(|record| record.created_at);
   let mut loaded = histories().lock().await;
   for record in records {
+    if record.cleanup_only {
+      schedule_action_journal_cleanup(record);
+      continue;
+    }
     let history = loaded
       .entry(history_key(&record.root_key, &record.actor))
       .or_default();
@@ -1173,6 +1243,7 @@ pub async fn capabilities(
         reason: None,
         managed_file: root.managed_file,
         limits: limits(),
+        supports_execution_modes: true,
       }
     }
     Ok(_) => FileManagerCapabilities {
@@ -1188,6 +1259,7 @@ pub async fn capabilities(
       ),
       managed_file: None,
       limits: limits(),
+      supports_execution_modes: true,
     },
     Err(error) => FileManagerCapabilities {
       available: false,
@@ -1195,6 +1267,7 @@ pub async fn capabilities(
       reason: Some(error.to_string()),
       managed_file: None,
       limits: limits(),
+      supports_execution_modes: true,
     },
   }
 }
@@ -1223,6 +1296,7 @@ pub async fn list_directory(
       })?;
       if name.starts_with(".komodo-file-manager-staging-")
         || name.starts_with(".komodo-upload-")
+        || name == PRIVATE_STATE_DIRECTORY
       {
         continue;
       }
@@ -1319,6 +1393,7 @@ pub async fn preflight(
   target: &PeripheryFileManagerTarget,
   actor: String,
   operation: FileManagerOperation,
+  execution_mode: FileManagerExecutionMode,
 ) -> anyhow::Result<FileManagerPreflight> {
   let root = resolve_root(target).await?;
   if root.read_only {
@@ -1328,34 +1403,60 @@ pub async fn preflight(
   validate_operation(&root, &operation)?;
   let root_key = root.key.clone();
   let plan_root_key = root.key.clone();
-  let (operation, conflicts, revisions, copy_targets) =
-    run_root_blocking(&root_key, move || {
-      let root_dir = match open_root(&root, false) {
-        Ok(root) => Some(root),
-        Err(_) if root.create_if_missing => None,
-        Err(error) => return Err(error),
-      };
-      let root_dir = root_dir.as_ref();
-      let copy_targets = resolve_copy_targets(root_dir, &operation)?;
-      let conflicts =
-        find_conflicts_planned(root_dir, &operation, &copy_targets)?;
-      let mut watched =
-        revision_paths_planned(&operation, &copy_targets)?;
-      watched.sort();
-      watched.dedup();
-      let revisions = watched
-        .into_iter()
-        .map(|path| {
-          let rev = root_dir
-            .map(|root| metadata_tree_revision(root, &path))
-            .transpose()?
-            .flatten();
-          anyhow::Ok((path, rev))
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
-      Ok((operation, conflicts, revisions, copy_targets))
-    })
-    .await?;
+  let (
+    operation,
+    conflicts,
+    revisions,
+    copy_targets,
+    recursive_revisions,
+  ) = run_root_blocking(&root_key, move || {
+    let root_dir = match open_root(&root, false) {
+      Ok(root) => Some(root),
+      Err(_) if root.create_if_missing => None,
+      Err(error) => return Err(error),
+    };
+    let root_dir = root_dir.as_ref();
+    let copy_targets = resolve_copy_targets(root_dir, &operation)?;
+    let conflicts =
+      find_conflicts_planned(root_dir, &operation, &copy_targets)?;
+    let recursive_revisions = root_dir
+      .map(|root| {
+        supports_action_journal(root, &operation, &copy_targets)
+          .map(|supported| !supported)
+      })
+      .transpose()?
+      .unwrap_or(false);
+    let mut watched =
+      revision_paths_planned(&operation, &copy_targets)?;
+    watched.sort();
+    watched.dedup();
+    let revisions = watched
+      .into_iter()
+      .map(|path| {
+        let rev = root_dir
+          .map(|root| {
+            if recursive_revisions {
+              metadata_tree_revision(root, &path)
+            } else {
+              entry_metadata(root, &path).map(|metadata| {
+                metadata.map(|metadata| revision(&metadata))
+              })
+            }
+          })
+          .transpose()?
+          .flatten();
+        anyhow::Ok((path, rev))
+      })
+      .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok((
+      operation,
+      conflicts,
+      revisions,
+      copy_targets,
+      recursive_revisions,
+    ))
+  })
+  .await?;
   let plan_id = Uuid::new_v4().to_string();
   let expires_at = komodo_timestamp() + PLAN_TTL_MS;
   let confirmation_required =
@@ -1373,6 +1474,8 @@ pub async fn preflight(
       confirmation_required,
       revisions,
       copy_targets,
+      execution_mode,
+      recursive_revisions,
     },
   );
   Ok(FileManagerPreflight {
@@ -1381,6 +1484,7 @@ pub async fn preflight(
     conflicts,
     confirmation_required,
     supports_durable_managed_transactions: true,
+    execution_mode,
   })
 }
 
@@ -1937,7 +2041,9 @@ pub async fn commit(
         &plan.operation,
         &plan.copy_targets,
       ),
-      undoable: plan.operation.is_undoable(),
+      undoable: plan.operation.is_undoable()
+        && plan.execution_mode
+          == FileManagerExecutionMode::Recoverable,
     };
   tokio::spawn(async move {
     let _archive_permit = if matches!(
@@ -1976,9 +2082,71 @@ pub async fn commit(
         WorkTotal::default(),
       );
       let root_dir = open_root(&root, true)?;
+      let use_action_journal = supports_action_journal(
+        &root_dir,
+        &plan.operation,
+        &plan.copy_targets,
+      )?;
+      if use_action_journal {
+        if matches!(&plan.operation, FileManagerOperation::Copy { .. }) {
+          ensure_free_space(&root.path, MINIMUM_FREE_BYTES)?;
+        }
+        verify_plan_revisions(
+          &root_dir,
+          &plan.revisions,
+          plan.recursive_revisions,
+          Some(&job_progress),
+        )?;
+        job_progress.phase(
+          FileManagerOperationPhase::Applying,
+          action_operation_work(&plan.operation),
+        );
+        let mut journal = create_action_journal(
+          &root,
+          &actor,
+          &operation_id,
+          &plan.operation,
+          plan.execution_mode,
+          durable_managed,
+        )?;
+        let operation_result = apply_action_operation(
+          &root_dir,
+          &mut journal,
+          &plan.operation,
+          &plan.copy_targets,
+          &decisions,
+          Some(&job_progress),
+        );
+        if let Err(error) = operation_result {
+          job_progress.phase(
+            FileManagerOperationPhase::RollingBack,
+            action_operation_work(&plan.operation),
+          );
+          let rollback = rollback_action_journal(&root_dir, &journal);
+          if let Err(rollback_error) = rollback {
+            return Err(RetainedJournalError {
+              message: format!(
+                "File operation failed: {error:#}; action rollback also failed: {rollback_error:#}"
+              ),
+              record: journal,
+            }
+            .into());
+          }
+          retire_action_journal(&journal)?;
+          return Err(error.context("File operation was rolled back"));
+        }
+        job_progress.check_cancelled()?;
+        let retain = journal.managed
+          || (plan.operation.is_undoable()
+            && plan.execution_mode
+              == FileManagerExecutionMode::Recoverable);
+        let journal = finish_action_journal(journal, retain)?;
+        return Ok((Some(journal), guard));
+      }
       verify_plan_revisions(
         &root_dir,
         &plan.revisions,
+        plan.recursive_revisions,
         Some(&job_progress),
       )?;
       ensure_operation_capacity(
@@ -2002,8 +2170,11 @@ pub async fn commit(
         &operation_id,
         &plan.operation,
         &plan.copy_targets,
-        durable_managed,
-        Some(&job_progress),
+        JournalCreateOptions {
+          execution_mode: plan.execution_mode,
+          durable_managed,
+          progress: Some(&job_progress),
+        },
       )?;
       job_progress.add_temporary_storage_bytes(snapshot_total.bytes);
       if let Err(error) = job_progress.check_cancelled() {
@@ -2030,6 +2201,7 @@ pub async fn commit(
       if let Err(error) = verify_plan_revisions(
         &root_dir,
         &plan.revisions,
+        plan.recursive_revisions,
         Some(&job_progress),
       ) {
         retire_journal_directory(&journal.id).context(
@@ -2046,7 +2218,11 @@ pub async fn commit(
           Some(&job_progress),
         )?;
         job_progress.check_cancelled()?;
-        if plan.operation.is_undoable() || journal.managed {
+        if (plan.operation.is_undoable()
+          && plan.execution_mode
+            == FileManagerExecutionMode::Recoverable)
+          || journal.managed
+        {
           let finalizing_total = work_for_paths(
             &root_dir,
             &watched_paths_planned(
@@ -2064,8 +2240,7 @@ pub async fn commit(
             Some(&job_progress),
           )?))
         } else {
-          retire_journal_directory(&journal.id)?;
-          Ok(None)
+          Ok(Some(finish_action_journal(journal.clone(), false)?))
         }
       })();
       match operation_result {
@@ -2081,6 +2256,10 @@ pub async fn commit(
     })
     .await;
     let result = match result {
+      Ok((Some(journal), _guard)) if journal.cleanup_only => {
+        schedule_action_journal_cleanup(journal);
+        Ok(())
+      }
       Ok((Some(journal), _guard)) => {
         let rollback_record = journal.clone();
         match push_journal(journal).await {
@@ -2092,6 +2271,32 @@ pub async fn commit(
             let registration_error = format!("{error:#}");
             let rollback_error = match run_heavy_blocking(move || {
               let error = match open_root(&rollback_root, true) {
+                Ok(root_dir) if !rollback_record.actions.is_empty() => {
+                  match rollback_action_journal(
+                    &root_dir,
+                    &rollback_record,
+                  ) {
+                    Ok(()) => match retire_action_journal(&rollback_record) {
+                      Ok(()) => error.context(
+                        "File operation was rolled back after its undo history could not be registered",
+                      ),
+                      Err(cleanup_error) => RetainedJournalError {
+                        message: format!(
+                          "Undo history registration failed: {error:#}; rollback succeeded but cleanup failed: {cleanup_error:#}"
+                        ),
+                        record: rollback_record,
+                      }
+                      .into(),
+                    },
+                    Err(restore_error) => RetainedJournalError {
+                      message: format!(
+                        "Undo history registration failed: {error:#}; action rollback also failed: {restore_error:#}"
+                      ),
+                      record: rollback_record,
+                    }
+                    .into(),
+                  }
+                }
                 Ok(root_dir) => rollback_or_retain(
                   &root_dir,
                   rollback_record,
@@ -2298,7 +2503,7 @@ pub async fn journal_status(
 ) -> anyhow::Result<FileManagerJournalStatus> {
   let root = resolve_root(target).await?;
   let key = history_key(&root.key, actor);
-  let (mut status, expired, retained_ids) = {
+  let (mut status, expired, retained_ids, has_action_journal) = {
     let mut histories = histories().lock().await;
     let history = histories.entry(key).or_default();
     let expired = prune_history(history);
@@ -2331,18 +2536,22 @@ pub async fn journal_status(
         .filter(|record| !record.recovery)
         .map(|record| record.expires_at),
       retained_storage_bytes: 0,
-      storage_description: match target {
-        PeripheryFileManagerTarget::Stack { .. } => "Stack files resolve beneath PERIPHERY_STACK_DIR, or PERIPHERY_ROOT_DIRECTORY/stacks by default. Recovery records use private File Manager journal storage. Absolute host paths remain server-side.".into(),
-        PeripheryFileManagerTarget::Volume { .. } => "Volume files use Docker's reported mountpoint (commonly Docker's volumes directory). Recovery records use private File Manager journal storage. Absolute host paths remain server-side.".into(),
-      },
+      retained_storage_bytes_exact: Some(true),
+      storage_description: "Recovery manifests use Periphery private storage. Large deleted or overwritten trees are retained in the target's hidden .komodo-file-manager directory so namespace changes remain fast.".into(),
     };
     let retained_ids = history
       .undo
       .iter()
       .chain(&history.redo)
+      .filter(|record| record.actions.is_empty())
       .map(|record| record.id.clone())
       .collect::<Vec<_>>();
-    (status, expired, retained_ids)
+    let has_action_journal = history
+      .undo
+      .iter()
+      .chain(&history.redo)
+      .any(|record| !record.actions.is_empty());
+    (status, expired, retained_ids, has_action_journal)
   };
   schedule_journal_cleanup(expired);
   status.retained_storage_bytes = run_read_blocking(move || {
@@ -2355,6 +2564,7 @@ pub async fn journal_status(
     }))
   })
   .await?;
+  status.retained_storage_bytes_exact = Some(!has_action_journal);
   Ok(status)
 }
 
@@ -2417,11 +2627,15 @@ pub async fn undo(
   let response =
     periphery_client::api::file_manager::FileManagerCommitResponse {
       operation_id: operation_id.to_string(),
-      affected_paths: record
-        .snapshots
-        .iter()
-        .map(|snapshot| snapshot.path.clone())
-        .collect(),
+      affected_paths: if record.actions.is_empty() {
+        record
+          .snapshots
+          .iter()
+          .map(|snapshot| snapshot.path.clone())
+          .collect()
+      } else {
+        action_paths(&record)
+      },
       undoable: !record.recovery,
     };
   tokio::spawn(async move {
@@ -2434,6 +2648,30 @@ pub async fn undo(
           .unwrap_or_default();
       let result = (|| {
         let root_dir = open_root(&root, true)?;
+        if !record.actions.is_empty() {
+          job_progress.phase(
+            if record.recovery {
+              FileManagerOperationPhase::RollingBack
+            } else {
+              FileManagerOperationPhase::Applying
+            },
+            WorkTotal {
+              entries: record.actions.len() as u64,
+              bytes: 0,
+            },
+          );
+          if record.recovery {
+            rollback_action_journal(&root_dir, &record)?;
+            retire_action_journal(&record)?;
+            return Ok(());
+          }
+          undo_action_journal(
+            &root_dir,
+            &mut record,
+            Some(&job_progress),
+          )?;
+          return Ok(());
+        }
         if record.recovery {
           job_progress.phase(
             FileManagerOperationPhase::Applying,
@@ -2571,11 +2809,15 @@ pub async fn redo(
   let response =
     periphery_client::api::file_manager::FileManagerCommitResponse {
       operation_id: operation_id.to_string(),
-      affected_paths: record
-        .snapshots
-        .iter()
-        .map(|snapshot| snapshot.path.clone())
-        .collect(),
+      affected_paths: if record.actions.is_empty() {
+        record
+          .snapshots
+          .iter()
+          .map(|snapshot| snapshot.path.clone())
+          .collect()
+      } else {
+        action_paths(&record)
+      },
       undoable: true,
     };
   tokio::spawn(async move {
@@ -2588,6 +2830,22 @@ pub async fn redo(
           .unwrap_or_default();
       job_progress.phase(FileManagerOperationPhase::Applying, total);
       let result = (|| {
+        if !record.actions.is_empty() {
+          let root_dir = open_root(&root, true)?;
+          job_progress.phase(
+            FileManagerOperationPhase::Applying,
+            WorkTotal {
+              entries: record.actions.len() as u64,
+              bytes: 0,
+            },
+          );
+          redo_action_journal(
+            &root_dir,
+            &mut record,
+            Some(&job_progress),
+          )?;
+          return Ok(());
+        }
         ensure_free_space(
           &root.path,
           total.bytes.saturating_add(MINIMUM_FREE_BYTES),
@@ -2917,7 +3175,8 @@ pub async fn start_upload(
             let lock = root_lock(&root.key).await;
             let guard = lock.lock_owned().await;
             let finalize_progress = progress.clone();
-            let (message, _guard) = run_heavy_blocking(move || {
+            let (message, _guard, cleanup) =
+              run_heavy_blocking(move || {
               finalize_progress.check_cancelled()?;
               let root_dir = open_root(&finalize_root, true)?;
               if metadata_tree_revision(&root_dir, &finalize_path)?
@@ -2959,8 +3218,12 @@ pub async fn start_upload(
                 &Uuid::new_v4().to_string(),
                 &operation,
                 &[],
-                false,
-                None,
+                JournalCreateOptions {
+                  execution_mode:
+                    FileManagerExecutionMode::Recoverable,
+                  durable_managed: false,
+                  progress: None,
+                },
               )?;
               if metadata_tree_revision(&root_dir, &finalize_path)?
                 != upload.initial_revision
@@ -3028,26 +3291,32 @@ pub async fn start_upload(
                   &root_dir, journal, error,
                 ));
               }
-              if let Err(error) =
-                retire_journal_directory(&journal.id)
-              {
+              let cleanup = match finish_action_journal(
+                journal.clone(),
+                false,
+              ) {
+                Ok(cleanup) => cleanup,
+                Err(error) => {
                 return Err(rollback_or_retain(
                   &root_dir,
                   journal,
                   error.context(
-                    "Published upload journal could not be retired",
+                    "Published upload journal could not be finalized for cleanup",
                   ),
                 ));
-              }
+                }
+              };
               Ok((
                 FileTransferMessage::Complete {
                   bytes: received,
                   sha256: actual,
                 },
                 guard,
+                cleanup,
               ))
             })
             .await?;
+            schedule_action_journal_cleanup(cleanup);
             progress.add_entry();
             return Ok(message);
           }
@@ -4132,6 +4401,273 @@ fn apply_operation_planned(
   Ok(())
 }
 
+fn supports_action_journal(
+  root: &Dir,
+  operation: &FileManagerOperation,
+  copy_targets: &[CopyTarget],
+) -> anyhow::Result<bool> {
+  let root_device = root.dir_metadata()?.dev();
+  let destination_is_local = |path: &str| -> anyhow::Result<bool> {
+    let path = relative_path(path, false)?;
+    let (parent, _) = open_parent_nofollow(root, &path)?;
+    Ok(parent.dir_metadata()?.dev() == root_device)
+  };
+  let entry_is_local = |path: &str| -> anyhow::Result<bool> {
+    let path = relative_path(path, false)?;
+    let (parent, name) = open_parent_nofollow(root, &path)?;
+    Ok(parent.symlink_metadata(name)?.dev() == root_device)
+  };
+  let destination_can_be_replaced =
+    |path: &str| -> anyhow::Result<bool> {
+      if !destination_is_local(path)? {
+        return Ok(false);
+      }
+      Ok(!visible_exists(root, path)? || entry_is_local(path)?)
+    };
+  match operation {
+    FileManagerOperation::CreateFile { path }
+    | FileManagerOperation::CreateDirectory { path } => {
+      destination_can_be_replaced(path)
+    }
+    FileManagerOperation::Rename { path, new_name } => {
+      let source = relative_path(path, false)?;
+      let destination = path_string(
+        &source
+          .parent()
+          .unwrap_or_else(|| Path::new(""))
+          .join(single_name(new_name)?),
+      )?;
+      Ok(
+        entry_is_local(path)?
+          && destination_can_be_replaced(&destination)?,
+      )
+    }
+    FileManagerOperation::Delete { paths } => {
+      for path in paths {
+        if !entry_is_local(path)? {
+          return Ok(false);
+        }
+      }
+      Ok(true)
+    }
+    FileManagerOperation::Move { paths, destination } => {
+      let destination = relative_path(destination, true)?;
+      for source in paths {
+        let source = relative_path(source, false)?;
+        let (source_parent, source_name) =
+          open_parent_nofollow(root, &source)?;
+        let source_metadata =
+          source_parent.symlink_metadata(&source_name)?;
+        let target = destination.join(&source_name);
+        let (target_parent, target_name) =
+          open_parent_nofollow(root, &target)?;
+        if source_metadata.dev() != root_device
+          || target_parent.dir_metadata()?.dev() != root_device
+        {
+          return Ok(false);
+        }
+        if let Ok(target_metadata) =
+          target_parent.symlink_metadata(&target_name)
+          && (target_metadata.dev() != root_device
+            || (source_metadata.is_dir()
+              && !source_metadata.file_type().is_symlink()
+              && target_metadata.is_dir()
+              && !target_metadata.file_type().is_symlink()))
+        {
+          return Ok(false);
+        }
+      }
+      Ok(true)
+    }
+    FileManagerOperation::Copy { .. } => {
+      for target in copy_targets {
+        if visible_exists(root, &target.destination)?
+          || !destination_is_local(&target.destination)?
+        {
+          return Ok(false);
+        }
+      }
+      Ok(true)
+    }
+    FileManagerOperation::WriteText { .. }
+    | FileManagerOperation::CreateArchive { .. }
+    | FileManagerOperation::ExtractArchive { .. } => Ok(false),
+  }
+}
+
+fn action_operation_work(
+  operation: &FileManagerOperation,
+) -> WorkTotal {
+  let entries = match operation {
+    FileManagerOperation::Delete { paths }
+    | FileManagerOperation::Move { paths, .. }
+    | FileManagerOperation::Copy { paths, .. } => paths.len() as u64,
+    _ => 1,
+  };
+  WorkTotal { entries, bytes: 0 }
+}
+
+fn apply_action_operation(
+  root: &Dir,
+  record: &mut JournalRecord,
+  operation: &FileManagerOperation,
+  copy_targets: &[CopyTarget],
+  decisions: &[FileManagerConflictDecision],
+  progress: Option<&OperationProgress>,
+) -> anyhow::Result<()> {
+  match operation {
+    FileManagerOperation::CreateFile { path } => {
+      if visible_exists(root, path)? {
+        match decision_for(path, decisions) {
+          Some(FileManagerConflictAction::Skip) => return Ok(()),
+          Some(FileManagerConflictAction::Overwrite) => {
+            quarantine_visible(root, record, path)?;
+          }
+          None => return Err(anyhow!("Destination already exists")),
+        }
+      }
+      let action = prepare_created_action(record, path)?;
+      let path = relative_path(path, false)?;
+      let (parent, name) = open_parent_nofollow(root, &path)?;
+      let mut options = OpenOptions::new();
+      options
+        .write(true)
+        .create_new(true)
+        .follow(FollowSymlinks::No);
+      parent.open_with(name, &options)?.sync_all()?;
+      sync_capability_directory(&parent)?;
+      mark_action_applied(record, action)?;
+    }
+    FileManagerOperation::CreateDirectory { path } => {
+      if visible_exists(root, path)? {
+        match decision_for(path, decisions) {
+          Some(FileManagerConflictAction::Skip) => return Ok(()),
+          Some(FileManagerConflictAction::Overwrite) => {
+            quarantine_visible(root, record, path)?;
+          }
+          None => return Err(anyhow!("Destination already exists")),
+        }
+      }
+      let action = prepare_created_action(record, path)?;
+      let path = relative_path(path, false)?;
+      let (parent, name) = open_parent_nofollow(root, &path)?;
+      parent.create_dir(name)?;
+      sync_capability_directory(&parent)?;
+      mark_action_applied(record, action)?;
+    }
+    FileManagerOperation::Rename { path, new_name } => {
+      let source = relative_path(path, false)?;
+      let destination = source
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .join(single_name(new_name)?);
+      let destination = path_string(&destination)?;
+      if visible_exists(root, &destination)? {
+        match decision_for(&destination, decisions) {
+          Some(FileManagerConflictAction::Skip) => return Ok(()),
+          Some(FileManagerConflictAction::Overwrite) => {
+            quarantine_visible(root, record, &destination)?;
+          }
+          None => return Err(anyhow!("Destination already exists")),
+        }
+      }
+      relocate_visible(root, record, path, &destination)?;
+    }
+    FileManagerOperation::Move { paths, destination } => {
+      let destination_path = relative_path(destination, true)?;
+      for source in paths {
+        if let Some(progress) = progress {
+          progress.check_cancelled()?;
+        }
+        let source_path = relative_path(source, false)?;
+        let target = path_string(
+          &destination_path.join(
+            source_path
+              .file_name()
+              .context("Source path has no filename")?,
+          ),
+        )?;
+        if visible_exists(root, &target)? {
+          match decision_for(&target, decisions) {
+            Some(FileManagerConflictAction::Skip) => continue,
+            Some(FileManagerConflictAction::Overwrite) => {
+              quarantine_visible(root, record, &target)?;
+            }
+            None => {
+              return Err(anyhow!("Destination already exists"));
+            }
+          }
+        }
+        relocate_visible(root, record, source, &target)?;
+        if let Some(progress) = progress {
+          progress.add_entry();
+        }
+      }
+      return Ok(());
+    }
+    FileManagerOperation::Copy { .. } => {
+      let operation_dir =
+        action_operation_directory(root, &record.id, false)?;
+      let staging = operation_dir.open_dir_nofollow("staging")?;
+      let mut copied_entries = 0_u64;
+      for (index, target) in copy_targets.iter().enumerate() {
+        if let Some(progress) = progress {
+          progress.check_cancelled()?;
+        }
+        let source = relative_path(&target.source, false)?;
+        let destination = relative_path(&target.destination, false)?;
+        let (source_parent, source_name) =
+          open_parent_nofollow(root, &source)?;
+        let staging_name = format!("copy-{index}");
+        copy_entry_counted(
+          &source_parent,
+          &source_name,
+          &staging,
+          std::ffi::OsStr::new(&staging_name),
+          progress,
+          &mut copied_entries,
+        )?;
+        let action =
+          prepare_created_action(record, &target.destination)?;
+        let (destination_parent, destination_name) =
+          open_parent_nofollow(root, &destination)?;
+        staging.rename(
+          &staging_name,
+          &destination_parent,
+          destination_name,
+        )?;
+        sync_capability_directory(&staging)?;
+        sync_capability_directory(&destination_parent)?;
+        mark_action_applied(record, action)?;
+      }
+      return Ok(());
+    }
+    FileManagerOperation::Delete { paths } => {
+      for path in paths {
+        if let Some(progress) = progress {
+          progress.check_cancelled()?;
+        }
+        quarantine_visible(root, record, path)?;
+        if let Some(progress) = progress {
+          progress.add_entry();
+        }
+      }
+      return Ok(());
+    }
+    FileManagerOperation::WriteText { .. }
+    | FileManagerOperation::CreateArchive { .. }
+    | FileManagerOperation::ExtractArchive { .. } => {
+      return Err(anyhow!(
+        "Operation requires the legacy transaction path"
+      ));
+    }
+  }
+  if let Some(progress) = progress {
+    progress.add_entry();
+  }
+  Ok(())
+}
+
 fn merge_entry(
   source_parent: &Dir,
   source_name: &std::ffi::OsStr,
@@ -4242,6 +4778,27 @@ fn copy_entry(
   destination_name: &std::ffi::OsStr,
   progress: Option<&OperationProgress>,
 ) -> anyhow::Result<()> {
+  let mut copied_entries = 0_u64;
+  copy_entry_counted(
+    source_parent,
+    source_name,
+    destination_parent,
+    destination_name,
+    progress,
+    &mut copied_entries,
+  )
+}
+
+fn copy_entry_counted(
+  source_parent: &Dir,
+  source_name: &std::ffi::OsStr,
+  destination_parent: &Dir,
+  destination_name: &std::ffi::OsStr,
+  progress: Option<&OperationProgress>,
+  copied_entries: &mut u64,
+) -> anyhow::Result<()> {
+  *copied_entries = copied_entries.saturating_add(1);
+  ensure_entry_limit(*copied_entries)?;
   let metadata = source_parent.symlink_metadata(source_name)?;
   if let Some(progress) = progress {
     progress.check_cancelled()?;
@@ -4262,14 +4819,12 @@ fn copy_entry(
       .follow(FollowSymlinks::No);
     let mut destination = destination_parent
       .open_with(destination_name, &write_options)?;
-    let mut source_hash = Sha256::new();
     let mut buffer = [0_u8; 128 * 1024];
     loop {
       let read = source.read(&mut buffer)?;
       if read == 0 {
         break;
       }
-      source_hash.update(&buffer[..read]);
       destination.write_all(&buffer[..read])?;
       if let Some(progress) = progress {
         progress.add_bytes(read as u64);
@@ -4281,22 +4836,6 @@ fn copy_entry(
       false,
     )?;
     destination.sync_all()?;
-    let mut destination = destination_parent
-      .open_with(destination_name, &read_options)?;
-    let mut destination_hash = Sha256::new();
-    loop {
-      let read = destination.read(&mut buffer)?;
-      if read == 0 {
-        break;
-      }
-      destination_hash.update(&buffer[..read]);
-    }
-    if source_hash.finalize() != destination_hash.finalize() {
-      let _ = destination_parent.remove_file(destination_name);
-      return Err(anyhow!(
-        "Copied file checksum verification failed"
-      ));
-    }
   } else if metadata.is_dir() {
     let source = source_parent.open_dir_nofollow(source_name)?;
     let source_metadata = source.dir_metadata()?;
@@ -4306,7 +4845,14 @@ fn copy_entry(
     for entry in source.entries()? {
       let entry = entry?;
       let name = entry.file_name();
-      copy_entry(&source, &name, &destination, &name, progress)?;
+      copy_entry_counted(
+        &source,
+        &name,
+        &destination,
+        &name,
+        progress,
+        copied_entries,
+      )?;
     }
     let destination_file = destination.open(".")?;
     apply_capability_file_metadata(
@@ -4718,13 +5264,18 @@ fn revision_paths_planned(
 fn verify_plan_revisions(
   root: &Dir,
   revisions: &[(String, Option<FileManagerRevision>)],
+  recursive: bool,
   progress: Option<&OperationProgress>,
 ) -> anyhow::Result<()> {
   for (path, expected) in revisions {
     if let Some(progress) = progress {
       progress.check_cancelled()?;
     }
-    let actual = metadata_tree_revision(root, path)?;
+    let actual = if recursive {
+      metadata_tree_revision(root, path)?
+    } else {
+      entry_metadata(root, path)?.map(|metadata| revision(&metadata))
+    };
     if &actual != expected {
       return Err(anyhow!(
         "File Manager contents changed after preflight; retry the operation"
@@ -4752,14 +5303,521 @@ fn affected_paths_planned(
   }
 }
 
+fn action_state_directory(root: &Dir) -> anyhow::Result<Dir> {
+  let created = match root.symlink_metadata(PRIVATE_STATE_DIRECTORY) {
+    Ok(metadata)
+      if metadata.is_dir() && !metadata.file_type().is_symlink() =>
+    {
+      #[cfg(unix)]
+      if cap_std::fs::MetadataExt::uid(&metadata)
+        != unsafe { libc::geteuid() }
+      {
+        return Err(anyhow!(
+          "Reserved File Manager recovery path is not owned by Periphery"
+        ));
+      }
+      false
+    }
+    Ok(_) => {
+      return Err(anyhow!(
+        "Reserved File Manager recovery path is not a directory"
+      ));
+    }
+    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+      create_private_capability_directory(
+        root,
+        PRIVATE_STATE_DIRECTORY,
+      )?;
+      sync_capability_directory(root)?;
+      true
+    }
+    Err(error) => return Err(error.into()),
+  };
+  let state = root
+    .open_dir_nofollow(PRIVATE_STATE_DIRECTORY)
+    .context("File Manager recovery state is inaccessible")?;
+  if created {
+    let mut options = OpenOptions::new();
+    options
+      .write(true)
+      .create_new(true)
+      .follow(FollowSymlinks::No);
+    let mut marker =
+      state.open_with(PRIVATE_STATE_MARKER, &options)?;
+    marker.write_all(PRIVATE_STATE_MARKER_CONTENTS)?;
+    #[cfg(unix)]
+    {
+      use cap_std::fs::PermissionsExt as _;
+      marker.set_permissions(cap_std::fs::Permissions::from_mode(
+        0o600,
+      ))?;
+    }
+    marker.sync_all()?;
+    sync_capability_directory(&state)?;
+  } else {
+    let mut options = OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    let marker = state
+      .open_with(PRIVATE_STATE_MARKER, &options)
+      .context(
+        "Reserved File Manager recovery path is not managed by Periphery",
+      )?;
+    let mut contents = Vec::new();
+    marker
+      .take((PRIVATE_STATE_MARKER_CONTENTS.len() + 1) as u64)
+      .read_to_end(&mut contents)?;
+    if contents != PRIVATE_STATE_MARKER_CONTENTS {
+      return Err(anyhow!(
+        "Reserved File Manager recovery path has an invalid ownership marker"
+      ));
+    }
+  }
+  #[cfg(unix)]
+  {
+    use cap_std::fs::PermissionsExt as _;
+    let directory = state.open(".")?;
+    directory
+      .set_permissions(cap_std::fs::Permissions::from_mode(0o700))?;
+    directory.sync_all()?;
+  }
+  Ok(state)
+}
+
+fn action_operation_directory(
+  root: &Dir,
+  id: &str,
+  create: bool,
+) -> anyhow::Result<Dir> {
+  let state = action_state_directory(root)?;
+  if create {
+    create_private_capability_directory(&state, id)?;
+    sync_capability_directory(&state)?;
+    let operation = state.open_dir_nofollow(id)?;
+    create_private_capability_directory(&operation, "quarantine")?;
+    create_private_capability_directory(&operation, "staging")?;
+    sync_capability_directory(&operation)?;
+    Ok(operation)
+  } else {
+    state.open_dir_nofollow(id).map_err(Into::into)
+  }
+}
+
+fn action_quarantine_directory(
+  root: &Dir,
+  id: &str,
+) -> anyhow::Result<Dir> {
+  action_operation_directory(root, id, false)?
+    .open_dir_nofollow("quarantine")
+    .map_err(Into::into)
+}
+
+fn sync_capability_directory(directory: &Dir) -> anyhow::Result<()> {
+  #[cfg(unix)]
+  directory.open(".")?.sync_all()?;
+  Ok(())
+}
+
+fn rename_visible(
+  root: &Dir,
+  from: &str,
+  to: &str,
+) -> anyhow::Result<()> {
+  let from = relative_path(from, false)?;
+  let to = relative_path(to, false)?;
+  let (from_parent, from_name) = open_parent_nofollow(root, &from)?;
+  let (to_parent, to_name) = open_parent_nofollow(root, &to)?;
+  from_parent.rename(from_name, &to_parent, to_name)?;
+  sync_capability_directory(&from_parent)?;
+  sync_capability_directory(&to_parent)?;
+  Ok(())
+}
+
+fn visible_exists(root: &Dir, path: &str) -> anyhow::Result<bool> {
+  let path = relative_path(path, false)?;
+  let (parent, name) = open_parent_nofollow(root, &path)?;
+  match parent.symlink_metadata(name) {
+    Ok(_) => Ok(true),
+    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+      Ok(false)
+    }
+    Err(error) => Err(error.into()),
+  }
+}
+
+fn append_action(
+  record: &mut JournalRecord,
+  kind: JournalActionKind,
+) -> anyhow::Result<usize> {
+  record.actions.push(JournalAction {
+    state: JournalActionState::Prepared,
+    kind,
+  });
+  persist_journal_record(record)?;
+  Ok(record.actions.len() - 1)
+}
+
+fn mark_action_applied(
+  record: &mut JournalRecord,
+  index: usize,
+) -> anyhow::Result<()> {
+  record.actions[index].state = JournalActionState::Applied;
+  persist_journal_record(record)
+}
+
+fn quarantine_visible(
+  root: &Dir,
+  record: &mut JournalRecord,
+  path: &str,
+) -> anyhow::Result<()> {
+  let quarantine_name = record.actions.len().to_string();
+  let index = append_action(
+    record,
+    JournalActionKind::Quarantine {
+      path: path.to_string(),
+      quarantine_name: quarantine_name.clone(),
+    },
+  )?;
+  let relative = relative_path(path, false)?;
+  let (parent, name) = open_parent_nofollow(root, &relative)?;
+  let quarantine = action_quarantine_directory(root, &record.id)?;
+  parent.rename(name, &quarantine, &quarantine_name)?;
+  sync_capability_directory(&parent)?;
+  sync_capability_directory(&quarantine)?;
+  mark_action_applied(record, index)
+}
+
+fn relocate_visible(
+  root: &Dir,
+  record: &mut JournalRecord,
+  from: &str,
+  to: &str,
+) -> anyhow::Result<()> {
+  let index = append_action(
+    record,
+    JournalActionKind::Relocate {
+      from: from.to_string(),
+      to: to.to_string(),
+    },
+  )?;
+  rename_visible(root, from, to)?;
+  mark_action_applied(record, index)
+}
+
+fn prepare_created_action(
+  record: &mut JournalRecord,
+  path: &str,
+) -> anyhow::Result<usize> {
+  append_action(
+    record,
+    JournalActionKind::Created {
+      path: path.to_string(),
+      quarantine_name: format!("created-{}", record.actions.len()),
+    },
+  )
+}
+
+fn create_action_journal(
+  root: &ResolvedRoot,
+  actor: &str,
+  id: &str,
+  operation: &FileManagerOperation,
+  execution_mode: FileManagerExecutionMode,
+  durable_managed: bool,
+) -> anyhow::Result<JournalRecord> {
+  let root_dir = open_root(root, true)?;
+  let journal_root = journal_root();
+  ensure_private_directory(&journal_root)?;
+  let central_directory = journal_root.join(id);
+  create_private_directory(&central_directory)?;
+  #[cfg(unix)]
+  if let Err(error) =
+    fs::File::open(&journal_root).and_then(|root| root.sync_all())
+  {
+    let _ = fs::remove_dir(&central_directory);
+    return Err(error.into());
+  }
+  let result = (|| {
+    action_operation_directory(&root_dir, id, true)?;
+    let created_at = komodo_timestamp();
+    let record = JournalRecord {
+      id: id.to_string(),
+      actor: actor.to_string(),
+      root_key: root.key.clone(),
+      root_path: root.path.clone(),
+      managed: operation_edits_managed_file(root, operation),
+      durable_managed: durable_managed
+        && operation_edits_managed_file(root, operation),
+      recovery: true,
+      history_side: JournalHistorySide::Undo,
+      transition: None,
+      created_at,
+      expires_at: created_at + JOURNAL_TTL_MS,
+      description: operation_description(operation),
+      execution_mode,
+      actions: Vec::new(),
+      cleanup_only: false,
+      snapshots: Vec::new(),
+      before_revisions: Vec::new(),
+      after_revisions: Vec::new(),
+    };
+    persist_journal_record(&record)?;
+    Ok(record)
+  })();
+  if result.is_err() {
+    let _ = fs::remove_dir_all(
+      root.path.join(PRIVATE_STATE_DIRECTORY).join(id),
+    );
+    let _ = fs::remove_dir_all(&central_directory);
+  }
+  result
+}
+
+fn finish_action_journal(
+  mut record: JournalRecord,
+  retain: bool,
+) -> anyhow::Result<JournalRecord> {
+  record.recovery = false;
+  record.cleanup_only = !retain;
+  persist_journal_record(&record)?;
+  Ok(record)
+}
+
+fn remove_action_state(record: &JournalRecord) -> anyhow::Result<()> {
+  let parent = record.root_path.join(PRIVATE_STATE_DIRECTORY);
+  let path = parent.join(&record.id);
+  match fs::remove_dir_all(path) {
+    Ok(()) => {
+      #[cfg(unix)]
+      fs::File::open(parent)?.sync_all()?;
+      Ok(())
+    }
+    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+      Ok(())
+    }
+    Err(error) => Err(error.into()),
+  }
+}
+
+fn retire_action_journal(
+  record: &JournalRecord,
+) -> anyhow::Result<()> {
+  let mut cleanup = record.clone();
+  cleanup.recovery = false;
+  cleanup.cleanup_only = true;
+  persist_journal_record(&cleanup)?;
+  remove_action_state(&cleanup)?;
+  retire_journal_directory(&record.id)
+}
+
+fn schedule_action_journal_cleanup(record: JournalRecord) {
+  tokio::spawn(async move {
+    let id = record.id.clone();
+    let result = run_heavy_blocking(move || {
+      remove_action_state(&record)?;
+      retire_journal_directory(&record.id)
+    })
+    .await;
+    if let Err(error) = result {
+      warn!(
+        "Failed to clean up File Manager operation {id}: {error:#}"
+      );
+    }
+  });
+}
+
+fn action_was_applied(
+  root: &Dir,
+  record: &JournalRecord,
+  action: &JournalAction,
+) -> anyhow::Result<bool> {
+  if action.state == JournalActionState::Applied {
+    return Ok(true);
+  }
+  let quarantine = action_quarantine_directory(root, &record.id)?;
+  match &action.kind {
+    JournalActionKind::Quarantine {
+      path,
+      quarantine_name,
+    } => Ok(
+      !visible_exists(root, path)?
+        && quarantine.symlink_metadata(quarantine_name).is_ok(),
+    ),
+    JournalActionKind::Relocate { from, to } => {
+      Ok(!visible_exists(root, from)? && visible_exists(root, to)?)
+    }
+    JournalActionKind::Created { path, .. } => {
+      visible_exists(root, path)
+    }
+  }
+}
+
+fn rollback_action_journal(
+  root: &Dir,
+  record: &JournalRecord,
+) -> anyhow::Result<()> {
+  let quarantine = action_quarantine_directory(root, &record.id)?;
+  for action in record.actions.iter().rev() {
+    if !action_was_applied(root, record, action)? {
+      continue;
+    }
+    match &action.kind {
+      JournalActionKind::Quarantine {
+        path,
+        quarantine_name,
+      } => {
+        let relative = relative_path(path, false)?;
+        let (parent, name) = open_parent_nofollow(root, &relative)?;
+        quarantine.rename(quarantine_name, &parent, name)?;
+        sync_capability_directory(&quarantine)?;
+        sync_capability_directory(&parent)?;
+      }
+      JournalActionKind::Relocate { from, to } => {
+        rename_visible(root, to, from)?;
+      }
+      JournalActionKind::Created { path, .. } => {
+        let relative = relative_path(path, false)?;
+        let (parent, name) = open_parent_nofollow(root, &relative)?;
+        if parent.symlink_metadata(&name).is_ok() {
+          remove_entry(&parent, name)?;
+        }
+      }
+    }
+  }
+  Ok(())
+}
+
+fn action_paths(record: &JournalRecord) -> Vec<String> {
+  let mut paths = record
+    .actions
+    .iter()
+    .flat_map(|action| match &action.kind {
+      JournalActionKind::Quarantine { path, .. }
+      | JournalActionKind::Created { path, .. } => vec![path.clone()],
+      JournalActionKind::Relocate { from, to } => {
+        vec![from.clone(), to.clone()]
+      }
+    })
+    .collect::<Vec<_>>();
+  paths.sort();
+  paths.dedup();
+  paths
+}
+
+fn ensure_visible_absent(
+  root: &Dir,
+  path: &str,
+) -> anyhow::Result<()> {
+  if visible_exists(root, path)? {
+    Err(anyhow!("Undo or redo is unsafe because {path} now exists"))
+  } else {
+    Ok(())
+  }
+}
+
+fn undo_action_journal(
+  root: &Dir,
+  record: &mut JournalRecord,
+  progress: Option<&OperationProgress>,
+) -> anyhow::Result<()> {
+  begin_journal_transition(record, JournalTransition::Undo)?;
+  let quarantine = action_quarantine_directory(root, &record.id)?;
+  for action in record.actions.iter().rev() {
+    if let Some(progress) = progress {
+      progress.check_cancelled()?;
+    }
+    match &action.kind {
+      JournalActionKind::Quarantine {
+        path,
+        quarantine_name,
+      } => {
+        ensure_visible_absent(root, path)?;
+        let relative = relative_path(path, false)?;
+        let (parent, name) = open_parent_nofollow(root, &relative)?;
+        quarantine.rename(quarantine_name, &parent, name)?;
+        sync_capability_directory(&quarantine)?;
+        sync_capability_directory(&parent)?;
+      }
+      JournalActionKind::Relocate { from, to } => {
+        ensure_visible_absent(root, from)?;
+        rename_visible(root, to, from)?;
+      }
+      JournalActionKind::Created {
+        path,
+        quarantine_name,
+      } => {
+        let relative = relative_path(path, false)?;
+        let (parent, name) = open_parent_nofollow(root, &relative)?;
+        parent.rename(name, &quarantine, quarantine_name)?;
+        sync_capability_directory(&parent)?;
+        sync_capability_directory(&quarantine)?;
+      }
+    }
+    if let Some(progress) = progress {
+      progress.add_entry();
+    }
+  }
+  complete_journal_transition(record, JournalHistorySide::Redo)
+}
+
+fn redo_action_journal(
+  root: &Dir,
+  record: &mut JournalRecord,
+  progress: Option<&OperationProgress>,
+) -> anyhow::Result<()> {
+  begin_journal_transition(record, JournalTransition::Redo)?;
+  let quarantine = action_quarantine_directory(root, &record.id)?;
+  for action in &record.actions {
+    if let Some(progress) = progress {
+      progress.check_cancelled()?;
+    }
+    match &action.kind {
+      JournalActionKind::Quarantine {
+        path,
+        quarantine_name,
+      } => {
+        let relative = relative_path(path, false)?;
+        let (parent, name) = open_parent_nofollow(root, &relative)?;
+        parent.rename(name, &quarantine, quarantine_name)?;
+        sync_capability_directory(&parent)?;
+        sync_capability_directory(&quarantine)?;
+      }
+      JournalActionKind::Relocate { from, to } => {
+        ensure_visible_absent(root, to)?;
+        rename_visible(root, from, to)?;
+      }
+      JournalActionKind::Created {
+        path,
+        quarantine_name,
+      } => {
+        ensure_visible_absent(root, path)?;
+        let relative = relative_path(path, false)?;
+        let (parent, name) = open_parent_nofollow(root, &relative)?;
+        quarantine.rename(quarantine_name, &parent, name)?;
+        sync_capability_directory(&quarantine)?;
+        sync_capability_directory(&parent)?;
+      }
+    }
+    if let Some(progress) = progress {
+      progress.add_entry();
+    }
+  }
+  complete_journal_transition(record, JournalHistorySide::Undo)
+}
+
+#[derive(Clone, Copy)]
+struct JournalCreateOptions<'a> {
+  execution_mode: FileManagerExecutionMode,
+  durable_managed: bool,
+  progress: Option<&'a OperationProgress>,
+}
+
 fn create_journal(
   root: &ResolvedRoot,
   actor: &str,
   id: &str,
   operation: &FileManagerOperation,
   copy_targets: &[CopyTarget],
-  durable_managed: bool,
-  progress: Option<&OperationProgress>,
+  options: JournalCreateOptions<'_>,
 ) -> anyhow::Result<JournalRecord> {
   let journal_root = journal_root();
   ensure_private_directory(&journal_root)?;
@@ -4791,7 +5849,10 @@ fn create_journal(
       };
       if existed {
         backup_from_capability(
-          &root_dir, &relative, &backup, progress,
+          &root_dir,
+          &relative,
+          &backup,
+          options.progress,
         )?;
       }
       snapshots.push(JournalSnapshot {
@@ -4810,7 +5871,7 @@ fn create_journal(
       root_key: root.key.clone(),
       root_path: root.path.clone(),
       managed: operation_edits_managed_file(root, operation),
-      durable_managed: durable_managed
+      durable_managed: options.durable_managed
         && operation_edits_managed_file(root, operation),
       recovery: true,
       history_side: JournalHistorySide::Undo,
@@ -4818,6 +5879,9 @@ fn create_journal(
       created_at,
       expires_at: created_at + JOURNAL_TTL_MS,
       description: operation_description(operation),
+      execution_mode: options.execution_mode,
+      actions: Vec::new(),
+      cleanup_only: false,
       snapshots,
       before_revisions,
       after_revisions: Vec::new(),
@@ -5219,6 +6283,31 @@ fn commit_redo_invalidation_batch(
 }
 
 fn cleanup_redo_invalidation_batch(batch: RedoInvalidationBatch) {
+  let entries = match fs::read_dir(&batch.path) {
+    Ok(entries) => entries,
+    Err(error) => {
+      warn!(
+        "Committed redo invalidation could not be inspected at {}: {error:#}",
+        batch.path.display()
+      );
+      return;
+    }
+  };
+  for entry in entries.flatten() {
+    if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+      continue;
+    }
+    if let Some(record) = read_active_journal_record(&entry.path())
+      && !record.actions.is_empty()
+      && let Err(error) = remove_action_state(&record)
+    {
+      warn!(
+        "Committed redo invalidation is retaining target recovery data for retry at {}: {error:#}",
+        batch.path.display()
+      );
+      return;
+    }
+  }
   if let Err(error) = fs::remove_dir_all(&batch.path) {
     warn!(
       "Committed redo invalidation awaits cleanup at {}: {error:#}",
@@ -5775,7 +6864,7 @@ fn history_key(root: &str, actor: &str) -> String {
 }
 
 fn journal_is_visible(record: &JournalRecord) -> bool {
-  !record.managed || record.recovery
+  !record.cleanup_only && (!record.managed || record.recovery)
 }
 
 fn journal_is_unexpired(record: &JournalRecord) -> bool {
@@ -5846,7 +6935,24 @@ fn schedule_journal_cleanup(ids: Vec<String>) {
   tokio::spawn(async move {
     let result = run_heavy_blocking(move || {
       for id in ids {
-        let _ = fs::remove_dir_all(journal_root().join(id));
+        if let Some(record) =
+          read_active_journal_record(&journal_root().join(&id))
+          && !record.actions.is_empty()
+          && let Err(error) = remove_action_state(&record)
+        {
+          warn!(
+            "Expired File Manager journal {id} is retaining target recovery data for retry: {error:#}"
+          );
+          continue;
+        }
+        if let Err(error) =
+          fs::remove_dir_all(journal_root().join(&id))
+          && error.kind() != std::io::ErrorKind::NotFound
+        {
+          warn!(
+            "Expired File Manager journal {id} awaits cleanup: {error:#}"
+          );
+        }
       }
       Ok(())
     })
@@ -6222,6 +7328,9 @@ mod tests {
       created_at,
       expires_at: created_at + JOURNAL_TTL_MS,
       description: id.into(),
+      execution_mode: FileManagerExecutionMode::Recoverable,
+      actions: Vec::new(),
+      cleanup_only: false,
       snapshots: Vec::new(),
       before_revisions: Vec::new(),
       after_revisions: Vec::new(),
@@ -6250,6 +7359,8 @@ mod tests {
         confirmation_required: false,
         revisions: Vec::new(),
         copy_targets: Vec::new(),
+        execution_mode: FileManagerExecutionMode::Recoverable,
+        recursive_revisions: false,
       },
     );
 
@@ -6314,6 +7425,88 @@ mod tests {
 
     apply_operation(&root, &operation, &[]).unwrap();
     assert!(!directory.join("folder").exists());
+    fs::remove_dir_all(directory).unwrap();
+  }
+
+  #[test]
+  fn large_directory_delete_uses_a_reversible_metadata_action() {
+    let directory =
+      std::env::temp_dir().join(Uuid::new_v4().to_string());
+    let tree = directory.join("tree");
+    fs::create_dir_all(tree.join("nested")).unwrap();
+    for index in 0..128 {
+      fs::write(
+        tree.join("nested").join(format!("{index}.txt")),
+        "contents",
+      )
+      .unwrap();
+    }
+    let root =
+      Dir::open_ambient_dir(&directory, ambient_authority()).unwrap();
+    let before =
+      file_identity(&root.symlink_metadata("tree").unwrap());
+    let operation = FileManagerOperation::Delete {
+      paths: vec!["tree".into()],
+    };
+    assert!(supports_action_journal(&root, &operation, &[]).unwrap());
+
+    let mut record = test_journal_record(
+      &Uuid::new_v4().to_string(),
+      komodo_timestamp(),
+      JournalHistorySide::Undo,
+    );
+    record.root_path = directory.clone();
+    let operation_directory =
+      directory.join(PRIVATE_STATE_DIRECTORY).join(&record.id);
+    fs::create_dir(directory.join(PRIVATE_STATE_DIRECTORY)).unwrap();
+    fs::write(
+      directory
+        .join(PRIVATE_STATE_DIRECTORY)
+        .join(PRIVATE_STATE_MARKER),
+      PRIVATE_STATE_MARKER_CONTENTS,
+    )
+    .unwrap();
+    fs::create_dir_all(operation_directory.join("quarantine"))
+      .unwrap();
+    fs::create_dir(operation_directory.join("staging")).unwrap();
+    fs::rename(&tree, operation_directory.join("quarantine/0"))
+      .unwrap();
+    record.actions.push(JournalAction {
+      state: JournalActionState::Applied,
+      kind: JournalActionKind::Quarantine {
+        path: "tree".into(),
+        quarantine_name: "0".into(),
+      },
+    });
+
+    rollback_action_journal(&root, &record).unwrap();
+    assert_eq!(
+      file_identity(&root.symlink_metadata("tree").unwrap()),
+      before
+    );
+    assert_eq!(
+      fs::read_to_string(tree.join("nested/127.txt")).unwrap(),
+      "contents"
+    );
+    fs::remove_dir_all(directory).unwrap();
+  }
+
+  #[test]
+  fn target_local_recovery_state_requires_ownership_marker() {
+    let directory =
+      std::env::temp_dir().join(Uuid::new_v4().to_string());
+    let reserved = directory.join(PRIVATE_STATE_DIRECTORY);
+    fs::create_dir_all(&reserved).unwrap();
+    fs::write(reserved.join("application-data"), "keep").unwrap();
+    let root =
+      Dir::open_ambient_dir(&directory, ambient_authority()).unwrap();
+
+    let error = action_state_directory(&root).unwrap_err();
+    assert!(error.to_string().contains("not managed by Periphery"));
+    assert_eq!(
+      fs::read_to_string(reserved.join("application-data")).unwrap(),
+      "keep"
+    );
     fs::remove_dir_all(directory).unwrap();
   }
 
@@ -7335,10 +8528,10 @@ mod tests {
       metadata_tree_revision(&root, "config.txt").unwrap(),
     )];
 
-    verify_plan_revisions(&root, &revisions, None).unwrap();
+    verify_plan_revisions(&root, &revisions, true, None).unwrap();
     fs::write(&path, "changed after snapshot").unwrap();
-    let error =
-      verify_plan_revisions(&root, &revisions, None).unwrap_err();
+    let error = verify_plan_revisions(&root, &revisions, true, None)
+      .unwrap_err();
     assert_eq!(
       error.to_string(),
       "File Manager contents changed after preflight; retry the operation"

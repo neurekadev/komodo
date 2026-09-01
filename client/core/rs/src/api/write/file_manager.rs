@@ -6,9 +6,9 @@ use crate::entities::{
   U64,
   file_manager::{
     FileManagerConflictAction, FileManagerConflictDecision,
-    FileManagerOperation, FileManagerOperationStatus,
-    FileManagerOperationTicket, FileManagerPreflight,
-    FileManagerRevision, FileManagerTarget,
+    FileManagerExecutionMode, FileManagerOperation,
+    FileManagerOperationStatus, FileManagerOperationTicket,
+    FileManagerPreflight, FileManagerRevision, FileManagerTarget,
     FileManagerTransferTicket,
   },
 };
@@ -24,6 +24,9 @@ use super::KomodoWriteRequest;
 pub struct PreflightFileManagerOperation {
   pub target: FileManagerTarget,
   pub operation: FileManagerOperation,
+  #[serde(default)]
+  #[typeshare(optional)]
+  pub execution_mode: FileManagerExecutionMode,
 }
 
 #[typeshare]

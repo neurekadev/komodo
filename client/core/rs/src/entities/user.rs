@@ -63,6 +63,11 @@ pub struct User {
   /// The primary user login.
   pub config: UserConfig,
 
+  /// Cross-device UI preferences owned by this user.
+  #[serde(default)]
+  #[typeshare(optional)]
+  pub preferences: UserPreferences,
+
   /// Additional linked login methods.
   /// May not contain 'Service' type config.
   #[serde(default)]
@@ -133,6 +138,7 @@ impl User {
       updated_at,
       last_update_view: 0,
       config,
+      preferences: Default::default(),
       recents: Default::default(),
       all: Default::default(),
       linked_logins: Default::default(),
@@ -141,6 +147,27 @@ impl User {
       external_skip_2fa: Default::default(),
     }
   }
+}
+
+#[typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+pub struct UserPreferences {
+  /// Keep eligible File Manager operations undoable by default.
+  #[serde(default = "default_file_manager_safe_mode")]
+  pub file_manager_safe_mode: bool,
+}
+
+impl Default for UserPreferences {
+  fn default() -> Self {
+    Self {
+      file_manager_safe_mode: true,
+    }
+  }
+}
+
+fn default_file_manager_safe_mode() -> bool {
+  true
 }
 
 #[typeshare]
@@ -475,4 +502,15 @@ pub fn repo_user() -> &'static User {
       ..Default::default()
     }
   })
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn file_manager_safe_mode_defaults_to_enabled() {
+    assert!(UserPreferences::default().file_manager_safe_mode);
+    assert!(User::default().preferences.file_manager_safe_mode);
+  }
 }

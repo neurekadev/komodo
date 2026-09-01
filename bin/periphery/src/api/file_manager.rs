@@ -41,8 +41,13 @@ impl Resolve<Args> for PreflightFileManagerOperation {
     self,
     _: &Args,
   ) -> anyhow::Result<FileManagerPreflight> {
-    file_manager::preflight(&self.target, self.actor, self.operation)
-      .await
+    file_manager::preflight(
+      &self.target,
+      self.actor,
+      self.operation,
+      self.execution_mode,
+    )
+    .await
   }
 }
 

@@ -803,6 +803,11 @@ export var FileManagerConflictAction;
     FileManagerConflictAction["Skip"] = "skip";
     FileManagerConflictAction["Overwrite"] = "overwrite";
 })(FileManagerConflictAction || (FileManagerConflictAction = {}));
+export var FileManagerExecutionMode;
+(function (FileManagerExecutionMode) {
+    FileManagerExecutionMode["Recoverable"] = "recoverable";
+    FileManagerExecutionMode["Permanent"] = "permanent";
+})(FileManagerExecutionMode || (FileManagerExecutionMode = {}));
 /**
  * Configures the behavior of [CreateTerminal] if the
  * specified terminal name already exists.

@@ -579,14 +579,24 @@ impl Resolve<WriteArgs> for PreflightFileManagerOperation {
         .await?;
     let (operation, managed) =
       prepare_managed_operation(&resolved, &self.operation).await?;
+    let requires_execution_mode = operation.is_undoable();
     let response = periphery_client(&resolved.server)
       .await?
       .request(periphery::PreflightFileManagerOperation {
         target: resolved.periphery,
         actor: user.id.clone(),
         operation,
+        execution_mode: self.execution_mode,
       })
       .await?;
+    if requires_execution_mode
+      && response.execution_mode != self.execution_mode
+    {
+      return Err(anyhow!(
+        "This Periphery version does not support permanent File Manager operations"
+      )
+      .into());
+    }
     let managed = managed.map(|(stack, before, after)| ManagedPlan {
       stack_id: stack.id,
       stack_name: stack.name,

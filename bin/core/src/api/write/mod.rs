@@ -187,6 +187,7 @@ pub enum WriteRequest {
   // ==== USER ====
   PushRecentlyViewed(PushRecentlyViewed),
   SetLastSeenUpdate(SetLastSeenUpdate),
+  SetFileManagerSafeMode(SetFileManagerSafeMode),
   CreateLocalUser(CreateLocalUser),
   DeleteUser(DeleteUser),
 
@@ -285,6 +286,7 @@ async fn task(
     request,
     WriteRequest::SetLastSeenUpdate(_)
       | WriteRequest::PushRecentlyViewed(_)
+      | WriteRequest::SetFileManagerSafeMode(_)
   ) {
     info!(
       task_id = task_id.to_string(),

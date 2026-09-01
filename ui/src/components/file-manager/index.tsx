@@ -1,5 +1,10 @@
 import { KOMODO_BASE_URL } from "@/main";
-import { useRead, useWrite } from "@/lib/hooks";
+import {
+  useRead,
+  useUser,
+  useUserInvalidate,
+  useWrite,
+} from "@/lib/hooks";
 import { ICONS } from "@/lib/icons";
 import {
   fileManagerTargetKey,
@@ -20,6 +25,7 @@ import {
   ScrollArea,
   Select,
   Stack,
+  Switch,
   Table,
   Tabs,
   Text,
@@ -399,6 +405,8 @@ export default function FileManager(props: FileManagerProps) {
 
 function TargetFileManager({ target, titleOther }: FileManagerProps) {
   const queryClient = useQueryClient();
+  const user = useUser().data;
+  const invalidateUser = useUserInvalidate();
   const operations = useFileOperations();
   const desktop = useMediaQuery("(min-width: 62em)");
   const inputRef = useRef<HTMLInputElement>(null);
@@ -432,6 +440,12 @@ function TargetFileManager({ target, titleOther }: FileManagerProps) {
   >({});
 
   const capabilities = useRead("GetFileManagerCapabilities", { target }).data;
+  const safeMode = user?.preferences?.file_manager_safe_mode ?? true;
+  const executionModesSupported =
+    capabilities?.supports_execution_modes !== false;
+  const defaultExecutionMode = safeMode || !executionModesSupported
+    ? Types.FileManagerExecutionMode.Recoverable
+    : Types.FileManagerExecutionMode.Permanent;
   const directory = useRead(
     "ListFileManagerDirectory",
     { target, path },
@@ -506,6 +520,12 @@ function TargetFileManager({ target, titleOther }: FileManagerProps) {
     "RedoFileManagerOperation",
     {
       onError: () => undefined,
+    },
+  );
+  const { mutate: setSafeMode, isPending: safeModePending } = useWrite(
+    "SetFileManagerSafeMode",
+    {
+      onSuccess: invalidateUser,
     },
   );
 
@@ -659,12 +679,19 @@ function TargetFileManager({ target, titleOther }: FileManagerProps) {
   const runOperation = useCallback(
     async (
       operation: Types.FileManagerOperation,
-      options: { clearClipboardOnSuccess?: boolean } = {},
+      options: {
+        clearClipboardOnSuccess?: boolean;
+        executionMode?: Types.FileManagerExecutionMode;
+      } = {},
     ) => {
       const label = operationLabel(operation);
       const notificationId = operations.begin(label);
       try {
-        const result = await preflight({ target, operation });
+        const result = await preflight({
+          target,
+          operation,
+          execution_mode: options.executionMode ?? defaultExecutionMode,
+        });
         const plan = {
           operation,
           preflight: result,
@@ -683,7 +710,7 @@ function TargetFileManager({ target, titleOther }: FileManagerProps) {
         operations.failPending(notificationId, label, error);
       }
     },
-    [completeCommit, operations, preflight, target],
+    [completeCommit, defaultExecutionMode, operations, preflight, target],
   );
 
   const runHistoryOperation = useCallback(
@@ -861,7 +888,12 @@ function TargetFileManager({ target, titleOther }: FileManagerProps) {
       if (entries[next]) setSelected([entries[next].path]);
     } else if (event.key === "Delete" && canChangeSelection) {
       event.preventDefault();
-      await runOperation({ type: "Delete", params: { paths: selected } });
+      await runOperation(
+        { type: "Delete", params: { paths: selected } },
+        event.shiftKey
+          ? { executionMode: Types.FileManagerExecutionMode.Permanent }
+          : undefined,
+      );
     } else if (event.key === "Escape") {
       if (editorPath) requestEditorClose();
       else setSelected([]);
@@ -1504,6 +1536,26 @@ function TargetFileManager({ target, titleOther }: FileManagerProps) {
               })}
             </Group>
             <Group gap={4}>
+              <Tooltip
+                label={
+                  safeMode
+                    ? "Deleted and replaced items can be undone"
+                    : !executionModesSupported
+                      ? "Upgrade Periphery to use permanent operations on this target"
+                      : "File operations permanently remove replaced data"
+                }
+              >
+                <Switch
+                  size="xs"
+                  label="Safe mode"
+                  checked={safeMode || !executionModesSupported}
+                  disabled={safeModePending || !executionModesSupported}
+                  onChange={(event) =>
+                    setSafeMode({ enabled: event.currentTarget.checked })
+                  }
+                />
+              </Tooltip>
+              <Divider orientation="vertical" />
               <ToolbarButton
                 label="New file"
                 icon={<FilePlus size={17} />}
@@ -1618,10 +1670,13 @@ function TargetFileManager({ target, titleOther }: FileManagerProps) {
               {clipboard.mode === "copy" ? "copy" : "move"}.
             </Text>
           )}
-          {!!journal.data?.retained_storage_bytes && (
+          {(journal.data?.can_undo || journal.data?.can_redo) && (
             <Text size="xs" c="dimmed" title={journal.data.storage_description}>
-              File Manager recovery storage:{" "}
-              {formatBytes(journal.data.retained_storage_bytes ?? 0)}
+              {journal.data.retained_storage_bytes_exact === false
+                ? "File Manager recovery data is retained beside the target."
+                : `File Manager recovery storage: ${formatBytes(
+                    journal.data.retained_storage_bytes ?? 0,
+                  )}`}
             </Text>
           )}
           <Box
@@ -2008,10 +2063,18 @@ function TargetFileManager({ target, titleOther }: FileManagerProps) {
         size="lg"
       >
         <Stack>
-          <Alert color="yellow" title="Review required">
-            This operation can replace or remove existing data. Review every
-            conflict before continuing.
-          </Alert>
+          {pendingCommit?.preflight.execution_mode ===
+          Types.FileManagerExecutionMode.Permanent ? (
+            <Alert color="red" title="Permanent operation">
+              Removed or replaced data will not be kept for Undo. This cannot
+              be reversed from File Manager.
+            </Alert>
+          ) : (
+            <Alert color="yellow" title="Review required">
+              This operation can replace or remove existing data. Review every
+              conflict before continuing.
+            </Alert>
+          )}
           {pendingCommit?.preflight.conflicts.map((conflict) => (
             <Group key={conflict.path} justify="space-between" wrap="nowrap">
               <Stack gap={0} style={{ minWidth: 0 }}>
@@ -2075,7 +2138,11 @@ function TargetFileManager({ target, titleOther }: FileManagerProps) {
                 )
               }
             >
-              Confirm operation
+              {pendingCommit?.preflight.execution_mode ===
+                Types.FileManagerExecutionMode.Permanent &&
+              pendingCommit.operation.type === "Delete"
+                ? "Delete permanently"
+                : "Confirm operation"}
             </Button>
           </Group>
         </Stack>

@@ -8,6 +8,7 @@ use cap_fs_ext::DirExt as _;
 use cap_std::fs::Dir;
 
 pub const MAX_DEPTH: usize = 128;
+pub const PRIVATE_STATE_DIRECTORY: &str = ".komodo-file-manager";
 
 /// Parse the only path representation accepted by File Manager APIs.
 ///
@@ -45,6 +46,13 @@ pub fn relative_path(
   for component in path.components() {
     match component {
       Component::Normal(name) if !name.is_empty() => {
+        if name.to_str().is_some_and(|name| {
+          name.eq_ignore_ascii_case(PRIVATE_STATE_DIRECTORY)
+        }) {
+          return Err(anyhow!(
+            "Path is reserved for File Manager recovery state"
+          ));
+        }
         depth += 1;
       }
       _ => {
@@ -139,6 +147,16 @@ mod tests {
   #[test]
   fn rejects_embedded_nul() {
     assert!(relative_path("config/\0secret", false).is_err());
+  }
+
+  #[test]
+  fn rejects_private_recovery_paths() {
+    assert!(relative_path(PRIVATE_STATE_DIRECTORY, false).is_err());
+    assert!(relative_path(".KOMODO-FILE-MANAGER", false).is_err());
+    assert!(
+      relative_path("data/.komodo-file-manager/entry", false)
+        .is_err()
+    );
   }
 
   #[test]
