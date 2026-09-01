@@ -56,7 +56,7 @@ pub struct FileManagerEntry {
   /// Unix timestamp in milliseconds.
   pub modified_at: I64,
   pub revision: FileManagerRevision,
-  /// The entry is the database-managed compose source.
+  /// The entry is backed by a database-managed source.
   #[serde(default)]
   pub managed: bool,
 }
@@ -77,6 +77,26 @@ pub struct FileManagerLimits {
 
 #[typeshare]
 #[derive(
+  Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize,
+)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedFileKind {
+  Compose,
+  Environment,
+}
+
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+pub struct ManagedFile {
+  /// Normalized path relative to the File Manager root.
+  pub path: String,
+  pub kind: ManagedFileKind,
+}
+
+#[typeshare]
+#[derive(
   Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize,
 )]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
@@ -84,7 +104,11 @@ pub struct FileManagerCapabilities {
   pub available: bool,
   pub read_only: bool,
   pub reason: Option<String>,
+  /// Backward-compatible path to the managed Compose file.
   pub managed_file: Option<String>,
+  /// Database-managed files exposed as virtual File Manager entries.
+  #[serde(default)]
+  pub managed_files: Vec<ManagedFile>,
   pub limits: FileManagerLimits,
   /// Whether this target supports explicitly selecting recoverable or
   /// permanent execution. Older Periphery versions omit this field.
@@ -483,5 +507,26 @@ mod tests {
       expected_revision: Default::default(),
     };
     assert_eq!(op.affected_paths(), ["compose.yaml"]);
+  }
+
+  #[test]
+  fn legacy_capabilities_default_the_managed_file_collection() {
+    let mut value =
+      serde_json::to_value(FileManagerCapabilities::default())
+        .unwrap();
+    let object = value.as_object_mut().unwrap();
+    object.remove("managed_files");
+    object.insert(
+      "managed_file".into(),
+      serde_json::Value::String("compose.yaml".into()),
+    );
+
+    let capabilities: FileManagerCapabilities =
+      serde_json::from_value(value).unwrap();
+    assert_eq!(
+      capabilities.managed_file.as_deref(),
+      Some("compose.yaml")
+    );
+    assert!(capabilities.managed_files.is_empty());
   }
 }

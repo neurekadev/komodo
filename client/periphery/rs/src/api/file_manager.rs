@@ -117,6 +117,35 @@ pub struct FinalizeManagedFileManagerTransaction {
   pub action: FileManagerManagedTransactionFinalizeAction,
 }
 
+/// Atomically move a UI-managed stack environment file before Core changes
+/// its configured path.
+#[derive(Debug, Clone, Serialize, Deserialize, Resolve)]
+#[response(FileManagerManagedTransactionStatus)]
+#[error(anyhow::Error)]
+pub struct PrepareManagedEnvironmentFileMigration {
+  pub target: PeripheryFileManagerTarget,
+  pub operation_id: String,
+  pub old_path: String,
+  pub new_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Resolve)]
+#[response(Option<FileManagerManagedTransactionStatus>)]
+#[error(anyhow::Error)]
+pub struct GetManagedEnvironmentFileMigration {
+  pub target: PeripheryFileManagerTarget,
+  pub operation_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Resolve)]
+#[response(FileManagerManagedTransactionStatus)]
+#[error(anyhow::Error)]
+pub struct FinalizeManagedEnvironmentFileMigration {
+  pub target: PeripheryFileManagerTarget,
+  pub operation_id: String,
+  pub action: FileManagerManagedTransactionFinalizeAction,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Resolve)]
 #[response(FileManagerCommitResponse)]
 #[error(anyhow::Error)]

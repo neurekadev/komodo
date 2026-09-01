@@ -12,3 +12,6 @@ komodo_client.workspace = true
 formatting.workspace = true
 #
 anyhow.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

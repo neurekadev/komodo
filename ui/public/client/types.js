@@ -852,6 +852,11 @@ export var FileManagerEntryKind;
     FileManagerEntryKind["Symlink"] = "symlink";
     FileManagerEntryKind["Special"] = "special";
 })(FileManagerEntryKind || (FileManagerEntryKind = {}));
+export var ManagedFileKind;
+(function (ManagedFileKind) {
+    ManagedFileKind["Compose"] = "compose";
+    ManagedFileKind["Environment"] = "environment";
+})(ManagedFileKind || (ManagedFileKind = {}));
 /**
  * Controls whether an eligible File Manager operation is retained in
  * user-visible undo history after it commits.

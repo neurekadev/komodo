@@ -1,5 +1,6 @@
 use std::{
   collections::HashMap,
+  path::{Component, Path},
   sync::{OnceLock, RwLock},
 };
 
@@ -11,6 +12,7 @@ use komodo_client::entities::{
     FileManagerEntryKind, FileManagerOperationPhase,
     FileManagerOperationState, FileManagerOperationStatus,
     FileManagerRevision, FileManagerTarget, FileManagerTextFile,
+    ManagedFile, ManagedFileKind,
   },
   permission::PermissionLevel,
   repo::Repo,
@@ -366,15 +368,71 @@ pub struct ResolvedFileManagerTarget {
   pub periphery: PeripheryFileManagerTarget,
   pub resource: ResourceTarget,
   pub stack: Option<Stack>,
+  /// Backward-compatible managed Compose path.
   pub managed_file: Option<String>,
+  pub managed_files: Vec<ManagedFile>,
 }
 
 pub fn require_managed_file(
   resolved: &ResolvedFileManagerTarget,
-) -> anyhow::Result<String> {
-  resolved.managed_file.clone().context(
-    "Rendered managed compose is available only for UI-managed stacks",
-  )
+  requested: Option<&str>,
+) -> anyhow::Result<ManagedFile> {
+  let path = requested.or(resolved.managed_file.as_deref()).context(
+    "Rendered managed files are available only for UI-managed stacks",
+  )?;
+  resolved
+    .managed_files
+    .iter()
+    .find(|managed| managed.path == path)
+    .cloned()
+    .context("The requested path is not a managed stack file")
+}
+
+fn normalize_managed_path(path: &str) -> anyhow::Result<String> {
+  let path = Path::new(path);
+  if path.is_absolute() {
+    return Err(anyhow!("Managed stack paths must be relative"));
+  }
+  let mut parts = Vec::new();
+  for component in path.components() {
+    match component {
+      Component::CurDir => {}
+      Component::Normal(part) => parts.push(
+        part
+          .to_str()
+          .context("Managed stack paths must be valid UTF-8")?,
+      ),
+      Component::ParentDir
+      | Component::RootDir
+      | Component::Prefix(_) => {
+        return Err(anyhow!(
+          "Managed stack paths cannot escape the stack root"
+        ));
+      }
+    }
+  }
+  if parts.is_empty() {
+    return Err(anyhow!("Managed stack paths cannot be empty"));
+  }
+  Ok(parts.join("/"))
+}
+
+pub fn managed_stack_files(
+  stack: &Stack,
+) -> anyhow::Result<Vec<ManagedFile>> {
+  if !is_ui_managed(stack) {
+    return Ok(Vec::new());
+  }
+  Ok(vec![
+    ManagedFile {
+      path: normalize_managed_path(&stack.compose_file_paths()[0])?,
+      kind: ManagedFileKind::Compose,
+    },
+    ManagedFile {
+      path: normalize_managed_path(&stack.config.env_file_path)?,
+      kind: ManagedFileKind::Environment,
+    },
+  ])
 }
 
 pub async fn resolve_target(
@@ -405,15 +463,11 @@ pub async fn resolve_target(
       } else {
         Some(resource::get::<Repo>(&stack.config.linked_repo).await?)
       };
-      let managed_file = is_ui_managed(&stack).then(|| {
-        stack
-          .compose_file_paths()
-          .first()
-          .and_then(|path| std::path::Path::new(path).file_name())
-          .and_then(|name| name.to_str())
-          .unwrap_or("compose.yaml")
-          .to_string()
-      });
+      let managed_files = managed_stack_files(&stack)?;
+      let managed_file = managed_files
+        .iter()
+        .find(|managed| managed.kind == ManagedFileKind::Compose)
+        .map(|managed| managed.path.clone());
       Ok(ResolvedFileManagerTarget {
         server,
         periphery: PeripheryFileManagerTarget::Stack {
@@ -423,6 +477,7 @@ pub async fn resolve_target(
         resource: ResourceTarget::Stack(stack.id.clone()),
         stack: Some(stack),
         managed_file,
+        managed_files,
       })
     }
     FileManagerTarget::Volume { server, volume } => {
@@ -443,6 +498,7 @@ pub async fn resolve_target(
         server,
         stack: None,
         managed_file: None,
+        managed_files: Vec::new(),
       })
     }
   }
@@ -465,24 +521,40 @@ pub fn is_ui_managed(stack: &Stack) -> bool {
 
 pub fn managed_text(
   stack: &Stack,
-  path: &str,
+  managed: &ManagedFile,
 ) -> FileManagerTextFile {
+  let contents = managed_source(stack, managed.kind);
   FileManagerTextFile {
-    path: path.to_string(),
-    contents: stack.config.file_contents.clone(),
-    revision: managed_revision(&stack.config.file_contents),
+    path: managed.path.clone(),
+    contents: contents.to_string(),
+    revision: managed_revision(contents),
   }
 }
 
-pub fn managed_entry(stack: &Stack, name: &str) -> FileManagerEntry {
+pub fn managed_entry(
+  stack: &Stack,
+  managed: &ManagedFile,
+) -> FileManagerEntry {
+  let contents = managed_source(stack, managed.kind);
+  let name = Path::new(&managed.path)
+    .file_name()
+    .and_then(|name| name.to_str())
+    .unwrap_or(&managed.path);
   FileManagerEntry {
-    path: name.to_string(),
+    path: managed.path.clone(),
     name: name.to_string(),
     kind: FileManagerEntryKind::File,
-    size: stack.config.file_contents.len() as u64,
+    size: contents.len() as u64,
     modified_at: 0,
-    revision: managed_revision(&stack.config.file_contents),
+    revision: managed_revision(contents),
     managed: true,
+  }
+}
+
+pub fn managed_source(stack: &Stack, kind: ManagedFileKind) -> &str {
+  match kind {
+    ManagedFileKind::Compose => &stack.config.file_contents,
+    ManagedFileKind::Environment => &stack.config.environment,
   }
 }
 
@@ -503,6 +575,43 @@ mod tests {
       server: "server-1".into(),
       volume: "volume-1".into(),
     }
+  }
+
+  #[test]
+  fn ui_stack_exposes_compose_and_nested_environment_files() {
+    let mut stack = Stack::default();
+    stack.config.file_paths = vec!["compose.yaml".into()];
+    stack.config.env_file_path = "config/runtime/stack.env".into();
+
+    assert_eq!(
+      managed_stack_files(&stack).unwrap(),
+      vec![
+        ManagedFile {
+          path: "compose.yaml".into(),
+          kind: ManagedFileKind::Compose,
+        },
+        ManagedFile {
+          path: "config/runtime/stack.env".into(),
+          kind: ManagedFileKind::Environment,
+        },
+      ]
+    );
+  }
+
+  #[test]
+  fn repository_stack_does_not_claim_managed_files() {
+    let mut stack = Stack::default();
+    stack.config.repo = "owner/repository".into();
+
+    assert!(managed_stack_files(&stack).unwrap().is_empty());
+  }
+
+  #[test]
+  fn managed_stack_paths_reject_parent_traversal() {
+    let mut stack = Stack::default();
+    stack.config.env_file_path = "../outside.env".into();
+
+    assert!(managed_stack_files(&stack).is_err());
   }
 
   #[test]

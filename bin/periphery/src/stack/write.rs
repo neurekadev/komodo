@@ -395,7 +395,7 @@ async fn write_stack_ui_defined_at(
       "failed to create stack run directory at {run_directory:?}"
     )
   })?;
-  let env_file_path = environment::write_env_file(
+  let env_file_path = environment::write_managed_env_file(
     &stack.config.env_vars()?,
     run_directory.as_path(),
     &stack.config.env_file_path,

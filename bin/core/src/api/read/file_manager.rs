@@ -4,7 +4,7 @@ use komodo_client::{
   entities::{
     file_manager::{
       FileManagerActiveOperations, FileManagerCapabilities,
-      FileManagerDirectory, FileManagerEntryKind,
+      FileManagerDirectory, FileManagerEntry, FileManagerEntryKind,
       FileManagerJournalStatus, FileManagerOperationPhase,
       FileManagerOperationState, FileManagerOperationStatus,
       FileManagerTextFile,
@@ -41,6 +41,8 @@ impl Resolve<ReadArgs> for GetFileManagerCapabilities {
         target: resolved.periphery,
       })
       .await?;
+    capabilities.managed_file = resolved.managed_file.clone();
+    capabilities.managed_files = resolved.managed_files.clone();
     if core_config().ui_write_disabled {
       capabilities.read_only = true;
       capabilities.reason =
@@ -63,25 +65,79 @@ impl Resolve<ReadArgs> for ListFileManagerDirectory {
     let resolved =
       resolve_target(&self.target, user, PermissionLevel::Read)
         .await?;
-    let mut directory = periphery_client(&resolved.server)
+    let virtual_directory = self.path.is_empty()
+      || resolved.managed_files.iter().any(|managed| {
+        managed
+          .path
+          .strip_prefix(&self.path)
+          .is_some_and(|suffix| suffix.starts_with('/'))
+      });
+    let directory_result = periphery_client(&resolved.server)
       .await?
       .request(periphery::ListFileManagerDirectory {
         target: resolved.periphery,
         path: self.path.clone(),
       })
-      .await?;
-    if self.path.is_empty()
-      && let (Some(stack), Some(managed)) =
-        (resolved.stack.as_ref(), resolved.managed_file.as_deref())
-    {
-      if let Some(entry) = directory
-        .entries
-        .iter_mut()
-        .find(|entry| entry.name == managed)
-      {
-        *entry = managed_entry(stack, managed);
-      } else {
-        directory.entries.push(managed_entry(stack, managed));
+      .await;
+    let mut directory = match directory_result {
+      Ok(directory) => directory,
+      Err(_) if virtual_directory => FileManagerDirectory {
+        path: self.path.clone(),
+        entries: Vec::new(),
+      },
+      Err(error) => return Err(error.into()),
+    };
+    if let Some(stack) = resolved.stack.as_ref() {
+      for managed in &resolved.managed_files {
+        let remainder = if self.path.is_empty() {
+          Some(managed.path.as_str())
+        } else {
+          managed
+            .path
+            .strip_prefix(&self.path)
+            .and_then(|suffix| suffix.strip_prefix('/'))
+        };
+        let Some(remainder) = remainder else {
+          continue;
+        };
+        let Some((name, nested)) = remainder
+          .split_once('/')
+          .map(|(name, _)| (name, true))
+          .or_else(|| {
+            (!remainder.is_empty()).then_some((remainder, false))
+          })
+        else {
+          continue;
+        };
+        let entry_path = if self.path.is_empty() {
+          name.to_string()
+        } else {
+          format!("{}/{name}", self.path)
+        };
+        let replacement = if nested {
+          FileManagerEntry {
+            path: entry_path.clone(),
+            name: name.to_string(),
+            kind: FileManagerEntryKind::Directory,
+            size: 0,
+            modified_at: 0,
+            revision: Default::default(),
+            managed: true,
+          }
+        } else {
+          managed_entry(stack, managed)
+        };
+        if let Some(entry) = directory
+          .entries
+          .iter_mut()
+          .find(|entry| entry.path == entry_path)
+        {
+          if !nested {
+            *entry = replacement;
+          }
+        } else {
+          directory.entries.push(replacement);
+        }
       }
       directory.entries.sort_by(|a, b| {
         (
@@ -106,12 +162,16 @@ impl Resolve<ReadArgs> for ReadFileManagerText {
     let resolved =
       resolve_target(&self.target, user, PermissionLevel::Read)
         .await?;
-    if resolved.managed_file.as_deref() == Some(self.path.as_str()) {
+    if let Some(managed) = resolved
+      .managed_files
+      .iter()
+      .find(|managed| managed.path == self.path)
+    {
       let stack = resolved
         .stack
         .as_ref()
         .context("Managed File Manager stack is missing")?;
-      return Ok(managed_text(stack, &self.path));
+      return Ok(managed_text(stack, managed));
     }
     Ok(
       periphery_client(&resolved.server)
@@ -133,13 +193,14 @@ impl Resolve<ReadArgs> for ReadManagedFileManagerRenderedText {
     let resolved =
       resolve_target(&self.target, user, PermissionLevel::Read)
         .await?;
-    let path = require_managed_file(&resolved)?;
+    let managed =
+      require_managed_file(&resolved, self.path.as_deref())?;
     Ok(
       periphery_client(&resolved.server)
         .await?
         .request(periphery::ReadFileManagerText {
           target: resolved.periphery,
-          path,
+          path: managed.path,
         })
         .await?,
     )

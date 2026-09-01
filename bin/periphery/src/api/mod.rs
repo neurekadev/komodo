@@ -71,6 +71,15 @@ pub enum PeripheryRequest {
   FinalizeManagedFileManagerTransaction(
     FinalizeManagedFileManagerTransaction,
   ),
+  PrepareManagedEnvironmentFileMigration(
+    PrepareManagedEnvironmentFileMigration,
+  ),
+  GetManagedEnvironmentFileMigration(
+    GetManagedEnvironmentFileMigration,
+  ),
+  FinalizeManagedEnvironmentFileMigration(
+    FinalizeManagedEnvironmentFileMigration,
+  ),
   CommitFileManagerOperation(CommitFileManagerOperation),
   GetFileManagerOperationStatus(GetFileManagerOperationStatus),
   ListActiveFileManagerOperations(ListActiveFileManagerOperations),

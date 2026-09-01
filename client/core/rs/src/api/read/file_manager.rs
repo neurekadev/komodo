@@ -51,6 +51,10 @@ pub struct ReadFileManagerText {
 #[error(mogh_error::Error)]
 pub struct ReadManagedFileManagerRenderedText {
   pub target: FileManagerTarget,
+  /// Managed file to read. Omit to read the Compose file for compatibility.
+  #[serde(default)]
+  #[typeshare(optional)]
+  pub path: Option<String>,
 }
 
 #[typeshare]

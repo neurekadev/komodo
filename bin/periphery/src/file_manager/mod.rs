@@ -31,6 +31,7 @@ use komodo_client::entities::{
     FileManagerOperationPhase, FileManagerOperationState,
     FileManagerOperationStatus, FileManagerPendingConflict,
     FileManagerPreflight, FileManagerRevision, FileManagerTextFile,
+    ManagedFile, ManagedFileKind,
   },
   komodo_timestamp, to_path_compatible_name,
 };
@@ -90,7 +91,9 @@ pub struct ResolvedRoot {
   pub path: PathBuf,
   pub key: String,
   pub read_only: bool,
+  /// Backward-compatible managed Compose path.
   pub managed_file: Option<String>,
+  pub managed_files: Vec<ManagedFile>,
   pub create_if_missing: bool,
 }
 
@@ -130,6 +133,20 @@ struct ManagedTransactionRecord {
   plan_id: String,
   state: FileManagerManagedTransactionState,
   affected_paths: Vec<String>,
+  #[serde(default)]
+  finalized_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ManagedEnvironmentMigrationRecord {
+  operation_id: String,
+  root_key: String,
+  old_path: String,
+  new_path: String,
+  old_present: bool,
+  #[serde(default)]
+  old_identity: Option<FileIdentity>,
+  state: FileManagerManagedTransactionState,
   #[serde(default)]
   finalized_at: Option<i64>,
 }
@@ -612,7 +629,9 @@ struct StreamingUpload {
   committed: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(
+  Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize,
+)]
 struct FileIdentity {
   device: u64,
   inode: u64,
@@ -657,6 +676,15 @@ fn managed_transactions()
     Mutex<HashMap<String, ManagedTransactionRecord>>,
   > = OnceLock::new();
   TRANSACTIONS.get_or_init(Default::default)
+}
+
+fn managed_environment_migrations()
+-> &'static Mutex<HashMap<String, ManagedEnvironmentMigrationRecord>>
+{
+  static MIGRATIONS: OnceLock<
+    Mutex<HashMap<String, ManagedEnvironmentMigrationRecord>>,
+  > = OnceLock::new();
+  MIGRATIONS.get_or_init(Default::default)
 }
 
 fn statuses() -> &'static Mutex<HashMap<String, OperationStatusRecord>>
@@ -712,7 +740,8 @@ async fn root_lock(key: &str) -> Arc<Mutex<()>> {
 
 pub async fn initialize() -> anyhow::Result<()> {
   let root = journal_root();
-  let (mut records, transactions) = run_heavy_blocking(move || {
+  let (mut records, transactions, migrations) =
+    run_heavy_blocking(move || {
     ensure_private_directory(&root)?;
     let _ = fs::remove_dir_all(root.join("transfers"));
     recover_redo_invalidation_batches(&root)?;
@@ -747,13 +776,47 @@ pub async fn initialize() -> anyhow::Result<()> {
         }
       }
     }
+    let migration_root = root.join("managed-environment-migrations");
+    ensure_private_directory(&migration_root)?;
+    let mut migrations = Vec::new();
+    for entry in fs::read_dir(&migration_root)? {
+      let entry = entry?;
+      if !entry.file_type()?.is_file()
+        || entry.path().extension().and_then(|value| value.to_str())
+          != Some("json")
+      {
+        continue;
+      }
+      if let Ok(bytes) = fs::read(entry.path()) {
+        match serde_json::from_slice::<
+          ManagedEnvironmentMigrationRecord,
+        >(&bytes)
+        {
+          Ok(record)
+            if managed_environment_migration_is_prunable(
+              &record,
+              komodo_timestamp(),
+            ) =>
+          {
+            let _ = fs::remove_file(entry.path());
+          }
+          Ok(record) => migrations.push(record),
+          Err(error) => warn!(
+            "Retaining unreadable managed environment migration marker {}: {error:#}",
+            entry.path().display()
+          ),
+        }
+      }
+    }
     let mut records = Vec::new();
     for entry in fs::read_dir(&root)? {
       let entry = entry?;
       if !entry.file_type()?.is_dir() {
         continue;
       }
-      if entry.file_name() == "managed-transactions" {
+      if entry.file_name() == "managed-transactions"
+        || entry.file_name() == "managed-environment-migrations"
+      {
         continue;
       }
       if entry.file_name().to_string_lossy().starts_with(".retired-")
@@ -788,7 +851,7 @@ pub async fn initialize() -> anyhow::Result<()> {
         }
       }
     }
-    Ok((records, transactions))
+    Ok((records, transactions, migrations))
   })
   .await?;
   records.sort_by_key(|record| record.created_at);
@@ -810,6 +873,13 @@ pub async fn initialize() -> anyhow::Result<()> {
       .insert(transaction.operation_id.clone(), transaction);
   }
   drop(loaded_transactions);
+  let mut loaded_migrations =
+    managed_environment_migrations().lock().await;
+  for migration in migrations {
+    loaded_migrations
+      .insert(migration.operation_id.clone(), migration);
+  }
+  drop(loaded_migrations);
 
   tokio::spawn(async {
     let mut interval =
@@ -823,6 +893,7 @@ pub async fn initialize() -> anyhow::Result<()> {
       };
       schedule_journal_cleanup(expired);
       prune_finalized_managed_transactions().await;
+      prune_finalized_managed_environment_migrations().await;
     }
   });
   Ok(())
@@ -886,93 +957,116 @@ fn configured_path(base: impl AsRef<Path>, value: &str) -> PathBuf {
 pub async fn resolve_root(
   target: &PeripheryFileManagerTarget,
 ) -> anyhow::Result<ResolvedRoot> {
-  let (path, read_only, managed_file, create_if_missing) =
-    match target {
-      PeripheryFileManagerTarget::Stack { stack, repo } => {
-        if !stack.config.swarm_id.is_empty() {
-          return Err(anyhow!(
-            "File Manager is unavailable for Swarm stacks"
-          ));
-        }
+  let (
+    path,
+    read_only,
+    managed_file,
+    managed_files,
+    create_if_missing,
+  ) = match target {
+    PeripheryFileManagerTarget::Stack { stack, repo } => {
+      if !stack.config.swarm_id.is_empty() {
+        return Err(anyhow!(
+          "File Manager is unavailable for Swarm stacks"
+        ));
+      }
 
-        let stack_name = to_path_compatible_name(&stack.name);
-        let (run_root, read_only, managed) =
-          if stack.config.files_on_host {
-            (
-              configured_path(
-                periphery_config().stack_dir().join(stack_name),
-                &stack.config.run_directory,
-              ),
-              false,
-              false,
-            )
-          } else if let Some(repo) = repo {
-            (
-              configured_path(
-                configured_path(
-                  periphery_config()
-                    .repo_dir()
-                    .join(to_path_compatible_name(&repo.name)),
-                  &repo.config.path,
-                ),
-                &stack.config.run_directory,
-              ),
-              true,
-              false,
-            )
-          } else if !stack.config.repo.is_empty() {
-            (
-              configured_path(
-                configured_path(
-                  periphery_config().stack_dir().join(stack_name),
-                  &stack.config.clone_path,
-                ),
-                &stack.config.run_directory,
-              ),
-              true,
-              false,
-            )
-          } else {
-            (
+      let stack_name = to_path_compatible_name(&stack.name);
+      let (run_root, read_only, managed) = if stack
+        .config
+        .files_on_host
+      {
+        (
+          configured_path(
+            periphery_config().stack_dir().join(stack_name),
+            &stack.config.run_directory,
+          ),
+          false,
+          false,
+        )
+      } else if let Some(repo) = repo {
+        (
+          configured_path(
+            configured_path(
+              periphery_config()
+                .repo_dir()
+                .join(to_path_compatible_name(&repo.name)),
+              &repo.config.path,
+            ),
+            &stack.config.run_directory,
+          ),
+          true,
+          false,
+        )
+      } else if !stack.config.repo.is_empty() {
+        (
+          configured_path(
+            configured_path(
               periphery_config().stack_dir().join(stack_name),
-              false,
-              true,
-            )
-          };
+              &stack.config.clone_path,
+            ),
+            &stack.config.run_directory,
+          ),
+          true,
+          false,
+        )
+      } else {
+        (periphery_config().stack_dir().join(stack_name), false, true)
+      };
 
-        let compose = stack
-          .config
-          .file_paths
-          .first()
-          .map(String::as_str)
-          .unwrap_or("compose.yaml");
+      let compose = stack
+        .config
+        .file_paths
+        .first()
+        .map(String::as_str)
+        .unwrap_or("compose.yaml");
+      if managed {
+        let compose = path_string(&relative_path(compose, false)?)?;
+        let environment = path_string(&relative_path(
+          &stack.config.env_file_path,
+          false,
+        )?)?;
+        let managed_files = vec![
+          ManagedFile {
+            path: compose.clone(),
+            kind: ManagedFileKind::Compose,
+          },
+          ManagedFile {
+            path: environment,
+            kind: ManagedFileKind::Environment,
+          },
+        ];
+        (run_root, read_only, Some(compose), managed_files, true)
+      } else {
         let compose = configured_path(&run_root, compose);
-        let name = compose
-          .file_name()
-          .and_then(|name| name.to_str())
-          .context("Compose path must end in a UTF-8 filename")?
-          .to_string();
         let root = compose
           .parent()
           .context("Compose path must have a parent directory")?
           .to_path_buf();
-        (root, read_only, managed.then_some(name), managed)
+        (root, read_only, None, Vec::new(), false)
       }
-      PeripheryFileManagerTarget::Volume { volume } => {
-        let client = docker_client().load();
-        let client = client
-          .iter()
-          .next()
-          .context("Could not connect to Docker")?;
-        let volume = client.inspect_volume(volume).await?;
-        if volume.mountpoint.is_empty() {
-          return Err(anyhow!(
-            "Docker did not report a volume mountpoint"
-          ));
-        }
-        (PathBuf::from(volume.mountpoint), false, None, false)
+    }
+    PeripheryFileManagerTarget::Volume { volume } => {
+      let client = docker_client().load();
+      let client = client
+        .iter()
+        .next()
+        .context("Could not connect to Docker")?;
+      let volume = client.inspect_volume(volume).await?;
+      if volume.mountpoint.is_empty() {
+        return Err(anyhow!(
+          "Docker did not report a volume mountpoint"
+        ));
       }
-    };
+      (
+        PathBuf::from(volume.mountpoint),
+        false,
+        None,
+        Vec::new(),
+        false,
+      )
+    }
+  };
 
   ensure_outside_private_journal(&path, &journal_root())?;
 
@@ -984,6 +1078,7 @@ pub async fn resolve_root(
     key,
     read_only,
     managed_file,
+    managed_files,
     create_if_missing,
   })
 }
@@ -996,6 +1091,10 @@ fn journal_root() -> PathBuf {
 
 fn managed_transaction_root() -> PathBuf {
   journal_root().join("managed-transactions")
+}
+
+fn managed_environment_migration_root() -> PathBuf {
+  journal_root().join("managed-environment-migrations")
 }
 
 fn managed_transaction_path(
@@ -1027,6 +1126,45 @@ fn persist_managed_transaction(
   Ok(())
 }
 
+fn managed_environment_migration_path(
+  operation_id: &str,
+) -> anyhow::Result<PathBuf> {
+  let id = Uuid::parse_str(operation_id)
+    .context("Managed environment migration id is invalid")?;
+  Ok(managed_environment_migration_root().join(format!("{id}.json")))
+}
+
+fn persist_managed_environment_migration(
+  record: &ManagedEnvironmentMigrationRecord,
+) -> anyhow::Result<()> {
+  let root = managed_environment_migration_root();
+  ensure_private_directory(&root)?;
+  let destination =
+    managed_environment_migration_path(&record.operation_id)?;
+  let temporary = root.join(format!(
+    ".{}.{}.tmp",
+    record.operation_id,
+    Uuid::new_v4()
+  ));
+  write_private_file(
+    &temporary,
+    &serde_json::to_vec_pretty(record)?,
+  )?;
+  fs::rename(&temporary, &destination)?;
+  #[cfg(unix)]
+  fs::File::open(&root)?.sync_all()?;
+  Ok(())
+}
+
+fn managed_environment_migration_status_from_record(
+  record: &ManagedEnvironmentMigrationRecord,
+) -> FileManagerManagedTransactionStatus {
+  FileManagerManagedTransactionStatus {
+    operation_id: record.operation_id.clone(),
+    state: record.state,
+  }
+}
+
 fn managed_transaction_status_from_record(
   record: &ManagedTransactionRecord,
 ) -> FileManagerManagedTransactionStatus {
@@ -1048,6 +1186,19 @@ fn managed_transaction_is_open(
 
 fn managed_transaction_is_prunable(
   record: &ManagedTransactionRecord,
+  now: i64,
+) -> bool {
+  matches!(
+    record.state,
+    FileManagerManagedTransactionState::RolledBack
+      | FileManagerManagedTransactionState::Committed
+  ) && record.finalized_at.is_some_and(|finalized_at| {
+    finalized_at + FINALIZED_MANAGED_TRANSACTION_TTL_MS < now
+  })
+}
+
+fn managed_environment_migration_is_prunable(
+  record: &ManagedEnvironmentMigrationRecord,
   now: i64,
 ) -> bool {
   matches!(
@@ -1248,6 +1399,7 @@ pub async fn capabilities(
         read_only: root.read_only,
         reason: None,
         managed_file: root.managed_file,
+        managed_files: root.managed_files,
         limits: limits(),
         supports_execution_modes: true,
       }
@@ -1264,6 +1416,7 @@ pub async fn capabilities(
         },
       ),
       managed_file: None,
+      managed_files: Vec::new(),
       limits: limits(),
       supports_execution_modes: true,
     },
@@ -1272,6 +1425,7 @@ pub async fn capabilities(
       read_only: true,
       reason: Some(error.to_string()),
       managed_file: None,
+      managed_files: Vec::new(),
       limits: limits(),
       supports_execution_modes: true,
     },
@@ -1315,8 +1469,10 @@ pub async fn list_directory(
         format!("{path}/{name}")
       };
       entries.push(FileManagerEntry {
-        managed: root.managed_file.as_deref()
-          == Some(entry_path.as_str()),
+        managed: root
+          .managed_files
+          .iter()
+          .any(|managed| managed.path == entry_path),
         path: entry_path,
         name,
         kind,
@@ -1503,11 +1659,13 @@ pub async fn begin_managed_transaction(
   Uuid::parse_str(operation_id)
     .context("Managed transaction id is invalid")?;
   let root = resolve_root(target).await?;
-  if root.read_only || root.managed_file.is_none() {
+  if root.read_only || root.managed_files.is_empty() {
     return Err(anyhow!(
       "Crash-durable coordination is available only for managed files"
     ));
   }
+  let lock = root_lock(&root.key).await;
+  let _guard = lock.lock_owned().await;
   let plan = {
     let plans = plans().lock().await;
     let plan = plans.get(plan_id).context(
@@ -1531,6 +1689,16 @@ pub async fn begin_managed_transaction(
     }
     plan.clone()
   };
+  if managed_environment_migrations().lock().await.values().any(
+    |migration| {
+      migration.root_key == root.key
+        && managed_transaction_is_open(migration.state)
+    },
+  ) {
+    return Err(anyhow!(
+      "The managed environment path is still being reconciled for this stack"
+    ));
+  }
   let mut transactions = managed_transactions().lock().await;
   if let Some(existing) = transactions.get(operation_id) {
     if existing.actor != actor
@@ -1585,6 +1753,489 @@ pub async fn managed_transaction_status(
     return Err(anyhow!("Managed transaction was not found"));
   }
   Ok(Some(managed_transaction_status_from_record(record)))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManagedMigrationEntry {
+  Absent,
+  Regular(FileIdentity),
+  Other,
+}
+
+fn inspect_managed_migration_entry(
+  root: &Dir,
+  path: &str,
+) -> anyhow::Result<ManagedMigrationEntry> {
+  let path = relative_path(path, false)?;
+  let components = path.components().collect::<Vec<_>>();
+  let mut current = root.try_clone()?;
+  for (index, component) in components.iter().enumerate() {
+    let Component::Normal(name) = component else {
+      return Err(anyhow!("Managed environment path is invalid"));
+    };
+    if index + 1 == components.len() {
+      return match current.symlink_metadata(name) {
+        Ok(metadata)
+          if metadata.is_file()
+            && !metadata.file_type().is_symlink() =>
+        {
+          Ok(ManagedMigrationEntry::Regular(file_identity(&metadata)))
+        }
+        Ok(_) => Ok(ManagedMigrationEntry::Other),
+        Err(error)
+          if error.kind() == std::io::ErrorKind::NotFound =>
+        {
+          Ok(ManagedMigrationEntry::Absent)
+        }
+        Err(error) => Err(error.into()),
+      };
+    }
+    current = match current.open_dir_nofollow(name) {
+      Ok(directory) => directory,
+      Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        return Ok(ManagedMigrationEntry::Absent);
+      }
+      Err(error) => {
+        return Err(error).with_context(|| {
+          format!(
+            "Managed environment directory component is inaccessible: {name:?}"
+          )
+        });
+      }
+    };
+  }
+  Err(anyhow!("Managed environment path is invalid"))
+}
+
+fn validate_managed_migration_entries(
+  root: &Dir,
+  record: &ManagedEnvironmentMigrationRecord,
+  expect_new: bool,
+) -> anyhow::Result<()> {
+  let old = inspect_managed_migration_entry(root, &record.old_path)?;
+  let new = inspect_managed_migration_entry(root, &record.new_path)?;
+  if record.old_present {
+    let identity = record.old_identity.context(
+      "Managed environment migration is missing its file identity",
+    )?;
+    let expected = if expect_new {
+      (
+        ManagedMigrationEntry::Absent,
+        ManagedMigrationEntry::Regular(identity),
+      )
+    } else {
+      (
+        ManagedMigrationEntry::Regular(identity),
+        ManagedMigrationEntry::Absent,
+      )
+    };
+    if (old, new) != expected {
+      return Err(anyhow!(
+        "Managed environment file changed during path migration; refusing an unsafe recovery"
+      ));
+    }
+  } else if old != ManagedMigrationEntry::Absent
+    || new != ManagedMigrationEntry::Absent
+  {
+    return Err(anyhow!(
+      "Managed environment path was populated during migration; refusing to overwrite it"
+    ));
+  }
+  Ok(())
+}
+
+fn move_managed_environment_file(
+  root: &Dir,
+  from: &str,
+  to: &str,
+) -> anyhow::Result<()> {
+  let from = relative_path(from, false)?;
+  let to = relative_path(to, false)?;
+  let (from_parent, from_name) = open_parent_nofollow(root, &from)?;
+  let (to_parent, to_name) = open_parent_nofollow(root, &to)
+    .context(
+      "Managed environment destination directory must already exist",
+    )?;
+  from_parent.rename(from_name, &to_parent, to_name)?;
+  from_parent.open(".")?.sync_all()?;
+  to_parent.open(".")?.sync_all()?;
+  Ok(())
+}
+
+fn apply_managed_environment_migration(
+  root: &Dir,
+  record: &ManagedEnvironmentMigrationRecord,
+) -> anyhow::Result<()> {
+  if !record.old_present {
+    return validate_managed_migration_entries(root, record, false);
+  }
+  let identity = record.old_identity.context(
+    "Managed environment migration is missing its file identity",
+  )?;
+  let old = inspect_managed_migration_entry(root, &record.old_path)?;
+  let new = inspect_managed_migration_entry(root, &record.new_path)?;
+  match (old, new) {
+    (
+      ManagedMigrationEntry::Regular(found),
+      ManagedMigrationEntry::Absent,
+    ) if found == identity => {
+      move_managed_environment_file(
+        root,
+        &record.old_path,
+        &record.new_path,
+      )?;
+      validate_managed_migration_entries(root, record, true)
+    }
+    (
+      ManagedMigrationEntry::Absent,
+      ManagedMigrationEntry::Regular(found),
+    ) if found == identity => Ok(()),
+    _ => Err(anyhow!(
+      "Managed environment file changed during path migration; refusing an unsafe recovery"
+    )),
+  }
+}
+
+async fn persist_managed_environment_migration_state(
+  operation_id: &str,
+  state: FileManagerManagedTransactionState,
+) -> anyhow::Result<FileManagerManagedTransactionStatus> {
+  let mut migrations = managed_environment_migrations().lock().await;
+  let record = migrations
+    .get_mut(operation_id)
+    .context("Managed environment migration disappeared")?;
+  let previous_state = record.state;
+  let previous_finalized_at = record.finalized_at;
+  record.state = state;
+  record.finalized_at = matches!(
+    state,
+    FileManagerManagedTransactionState::RolledBack
+      | FileManagerManagedTransactionState::Committed
+  )
+  .then(komodo_timestamp);
+  if let Err(error) = persist_managed_environment_migration(record) {
+    record.state = previous_state;
+    record.finalized_at = previous_finalized_at;
+    return Err(error);
+  }
+  Ok(managed_environment_migration_status_from_record(record))
+}
+
+pub async fn prepare_managed_environment_migration(
+  target: &PeripheryFileManagerTarget,
+  operation_id: &str,
+  old_path: &str,
+  new_path: &str,
+) -> anyhow::Result<FileManagerManagedTransactionStatus> {
+  Uuid::parse_str(operation_id)
+    .context("Managed environment migration id is invalid")?;
+  relative_path(old_path, false)?;
+  relative_path(new_path, false)?;
+  if old_path == new_path {
+    return Err(anyhow!(
+      "Managed environment source and destination paths are identical"
+    ));
+  }
+  let root = resolve_root(target).await?;
+  if root.read_only
+    || !root.managed_files.iter().any(|file| {
+      file.kind == ManagedFileKind::Environment
+        && file.path == old_path
+    })
+  {
+    return Err(anyhow!(
+      "Environment path migration is available only for UI-managed stack environment files"
+    ));
+  }
+  let lock = root_lock(&root.key).await;
+  let _guard = lock.lock_owned().await;
+
+  if let Some(existing) = managed_environment_migrations()
+    .lock()
+    .await
+    .get(operation_id)
+    .cloned()
+  {
+    if existing.root_key != root.key
+      || existing.old_path != old_path
+      || existing.new_path != new_path
+    {
+      return Err(anyhow!(
+        "Managed environment migration id belongs to another operation"
+      ));
+    }
+    if existing.state != FileManagerManagedTransactionState::Prepared
+    {
+      return Ok(managed_environment_migration_status_from_record(
+        &existing,
+      ));
+    }
+    let apply_root = root.clone();
+    let apply_record = existing.clone();
+    run_root_blocking(&root.key, move || {
+      let root = open_root(&apply_root, false)?;
+      apply_managed_environment_migration(&root, &apply_record)
+    })
+    .await?;
+    return persist_managed_environment_migration_state(
+      operation_id,
+      FileManagerManagedTransactionState::Applied,
+    )
+    .await;
+  }
+
+  if managed_transactions()
+    .lock()
+    .await
+    .values()
+    .any(|transaction| {
+      transaction.root_key == root.key
+        && managed_transaction_is_open(transaction.state)
+    })
+    || managed_environment_migrations().lock().await.values().any(
+      |migration| {
+        migration.root_key == root.key
+          && managed_transaction_is_open(migration.state)
+      },
+    )
+  {
+    return Err(anyhow!(
+      "Another managed file operation is still being reconciled for this stack"
+    ));
+  }
+
+  let inspect_root = root.clone();
+  let old_path_owned = old_path.to_string();
+  let new_path_owned = new_path.to_string();
+  let (old_present, old_identity) =
+    run_root_blocking(&root.key, move || {
+      if inspect_root.create_if_missing && !inspect_root.path.exists() {
+        return Ok((false, None));
+      }
+      let root = open_root(&inspect_root, false)?;
+      let old =
+        inspect_managed_migration_entry(&root, &old_path_owned)?;
+      let new =
+        inspect_managed_migration_entry(&root, &new_path_owned)?;
+      if new != ManagedMigrationEntry::Absent {
+        return Err(anyhow!(
+          "Managed environment destination already exists; refusing to overwrite it"
+        ));
+      }
+      match old {
+        ManagedMigrationEntry::Absent => Ok((false, None)),
+        ManagedMigrationEntry::Regular(identity) => {
+          // This also proves every destination parent is a real directory.
+          let destination = relative_path(&new_path_owned, false)?;
+          open_parent_nofollow(&root, &destination).context(
+            "Managed environment destination directory must already exist",
+          )?;
+          Ok((true, Some(identity)))
+        }
+        ManagedMigrationEntry::Other => Err(anyhow!(
+          "Managed environment source is not a regular file"
+        )),
+      }
+    })
+    .await?;
+  let record = ManagedEnvironmentMigrationRecord {
+    operation_id: operation_id.to_string(),
+    root_key: root.key.clone(),
+    old_path: old_path.to_string(),
+    new_path: new_path.to_string(),
+    old_present,
+    old_identity,
+    state: FileManagerManagedTransactionState::Prepared,
+    finalized_at: None,
+  };
+  persist_managed_environment_migration(&record)?;
+  managed_environment_migrations()
+    .lock()
+    .await
+    .insert(operation_id.to_string(), record.clone());
+
+  if old_present {
+    let apply_root = root.clone();
+    let apply_record = record;
+    run_root_blocking(&root.key, move || {
+      let root = open_root(&apply_root, false)?;
+      apply_managed_environment_migration(&root, &apply_record)
+    })
+    .await?;
+  }
+  persist_managed_environment_migration_state(
+    operation_id,
+    FileManagerManagedTransactionState::Applied,
+  )
+  .await
+}
+
+pub async fn managed_environment_migration_status(
+  target: &PeripheryFileManagerTarget,
+  operation_id: &str,
+) -> anyhow::Result<Option<FileManagerManagedTransactionStatus>> {
+  Uuid::parse_str(operation_id)
+    .context("Managed environment migration id is invalid")?;
+  let root = resolve_root(target).await?;
+  let migrations = managed_environment_migrations().lock().await;
+  let Some(record) = migrations.get(operation_id) else {
+    return Ok(None);
+  };
+  if record.root_key != root.key {
+    return Err(anyhow!(
+      "Managed environment migration was not found"
+    ));
+  }
+  Ok(Some(managed_environment_migration_status_from_record(
+    record,
+  )))
+}
+
+pub async fn finalize_managed_environment_migration(
+  target: &PeripheryFileManagerTarget,
+  operation_id: &str,
+  action: FileManagerManagedTransactionFinalizeAction,
+) -> anyhow::Result<FileManagerManagedTransactionStatus> {
+  Uuid::parse_str(operation_id)
+    .context("Managed environment migration id is invalid")?;
+  let root = resolve_root(target).await?;
+  let lock = root_lock(&root.key).await;
+  let _guard = lock.lock_owned().await;
+  let record = managed_environment_migrations()
+    .lock()
+    .await
+    .get(operation_id)
+    .cloned()
+    .context("Managed environment migration was not found")?;
+  if record.root_key != root.key {
+    return Err(anyhow!(
+      "Managed environment migration was not found"
+    ));
+  }
+
+  match action {
+    FileManagerManagedTransactionFinalizeAction::Commit => {
+      if record.state == FileManagerManagedTransactionState::Committed
+      {
+        return Ok(managed_environment_migration_status_from_record(
+          &record,
+        ));
+      }
+      if matches!(
+        record.state,
+        FileManagerManagedTransactionState::RollbackRequested
+          | FileManagerManagedTransactionState::RolledBack
+      ) {
+        return Err(anyhow!(
+          "Rolled-back managed environment migration cannot be committed"
+        ));
+      }
+      let verify_root = root.clone();
+      let verify_record = record.clone();
+      run_root_blocking(&root.key, move || {
+        if verify_root.create_if_missing && !verify_root.path.exists()
+        {
+          return if verify_record.old_present {
+            Err(anyhow!("Managed environment root disappeared"))
+          } else {
+            Ok(())
+          };
+        }
+        let root = open_root(&verify_root, false)?;
+        validate_managed_migration_entries(
+          &root,
+          &verify_record,
+          verify_record.old_present,
+        )
+      })
+      .await?;
+      persist_managed_environment_migration_state(
+        operation_id,
+        FileManagerManagedTransactionState::Committed,
+      )
+      .await
+    }
+    FileManagerManagedTransactionFinalizeAction::Rollback => {
+      if record.state
+        == FileManagerManagedTransactionState::RolledBack
+      {
+        return Ok(managed_environment_migration_status_from_record(
+          &record,
+        ));
+      }
+      if record.state == FileManagerManagedTransactionState::Committed
+      {
+        return Err(anyhow!(
+          "Committed managed environment migration cannot be rolled back"
+        ));
+      }
+      persist_managed_environment_migration_state(
+        operation_id,
+        FileManagerManagedTransactionState::RollbackRequested,
+      )
+      .await?;
+      let rollback_root = root.clone();
+      let rollback_record = record;
+      run_root_blocking(&root.key, move || {
+        if rollback_root.create_if_missing && !rollback_root.path.exists() {
+          return if rollback_record.old_present {
+            Err(anyhow!("Managed environment root disappeared"))
+          } else {
+            Ok(())
+          };
+        }
+        let root = open_root(&rollback_root, false)?;
+        if !rollback_record.old_present {
+          return validate_managed_migration_entries(
+            &root,
+            &rollback_record,
+            false,
+          );
+        }
+        let identity = rollback_record.old_identity.context(
+          "Managed environment migration is missing its file identity",
+        )?;
+        let old = inspect_managed_migration_entry(
+          &root,
+          &rollback_record.old_path,
+        )?;
+        let new = inspect_managed_migration_entry(
+          &root,
+          &rollback_record.new_path,
+        )?;
+        match (old, new) {
+          (
+            ManagedMigrationEntry::Absent,
+            ManagedMigrationEntry::Regular(found),
+          ) if found == identity => move_managed_environment_file(
+            &root,
+            &rollback_record.new_path,
+            &rollback_record.old_path,
+          )?,
+          (
+            ManagedMigrationEntry::Regular(found),
+            ManagedMigrationEntry::Absent,
+          ) if found == identity => {}
+          _ => {
+            return Err(anyhow!(
+              "Managed environment file changed during rollback; refusing an unsafe recovery"
+            ));
+          }
+        }
+        validate_managed_migration_entries(
+          &root,
+          &rollback_record,
+          false,
+        )
+      })
+      .await?;
+      persist_managed_environment_migration_state(
+        operation_id,
+        FileManagerManagedTransactionState::RolledBack,
+      )
+      .await
+    }
+  }
 }
 
 async fn take_exact_managed_journal(
@@ -2984,9 +3635,13 @@ pub async fn start_upload(
   let file_name = single_name(&file_name)?;
   let relative = destination.join(&file_name);
   let path = path_string(&relative)?;
-  if root.managed_file.as_deref() == Some(path.as_str()) {
+  if root
+    .managed_files
+    .iter()
+    .any(|managed| managed.path == path)
+  {
     return Err(anyhow!(
-      "The managed compose file can only be changed in the editor"
+      "Managed files can only be changed in the editor"
     ));
   }
   let core_key = core.to_string();
@@ -3385,14 +4040,14 @@ pub async fn start_download(
     return Err(anyhow!("Select at least one entry to download"));
   }
   let root = resolve_root(&target).await?;
-  if root
-    .managed_file
-    .as_ref()
-    .is_some_and(|managed| paths.iter().any(|path| path == managed))
-    && !allow_managed
+  if root.managed_files.iter().any(|managed| {
+    paths
+      .iter()
+      .any(|path| path_is_managed_or_ancestor(path, &managed.path))
+  }) && !allow_managed
   {
     return Err(anyhow!(
-      "The managed compose file is available only through the editor"
+      "Managed files are available only through the editor"
     ));
   }
   let core_key = core.to_string();
@@ -3981,16 +4636,17 @@ fn validate_operation(
   {
     return Err(anyhow!("Text exceeds the editor size limit"));
   }
-  if let Some(managed) = root.managed_file.as_deref() {
-    let touches_managed =
-      watched_paths(operation)?.iter().any(|path| path == managed);
-    if touches_managed
-      && !matches!(operation, FileManagerOperation::WriteText { path, .. } if path == managed)
-    {
-      return Err(anyhow!(
-        "The managed compose file can only be changed in the editor"
-      ));
-    }
+  let touches_managed =
+    watched_paths(operation)?.iter().any(|path| {
+      root.managed_files.iter().any(|managed| {
+        path_is_managed_or_ancestor(path, &managed.path)
+      })
+    });
+  if touches_managed && !operation_edits_managed_file(root, operation)
+  {
+    return Err(anyhow!(
+      "Managed files and their parent directories can only be changed through a managed editor"
+    ));
   }
   Ok(())
 }
@@ -6204,8 +6860,16 @@ fn operation_edits_managed_file(
   matches!(
     operation,
     FileManagerOperation::WriteText { path, .. }
-      if root.managed_file.as_deref() == Some(path.as_str())
+      if root.managed_files.iter().any(|managed| managed.path == path.as_str())
   )
+}
+
+fn path_is_managed_or_ancestor(path: &str, managed: &str) -> bool {
+  path == managed
+    || path.is_empty()
+    || managed
+      .strip_prefix(path)
+      .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 fn finish_journal(
@@ -7294,6 +7958,59 @@ async fn prune_finalized_managed_transactions() {
   }
 }
 
+async fn prune_finalized_managed_environment_migrations() {
+  let now = komodo_timestamp();
+  let candidates = {
+    let migrations = managed_environment_migrations().lock().await;
+    migrations
+      .values()
+      .filter(|record| {
+        managed_environment_migration_is_prunable(record, now)
+      })
+      .map(|record| record.operation_id.clone())
+      .collect::<Vec<_>>()
+  };
+  if candidates.is_empty() {
+    return;
+  }
+  let removed = match run_heavy_blocking(move || {
+    let mut removed = Vec::new();
+    for operation_id in candidates {
+      let path =
+        managed_environment_migration_path(&operation_id)?;
+      match fs::remove_file(path) {
+        Ok(()) => removed.push(operation_id),
+        Err(error)
+          if error.kind() == std::io::ErrorKind::NotFound =>
+        {
+          removed.push(operation_id)
+        }
+        Err(error) => warn!(
+          "Failed to prune finalized managed environment migration {operation_id}: {error:#}"
+        ),
+      }
+    }
+    #[cfg(unix)]
+    fs::File::open(managed_environment_migration_root())?
+      .sync_all()?;
+    Ok(removed)
+  })
+  .await
+  {
+    Ok(removed) => removed,
+    Err(error) => {
+      warn!(
+        "Failed to prune finalized managed environment migrations: {error:#}"
+      );
+      return;
+    }
+  };
+  let mut migrations = managed_environment_migrations().lock().await;
+  for operation_id in removed {
+    migrations.remove(&operation_id);
+  }
+}
+
 fn operation_description(operation: &FileManagerOperation) -> String {
   match operation {
     FileManagerOperation::CreateFile { .. } => "Create file",
@@ -7811,6 +8528,16 @@ mod tests {
       key: "root".into(),
       read_only: false,
       managed_file: Some("compose.yaml".into()),
+      managed_files: vec![
+        ManagedFile {
+          path: "compose.yaml".into(),
+          kind: ManagedFileKind::Compose,
+        },
+        ManagedFile {
+          path: "config/stack.env".into(),
+          kind: ManagedFileKind::Environment,
+        },
+      ],
       create_if_missing: false,
     };
     assert!(operation_edits_managed_file(
@@ -7827,6 +8554,117 @@ mod tests {
         paths: vec!["notes.txt".into()],
       }
     ));
+  }
+
+  #[test]
+  fn managed_environment_migration_moves_and_rolls_back_exact_file() {
+    let directory =
+      std::env::temp_dir().join(Uuid::new_v4().to_string());
+    fs::create_dir_all(directory.join("config")).unwrap();
+    fs::write(directory.join(".env"), "ITEM=preserve-me\n").unwrap();
+    let root =
+      Dir::open_ambient_dir(&directory, ambient_authority()).unwrap();
+    let identity =
+      match inspect_managed_migration_entry(&root, ".env").unwrap() {
+        ManagedMigrationEntry::Regular(identity) => identity,
+        state => panic!("unexpected source state: {state:?}"),
+      };
+    let record = ManagedEnvironmentMigrationRecord {
+      operation_id: Uuid::new_v4().to_string(),
+      root_key: "stack:test".into(),
+      old_path: ".env".into(),
+      new_path: "config/stack.env".into(),
+      old_present: true,
+      old_identity: Some(identity),
+      state: FileManagerManagedTransactionState::Prepared,
+      finalized_at: None,
+    };
+
+    apply_managed_environment_migration(&root, &record).unwrap();
+    assert!(!directory.join(".env").exists());
+    assert_eq!(
+      fs::read_to_string(directory.join("config/stack.env")).unwrap(),
+      "ITEM=preserve-me\n"
+    );
+    validate_managed_migration_entries(&root, &record, true).unwrap();
+    let recovered: ManagedEnvironmentMigrationRecord =
+      serde_json::from_slice(&serde_json::to_vec(&record).unwrap())
+        .unwrap();
+    apply_managed_environment_migration(&root, &recovered).unwrap();
+
+    move_managed_environment_file(&root, "config/stack.env", ".env")
+      .unwrap();
+    validate_managed_migration_entries(&root, &record, false)
+      .unwrap();
+    fs::remove_dir_all(directory).unwrap();
+  }
+
+  #[test]
+  fn managed_environment_migration_never_overwrites_destination() {
+    let directory =
+      std::env::temp_dir().join(Uuid::new_v4().to_string());
+    fs::create_dir_all(directory.join("config")).unwrap();
+    fs::write(directory.join(".env"), "SOURCE=keep\n").unwrap();
+    fs::write(
+      directory.join("config/stack.env"),
+      "DESTINATION=keep\n",
+    )
+    .unwrap();
+    let root =
+      Dir::open_ambient_dir(&directory, ambient_authority()).unwrap();
+    let identity =
+      match inspect_managed_migration_entry(&root, ".env").unwrap() {
+        ManagedMigrationEntry::Regular(identity) => identity,
+        state => panic!("unexpected source state: {state:?}"),
+      };
+    let record = ManagedEnvironmentMigrationRecord {
+      operation_id: Uuid::new_v4().to_string(),
+      root_key: "stack:test".into(),
+      old_path: ".env".into(),
+      new_path: "config/stack.env".into(),
+      old_present: true,
+      old_identity: Some(identity),
+      state: FileManagerManagedTransactionState::Prepared,
+      finalized_at: None,
+    };
+
+    assert!(
+      apply_managed_environment_migration(&root, &record).is_err()
+    );
+    assert_eq!(
+      fs::read_to_string(directory.join(".env")).unwrap(),
+      "SOURCE=keep\n"
+    );
+    assert_eq!(
+      fs::read_to_string(directory.join("config/stack.env")).unwrap(),
+      "DESTINATION=keep\n"
+    );
+    fs::remove_dir_all(directory).unwrap();
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn managed_environment_migration_rejects_symlink_sources() {
+    use std::os::unix::fs::symlink;
+
+    let directory =
+      std::env::temp_dir().join(Uuid::new_v4().to_string());
+    fs::create_dir_all(directory.join("config")).unwrap();
+    fs::write(directory.join("outside.env"), "ITEM=outside\n")
+      .unwrap();
+    symlink("outside.env", directory.join(".env")).unwrap();
+    let root =
+      Dir::open_ambient_dir(&directory, ambient_authority()).unwrap();
+
+    assert_eq!(
+      inspect_managed_migration_entry(&root, ".env").unwrap(),
+      ManagedMigrationEntry::Other
+    );
+    assert_eq!(
+      fs::read_to_string(directory.join("outside.env")).unwrap(),
+      "ITEM=outside\n"
+    );
+    fs::remove_dir_all(directory).unwrap();
   }
 
   #[test]
@@ -8472,6 +9310,16 @@ mod tests {
       key: "test".into(),
       read_only: false,
       managed_file: Some("compose.yaml".into()),
+      managed_files: vec![
+        ManagedFile {
+          path: "compose.yaml".into(),
+          kind: ManagedFileKind::Compose,
+        },
+        ManagedFile {
+          path: "config/stack.env".into(),
+          kind: ManagedFileKind::Environment,
+        },
+      ],
       create_if_missing: false,
     };
     assert!(
@@ -8479,6 +9327,15 @@ mod tests {
         &root,
         &FileManagerOperation::Delete {
           paths: vec!["compose.yaml".into()]
+        }
+      )
+      .is_err()
+    );
+    assert!(
+      validate_operation(
+        &root,
+        &FileManagerOperation::Delete {
+          paths: vec!["config".into()]
         }
       )
       .is_err()

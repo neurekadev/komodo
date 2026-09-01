@@ -95,6 +95,48 @@ impl Resolve<Args> for FinalizeManagedFileManagerTransaction {
   }
 }
 
+impl Resolve<Args> for PrepareManagedEnvironmentFileMigration {
+  async fn resolve(
+    self,
+    _: &Args,
+  ) -> anyhow::Result<FileManagerManagedTransactionStatus> {
+    file_manager::prepare_managed_environment_migration(
+      &self.target,
+      &self.operation_id,
+      &self.old_path,
+      &self.new_path,
+    )
+    .await
+  }
+}
+
+impl Resolve<Args> for GetManagedEnvironmentFileMigration {
+  async fn resolve(
+    self,
+    _: &Args,
+  ) -> anyhow::Result<Option<FileManagerManagedTransactionStatus>> {
+    file_manager::managed_environment_migration_status(
+      &self.target,
+      &self.operation_id,
+    )
+    .await
+  }
+}
+
+impl Resolve<Args> for FinalizeManagedEnvironmentFileMigration {
+  async fn resolve(
+    self,
+    _: &Args,
+  ) -> anyhow::Result<FileManagerManagedTransactionStatus> {
+    file_manager::finalize_managed_environment_migration(
+      &self.target,
+      &self.operation_id,
+      self.action,
+    )
+    .await
+  }
+}
+
 impl Resolve<Args> for CommitFileManagerOperation {
   async fn resolve(
     self,

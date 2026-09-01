@@ -1,10 +1,5 @@
 import { KOMODO_BASE_URL } from "@/main";
-import {
-  useRead,
-  useUser,
-  useUserInvalidate,
-  useWrite,
-} from "@/lib/hooks";
+import { useRead, useUser, useUserInvalidate, useWrite } from "@/lib/hooks";
 import { ICONS } from "@/lib/icons";
 import {
   fileManagerTargetKey,
@@ -443,9 +438,10 @@ function TargetFileManager({ target, titleOther }: FileManagerProps) {
   const safeMode = user?.preferences?.file_manager_safe_mode ?? true;
   const executionModesSupported =
     capabilities?.supports_execution_modes !== false;
-  const defaultExecutionMode = safeMode || !executionModesSupported
-    ? Types.FileManagerExecutionMode.Recoverable
-    : Types.FileManagerExecutionMode.Permanent;
+  const defaultExecutionMode =
+    safeMode || !executionModesSupported
+      ? Types.FileManagerExecutionMode.Recoverable
+      : Types.FileManagerExecutionMode.Permanent;
   const directory = useRead(
     "ListFileManagerDirectory",
     { target, path },
@@ -465,11 +461,25 @@ function TargetFileManager({ target, titleOther }: FileManagerProps) {
     { target, path: editorPath ?? "" },
     { enabled: !!editorPath && capabilities?.available === true },
   );
-  const editorManaged =
-    !!editorPath && capabilities?.managed_file === editorPath;
+  const editorManagedFile = editorPath
+    ? (capabilities?.managed_files?.find(
+        (managed) => managed.path === editorPath,
+      ) ??
+      (capabilities?.managed_file === editorPath
+        ? {
+            path: editorPath,
+            kind: Types.ManagedFileKind.Compose,
+          }
+        : undefined))
+    : undefined;
+  const editorManaged = !!editorManagedFile;
+  const editorManagedLabel =
+    editorManagedFile?.kind === Types.ManagedFileKind.Environment
+      ? "environment"
+      : "compose";
   const deployedTextFile = useRead(
     "ReadManagedFileManagerRenderedText",
-    { target },
+    { target, path: editorPath },
     {
       enabled:
         editorManaged &&
@@ -592,14 +602,28 @@ function TargetFileManager({ target, titleOther }: FileManagerProps) {
               queryKey: ["ReadFileManagerText", { target, path: textPath }],
             })
           : Promise.resolve(),
-        forceEditor && writtenTextPath === capabilities?.managed_file
+        forceEditor &&
+        (capabilities?.managed_files?.some(
+          (managed) => managed.path === writtenTextPath,
+        ) ||
+          capabilities?.managed_file === writtenTextPath)
           ? queryClient.invalidateQueries({
-              queryKey: ["ReadManagedFileManagerRenderedText", { target }],
+              queryKey: [
+                "ReadManagedFileManagerRenderedText",
+                { target, path: writtenTextPath },
+              ],
             })
           : Promise.resolve(),
       ]);
     },
-    [capabilities?.managed_file, editorDirty, editorPath, queryClient, target],
+    [
+      capabilities?.managed_file,
+      capabilities?.managed_files,
+      editorDirty,
+      editorPath,
+      queryClient,
+      target,
+    ],
   );
 
   useEffect(() => {
@@ -1094,12 +1118,15 @@ function TargetFileManager({ target, titleOther }: FileManagerProps) {
   const downloadManagedRendered = async () => {
     if (!editorManaged || !editorPath || deployedDownloadPending) return;
     const controller = new AbortController();
-    const label = "Download deployed compose";
+    const label = `Download deployed ${editorManagedLabel}`;
     const notificationId = operations.begin(label);
     let operationId: string | undefined;
     setDeployedDownloadPending(true);
     try {
-      const ticket = await prepareManagedRenderedDownload({ target });
+      const ticket = await prepareManagedRenderedDownload({
+        target,
+        path: editorPath,
+      });
       operationId = ticket.operation_id;
       const statusPromise = operations.track(
         ticket.operation_id,
@@ -1432,11 +1459,11 @@ function TargetFileManager({ target, titleOther }: FileManagerProps) {
     <Stack>
       <Alert
         color="orange"
-        title="Deployed compose may contain resolved secrets"
+        title={`Deployed ${editorManagedLabel} may contain resolved secrets`}
       >
-        This is the exact compose file currently on the host. It may contain
-        resolved secret values, so treat its contents and downloads as
-        sensitive.
+        This is the exact {editorManagedLabel} file currently on the host. It
+        may contain resolved secret values, so treat its contents and downloads
+        as sensitive.
       </Alert>
       <Group justify="end">
         <Button
@@ -1445,17 +1472,18 @@ function TargetFileManager({ target, titleOther }: FileManagerProps) {
           disabled={deployedDownloadPending || busy}
           onClick={() => void downloadManagedRendered()}
         >
-          Download deployed compose
+          Download deployed {editorManagedLabel}
         </Button>
       </Group>
       {deployedTextFile.isPending ? (
         <Loader />
       ) : deployedTextFile.isError || !deployedTextFile.data ? (
-        <Alert color="red" title="Deployed compose unavailable">
+        <Alert color="red" title={`Deployed ${editorManagedLabel} unavailable`}>
           <Stack gap="xs">
             <Text size="sm">
-              Komodo could not read a deployed compose file from the host. It
-              may not exist yet. Source and any unsaved draft remain available.
+              Komodo could not read the deployed {editorManagedLabel} file from
+              the host. It may not exist yet. Source and any unsaved draft
+              remain available.
             </Text>
             <Group>
               <Button
@@ -2074,8 +2102,8 @@ function TargetFileManager({ target, titleOther }: FileManagerProps) {
           {pendingCommit?.preflight.execution_mode ===
           Types.FileManagerExecutionMode.Permanent ? (
             <Alert color="red" title="Permanent operation">
-              Removed or replaced data will not be kept for Undo. This cannot
-              be reversed from File Manager.
+              Removed or replaced data will not be kept for Undo. This cannot be
+              reversed from File Manager.
             </Alert>
           ) : (
             <Alert color="yellow" title="Review required">

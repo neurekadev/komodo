@@ -5,20 +5,25 @@ import { fileURLToPath } from "url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-console.log("generating typescript types...");
-
-const gen_command =
-  "RUST_BACKTRACE=1 typeshare . --lang=typescript --output-file=./client/core/ts/src/types.ts";
-
-exec(gen_command, (error, _stdout, _stderr) => {
-  if (error) {
-    console.error(error);
-    return;
-  }
-  console.log("generated types using typeshare");
+if (process.argv.includes("--fix-only")) {
   fix_types();
   console.log("finished.");
-});
+} else {
+  console.log("generating typescript types...");
+
+  const gen_command =
+    "RUST_BACKTRACE=1 typeshare . --lang=typescript --output-file=./client/core/ts/src/types.ts";
+
+  exec(gen_command, (error, _stdout, _stderr) => {
+    if (error) {
+      console.error(error);
+      return;
+    }
+    console.log("generated types using typeshare");
+    fix_types();
+    console.log("finished.");
+  });
+}
 
 function fix_types() {
   const types_path = __dirname + "/src/types.ts";
@@ -36,11 +41,11 @@ function fix_types() {
     .replaceAll("IndexSet", "Array")
     .replaceAll(
       ": PermissionLevelAndSpecifics",
-      ": PermissionLevelAndSpecifics | PermissionLevel"
+      ": PermissionLevelAndSpecifics | PermissionLevel",
     )
     .replaceAll(
       ", PermissionLevelAndSpecifics",
-      ", PermissionLevelAndSpecifics | PermissionLevel"
+      ", PermissionLevelAndSpecifics | PermissionLevel",
     )
     .replaceAll("IndexMap", "Record")
     .split("\n")

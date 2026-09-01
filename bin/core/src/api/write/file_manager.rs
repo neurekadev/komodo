@@ -23,7 +23,7 @@ use komodo_client::{
       FileManagerOperation, FileManagerOperationState,
       FileManagerOperationStatus, FileManagerOperationTicket,
       FileManagerPreflight, FileManagerRevision, FileManagerTarget,
-      FileManagerTransferTicket,
+      FileManagerTransferTicket, ManagedFile, ManagedFileKind,
     },
     komodo_timestamp,
     permission::PermissionLevel,
@@ -44,7 +44,7 @@ use crate::{
     ResolvedFileManagerTarget, TransferSessionKind,
     cancel_pending_transfer_session, complete_operation,
     create_operation_status, create_transfer_session, fail_operation,
-    get_core_operation_status, managed_revision,
+    get_core_operation_status, managed_revision, managed_source,
     require_managed_file, resolve_target, set_operation_finalizing,
     update_operation_status,
   },
@@ -63,6 +63,7 @@ use super::WriteArgs;
 struct ManagedPlan {
   stack_id: String,
   stack_name: String,
+  managed_file: ManagedFile,
   compose_file_path: String,
   before: String,
   after: String,
@@ -78,7 +79,10 @@ struct ManagedFileManagerTransaction {
   actor: String,
   target: FileManagerTarget,
   server_id: String,
+  /// Retained for recovery compatibility with Compose-only transactions.
   compose_file_path: String,
+  #[serde(default)]
+  managed_file: Option<ManagedFile>,
   source_before: String,
   source_after: String,
   begun: bool,
@@ -89,8 +93,37 @@ struct ManagedFileManagerTransaction {
   last_error: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagedEnvironmentPathMigration {
+  #[serde(rename = "_id")]
+  stack_id: String,
+  stack_name: String,
+  operation_id: String,
+  server_id: String,
+  compose_file_path: String,
+  old_path: String,
+  new_path: String,
+  created_at: i64,
+  #[serde(default)]
+  last_error: Option<String>,
+}
+
+fn transaction_managed_file(
+  transaction: &ManagedFileManagerTransaction,
+) -> ManagedFile {
+  transaction
+    .managed_file
+    .clone()
+    .unwrap_or_else(|| ManagedFile {
+      path: transaction.compose_file_path.clone(),
+      kind: ManagedFileKind::Compose,
+    })
+}
+
 const MANAGED_TRANSACTION_COLLECTION: &str =
   "FileManagerManagedTransaction";
+const MANAGED_ENVIRONMENT_MIGRATION_COLLECTION: &str =
+  "FileManagerManagedEnvironmentMigration";
 const MANAGED_TRANSACTION_LEASE_MS: i64 = 30_000;
 const MANAGED_TRANSACTION_RECONCILE_INTERVAL: Duration =
   Duration::from_secs(10);
@@ -102,12 +135,25 @@ fn managed_transaction_collection()
   db_client().db.collection(MANAGED_TRANSACTION_COLLECTION)
 }
 
+fn managed_environment_migration_collection()
+-> Collection<ManagedEnvironmentPathMigration> {
+  db_client()
+    .db
+    .collection(MANAGED_ENVIRONMENT_MIGRATION_COLLECTION)
+}
+
 fn managed_transaction_owner() -> &'static str {
   static OWNER: OnceLock<String> = OnceLock::new();
   OWNER.get_or_init(|| Uuid::new_v4().to_string())
 }
 
 fn live_managed_transactions() -> &'static RwLock<HashSet<String>> {
+  static LIVE: OnceLock<RwLock<HashSet<String>>> = OnceLock::new();
+  LIVE.get_or_init(Default::default)
+}
+
+fn live_managed_environment_migrations()
+-> &'static RwLock<HashSet<String>> {
   static LIVE: OnceLock<RwLock<HashSet<String>>> = OnceLock::new();
   LIVE.get_or_init(Default::default)
 }
@@ -127,6 +173,19 @@ impl Drop for LiveManagedTransaction {
   }
 }
 
+pub struct LiveManagedEnvironmentPathMigration {
+  transaction: ManagedEnvironmentPathMigration,
+}
+
+impl Drop for LiveManagedEnvironmentPathMigration {
+  fn drop(&mut self) {
+    live_managed_environment_migrations()
+      .write()
+      .unwrap()
+      .remove(&self.transaction.operation_id);
+  }
+}
+
 async fn insert_managed_transaction(
   transaction: &ManagedFileManagerTransaction,
 ) -> anyhow::Result<()> {
@@ -139,6 +198,18 @@ async fn insert_managed_transaction(
   {
     return Err(anyhow!(
       "Another managed save is still being reconciled for this stack"
+    ));
+  }
+  if managed_environment_migration_collection()
+    .find_one(doc! { "_id": &transaction.stack_id })
+    .await
+    .context(
+      "Failed to check pending managed environment migrations",
+    )?
+    .is_some()
+  {
+    return Err(anyhow!(
+      "The managed environment path is still being reconciled for this stack"
     ));
   }
   collection
@@ -244,10 +315,47 @@ fn transaction_periphery_target(
   stack.config.server_id = transaction.server_id.clone();
   stack.config.file_paths =
     vec![transaction.compose_file_path.clone()];
+  let managed = transaction_managed_file(transaction);
+  if managed.kind == ManagedFileKind::Environment {
+    stack.config.env_file_path = managed.path;
+  }
   periphery::PeripheryFileManagerTarget::Stack {
     stack: Box::new(stack),
     repo: None,
   }
+}
+
+fn environment_migration_periphery_target(
+  transaction: &ManagedEnvironmentPathMigration,
+) -> periphery::PeripheryFileManagerTarget {
+  let mut stack = Stack {
+    id: transaction.stack_id.clone(),
+    name: transaction.stack_name.clone(),
+    ..Default::default()
+  };
+  stack.config.server_id = transaction.server_id.clone();
+  stack.config.file_paths =
+    vec![transaction.compose_file_path.clone()];
+  stack.config.env_file_path = transaction.old_path.clone();
+  periphery::PeripheryFileManagerTarget::Stack {
+    stack: Box::new(stack),
+    repo: None,
+  }
+}
+
+async fn stored_stack_environment_path(
+  stack_id: &str,
+) -> anyhow::Result<Option<String>> {
+  let id = ObjectId::from_str(stack_id)
+    .context("Managed stack id is invalid")?;
+  Ok(
+    db_client()
+      .stacks
+      .find_one(doc! { "_id": id })
+      .await
+      .context("Failed to read managed environment path")?
+      .map(|stack| stack.config.env_file_path),
+  )
 }
 
 async fn claim_managed_transaction(
@@ -277,6 +385,7 @@ async fn claim_managed_transaction(
 
 async fn managed_stack_source(
   stack_id: &str,
+  kind: ManagedFileKind,
 ) -> anyhow::Result<Option<String>> {
   let id = ObjectId::from_str(stack_id)
     .context("Managed stack id is invalid")?;
@@ -286,7 +395,10 @@ async fn managed_stack_source(
       .find_one(doc! { "_id": id })
       .await
       .context("Failed to read managed compose source")?
-      .map(|stack| stack.config.file_contents),
+      .map(|stack| match kind {
+        ManagedFileKind::Compose => stack.config.file_contents,
+        ManagedFileKind::Environment => stack.config.environment,
+      }),
   )
 }
 
@@ -307,6 +419,257 @@ async fn record_managed_transaction_error(
       } },
     )
     .await;
+}
+
+async fn delete_managed_environment_migration(
+  transaction: &ManagedEnvironmentPathMigration,
+) -> anyhow::Result<()> {
+  managed_environment_migration_collection()
+    .delete_one(doc! {
+      "_id": &transaction.stack_id,
+      "operation_id": &transaction.operation_id,
+    })
+    .await
+    .context(
+      "Failed to retire managed environment migration intent",
+    )?;
+  Ok(())
+}
+
+async fn record_managed_environment_migration_error(
+  transaction: &ManagedEnvironmentPathMigration,
+  error: &anyhow::Error,
+) {
+  let _ = managed_environment_migration_collection()
+    .update_one(
+      doc! {
+        "_id": &transaction.stack_id,
+        "operation_id": &transaction.operation_id,
+      },
+      doc! { "$set": { "last_error": format!("{error:#}") } },
+    )
+    .await;
+}
+
+async fn finalize_managed_environment_migration(
+  transaction: &ManagedEnvironmentPathMigration,
+  server: &Server,
+  target: &periphery::PeripheryFileManagerTarget,
+  action: periphery::FileManagerManagedTransactionFinalizeAction,
+) -> anyhow::Result<()> {
+  let expected = match action {
+    periphery::FileManagerManagedTransactionFinalizeAction::Commit => {
+      periphery::FileManagerManagedTransactionState::Committed
+    }
+    periphery::FileManagerManagedTransactionFinalizeAction::Rollback => {
+      periphery::FileManagerManagedTransactionState::RolledBack
+    }
+  };
+  let status = periphery_client(server)
+    .await?
+    .request(periphery::FinalizeManagedEnvironmentFileMigration {
+      target: target.clone(),
+      operation_id: transaction.operation_id.clone(),
+      action,
+    })
+    .await?;
+  if status.state != expected {
+    return Err(anyhow!(
+      "Managed environment migration returned invalid state {:?}",
+      status.state
+    ));
+  }
+  delete_managed_environment_migration(transaction).await
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManagedEnvironmentReconciliationAction {
+  DeleteIntent,
+  CommitHost,
+  RollbackHost,
+  Indeterminate,
+}
+
+fn managed_environment_reconciliation_action(
+  stored_path: Option<&str>,
+  state: Option<periphery::FileManagerManagedTransactionState>,
+  old_path: &str,
+  new_path: &str,
+) -> ManagedEnvironmentReconciliationAction {
+  use periphery::FileManagerManagedTransactionState as State;
+  match (stored_path, state) {
+    (Some(path), None) if path == old_path => {
+      ManagedEnvironmentReconciliationAction::DeleteIntent
+    }
+    (Some(path), Some(State::RolledBack)) if path == old_path => {
+      ManagedEnvironmentReconciliationAction::DeleteIntent
+    }
+    (Some(path), Some(state))
+      if path == old_path
+        && !matches!(
+          state,
+          State::CommitRequested | State::Committed
+        ) =>
+    {
+      ManagedEnvironmentReconciliationAction::RollbackHost
+    }
+    (Some(path), Some(state))
+      if path == new_path
+        && !matches!(
+          state,
+          State::RollbackRequested | State::RolledBack
+        ) =>
+    {
+      ManagedEnvironmentReconciliationAction::CommitHost
+    }
+    _ => ManagedEnvironmentReconciliationAction::Indeterminate,
+  }
+}
+
+async fn reconcile_managed_environment_migration(
+  transaction: &ManagedEnvironmentPathMigration,
+) -> anyhow::Result<()> {
+  let server = resource::get::<Server>(&transaction.server_id)
+    .await
+    .context("Managed environment migration server is unavailable")?;
+  let target = environment_migration_periphery_target(transaction);
+  let stored_path =
+    stored_stack_environment_path(&transaction.stack_id).await?;
+  let status = periphery_client(&server)
+    .await?
+    .request(periphery::GetManagedEnvironmentFileMigration {
+      target: target.clone(),
+      operation_id: transaction.operation_id.clone(),
+    })
+    .await?;
+  match managed_environment_reconciliation_action(
+    stored_path.as_deref(),
+    status.map(|status| status.state),
+    &transaction.old_path,
+    &transaction.new_path,
+  ) {
+    ManagedEnvironmentReconciliationAction::DeleteIntent => {
+      delete_managed_environment_migration(transaction).await
+    }
+    ManagedEnvironmentReconciliationAction::RollbackHost => {
+      finalize_managed_environment_migration(
+        transaction,
+        &server,
+        &target,
+        periphery::FileManagerManagedTransactionFinalizeAction::Rollback,
+      )
+      .await
+    }
+    ManagedEnvironmentReconciliationAction::CommitHost => {
+      finalize_managed_environment_migration(
+        transaction,
+        &server,
+        &target,
+        periphery::FileManagerManagedTransactionFinalizeAction::Commit,
+      )
+      .await
+    }
+    ManagedEnvironmentReconciliationAction::Indeterminate => Err(anyhow!(
+      "Managed environment migration has contradictory database and host state; retaining it for safe retry"
+    )),
+  }
+}
+
+pub async fn prepare_managed_environment_path_migration(
+  stack: &Stack,
+  new_path: &str,
+) -> anyhow::Result<LiveManagedEnvironmentPathMigration> {
+  let compose_file_path =
+    crate::file_manager::managed_stack_files(stack)?
+      .into_iter()
+      .find(|file| file.kind == ManagedFileKind::Compose)
+      .context("Managed Compose path is unavailable")?
+      .path;
+  let transaction = ManagedEnvironmentPathMigration {
+    stack_id: stack.id.clone(),
+    stack_name: stack.name.clone(),
+    operation_id: Uuid::new_v4().to_string(),
+    server_id: stack.config.server_id.clone(),
+    compose_file_path,
+    old_path: stack.config.env_file_path.clone(),
+    new_path: new_path.to_string(),
+    created_at: komodo_timestamp(),
+    last_error: None,
+  };
+  if managed_transaction_collection()
+    .find_one(doc! { "_id": &transaction.stack_id })
+    .await
+    .context("Failed to check pending managed saves")?
+    .is_some()
+  {
+    return Err(anyhow!(
+      "Another managed save is still being reconciled for this stack"
+    ));
+  }
+  managed_environment_migration_collection()
+    .insert_one(&transaction)
+    .await
+    .context(
+      "Failed to durably record the environment path migration before changing the host",
+    )?;
+  live_managed_environment_migrations()
+    .write()
+    .unwrap()
+    .insert(transaction.operation_id.clone());
+  let live = LiveManagedEnvironmentPathMigration {
+    transaction: transaction.clone(),
+  };
+  let result = async {
+    let server = resource::get::<Server>(&transaction.server_id)
+      .await
+      .context(
+        "Managed environment migration server is unavailable",
+      )?;
+    let status = periphery_client(&server)
+      .await?
+      .request(periphery::PrepareManagedEnvironmentFileMigration {
+        target: environment_migration_periphery_target(&transaction),
+        operation_id: transaction.operation_id.clone(),
+        old_path: transaction.old_path.clone(),
+        new_path: transaction.new_path.clone(),
+      })
+      .await
+      .context(
+        "Failed to prepare the managed environment path migration",
+      )?;
+    if status.state
+      != periphery::FileManagerManagedTransactionState::Applied
+    {
+      return Err(anyhow!(
+        "Managed environment migration returned invalid state {:?}",
+        status.state
+      ));
+    }
+    Ok(())
+  }
+  .await;
+  if let Err(error) = result {
+    if let Err(reconcile_error) =
+      reconcile_managed_environment_migration(&transaction).await
+    {
+      record_managed_environment_migration_error(
+        &transaction,
+        &reconcile_error,
+      )
+      .await;
+      return Err(anyhow!(
+        "Environment path migration failed: {error:#}; recovery remains pending: {reconcile_error:#}"
+      ));
+    }
+    return Err(error);
+  }
+  Ok(live)
+}
+
+pub async fn finish_managed_environment_path_migration(
+  live: &LiveManagedEnvironmentPathMigration,
+) -> anyhow::Result<()> {
+  reconcile_managed_environment_migration(&live.transaction).await
 }
 
 pub fn spawn_managed_transaction_reconciliation_loop() {
@@ -358,6 +721,42 @@ pub fn spawn_managed_transaction_reconciliation_loop() {
           );
           record_managed_transaction_error(&transaction, &error)
             .await;
+        }
+      }
+      let migrations = match find_collect(
+        &managed_environment_migration_collection(),
+        None,
+        None,
+      )
+      .await
+      {
+        Ok(migrations) => migrations,
+        Err(error) => {
+          warn!(
+            "Failed to list pending managed environment migrations: {error:#}"
+          );
+          continue;
+        }
+      };
+      for migration in migrations {
+        if live_managed_environment_migrations()
+          .read()
+          .unwrap()
+          .contains(&migration.operation_id)
+        {
+          continue;
+        }
+        if let Err(error) =
+          reconcile_managed_environment_migration(&migration).await
+        {
+          warn!(
+            "Managed environment migration {} still needs reconciliation: {error:#}",
+            migration.operation_id
+          );
+          record_managed_environment_migration_error(
+            &migration, &error,
+          )
+          .await;
         }
       }
     }
@@ -459,7 +858,9 @@ async fn reconcile_managed_transaction(
     .await
     .context("Managed save server is unavailable")?;
   let target = transaction_periphery_target(transaction);
-  let source = managed_stack_source(&transaction.stack_id).await?;
+  let managed = transaction_managed_file(transaction);
+  let source =
+    managed_stack_source(&transaction.stack_id, managed.kind).await?;
   let status = periphery_client(&server)
     .await?
     .request(periphery::GetManagedFileManagerTransaction {
@@ -485,6 +886,7 @@ async fn reconcile_managed_transaction(
     ManagedReconciliationAction::RollSourceForward => {
       update_managed_source(
         &transaction.stack_id,
+        managed.kind,
         &transaction.source_before,
         &transaction.source_after,
       )
@@ -597,19 +999,23 @@ impl Resolve<WriteArgs> for PreflightFileManagerOperation {
       )
       .into());
     }
-    let managed = managed.map(|(stack, before, after)| ManagedPlan {
-      stack_id: stack.id,
-      stack_name: stack.name,
-      compose_file_path: stack
-        .config
-        .file_paths
-        .first()
-        .cloned()
-        .unwrap_or_else(|| "compose.yaml".into()),
-      before,
-      after,
-      durable: response.supports_durable_managed_transactions,
-    });
+    let managed =
+      managed.map(|(stack, managed_file, before, after)| {
+        ManagedPlan {
+          stack_id: stack.id,
+          stack_name: stack.name,
+          managed_file,
+          compose_file_path: stack
+            .config
+            .file_paths
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "compose.yaml".into()),
+          before,
+          after,
+          durable: response.supports_durable_managed_transactions,
+        }
+      });
     let mut plans = file_manager_plans().write().unwrap();
     plans.retain(|_, plan| plan.expires_at > komodo_timestamp());
     plans.insert(
@@ -660,6 +1066,7 @@ impl Resolve<WriteArgs> for CommitFileManagerOperation {
         target: self.target.clone(),
         server_id: resolved.server.id.clone(),
         compose_file_path: plan.compose_file_path.clone(),
+        managed_file: Some(plan.managed_file.clone()),
         source_before: plan.before.clone(),
         source_after: plan.after.clone(),
         begun: false,
@@ -870,6 +1277,7 @@ impl Resolve<WriteArgs> for CommitFileManagerOperation {
       if let Some(plan) = &managed {
         if let Err(error) = update_managed_source(
           &plan.stack_id,
+          plan.managed_file.kind,
           &plan.before,
           &plan.after,
         )
@@ -1190,13 +1598,18 @@ impl Resolve<WriteArgs> for PrepareFileManagerDownload {
         anyhow!("Select at least one entry to download").into(),
       );
     }
-    if resolved.managed_file.as_ref().is_some_and(|managed| {
-      self.paths.iter().any(|path| path == managed)
+    if resolved.managed_files.iter().any(|managed| {
+      self
+        .paths
+        .iter()
+        .any(|path| path_is_managed_or_ancestor(path, &managed.path))
     }) {
-      return Err(anyhow!(
-        "The managed compose file is available only through the editor"
-      )
-      .into());
+      return Err(
+        anyhow!(
+          "Managed files are available only through the editor"
+        )
+        .into(),
+      );
     }
     let (token, session) = create_transfer_session(
       user.id.clone(),
@@ -1225,12 +1638,13 @@ impl Resolve<WriteArgs>
     let resolved =
       resolve_target(&self.target, user, PermissionLevel::Read)
         .await?;
-    let path = require_managed_file(&resolved)?;
+    let managed =
+      require_managed_file(&resolved, self.path.as_deref())?;
     let (token, session) = create_transfer_session(
       user.id.clone(),
       self.target,
       TransferSessionKind::Download {
-        paths: vec![path],
+        paths: vec![managed.path],
         allow_managed: true,
       },
     );
@@ -1248,7 +1662,7 @@ async fn prepare_managed_operation(
   operation: &FileManagerOperation,
 ) -> anyhow::Result<(
   FileManagerOperation,
-  Option<(Stack, String, String)>,
+  Option<(Stack, ManagedFile, String, String)>,
 )> {
   let FileManagerOperation::WriteText {
     path,
@@ -1258,18 +1672,22 @@ async fn prepare_managed_operation(
   else {
     return Ok((operation.clone(), None));
   };
-  if resolved.managed_file.as_deref() != Some(path.as_str()) {
+  let Some(managed) = resolved
+    .managed_files
+    .iter()
+    .find(|managed| managed.path == *path)
+    .cloned()
+  else {
     return Ok((operation.clone(), None));
-  }
+  };
   let stack = resolved
     .stack
     .as_ref()
     .context("Managed File Manager stack is missing")?;
-  if managed_revision(&stack.config.file_contents)
-    != *expected_revision
-  {
+  let source = managed_source(stack, managed.kind);
+  if managed_revision(source) != *expected_revision {
     return Err(anyhow!(
-      "Managed compose source changed since it was opened; reload before saving"
+      "Managed source changed since it was opened; reload before saving"
     ));
   }
   let expected_revision = periphery_client(&resolved.server)
@@ -1281,8 +1699,12 @@ async fn prepare_managed_operation(
     .await
     .map(|file| file.revision)
     .unwrap_or_else(|_| FileManagerRevision::default());
-  let expanded =
-    expand_managed_source(stack.clone(), contents.clone()).await?;
+  let expanded = expand_managed_source(
+    stack.clone(),
+    managed.kind,
+    contents.clone(),
+  )
+  .await?;
   Ok((
     FileManagerOperation::WriteText {
       path: path.clone(),
@@ -1291,7 +1713,8 @@ async fn prepare_managed_operation(
     },
     Some((
       stack.clone(),
-      stack.config.file_contents.clone(),
+      managed,
+      source.to_string(),
       contents.clone(),
     )),
   ))
@@ -1299,39 +1722,55 @@ async fn prepare_managed_operation(
 
 async fn expand_managed_source(
   mut stack: Stack,
+  kind: ManagedFileKind,
   contents: String,
 ) -> anyhow::Result<String> {
-  stack.config.file_contents = contents;
+  match kind {
+    ManagedFileKind::Compose => stack.config.file_contents = contents,
+    ManagedFileKind::Environment => {
+      stack.config.environment = contents
+    }
+  }
   if !stack.config.skip_secret_interp {
     let VariablesAndSecrets { variables, secrets } =
       get_variables_and_secrets().await?;
     Interpolator::new(Some(&variables), &secrets)
       .interpolate_stack(&mut stack)?;
   }
-  Ok(stack.config.file_contents)
+  match kind {
+    ManagedFileKind::Compose => Ok(stack.config.file_contents),
+    ManagedFileKind::Environment => {
+      Ok(environment::render_env_file(&stack.config.env_vars()?))
+    }
+  }
 }
 
 async fn update_managed_source(
   stack_id: &str,
+  kind: ManagedFileKind,
   expected: &str,
   contents: &str,
 ) -> anyhow::Result<()> {
   let stack_id = ObjectId::from_str(stack_id)
     .context("Managed stack id is invalid")?;
+  let field = match kind {
+    ManagedFileKind::Compose => "config.file_contents",
+    ManagedFileKind::Environment => "config.environment",
+  };
   let result = db_client()
     .stacks
     .update_one(
       doc! {
         "_id": stack_id,
-        "config.file_contents": expected,
+        (field): expected,
       },
-      doc! { "$set": { "config.file_contents": contents } },
+      doc! { "$set": { (field): contents } },
     )
     .await
     .context("Failed to update managed compose source")?;
   if result.matched_count != 1 {
     return Err(anyhow!(
-      "Managed compose source changed concurrently; reload and retry"
+      "Managed source changed concurrently; reload and retry"
     ));
   }
   Ok(())
@@ -1638,6 +2077,14 @@ fn ensure_writes_enabled() -> anyhow::Result<()> {
   }
 }
 
+fn path_is_managed_or_ancestor(path: &str, managed: &str) -> bool {
+  path == managed
+    || path.is_empty()
+    || managed
+      .strip_prefix(path)
+      .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -1659,6 +2106,10 @@ mod tests {
       managed: managed.then(|| ManagedPlan {
         stack_id: "stack-id".into(),
         stack_name: "stack".into(),
+        managed_file: ManagedFile {
+          path: "compose.yaml".into(),
+          kind: ManagedFileKind::Compose,
+        },
         compose_file_path: "compose.yaml".into(),
         before: "before".into(),
         after: "after".into(),
@@ -1882,5 +2333,57 @@ mod tests {
       .unwrap();
 
     assert_eq!(outcome, ManagedRollbackOutcome::Unavailable);
+  }
+
+  #[test]
+  fn environment_path_migration_follows_durable_database_outcome() {
+    use ManagedEnvironmentReconciliationAction as Action;
+    use periphery::FileManagerManagedTransactionState as State;
+
+    assert_eq!(
+      managed_environment_reconciliation_action(
+        Some("config/stack.env"),
+        Some(State::Applied),
+        ".env",
+        "config/stack.env",
+      ),
+      Action::CommitHost
+    );
+    assert_eq!(
+      managed_environment_reconciliation_action(
+        Some(".env"),
+        Some(State::Applied),
+        ".env",
+        "config/stack.env",
+      ),
+      Action::RollbackHost
+    );
+    assert_eq!(
+      managed_environment_reconciliation_action(
+        Some(".env"),
+        None,
+        ".env",
+        "config/stack.env",
+      ),
+      Action::DeleteIntent
+    );
+    assert_eq!(
+      managed_environment_reconciliation_action(
+        Some("unexpected.env"),
+        Some(State::Applied),
+        ".env",
+        "config/stack.env",
+      ),
+      Action::Indeterminate
+    );
+    assert_eq!(
+      managed_environment_reconciliation_action(
+        Some(".env"),
+        Some(State::Committed),
+        ".env",
+        "config/stack.env",
+      ),
+      Action::Indeterminate
+    );
   }
 }

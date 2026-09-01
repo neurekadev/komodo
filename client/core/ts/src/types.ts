@@ -8016,6 +8016,17 @@ export interface FileManagerActiveOperations {
 	operations: FileManagerOperationStatus[];
 }
 
+export enum ManagedFileKind {
+	Compose = "compose",
+	Environment = "environment",
+}
+
+export interface ManagedFile {
+	/** Normalized path relative to the File Manager root. */
+	path: string;
+	kind: ManagedFileKind;
+}
+
 export interface FileManagerLimits {
 	max_text_bytes: U64;
 	max_entries: U64;
@@ -8029,7 +8040,10 @@ export interface FileManagerCapabilities {
 	available: boolean;
 	read_only: boolean;
 	reason?: string;
+	/** Backward-compatible path to the managed Compose file. */
 	managed_file?: string;
+	/** Database-managed files exposed as virtual File Manager entries. */
+	managed_files?: ManagedFile[];
 	limits: FileManagerLimits;
 	/**
 	 * Whether this target supports explicitly selecting recoverable or
@@ -8052,7 +8066,7 @@ export interface FileManagerEntry {
 	/** Unix timestamp in milliseconds. */
 	modified_at: I64;
 	revision: FileManagerRevision;
-	/** The entry is the database-managed compose source. */
+	/** The entry is backed by a database-managed source. */
 	managed?: boolean;
 }
 
@@ -10642,6 +10656,11 @@ export interface PrepareFileManagerUpload {
 
 export interface PrepareManagedFileManagerRenderedDownload {
 	target: FileManagerTarget;
+	/**
+	 * Managed file to download. Omit to download the Compose file for
+	 * compatibility.
+	 */
+	path?: string;
 }
 
 /**
@@ -10766,6 +10785,8 @@ export interface ReadFileManagerText {
 
 export interface ReadManagedFileManagerRenderedText {
 	target: FileManagerTarget;
+	/** Managed file to read. Omit to read the Compose file for compatibility. */
+	path?: string;
 }
 
 export interface RedoFileManagerOperation {

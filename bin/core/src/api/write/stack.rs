@@ -38,6 +38,10 @@ use periphery_client::api::compose::{
 use crate::{
   alert::send_alerts,
   api::execute::{self, ExecuteRequest, ExecutionResult},
+  api::write::file_manager::{
+    finish_managed_environment_path_migration,
+    prepare_managed_environment_path_migration,
+  },
   config::core_config,
   helpers::{
     query::{get_all_tags, get_swarm_or_server},
@@ -146,8 +150,92 @@ impl Resolve<WriteArgs> for UpdateStack {
       || self.config.files_on_host.is_some()
       || self.config.file_contents.is_some();
 
-    let stack =
-      resource::update::<Stack>(&self.id, self.config, user).await?;
+    let current = get_check_permissions::<Stack>(
+      &self.id,
+      user,
+      PermissionLevel::Write.into(),
+    )
+    .await?;
+    let requested_environment_path = self
+      .config
+      .env_file_path
+      .as_deref()
+      .filter(|path| *path != current.config.env_file_path);
+    let remains_ui_managed = !self
+      .config
+      .files_on_host
+      .unwrap_or(current.config.files_on_host)
+      && self
+        .config
+        .repo
+        .as_deref()
+        .unwrap_or(&current.config.repo)
+        .is_empty()
+      && self
+        .config
+        .linked_repo
+        .as_deref()
+        .unwrap_or(&current.config.linked_repo)
+        .is_empty()
+      && self
+        .config
+        .swarm_id
+        .as_deref()
+        .unwrap_or(&current.config.swarm_id)
+        .is_empty();
+    let migration = if let Some(new_path) = requested_environment_path
+      && crate::file_manager::is_ui_managed(&current)
+      && current.config.swarm_id.is_empty()
+      && remains_ui_managed
+    {
+      if current.config.server_id.is_empty() {
+        return Err(anyhow!(
+          "Assign a server before changing the managed environment path"
+        )
+        .into());
+      }
+      if self.config.server_id.as_ref().is_some_and(|server_id| {
+        server_id != &current.config.server_id
+      }) {
+        return Err(anyhow!(
+          "Change the stack server and managed environment path in separate updates"
+        )
+        .into());
+      }
+      Some(
+        prepare_managed_environment_path_migration(
+          &current, new_path,
+        )
+        .await?,
+      )
+    } else {
+      None
+    };
+
+    let update_result =
+      resource::update::<Stack>(&self.id, self.config, user).await;
+    let reconciliation_result = match migration.as_ref() {
+      Some(migration) => {
+        finish_managed_environment_path_migration(migration).await
+      }
+      None => Ok(()),
+    };
+    let stack = match (update_result, reconciliation_result) {
+      (Ok(stack), Ok(())) => stack,
+      (Err(error), Ok(())) => return Err(error.into()),
+      (Ok(_), Err(error)) => {
+        return Err(anyhow!(
+          "Stack configuration was updated, but managed environment migration cleanup remains pending: {error:#}"
+        )
+        .into());
+      }
+      (Err(error), Err(reconcile_error)) => {
+        return Err(anyhow!(
+          "Stack update failed: {error:#}; managed environment migration recovery remains pending: {reconcile_error:#}"
+        )
+        .into());
+      }
+    };
 
     if compose_update {
       tokio::spawn(async move {

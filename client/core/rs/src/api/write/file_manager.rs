@@ -107,6 +107,11 @@ pub struct PrepareFileManagerDownload {
 #[error(mogh_error::Error)]
 pub struct PrepareManagedFileManagerRenderedDownload {
   pub target: FileManagerTarget,
+  /// Managed file to download. Omit to download the Compose file for
+  /// compatibility.
+  #[serde(default)]
+  #[typeshare(optional)]
+  pub path: Option<String>,
 }
 
 #[typeshare]
