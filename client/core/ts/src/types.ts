@@ -8063,7 +8063,7 @@ export interface FileManagerPreflight {
 	expires_at: I64;
 	conflicts: FileManagerConflict[];
 	confirmation_required: boolean;
-	supports_durable_managed_transactions: boolean;
+	supports_durable_managed_transactions?: boolean;
 }
 
 export interface FileManagerTextFile {

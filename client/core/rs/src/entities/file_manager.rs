@@ -269,6 +269,7 @@ pub struct FileManagerPreflight {
   /// Whether this Periphery supports crash-durable coordination for writes to
   /// database-managed files. Older Periphery versions omit this field.
   #[serde(default)]
+  #[typeshare(optional)]
   pub supports_durable_managed_transactions: bool,
 }
 
