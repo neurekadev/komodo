@@ -20,6 +20,7 @@ use crate::{
   api::Args, config::periphery_config, docker::docker_login,
 };
 
+pub mod delete;
 pub mod write;
 
 #[instrument(

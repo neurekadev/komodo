@@ -28,6 +28,7 @@ async fn app() -> anyhow::Result<()> {
 
   let startup_span = info_span!("PeripheryStartup");
   file_manager::initialize().await?;
+  stack::delete::initialize().await?;
 
   let mut handles = async {
     info!("Komodo Periphery version: v{}", env!("CARGO_PKG_VERSION"));

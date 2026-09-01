@@ -75,6 +75,7 @@ async fn app() -> anyhow::Result<()> {
     helpers::prune::spawn_prune_loop();
     report::spawn_reporting_loop();
     api::write::spawn_managed_transaction_reconciliation_loop();
+    resource::spawn_stack_delete_reconciliation_loop();
   }
   .instrument(startup_span)
   .await;

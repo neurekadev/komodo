@@ -2,6 +2,7 @@ use std::{
   collections::{HashMap, HashSet},
   future::Future,
   str::FromStr,
+  sync::{Mutex as StdMutex, OnceLock},
 };
 
 use anyhow::{Context, anyhow};
@@ -48,7 +49,7 @@ use crate::{
   helpers::{
     create_permission, flatten_document,
     query::{get_tag, id_or_name_filter},
-    update::{add_update, make_update},
+    update::{add_update, make_update, update_update},
   },
   permission::{get_check_permissions, list_resources_for_user},
   state::db_client,
@@ -88,6 +89,7 @@ pub use repo::{
   spawn_repo_state_refresh_loop,
 };
 pub use server::{rotate_server_keys, update_server_public_key};
+pub use stack::spawn_stack_delete_reconciliation_loop;
 
 /// Implement on each Komodo resource for common methods
 pub trait KomodoResource {
@@ -222,6 +224,40 @@ pub trait KomodoResource {
     resource: &Resource<Self::Config, Self::Info>,
     update: &mut Update,
   ) -> anyhow::Result<()>;
+
+  /// Stack deletion overrides this to use a crash-durable transaction.
+  fn transactional_delete() -> bool {
+    false
+  }
+
+  async fn delete_transaction_data(
+    _resource: &Resource<Self::Config, Self::Info>,
+    _remove_volumes: bool,
+  ) -> anyhow::Result<String> {
+    Ok(String::new())
+  }
+
+  async fn pre_delete_transaction(
+    resource: &Resource<Self::Config, Self::Info>,
+    update: &mut Update,
+    _remove_volumes: bool,
+  ) -> anyhow::Result<()> {
+    Self::pre_delete(resource, update).await
+  }
+
+  async fn rollback_delete_transaction(
+    _resource: &Resource<Self::Config, Self::Info>,
+    _update: &mut Update,
+  ) -> anyhow::Result<()> {
+    Ok(())
+  }
+
+  async fn commit_delete_transaction(
+    _resource: &Resource<Self::Config, Self::Info>,
+    _update: &mut Update,
+  ) -> anyhow::Result<()> {
+    Ok(())
+  }
 
   /// Run any required task after resource deleted from database but
   /// before the request resolves.
@@ -995,6 +1031,9 @@ pub async fn delete<T: KomodoResource>(
   id_or_name: &str,
   user: &User,
 ) -> anyhow::Result<Resource<T::Config, T::Info>> {
+  if T::transactional_delete() {
+    return delete_transactional::<T>(id_or_name, user, false).await;
+  }
   let resource = get_check_permissions::<T>(
     id_or_name,
     user,
@@ -1052,6 +1091,172 @@ pub async fn delete<T: KomodoResource>(
   add_update(update).await?;
 
   Ok(resource)
+}
+
+pub async fn delete_with_options<T: KomodoResource>(
+  id_or_name: &str,
+  user: &User,
+  remove_volumes: bool,
+) -> anyhow::Result<Resource<T::Config, T::Info>> {
+  if !T::transactional_delete() {
+    return Err(anyhow!(
+      "Delete options are unsupported for {}",
+      T::resource_type()
+    ));
+  }
+  delete_transactional::<T>(id_or_name, user, remove_volumes).await
+}
+
+async fn delete_transactional<T: KomodoResource>(
+  id_or_name: &str,
+  user: &User,
+  remove_volumes: bool,
+) -> anyhow::Result<Resource<T::Config, T::Info>> {
+  let resource = get_check_permissions::<T>(
+    id_or_name,
+    user,
+    PermissionLevel::Write.into(),
+  )
+  .await?;
+  if T::busy(&resource.id).await? {
+    return Err(anyhow!("{} busy", T::resource_type()));
+  }
+
+  let target = resource_target::<T>(resource.id.clone());
+  let toml = ExportResourcesToToml {
+    targets: vec![target.clone()],
+    ..Default::default()
+  }
+  .resolve(&ReadArgs { user: user.clone() })
+  .await
+  .map_err(|error| error.error)?
+  .toml;
+  let mut update =
+    make_update(target.clone(), T::delete_operation(), user);
+  update.other_data =
+    T::delete_transaction_data(&resource, remove_volumes).await?;
+  update.in_progress();
+  update.id = add_update(update.clone()).await?;
+  let _active = ActiveDeleteTransaction::new(update.id.clone());
+
+  if let Err(error) =
+    T::pre_delete_transaction(&resource, &mut update, remove_volumes)
+      .await
+  {
+    update.push_error_log("Prepare deletion", format!("{error:#}"));
+    match T::rollback_delete_transaction(&resource, &mut update).await
+    {
+      Ok(()) => {
+        update.finalize();
+      }
+      Err(rollback_error) => {
+        update.push_simple_log(
+          "Deletion recovery pending",
+          format!(
+            "Stack files remain quarantined until recovery succeeds: {rollback_error:#}"
+          ),
+        );
+      }
+    }
+    update_update(update).await?;
+    return Err(error);
+  }
+
+  if let Err(error) = delete_one_by_id(T::coll(), &resource.id, None)
+    .await
+    .with_context(|| {
+      format!("Failed to delete {} from database", T::resource_type())
+    })
+  {
+    update
+      .push_error_log("Delete database record", format!("{error:#}"));
+    match T::rollback_delete_transaction(&resource, &mut update).await
+    {
+      Ok(()) => update.finalize(),
+      Err(rollback_error) => update.push_simple_log(
+        "Deletion recovery pending",
+        format!(
+          "Stack files remain quarantined until recovery succeeds: {rollback_error:#}"
+        ),
+      ),
+    }
+    update_update(update).await?;
+    return Err(error);
+  }
+
+  delete_all_permissions_on_resource(target.clone()).await;
+  remove_from_recently_viewed(target.clone()).await;
+  update.push_simple_log(
+    &format!("Delete {}", T::resource_type()),
+    format!("Deleted {} {}", T::resource_type(), resource.name),
+  );
+  update.push_simple_log("Deleted Toml", toml);
+
+  tokio::join!(
+    async {
+      if let Err(error) = T::post_delete(&resource, &mut update).await
+      {
+        update.push_error_log(
+          "Post delete",
+          format_serror(&error.into()),
+        );
+      }
+    },
+    delete_from_alerters::<T>(&resource.id)
+  );
+  refresh_all_resources_cache().await;
+
+  if let Err(error) =
+    T::commit_delete_transaction(&resource, &mut update).await
+  {
+    update.push_simple_log(
+      "Deletion cleanup pending",
+      format!(
+        "The stack is deleted; protected file cleanup will retry automatically: {error:#}"
+      ),
+    );
+    update_update(update).await?;
+    return Ok(resource);
+  }
+
+  update.finalize();
+  update_update(update).await?;
+  Ok(resource)
+}
+
+fn active_delete_transactions() -> &'static StdMutex<HashSet<String>>
+{
+  static ACTIVE: OnceLock<StdMutex<HashSet<String>>> =
+    OnceLock::new();
+  ACTIVE.get_or_init(Default::default)
+}
+
+struct ActiveDeleteTransaction(String);
+
+impl ActiveDeleteTransaction {
+  fn new(id: String) -> Self {
+    active_delete_transactions()
+      .lock()
+      .expect("active delete transaction lock poisoned")
+      .insert(id.clone());
+    Self(id)
+  }
+}
+
+impl Drop for ActiveDeleteTransaction {
+  fn drop(&mut self) {
+    active_delete_transactions()
+      .lock()
+      .expect("active delete transaction lock poisoned")
+      .remove(&self.0);
+  }
+}
+
+pub(super) fn delete_transaction_is_active(id: &str) -> bool {
+  active_delete_transactions()
+    .lock()
+    .expect("active delete transaction lock poisoned")
+    .contains(id)
 }
 
 async fn delete_from_alerters<T: KomodoResource>(id: &str) {

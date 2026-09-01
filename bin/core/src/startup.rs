@@ -139,7 +139,13 @@ async fn in_progress_update_cleanup() {
   if let Err(e) = db_client()
     .updates
     .update_many(
-      doc! { "status": "InProgress" },
+      doc! {
+        "status": "InProgress",
+        "$or": [
+          { "operation": { "$ne": "DeleteStack" } },
+          { "other_data": "" },
+        ],
+      },
       doc! {
         "$set": {
           "status": "Complete",

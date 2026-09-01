@@ -8,7 +8,8 @@ use komodo_client::entities::{
 use mogh_resolver::Resolve;
 use periphery_client::api::{
   build::*, compose::*, container::*, docker::*, file_manager::*,
-  git::*, keys::*, poll::*, stats::*, swarm::*, terminal::*, *,
+  git::*, keys::*, poll::*, stack::*, stats::*, swarm::*,
+  terminal::*, *,
 };
 use serde::{Deserialize, Serialize};
 use strum::EnumDiscriminants;
@@ -110,6 +111,12 @@ pub enum PeripheryRequest {
   ComposeUp(ComposeUp),
   ComposeExecution(ComposeExecution),
   ComposeRun(ComposeRun),
+
+  // Stack deletion transaction
+  ValidateStackDeletion(ValidateStackDeletion),
+  PrepareStackDeletion(PrepareStackDeletion),
+  RollbackStackDeletion(RollbackStackDeletion),
+  CommitStackDeletion(CommitStackDeletion),
 
   // Container (Read)
   InspectContainer(InspectContainer),

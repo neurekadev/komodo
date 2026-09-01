@@ -116,7 +116,14 @@ impl Resolve<WriteArgs> for DeleteStack {
     self,
     WriteArgs { user }: &WriteArgs,
   ) -> mogh_error::Result<Stack> {
-    Ok(resource::delete::<Stack>(&self.id, user).await?)
+    Ok(
+      resource::delete_with_options::<Stack>(
+        &self.id,
+        user,
+        self.remove_volumes,
+      )
+      .await?,
+    )
   }
 }
 

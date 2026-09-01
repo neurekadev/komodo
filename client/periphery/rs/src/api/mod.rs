@@ -15,6 +15,7 @@ pub mod file_manager;
 pub mod git;
 pub mod keys;
 pub mod poll;
+pub mod stack;
 pub mod stats;
 pub mod swarm;
 pub mod terminal;

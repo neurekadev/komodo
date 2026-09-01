@@ -103,7 +103,7 @@ pub async fn write_stack<'a>(
   }
 }
 
-fn resolved_run_directory(
+pub(super) fn resolved_run_directory(
   stack: &Stack,
   repo: Option<&Repo>,
 ) -> PathBuf {

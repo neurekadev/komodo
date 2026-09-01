@@ -803,11 +803,6 @@ export var FileManagerConflictAction;
     FileManagerConflictAction["Skip"] = "skip";
     FileManagerConflictAction["Overwrite"] = "overwrite";
 })(FileManagerConflictAction || (FileManagerConflictAction = {}));
-export var FileManagerExecutionMode;
-(function (FileManagerExecutionMode) {
-    FileManagerExecutionMode["Recoverable"] = "recoverable";
-    FileManagerExecutionMode["Permanent"] = "permanent";
-})(FileManagerExecutionMode || (FileManagerExecutionMode = {}));
 /**
  * Configures the behavior of [CreateTerminal] if the
  * specified terminal name already exists.
@@ -857,6 +852,15 @@ export var FileManagerEntryKind;
     FileManagerEntryKind["Symlink"] = "symlink";
     FileManagerEntryKind["Special"] = "special";
 })(FileManagerEntryKind || (FileManagerEntryKind = {}));
+/**
+ * Controls whether an eligible File Manager operation is retained in
+ * user-visible undo history after it commits.
+ */
+export var FileManagerExecutionMode;
+(function (FileManagerExecutionMode) {
+    FileManagerExecutionMode["Recoverable"] = "recoverable";
+    FileManagerExecutionMode["Permanent"] = "permanent";
+})(FileManagerExecutionMode || (FileManagerExecutionMode = {}));
 export var ActionSortBy;
 (function (ActionSortBy) {
     /** Sort by name. Default. */

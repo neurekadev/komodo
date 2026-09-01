@@ -1313,6 +1313,10 @@ export type UserConfig =
         description: string;
     };
 };
+export interface UserPreferences {
+    /** Keep eligible File Manager operations undoable by default. */
+    file_manager_safe_mode: boolean;
+}
 export type LinkedLoginsMap = Record<UserConfig["type"], UserConfig>;
 export interface UserTotpConfig {
     /** TOTP shared secret, encrypted */
@@ -1370,10 +1374,6 @@ export interface User {
     /** Give the user elevated permissions on all resources of a certain type */
     all?: Record<ResourceTarget["type"], PermissionLevelAndSpecifics | PermissionLevel>;
     updated_at?: I64;
-}
-export interface UserPreferences {
-    /** Keep eligible File Manager operations undoable by default. */
-    file_manager_safe_mode: boolean;
 }
 export type CreateLocalUserResponse = User;
 export type CreateProcedureResponse = Procedure;
@@ -5818,8 +5818,8 @@ export interface ServerQuerySpecifics {
 }
 /** Server-specific query */
 export type ServerQuery = ResourceQuery<ServerQuerySpecifics>;
-export type SetLastSeenUpdateResponse = NoData;
 export type SetFileManagerSafeModeResponse = NoData;
+export type SetLastSeenUpdateResponse = NoData;
 export interface StackQuerySpecifics {
     /**
      * Query only for Stacks on these Servers.
@@ -6454,10 +6454,6 @@ export interface CloseAlert {
 export declare enum FileManagerConflictAction {
     Skip = "skip",
     Overwrite = "overwrite"
-}
-export declare enum FileManagerExecutionMode {
-    Recoverable = "recoverable",
-    Permanent = "permanent"
 }
 export interface FileManagerConflictDecision {
     path: string;
@@ -7304,6 +7300,11 @@ export interface DeleteServer {
 export interface DeleteStack {
     /** The id or name of the stack to delete. */
     id: string;
+    /**
+     * Also remove volumes owned by this stack. External Compose volumes are
+     * never removed. Defaults to false.
+     */
+    remove_volumes?: boolean;
 }
 /**
  * Deletes the Swarm at the given id, and returns the deleted Swarm.
@@ -7708,6 +7709,10 @@ export interface FileManagerCapabilities {
     reason?: string;
     managed_file?: string;
     limits: FileManagerLimits;
+    /**
+     * Whether this target supports explicitly selecting recoverable or
+     * permanent execution. Older Periphery versions omit this field.
+     */
     supports_execution_modes?: boolean;
 }
 /** An opaque optimistic-concurrency revision. */
@@ -7738,20 +7743,39 @@ export interface FileManagerJournalStatus {
     expires_at?: I64;
     /** Bytes retained for the current undo/redo history. */
     retained_storage_bytes?: U64;
+    /**
+     * False when retained trees were quarantined atomically and have not been
+     * recursively measured.
+     */
+    retained_storage_bytes_exact?: boolean;
     /** Server-safe explanation of where File Manager data is stored. */
     storage_description?: string;
-    /** Whether retained_storage_bytes includes target-local recovery data. */
-    retained_storage_bytes_exact?: boolean;
 }
 export interface FileManagerOperationTicket {
     operation_id: string;
+}
+/**
+ * Controls whether an eligible File Manager operation is retained in
+ * user-visible undo history after it commits.
+ */
+export declare enum FileManagerExecutionMode {
+    Recoverable = "recoverable",
+    Permanent = "permanent"
 }
 export interface FileManagerPreflight {
     plan_id: string;
     expires_at: I64;
     conflicts: FileManagerConflict[];
     confirmation_required: boolean;
+    /**
+     * Whether this Periphery supports crash-durable coordination for writes to
+     * database-managed files. Older Periphery versions omit this field.
+     */
     supports_durable_managed_transactions?: boolean;
+    /**
+     * The execution mode accepted for this plan. Older Periphery versions
+     * omit this field and are recoverable-only.
+     */
     execution_mode?: FileManagerExecutionMode;
 }
 export interface FileManagerTextFile {
@@ -10101,9 +10125,6 @@ export interface PrepareFileManagerDownload {
     target: FileManagerTarget;
     paths: string[];
 }
-export interface PrepareManagedFileManagerRenderedDownload {
-    target: FileManagerTarget;
-}
 export interface PrepareFileManagerUpload {
     target: FileManagerTarget;
     destination: string;
@@ -10112,6 +10133,9 @@ export interface PrepareFileManagerUpload {
     overwrite?: boolean;
     confirmed?: boolean;
     expected_revision?: FileManagerRevision;
+}
+export interface PrepareManagedFileManagerRenderedDownload {
+    target: FileManagerTarget;
 }
 /**
  * Prunes the docker buildx cache on the target server. Response: [Update].
@@ -10848,16 +10872,16 @@ export interface SetEveryoneUserGroup {
     /** Whether this user group applies to everyone. */
     everyone: boolean;
 }
+/** Update the calling user's default File Manager safety behavior. */
+export interface SetFileManagerSafeMode {
+    enabled: boolean;
+}
 /**
  * Set the time the calling user most recently opened the UI updates dropdown.
  * Used for unseen notification dot.
  * Response: [NoData]
  */
 export interface SetLastSeenUpdate {
-}
-/** Update the calling user's default File Manager safety behavior. */
-export interface SetFileManagerSafeMode {
-    enabled: boolean;
 }
 /**
  * **Admin only.** Completely override the users in the group.

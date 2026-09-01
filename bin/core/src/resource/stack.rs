@@ -1,7 +1,11 @@
 use std::path::Path;
 
 use anyhow::Context;
-use database::mungos::mongodb::Collection;
+use database::mungos::{
+  by_id::find_one_by_id,
+  find::find_collect,
+  mongodb::{Collection, bson::doc},
+};
 use formatting::format_serror;
 use indexmap::IndexSet;
 use komodo_client::{
@@ -26,8 +30,13 @@ use komodo_client::{
 };
 use mogh_resolver::Resolve;
 use periphery_client::api::{
-  compose::ComposeExecution, swarm::RemoveSwarmStacks,
+  stack::{
+    CommitStackDeletion, PrepareStackDeletion, RollbackStackDeletion,
+    StackDeletionMode, ValidateStackDeletion,
+  },
+  swarm::RemoveSwarmStacks,
 };
+use serde::{Deserialize, Serialize};
 
 use crate::{
   api::write::WriteArgs,
@@ -39,6 +48,7 @@ use crate::{
     },
     repo_link,
     swarm::swarm_request,
+    update::update_update,
   },
   monitor::{refresh_server_cache, refresh_swarm_cache},
   state::{
@@ -368,105 +378,51 @@ impl super::KomodoResource for Stack {
     stack: &Resource<Self::Config, Self::Info>,
     update: &mut Update,
   ) -> anyhow::Result<()> {
-    // If it is Up, it should be taken down
-    let state = get_stack_state(stack)
-      .await
-      .context("failed to get stack state")?;
-    if matches!(state, StackState::Down | StackState::Unknown) {
-      return Ok(());
-    }
-    // stack needs to be destroyed
-    let swarm_or_server = match get_swarm_or_server(
-      &stack.config.swarm_id,
-      &stack.config.server_id,
-    )
-    .await
-    {
-      Ok(res) => res,
-      Err(e) => {
-        update.push_error_log(
-          "Destroy Stack",
-          format_serror(
-            &e.context(
-              "Failed to retrieve Swarm or Server from database.",
-            )
-            .into(),
-          ),
-        );
-        return Ok(());
-      }
-    };
+    Self::pre_delete_transaction(stack, update, false).await
+  }
 
-    match swarm_or_server {
-      SwarmOrServer::None => {}
-      SwarmOrServer::Swarm(swarm) => {
-        match swarm_request(
-          &swarm.config.server_ids,
-          RemoveSwarmStacks {
-            stacks: vec![stack.project_name(false)],
-            detach: true,
-          },
-        )
-        .await
-        {
-          Ok(log) => update.logs.push(log),
-          Err(e) => update.push_simple_log(
-            "Failed to destroy stack",
-            format_serror(
-              &e.context(
-                "Failed to destroy Stack on Swarm before delete",
-              )
-              .into(),
-            ),
-          ),
-        }
-      }
-      SwarmOrServer::Server(server) => {
-        if !server.config.enabled {
-          update.push_simple_log(
-            "Destroy Stack",
-            "Skipping stack destroy, Server is disabled.",
-          );
-          return Ok(());
-        }
+  fn transactional_delete() -> bool {
+    true
+  }
 
-        let periphery = match periphery_client(&server).await {
-          Ok(periphery) => periphery,
-          Err(e) => {
-            // This case won't ever happen, as periphery_client only fallible if the server is disabled.
-            // Leaving it for completeness sake
-            update.push_error_log(
-              "Destroy Stack",
-              format_serror(
-                &e.context("Failed to get periphery client").into(),
-              ),
-            );
-            return Ok(());
-          }
-        };
+  async fn delete_transaction_data(
+    stack: &Resource<Self::Config, Self::Info>,
+    _remove_volumes: bool,
+  ) -> anyhow::Result<String> {
+    let (_, servers) = stack_delete_servers(stack).await?;
+    Ok(serde_json::to_string(&StackDeleteTransaction {
+      transaction_id: stack.id.clone(),
+      stack_id: stack.id.clone(),
+      stack_name: stack.name.clone(),
+      server_ids: servers
+        .into_iter()
+        .map(|server| server.id)
+        .collect(),
+    })?)
+  }
 
-        match periphery
-          .request(ComposeExecution {
-            project: stack.project_name(false),
-            command: String::from("down --remove-orphans"),
-          })
-          .await
-        {
-          Ok(log) => update.logs.push(log),
-          Err(e) => update.push_simple_log(
-            "Failed to destroy stack",
-            format_serror(
-              &e.context(
-                "failed to destroy stack on periphery server before delete",
-              )
-              .into(),
-            ),
-          ),
-        };
-      }
-    }
+  async fn pre_delete_transaction(
+    stack: &Resource<Self::Config, Self::Info>,
+    update: &mut Update,
+    remove_volumes: bool,
+  ) -> anyhow::Result<()> {
+    prepare_stack_delete(stack, update, remove_volumes).await
+  }
 
-    Ok(())
+  async fn rollback_delete_transaction(
+    _stack: &Resource<Self::Config, Self::Info>,
+    update: &mut Update,
+  ) -> anyhow::Result<()> {
+    let transaction = parse_stack_delete_transaction(update)?;
+    reconcile_stack_delete_hosts(&transaction, false).await
+  }
+
+  async fn commit_delete_transaction(
+    _stack: &Resource<Self::Config, Self::Info>,
+    update: &mut Update,
+  ) -> anyhow::Result<()> {
+    let transaction = parse_stack_delete_transaction(update)?;
+    reconcile_stack_delete_hosts(&transaction, true).await
   }
 
   async fn post_delete(
@@ -476,6 +432,278 @@ impl super::KomodoResource for Stack {
     stack_status_cache().remove(&resource.id).await;
     Ok(())
   }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StackDeleteTransaction {
+  transaction_id: String,
+  stack_id: String,
+  stack_name: String,
+  server_ids: Vec<String>,
+}
+
+fn parse_stack_delete_transaction(
+  update: &Update,
+) -> anyhow::Result<StackDeleteTransaction> {
+  serde_json::from_str(&update.other_data)
+    .context("Missing stack deletion transaction state")
+}
+
+async fn stack_delete_servers(
+  stack: &Stack,
+) -> anyhow::Result<(StackDeletionMode, Vec<Server>)> {
+  let target = get_swarm_or_server(
+    &stack.config.swarm_id,
+    &stack.config.server_id,
+  )
+  .await
+  .context("Failed to resolve the stack host for deletion")?;
+  let (mode, server_ids) = match target {
+    SwarmOrServer::Swarm(swarm) => {
+      (StackDeletionMode::Swarm, swarm.config.server_ids)
+    }
+    SwarmOrServer::Server(server) => {
+      (StackDeletionMode::Compose, vec![server.id])
+    }
+    SwarmOrServer::None => {
+      if stack_requires_host_for_deletion(stack) {
+        return Err(anyhow::anyhow!(
+          "Stack has deployment history but no configured host; refusing deletion because stack files cannot be retired safely"
+        ));
+      }
+      return Ok((StackDeletionMode::Compose, Vec::new()));
+    }
+  };
+
+  let mut servers = Vec::with_capacity(server_ids.len());
+  for server_id in server_ids {
+    let server =
+      super::get::<Server>(&server_id).await.with_context(|| {
+        format!("Failed to load stack host {server_id}")
+      })?;
+    if !server.config.enabled {
+      return Err(anyhow::anyhow!(
+        "Stack host {} is disabled; refusing deletion",
+        server.name
+      ));
+    }
+    periphery_client(&server)
+      .await?
+      .health_check()
+      .await
+      .with_context(|| {
+        format!(
+          "Stack host {} is not connected; refusing deletion",
+          server.name
+        )
+      })?;
+    servers.push(server);
+  }
+  Ok((mode, servers))
+}
+
+fn stack_requires_host_for_deletion(stack: &Stack) -> bool {
+  stack.info.deployed_project_name.is_some()
+    || stack.info.deployed_contents.is_some()
+    || stack.info.remote_contents.is_some()
+}
+
+async fn prepare_stack_delete(
+  stack: &Stack,
+  update: &mut Update,
+  remove_volumes: bool,
+) -> anyhow::Result<()> {
+  let state = get_stack_state(stack)
+    .await
+    .context("Failed to confirm stack state before deletion")?;
+  update.push_simple_log(
+    "Confirm stack state",
+    format!("Observed stack state: {state}"),
+  );
+  let (mode, servers) = stack_delete_servers(stack).await?;
+  if servers.is_empty() {
+    update.push_simple_log(
+      "Prepare stack deletion",
+      "The stack has no configured host and no host-owned files",
+    );
+    return Ok(());
+  }
+
+  let repo = if stack.config.linked_repo.is_empty() {
+    None
+  } else {
+    Some(
+      super::get::<Repo>(&stack.config.linked_repo)
+        .await
+        .context("Failed to load linked repository for deletion")?,
+    )
+  };
+
+  if matches!(mode, StackDeletionMode::Swarm) {
+    for server in &servers {
+      let log = periphery_client(server)
+        .await?
+        .request(ValidateStackDeletion {
+          stack: stack.clone(),
+          remove_volumes,
+        })
+        .await
+        .with_context(|| {
+          format!(
+            "Stack deletion safety checks failed on host {}",
+            server.name
+          )
+        })?;
+      update.logs.push(log);
+    }
+    let log = swarm_request(
+      &servers
+        .iter()
+        .map(|server| server.id.clone())
+        .collect::<Vec<_>>(),
+      RemoveSwarmStacks {
+        stacks: vec![stack.project_name(false)],
+        detach: false,
+      },
+    )
+    .await
+    .context("Failed to remove the Swarm stack")?;
+    let success = log.success;
+    update.logs.push(log);
+    if !success {
+      return Err(anyhow::anyhow!(
+        "Swarm stack removal did not complete successfully"
+      ));
+    }
+  }
+
+  for server in servers {
+    let response = periphery_client(&server)
+      .await?
+      .request(PrepareStackDeletion {
+        transaction_id: stack.id.clone(),
+        stack: stack.clone(),
+        repo: repo.clone(),
+        mode,
+        remove_volumes,
+      })
+      .await
+      .with_context(|| {
+        format!(
+          "Failed to prepare deletion on stack host {}",
+          server.name
+        )
+      })?;
+    update.logs.extend(response);
+  }
+  Ok(())
+}
+
+async fn reconcile_stack_delete_hosts(
+  transaction: &StackDeleteTransaction,
+  commit: bool,
+) -> anyhow::Result<()> {
+  let mut errors = Vec::new();
+  for server_id in &transaction.server_ids {
+    let result = async {
+      let server = super::get::<Server>(server_id).await?;
+      let periphery = periphery_client(&server).await?;
+      if commit {
+        periphery
+          .request(CommitStackDeletion {
+            transaction_id: transaction.transaction_id.clone(),
+            stack_name: transaction.stack_name.clone(),
+          })
+          .await?;
+      } else {
+        periphery
+          .request(RollbackStackDeletion {
+            transaction_id: transaction.transaction_id.clone(),
+            stack_name: transaction.stack_name.clone(),
+          })
+          .await?;
+      }
+      anyhow::Ok(())
+    }
+    .await;
+    if let Err(error) = result {
+      errors.push(format!("{server_id}: {error:#}"));
+    }
+  }
+  if errors.is_empty() {
+    Ok(())
+  } else {
+    Err(anyhow::anyhow!(errors.join("; ")))
+  }
+}
+
+pub fn spawn_stack_delete_reconciliation_loop() {
+  tokio::spawn(async {
+    loop {
+      tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+      if let Err(error) = reconcile_stack_delete_transactions().await
+      {
+        warn!("Failed to reconcile stack deletions: {error:#}");
+      }
+    }
+  });
+}
+
+async fn reconcile_stack_delete_transactions() -> anyhow::Result<()> {
+  let updates = find_collect(
+    &db_client().updates,
+    doc! {
+      "status": "InProgress",
+      "operation": "DeleteStack",
+      "other_data": { "$ne": "" },
+    },
+    None,
+  )
+  .await
+  .context("Failed to load pending stack deletion transactions")?;
+  for mut update in updates {
+    if super::delete_transaction_is_active(&update.id) {
+      continue;
+    }
+    let transaction = match parse_stack_delete_transaction(&update) {
+      Ok(transaction) => transaction,
+      Err(error) => {
+        warn!(
+          "Invalid pending stack deletion update {}: {error:#}",
+          update.id
+        );
+        continue;
+      }
+    };
+    let stack_exists =
+      find_one_by_id(&db_client().stacks, &transaction.stack_id)
+        .await
+        .context("Failed to determine stack deletion outcome")?
+        .is_some();
+    if let Err(error) =
+      reconcile_stack_delete_hosts(&transaction, !stack_exists).await
+    {
+      warn!(
+        "Stack deletion transaction {} is still pending: {error:#}",
+        transaction.transaction_id
+      );
+      continue;
+    }
+    if stack_exists {
+      update.push_error_log(
+        "Deletion recovered",
+        "Core stopped before database deletion; retired stack files were restored",
+      );
+    } else {
+      update.push_simple_log(
+        "Deletion recovered",
+        "Database deletion completed; retired stack files were committed to cleanup",
+      );
+    }
+    update.finalize();
+    update_update(update).await?;
+  }
+  Ok(())
 }
 
 #[instrument("ValidateStackConfig", skip_all)]
@@ -589,5 +817,17 @@ mod tests {
       )
       .is_ok()
     );
+  }
+
+  #[test]
+  fn deployment_history_requires_a_host_for_safe_deletion() {
+    let mut stack = Stack {
+      info: StackInfo::default(),
+      ..Default::default()
+    };
+    assert!(!stack_requires_host_for_deletion(&stack));
+
+    stack.info.deployed_project_name = Some("sites".into());
+    assert!(stack_requires_host_for_deletion(&stack));
   }
 }

@@ -93,6 +93,11 @@ pub fn delete_stack() {}
 pub struct DeleteStack {
   /// The id or name of the stack to delete.
   pub id: String,
+  /// Also remove volumes owned by this stack. External Compose volumes are
+  /// never removed. Defaults to false.
+  #[serde(default)]
+  #[typeshare(optional)]
+  pub remove_volumes: bool,
 }
 
 //
@@ -342,4 +347,16 @@ pub type BatchCheckStackForUpdateResponse =
 pub enum StackWebhookAction {
   Refresh,
   Deploy,
+}
+
+#[cfg(test)]
+mod tests {
+  use super::DeleteStack;
+
+  #[test]
+  fn delete_stack_remove_volumes_defaults_to_false() {
+    let request: DeleteStack =
+      serde_json::from_str(r#"{"id":"stack-id"}"#).unwrap();
+    assert!(!request.remove_volumes);
+  }
 }
