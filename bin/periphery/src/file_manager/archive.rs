@@ -29,17 +29,37 @@ use zip::{
 
 use super::{
   MAX_ARCHIVE_EXPANSION_RATIO, MINIMUM_FREE_BYTES, OperationProgress,
-  WorkTotal, collect_merge_conflicts, copy_with_progress,
-  decision_for, ensure_entry_limit, ensure_free_space,
-  path::MAX_DEPTH, path::open_parent_nofollow, path::relative_path,
-  path_string, remove_entry,
+  WorkTotal, copy_with_progress, create_private_file, decision_for,
+  ensure_entry_limit, path::MAX_DEPTH, path::open_parent_nofollow,
+  path::relative_path, path_string, remove_entry,
 };
 
-struct TemporaryDirectory(PathBuf);
+struct TemporaryCapabilityDirectory {
+  parent: Dir,
+  name: OsString,
+}
 
-impl Drop for TemporaryDirectory {
+impl TemporaryCapabilityDirectory {
+  fn create(parent: &Dir, name: OsString) -> anyhow::Result<Self> {
+    let cleanup_parent = parent.try_clone()?;
+    create_private_capability_directory(parent, &name)?;
+    Ok(Self {
+      parent: cleanup_parent,
+      name,
+    })
+  }
+
+  fn open(&self) -> anyhow::Result<Dir> {
+    self
+      .parent
+      .open_dir_nofollow(&self.name)
+      .map_err(Into::into)
+  }
+}
+
+impl Drop for TemporaryCapabilityDirectory {
   fn drop(&mut self) {
-    let _ = fs::remove_dir_all(&self.0);
+    let _ = self.parent.remove_dir_all(&self.name);
   }
 }
 
@@ -58,11 +78,51 @@ impl fmt::Display for LatePublishConflict {
 
 impl std::error::Error for LatePublishConflict {}
 
+#[derive(Clone, Copy)]
+enum PublishRoot {
+  Staging,
+  Destination,
+  Rollback,
+}
+
+struct PublishLocation {
+  root: PublishRoot,
+  path: PathBuf,
+}
+
+struct PublishRollbackAction {
+  from: PublishLocation,
+  to: PublishLocation,
+}
+
 struct PublishRollback {
-  from_parent: Dir,
-  from_name: OsString,
-  to_parent: Dir,
-  to_name: OsString,
+  staging: Dir,
+  destination: Dir,
+  rollback: Dir,
+  actions: Vec<PublishRollbackAction>,
+}
+
+impl PublishRollback {
+  fn new(
+    staging: &Dir,
+    destination: &Dir,
+    rollback: &Dir,
+  ) -> anyhow::Result<Self> {
+    Ok(Self {
+      staging: staging.try_clone()?,
+      destination: destination.try_clone()?,
+      rollback: rollback.try_clone()?,
+      actions: Vec::new(),
+    })
+  }
+
+  fn root(&self, root: PublishRoot) -> &Dir {
+    match root {
+      PublishRoot::Staging => &self.staging,
+      PublishRoot::Destination => &self.destination,
+      PublishRoot::Rollback => &self.rollback,
+    }
+  }
 }
 
 pub fn create(
@@ -130,7 +190,7 @@ pub fn create_download_zip(
   if paths.is_empty() {
     return Err(anyhow!("Select at least one entry to download"));
   }
-  let file = fs::File::create(output)?;
+  let file = create_private_file(output)?;
   let mut writer = ZipWriter::new(file);
   let options = SimpleFileOptions::default()
     .compression_method(CompressionMethod::Deflated)
@@ -162,7 +222,6 @@ pub fn create_download_zip(
 
 pub fn extract(
   root: &Dir,
-  root_path: &Path,
   archive_path: &str,
   destination: &str,
   decisions: &[FileManagerConflictDecision],
@@ -186,38 +245,43 @@ pub fn extract(
     .open_with(archive_name, &read_options)?
     .into_std();
 
-  let destination_parent_path =
-    destination.parent().unwrap_or_else(|| Path::new(""));
   let (destination_parent, destination_name) =
     open_parent_nofollow(root, &destination)?;
-  let staging_name =
-    format!(".komodo-file-manager-staging-{}", Uuid::new_v4());
-  destination_parent.create_dir(&staging_name)?;
-  let staging =
-    root_path.join(destination_parent_path).join(&staging_name);
-  let _cleanup = TemporaryDirectory(staging.clone());
-  let rollback_name = format!("{staging_name}-rollback");
-  destination_parent.create_dir(&rollback_name)?;
-  let rollback_path =
-    root_path.join(destination_parent_path).join(&rollback_name);
-  let _rollback_cleanup = TemporaryDirectory(rollback_path);
-  let rollback_dir =
-    destination_parent.open_dir_nofollow(&rollback_name)?;
+  let staging_name = OsString::from(format!(
+    ".komodo-file-manager-staging-{}",
+    Uuid::new_v4()
+  ));
+  let staging_guard = TemporaryCapabilityDirectory::create(
+    &destination_parent,
+    staging_name.clone(),
+  )?;
+  let staging = staging_guard.open()?;
+  staging.create_dir("payload")?;
+  let payload = staging.open_dir_nofollow("payload")?;
+  let rollback_name = OsString::from(format!(
+    "{}-rollback",
+    staging_name.to_string_lossy()
+  ));
+  let rollback_guard = TemporaryCapabilityDirectory::create(
+    &destination_parent,
+    rollback_name,
+  )?;
+  let rollback_dir = rollback_guard.open()?;
   let format = detect_format(&source)?;
 
   (|| {
     match format {
       DetectedArchive::Zip => {
-        extract_zip(source, &staging, progress)?
+        extract_zip(source, &payload, progress)?
       }
       DetectedArchive::Tar => {
-        extract_tar(source, &staging, progress)?
+        extract_tar(source, &payload, progress)?
       }
       DetectedArchive::TarGz => {
-        extract_tar_gz(source, &staging, progress)?
+        extract_tar_gz(source, &payload, progress)?
       }
       DetectedArchive::SevenZip => {
-        extract_seven_zip(source, &staging, progress)?
+        extract_seven_zip(source, &payload, progress)?
       }
       DetectedArchive::Rar => {
         return Err(anyhow!(
@@ -225,19 +289,20 @@ pub fn extract(
         ));
       }
     }
-    validate_staged_tree(&staging)?;
-    sync_staged_tree(&staging)?;
+    validate_staged_tree(&payload)?;
+    sync_staged_tree(&payload)?;
     if let Some(progress) = progress {
-      progress.add_temporary_storage_bytes(host_bytes(&staging)?);
+      progress
+        .add_temporary_storage_bytes(capability_bytes(&payload)?);
     }
 
-    let staging_relative =
-      destination_parent_path.join(&staging_name);
     let mut conflicts = Vec::<FileManagerConflict>::new();
-    collect_merge_conflicts(
-      root,
-      &staging_relative,
-      &destination,
+    collect_merge_conflicts_from_capabilities(
+      &staging,
+      OsStr::new("payload"),
+      &destination_parent,
+      &destination_name,
+      &path_string(&destination)?,
       &mut conflicts,
     )?;
     let mut resolved = decisions.to_vec();
@@ -268,13 +333,19 @@ pub fn extract(
     }
 
     loop {
-      let mut rollback = Vec::new();
+      let mut rollback = PublishRollback::new(
+        &staging,
+        &destination_parent,
+        &rollback_dir,
+      )?;
       let mut backup_index = 0_u64;
       let publish = publish_staged_entry(
-        &destination_parent,
-        OsStr::new(&staging_name),
+        &staging,
+        OsStr::new("payload"),
+        Path::new("payload"),
         &destination_parent,
         &destination_name,
+        Path::new(&destination_name),
         &path_string(&destination)?,
         &rollback_dir,
         &mut backup_index,
@@ -322,18 +393,75 @@ pub fn extract(
   })()
 }
 
-#[allow(clippy::too_many_arguments)]
-fn publish_staged_entry(
+fn collect_merge_conflicts_from_capabilities(
   source_parent: &Dir,
   source_name: &OsStr,
   destination_parent: &Dir,
   destination_name: &OsStr,
   destination_path: &str,
+  conflicts: &mut Vec<FileManagerConflict>,
+) -> anyhow::Result<()> {
+  let source_metadata =
+    source_parent.symlink_metadata(source_name)?;
+  let destination_metadata =
+    match destination_parent.symlink_metadata(destination_name) {
+      Ok(metadata) => metadata,
+      Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        return Ok(());
+      }
+      Err(error) => return Err(error.into()),
+    };
+  if source_metadata.is_dir()
+    && !source_metadata.file_type().is_symlink()
+    && destination_metadata.is_dir()
+    && !destination_metadata.file_type().is_symlink()
+  {
+    let source = source_parent.open_dir_nofollow(source_name)?;
+    let destination =
+      destination_parent.open_dir_nofollow(destination_name)?;
+    let mut children = source
+      .entries()?
+      .map(|entry| entry.map(|entry| entry.file_name()))
+      .collect::<std::io::Result<Vec<_>>>()?;
+    children.sort();
+    for child in children {
+      let child_name = child
+        .to_str()
+        .context("Non-UTF-8 filenames are unsupported")?;
+      collect_merge_conflicts_from_capabilities(
+        &source,
+        &child,
+        &destination,
+        &child,
+        &format!("{destination_path}/{child_name}"),
+        conflicts,
+      )?;
+    }
+  } else {
+    ensure_entry_limit(conflicts.len() as u64 + 1)?;
+    conflicts.push(FileManagerConflict {
+      path: destination_path.to_string(),
+      existing_kind: super::entry_kind(&destination_metadata),
+      incoming_kind: super::entry_kind(&source_metadata),
+    });
+  }
+  Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_staged_entry(
+  source_parent: &Dir,
+  source_name: &OsStr,
+  source_path: &Path,
+  destination_parent: &Dir,
+  destination_name: &OsStr,
+  destination_relative: &Path,
+  destination_path: &str,
   rollback_dir: &Dir,
   backup_index: &mut u64,
   decisions: &[FileManagerConflictDecision],
   progress: Option<&OperationProgress>,
-  rollback: &mut Vec<PublishRollback>,
+  rollback: &mut PublishRollback,
 ) -> anyhow::Result<()> {
   if let Some(progress) = progress {
     progress.check_cancelled()?;
@@ -371,8 +499,10 @@ fn publish_staged_entry(
         publish_staged_entry(
           &source_dir,
           &child,
+          &source_path.join(&child),
           &destination_dir,
           &child,
+          &destination_relative.join(&child),
           &format!("{destination_path}/{child_name}"),
           rollback_dir,
           backup_index,
@@ -403,8 +533,16 @@ fn publish_staged_entry(
         rename_with_rollback(
           destination_parent,
           destination_name,
+          PublishLocation {
+            root: PublishRoot::Destination,
+            path: destination_relative.to_path_buf(),
+          },
           rollback_dir,
           &backup_name,
+          PublishLocation {
+            root: PublishRoot::Rollback,
+            path: PathBuf::from(&backup_name),
+          },
           rollback,
         )?;
       }
@@ -424,8 +562,16 @@ fn publish_staged_entry(
   rename_with_rollback(
     source_parent,
     source_name,
+    PublishLocation {
+      root: PublishRoot::Staging,
+      path: source_path.to_path_buf(),
+    },
     destination_parent,
     destination_name,
+    PublishLocation {
+      root: PublishRoot::Destination,
+      path: destination_relative.to_path_buf(),
+    },
     rollback,
   )
 }
@@ -433,33 +579,42 @@ fn publish_staged_entry(
 fn rename_with_rollback(
   source_parent: &Dir,
   source_name: &OsStr,
+  source: PublishLocation,
   destination_parent: &Dir,
   destination_name: &OsStr,
-  rollback: &mut Vec<PublishRollback>,
+  destination: PublishLocation,
+  rollback: &mut PublishRollback,
 ) -> anyhow::Result<()> {
+  rollback
+    .actions
+    .try_reserve(1)
+    .context("Could not reserve extraction rollback bookkeeping")?;
+  let rollback_action = PublishRollbackAction {
+    from: destination,
+    to: source,
+  };
   source_parent.rename(
     source_name,
     destination_parent,
     destination_name,
   )?;
-  rollback.push(PublishRollback {
-    from_parent: destination_parent.try_clone()?,
-    from_name: destination_name.to_os_string(),
-    to_parent: source_parent.try_clone()?,
-    to_name: source_name.to_os_string(),
-  });
+  rollback.actions.push(rollback_action);
   Ok(())
 }
 
 fn rollback_publish(
-  rollback: Vec<PublishRollback>,
+  mut rollback: PublishRollback,
 ) -> anyhow::Result<()> {
-  for action in rollback.into_iter().rev() {
-    action.from_parent.rename(
-      &action.from_name,
-      &action.to_parent,
-      &action.to_name,
+  while let Some(action) = rollback.actions.pop() {
+    let (from_parent, from_name) = open_parent_nofollow(
+      rollback.root(action.from.root),
+      &action.from.path,
     )?;
+    let (to_parent, to_name) = open_parent_nofollow(
+      rollback.root(action.to.root),
+      &action.to.path,
+    )?;
+    from_parent.rename(&from_name, &to_parent, &to_name)?;
   }
   Ok(())
 }
@@ -898,7 +1053,7 @@ fn detect_format(file: &fs::File) -> anyhow::Result<DetectedArchive> {
 
 fn extract_zip(
   source: fs::File,
-  destination: &Path,
+  destination: &Dir,
   progress: Option<&OperationProgress>,
 ) -> anyhow::Result<()> {
   let compressed_size = source.metadata()?.len().max(1);
@@ -926,15 +1081,12 @@ fn extract_zip(
         ));
       }
     }
-    let output = destination.join(archive_relative(entry.name())?);
+    let output = archive_relative(entry.name())?;
     if entry.is_dir() {
-      fs::create_dir_all(&output)?;
+      ensure_capability_directory(destination, &output)?;
     } else {
-      if let Some(parent) = output.parent() {
-        fs::create_dir_all(parent)?;
-      }
-      let mut file = create_safe_file(&output)?;
-      ensure_free_space(
+      let mut file = create_capability_file(destination, &output)?;
+      ensure_free_space_capability(
         destination,
         entry.size().saturating_add(MINIMUM_FREE_BYTES),
       )?;
@@ -960,7 +1112,7 @@ fn extract_zip(
 
 fn extract_tar(
   source: fs::File,
-  destination: &Path,
+  destination: &Dir,
   progress: Option<&OperationProgress>,
 ) -> anyhow::Result<()> {
   let compressed_size = source.metadata()?.len().max(1);
@@ -974,7 +1126,7 @@ fn extract_tar(
 
 fn extract_tar_gz(
   source: fs::File,
-  destination: &Path,
+  destination: &Dir,
   progress: Option<&OperationProgress>,
 ) -> anyhow::Result<()> {
   let compressed_size = source.metadata()?.len().max(1);
@@ -989,7 +1141,7 @@ fn extract_tar_gz(
 fn extract_tar_reader<R: Read>(
   reader: R,
   compressed_size: u64,
-  destination: &Path,
+  destination: &Dir,
   progress: Option<&OperationProgress>,
 ) -> anyhow::Result<()> {
   let mut archive = TarArchive::new(reader);
@@ -1014,15 +1166,12 @@ fn extract_tar_reader<R: Read>(
       .checked_add(size)
       .context("Archive expanded size overflow")?;
     enforce_expansion_limits(expanded, compressed_size)?;
-    let output = destination.join(archive_relative(path)?);
+    let output = archive_relative(path)?;
     if entry_type.is_dir() {
-      fs::create_dir_all(output)?;
+      ensure_capability_directory(destination, &output)?;
     } else {
-      if let Some(parent) = output.parent() {
-        fs::create_dir_all(parent)?;
-      }
-      let mut file = create_safe_file(&output)?;
-      ensure_free_space(
+      let mut file = create_capability_file(destination, &output)?;
+      ensure_free_space_capability(
         destination,
         size.saturating_add(MINIMUM_FREE_BYTES),
       )?;
@@ -1048,7 +1197,7 @@ fn extract_tar_reader<R: Read>(
 
 fn extract_seven_zip(
   source: fs::File,
-  destination: &Path,
+  destination: &Dir,
   progress: Option<&OperationProgress>,
 ) -> anyhow::Result<()> {
   let compressed_size = source.metadata()?.len().max(1);
@@ -1099,31 +1248,27 @@ fn extract_seven_zip(
         sevenz_rust2::Error::Other(Cow::Owned(error.to_string()))
       })?;
     }
-    ensure_free_space(
+    ensure_free_space_capability(
       destination,
       entry.size().saturating_add(MINIMUM_FREE_BYTES),
     )
     .map_err(|error| {
       sevenz_rust2::Error::Other(Cow::Owned(error.to_string()))
     })?;
-    let output = destination.join(
-      archive_relative(entry.name()).map_err(|error| {
-        sevenz_rust2::Error::Other(Cow::Owned(error.to_string()))
-      })?,
-    );
+    let output = archive_relative(entry.name()).map_err(|error| {
+      sevenz_rust2::Error::Other(Cow::Owned(error.to_string()))
+    })?;
     if entry.is_directory() {
-      fs::create_dir_all(&output).map_err(|error| {
-        sevenz_rust2::Error::Other(Cow::Owned(error.to_string()))
-      })?;
+      ensure_capability_directory(destination, &output).map_err(
+        |error| {
+          sevenz_rust2::Error::Other(Cow::Owned(error.to_string()))
+        },
+      )?;
     } else {
-      if let Some(parent) = output.parent() {
-        fs::create_dir_all(parent).map_err(|error| {
+      let mut file = create_capability_file(destination, &output)
+        .map_err(|error| {
           sevenz_rust2::Error::Other(Cow::Owned(error.to_string()))
         })?;
-      }
-      let mut file = create_safe_file(&output).map_err(|error| {
-        sevenz_rust2::Error::Other(Cow::Owned(error.to_string()))
-      })?;
       let copied = copy_extracted_entry(
         reader,
         &mut file,
@@ -1198,8 +1343,8 @@ fn enforce_expansion_limits(
 
 fn copy_extracted_entry(
   source: &mut (impl Read + ?Sized),
-  destination: &mut fs::File,
-  staging: &Path,
+  destination: &mut impl Write,
+  staging: &Dir,
   progress: Option<&OperationProgress>,
   count_bytes: bool,
 ) -> anyhow::Result<u64> {
@@ -1213,7 +1358,7 @@ fn copy_extracted_entry(
     if read == 0 {
       break;
     }
-    ensure_free_space(
+    ensure_free_space_capability(
       staging,
       (read as u64).saturating_add(MINIMUM_FREE_BYTES),
     )?;
@@ -1226,52 +1371,71 @@ fn copy_extracted_entry(
   Ok(copied)
 }
 
-fn host_bytes(path: &Path) -> anyhow::Result<u64> {
-  let metadata = fs::symlink_metadata(path)?;
-  if metadata.is_file() {
-    return Ok(metadata.len());
-  }
+fn capability_bytes(directory: &Dir) -> anyhow::Result<u64> {
   let mut total = 0_u64;
-  for entry in fs::read_dir(path)? {
-    total = total.saturating_add(host_bytes(&entry?.path())?);
+  for entry in directory.entries()? {
+    let entry = entry?;
+    let name = entry.file_name();
+    let metadata = directory.symlink_metadata(&name)?;
+    if metadata.file_type().is_symlink()
+      || (!metadata.is_file() && !metadata.is_dir())
+    {
+      return Err(anyhow!(
+        "Archive produced a link or special entry"
+      ));
+    }
+    if metadata.is_file() {
+      total = total.saturating_add(metadata.len());
+    } else {
+      total = total.saturating_add(capability_bytes(
+        &directory.open_dir_nofollow(&name)?,
+      )?);
+    }
   }
   Ok(total)
 }
 
-fn sync_staged_tree(path: &Path) -> anyhow::Result<()> {
+fn sync_staged_tree(directory: &Dir) -> anyhow::Result<()> {
   #[cfg(unix)]
   {
     use std::os::fd::AsRawFd as _;
-    let directory = fs::File::open(path)?;
-    let result = unsafe { libc::syncfs(directory.as_raw_fd()) };
+    let directory_file = directory.open(".")?;
+    let result = unsafe { libc::syncfs(directory_file.as_raw_fd()) };
     if result == 0 {
       return Ok(());
     }
+    Err(std::io::Error::last_os_error().into())
   }
 
-  fn sync_fallback(path: &Path) -> anyhow::Result<()> {
-    for entry in fs::read_dir(path)? {
-      let entry = entry?;
-      if entry.file_type()?.is_dir() {
-        sync_fallback(&entry.path())?;
-      } else {
-        fs::File::open(entry.path())?.sync_all()?;
+  #[cfg(not(unix))]
+  {
+    fn sync_files(directory: &Dir) -> anyhow::Result<()> {
+      for entry in directory.entries()? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let metadata = directory.symlink_metadata(&name)?;
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+          sync_files(&directory.open_dir_nofollow(&name)?)?;
+        } else if metadata.is_file() {
+          let mut options = OpenOptions::new();
+          options.read(true).follow(FollowSymlinks::No);
+          directory.open_with(&name, &options)?.sync_all()?;
+        }
       }
+      Ok(())
     }
-    fs::File::open(path)?.sync_all()?;
-    Ok(())
+    sync_files(directory)
   }
-
-  sync_fallback(path)
 }
 
-fn validate_staged_tree(root: &Path) -> anyhow::Result<()> {
-  fn visit(path: &Path, count: &mut u64) -> anyhow::Result<()> {
-    for entry in fs::read_dir(path)? {
+fn validate_staged_tree(root: &Dir) -> anyhow::Result<()> {
+  fn visit(directory: &Dir, count: &mut u64) -> anyhow::Result<()> {
+    for entry in directory.entries()? {
       *count += 1;
       ensure_entry_limit(*count)?;
       let entry = entry?;
-      let metadata = fs::symlink_metadata(entry.path())?;
+      let name = entry.file_name();
+      let metadata = directory.symlink_metadata(&name)?;
       if metadata.file_type().is_symlink()
         || (!metadata.is_file() && !metadata.is_dir())
       {
@@ -1280,7 +1444,7 @@ fn validate_staged_tree(root: &Path) -> anyhow::Result<()> {
         ));
       }
       if metadata.is_dir() {
-        visit(&entry.path(), count)?;
+        visit(&directory.open_dir_nofollow(&name)?, count)?;
       }
     }
     Ok(())
@@ -1289,16 +1453,89 @@ fn validate_staged_tree(root: &Path) -> anyhow::Result<()> {
   visit(root, &mut count)
 }
 
-fn create_safe_file(path: &Path) -> anyhow::Result<fs::File> {
-  use std::fs::OpenOptions as StdOpenOptions;
-  let mut options = StdOpenOptions::new();
-  options.write(true).create_new(true);
+fn ensure_capability_directory(
+  root: &Dir,
+  path: &Path,
+) -> anyhow::Result<Dir> {
+  let mut directory = root.try_clone()?;
+  for component in path.components() {
+    let Component::Normal(name) = component else {
+      return Err(anyhow!("Archive entry path is unsafe"));
+    };
+    match directory.create_dir(name) {
+      Ok(()) => {}
+      Err(error)
+        if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+      Err(error) => return Err(error.into()),
+    }
+    directory = directory.open_dir_nofollow(name)?;
+  }
+  Ok(directory)
+}
+
+fn create_capability_file(
+  root: &Dir,
+  path: &Path,
+) -> anyhow::Result<cap_std::fs::File> {
+  let name = path
+    .file_name()
+    .context("Archive entry path has no filename")?;
+  let parent = ensure_capability_directory(
+    root,
+    path.parent().unwrap_or_else(|| Path::new("")),
+  )?;
+  let mut options = OpenOptions::new();
+  options
+    .write(true)
+    .create_new(true)
+    .follow(FollowSymlinks::No);
   #[cfg(unix)]
   {
-    use std::os::unix::fs::OpenOptionsExt as _;
+    use cap_std::fs::OpenOptionsExt as _;
     options.mode(0o600);
   }
-  options.open(path).map_err(Into::into)
+  parent.open_with(name, &options).map_err(Into::into)
+}
+
+fn create_private_capability_directory(
+  parent: &Dir,
+  name: &OsStr,
+) -> std::io::Result<()> {
+  let mut builder = cap_std::fs::DirBuilder::new();
+  #[cfg(unix)]
+  {
+    use cap_std::fs::DirBuilderExt as _;
+    builder.mode(0o700);
+  }
+  parent.create_dir_with(name, &builder)
+}
+
+#[cfg(unix)]
+fn ensure_free_space_capability(
+  directory: &Dir,
+  required: u64,
+) -> anyhow::Result<()> {
+  use std::{mem::MaybeUninit, os::fd::AsRawFd as _};
+  let mut stats = MaybeUninit::<libc::statvfs>::uninit();
+  let result = unsafe {
+    libc::fstatvfs(directory.as_raw_fd(), stats.as_mut_ptr())
+  };
+  if result != 0 {
+    return Err(std::io::Error::last_os_error().into());
+  }
+  let stats = unsafe { stats.assume_init() };
+  super::validate_free_space(
+    stats.f_bavail.saturating_mul(stats.f_frsize),
+    required,
+  )
+}
+
+#[cfg(not(unix))]
+fn ensure_free_space_capability(
+  _directory: &Dir,
+  _required: u64,
+) -> anyhow::Result<()> {
+  Ok(())
 }
 
 #[cfg(test)]
@@ -1376,14 +1613,17 @@ mod tests {
       Dir::open_ambient_dir(&directory, cap_std::ambient_authority())
         .unwrap();
     let rollback_dir = root.open_dir_nofollow("rollback").unwrap();
-    let mut rollback = Vec::new();
+    let mut rollback =
+      PublishRollback::new(&root, &root, &rollback_dir).unwrap();
     let mut backup_index = 0;
 
     let error = publish_staged_entry(
       &root,
       OsStr::new("staging"),
+      Path::new("staging"),
       &root,
       OsStr::new("destination"),
+      Path::new("destination"),
       "destination",
       &rollback_dir,
       &mut backup_index,
@@ -1397,6 +1637,7 @@ mod tests {
       fs::read(directory.join("destination/a-new.txt")).unwrap(),
       b"new"
     );
+    assert_eq!(rollback.actions.len(), 1);
 
     rollback_publish(rollback).unwrap();
     assert!(!directory.join("destination/a-new.txt").exists());
@@ -1409,6 +1650,56 @@ mod tests {
       b"existing"
     );
 
+    fs::remove_dir_all(directory).unwrap();
+  }
+
+  #[cfg(target_os = "linux")]
+  #[test]
+  fn extraction_publish_rollback_uses_bounded_file_descriptors() {
+    let directory =
+      std::env::temp_dir().join(Uuid::new_v4().to_string());
+    fs::create_dir_all(directory.join("staging")).unwrap();
+    fs::create_dir_all(directory.join("destination")).unwrap();
+    fs::create_dir_all(directory.join("rollback")).unwrap();
+    for index in 0..256 {
+      fs::write(
+        directory.join(format!("staging/{index}.txt")),
+        b"contents",
+      )
+      .unwrap();
+    }
+    let root =
+      Dir::open_ambient_dir(&directory, cap_std::ambient_authority())
+        .unwrap();
+    let rollback_dir = root.open_dir_nofollow("rollback").unwrap();
+    let descriptors_before =
+      fs::read_dir("/proc/self/fd").unwrap().count();
+    let mut rollback =
+      PublishRollback::new(&root, &root, &rollback_dir).unwrap();
+
+    publish_staged_entry(
+      &root,
+      OsStr::new("staging"),
+      Path::new("staging"),
+      &root,
+      OsStr::new("destination"),
+      Path::new("destination"),
+      "destination",
+      &rollback_dir,
+      &mut 0,
+      &[],
+      None,
+      &mut rollback,
+    )
+    .unwrap();
+
+    let descriptors_after =
+      fs::read_dir("/proc/self/fd").unwrap().count();
+    assert_eq!(rollback.actions.len(), 256);
+    assert!(descriptors_after <= descriptors_before + 16);
+
+    rollback_publish(rollback).unwrap();
+    assert!(directory.join("staging/255.txt").exists());
     fs::remove_dir_all(directory).unwrap();
   }
 
@@ -1444,18 +1735,22 @@ mod tests {
         action: FileManagerConflictAction::Skip,
       },
     ];
+    let mut publish_rollback =
+      PublishRollback::new(&root, &root, &rollback_dir).unwrap();
 
     publish_staged_entry(
       &root,
       OsStr::new("staging"),
+      Path::new("staging"),
       &root,
       OsStr::new("destination"),
+      Path::new("destination"),
       "destination",
       &rollback_dir,
       &mut 0,
       &decisions,
       None,
-      &mut Vec::new(),
+      &mut publish_rollback,
     )
     .unwrap();
 
@@ -1581,6 +1876,8 @@ mod tests {
     ] {
       let destination = directory.join(format!("extract-{name}"));
       fs::create_dir(&destination).unwrap();
+      let destination_dir =
+        root.open_dir_nofollow(format!("extract-{name}")).unwrap();
       let progress = OperationProgress::new(
         format!("progress-{name}"),
         "Extract archive".into(),
@@ -1592,16 +1889,16 @@ mod tests {
       let source = fs::File::open(directory.join(name)).unwrap();
       match name {
         "archive.zip" => {
-          extract_zip(source, &destination, Some(&progress))
+          extract_zip(source, &destination_dir, Some(&progress))
         }
         "archive.tar" => {
-          extract_tar(source, &destination, Some(&progress))
+          extract_tar(source, &destination_dir, Some(&progress))
         }
         "archive.tar.gz" => {
-          extract_tar_gz(source, &destination, Some(&progress))
+          extract_tar_gz(source, &destination_dir, Some(&progress))
         }
         "archive.7z" => {
-          extract_seven_zip(source, &destination, Some(&progress))
+          extract_seven_zip(source, &destination_dir, Some(&progress))
         }
         _ => unreachable!(),
       }
@@ -1636,9 +1933,15 @@ mod tests {
     archive.write_all(b"safe contents").unwrap();
     archive.finish().unwrap();
 
+    let root =
+      Dir::open_ambient_dir(&directory, cap_std::ambient_authority())
+        .unwrap();
+    let extracted_dir = root.open_dir_nofollow("extracted").unwrap();
+    root.create_dir("reference-directory").unwrap();
+
     extract_zip(
       fs::File::open(&archive_path).unwrap(),
-      &extracted,
+      &extracted_dir,
       None,
     )
     .unwrap();
@@ -1646,6 +1949,30 @@ mod tests {
       fs::read(extracted.join("folder/config.txt")).unwrap(),
       b"safe contents"
     );
+    #[cfg(unix)]
+    {
+      use std::os::unix::fs::PermissionsExt as _;
+      assert_eq!(
+        fs::metadata(extracted.join("folder"))
+          .unwrap()
+          .permissions()
+          .mode()
+          & 0o777,
+        fs::metadata(directory.join("reference-directory"))
+          .unwrap()
+          .permissions()
+          .mode()
+          & 0o777
+      );
+      assert_eq!(
+        fs::metadata(extracted.join("folder/config.txt"))
+          .unwrap()
+          .permissions()
+          .mode()
+          & 0o777,
+        0o600
+      );
+    }
     fs::remove_dir_all(directory).unwrap();
   }
 
@@ -1664,15 +1991,106 @@ mod tests {
     archive.write_all(b"unsafe").unwrap();
     archive.finish().unwrap();
 
+    let root =
+      Dir::open_ambient_dir(&directory, cap_std::ambient_authority())
+        .unwrap();
+    let extracted_dir = root.open_dir_nofollow("extracted").unwrap();
+
     assert!(
       extract_zip(
         fs::File::open(&archive_path).unwrap(),
-        &extracted,
+        &extracted_dir,
         None,
       )
       .is_err()
     );
     assert!(!directory.join("escape.txt").exists());
+    fs::remove_dir_all(directory).unwrap();
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn extraction_uses_the_opened_staging_directory_after_replacement()
+  {
+    use std::os::unix::fs::symlink;
+
+    let directory =
+      std::env::temp_dir().join(Uuid::new_v4().to_string());
+    fs::create_dir_all(directory.join("staging/payload")).unwrap();
+    fs::create_dir_all(directory.join("outside")).unwrap();
+    fs::create_dir_all(directory.join("rollback")).unwrap();
+    let archive_path = directory.join("archive.zip");
+    let file = fs::File::create(&archive_path).unwrap();
+    let mut archive = ZipWriter::new(file);
+    archive
+      .start_file("payload.txt", SimpleFileOptions::default())
+      .unwrap();
+    archive.write_all(b"capability confined").unwrap();
+    archive.finish().unwrap();
+
+    let root =
+      Dir::open_ambient_dir(&directory, cap_std::ambient_authority())
+        .unwrap();
+    let staging = root.open_dir_nofollow("staging").unwrap();
+    let payload = staging.open_dir_nofollow("payload").unwrap();
+    fs::rename(directory.join("staging"), directory.join("held"))
+      .unwrap();
+    symlink(directory.join("outside"), directory.join("staging"))
+      .unwrap();
+
+    extract_zip(
+      fs::File::open(&archive_path).unwrap(),
+      &payload,
+      None,
+    )
+    .unwrap();
+    let rollback = root.open_dir_nofollow("rollback").unwrap();
+    let mut publish_rollback =
+      PublishRollback::new(&staging, &root, &rollback).unwrap();
+    publish_staged_entry(
+      &staging,
+      OsStr::new("payload"),
+      Path::new("payload"),
+      &root,
+      OsStr::new("destination"),
+      Path::new("destination"),
+      "destination",
+      &rollback,
+      &mut 0,
+      &[],
+      None,
+      &mut publish_rollback,
+    )
+    .unwrap();
+    assert_eq!(
+      fs::read(directory.join("destination/payload.txt")).unwrap(),
+      b"capability confined"
+    );
+    assert!(!directory.join("outside/payload.txt").exists());
+    fs::remove_dir_all(directory).unwrap();
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn capability_staging_directories_are_private() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let directory =
+      std::env::temp_dir().join(Uuid::new_v4().to_string());
+    fs::create_dir(&directory).unwrap();
+    let root =
+      Dir::open_ambient_dir(&directory, cap_std::ambient_authority())
+        .unwrap();
+    create_private_capability_directory(&root, OsStr::new("staging"))
+      .unwrap();
+    assert_eq!(
+      fs::metadata(directory.join("staging"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777,
+      0o700
+    );
     fs::remove_dir_all(directory).unwrap();
   }
 
@@ -1719,7 +2137,6 @@ mod tests {
     );
     extract(
       &root,
-      &directory,
       "archive.zip",
       "destination",
       &[],

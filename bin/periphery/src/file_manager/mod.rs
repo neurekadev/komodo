@@ -1,6 +1,5 @@
 use std::{
   collections::{HashMap, HashSet, VecDeque},
-  ffi::OsString,
   fs,
   io::{Read as _, Write as _},
   path::{Component, Path, PathBuf},
@@ -8,7 +7,7 @@ use std::{
     Arc, Mutex as StdMutex, OnceLock, RwLock as StdRwLock,
     atomic::{AtomicBool, Ordering},
   },
-  time::UNIX_EPOCH,
+  time::{Duration, UNIX_EPOCH},
 };
 
 use anyhow::{Context, anyhow};
@@ -36,11 +35,17 @@ use komodo_client::entities::{
   komodo_timestamp, to_path_compatible_name,
 };
 use periphery_client::api::file_manager::{
-  PeripheryFileManagerTarget, StartFileManagerUpload,
+  FileManagerManagedTransactionFinalizeAction,
+  FileManagerManagedTransactionState,
+  FileManagerManagedTransactionStatus, PeripheryFileManagerTarget,
+  StartFileManagerUpload,
 };
 use periphery_client::{
   api::file_manager::StartFileManagerDownloadResponse,
-  transport::{EncodedFileTransferMessage, FileTransferMessage},
+  transport::{
+    EncodedFileTransferMessage, EncodedTransportMessage,
+    FileTransferMessage,
+  },
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -67,8 +72,14 @@ pub const MAX_ARCHIVE_EXPANSION_RATIO: u64 = 1_000;
 pub const MINIMUM_FREE_BYTES: u64 = 256 * 1024 * 1024;
 const PLAN_TTL_MS: i64 = 5 * 60 * 1_000;
 const JOURNAL_TTL_MS: i64 = 24 * 60 * 60 * 1_000;
+const FINALIZED_MANAGED_TRANSACTION_TTL_MS: i64 =
+  30 * 24 * 60 * 60 * 1_000;
 const MAX_HEAVY_JOBS: usize = 2;
 const MAX_READ_JOBS: usize = 4;
+const MAX_DOWNLOAD_CREDITS: u32 = 32;
+const DOWNLOAD_HEARTBEAT_LEASE: Duration = Duration::from_secs(60);
+const FILE_TRANSFER_FINAL_SEND_TIMEOUT: Duration =
+  Duration::from_secs(1);
 
 #[derive(Debug, Clone)]
 pub struct ResolvedRoot {
@@ -103,6 +114,18 @@ struct OperationStatusRecord {
   root_key: String,
   expires_at: i64,
   progress: OperationProgress,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ManagedTransactionRecord {
+  operation_id: String,
+  actor: String,
+  root_key: String,
+  plan_id: String,
+  state: FileManagerManagedTransactionState,
+  affected_paths: Vec<String>,
+  #[serde(default)]
+  finalized_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -406,6 +429,16 @@ struct JournalRecord {
   root_path: PathBuf,
   #[serde(default)]
   managed: bool,
+  /// This managed journal is retained until Core explicitly commits or rolls
+  /// back the corresponding database transaction.
+  #[serde(default)]
+  durable_managed: bool,
+  #[serde(default)]
+  recovery: bool,
+  #[serde(default)]
+  history_side: JournalHistorySide,
+  #[serde(default)]
+  transition: Option<JournalTransition>,
   created_at: i64,
   expires_at: i64,
   description: String,
@@ -415,17 +448,93 @@ struct JournalRecord {
   after_revisions: Vec<(String, Option<FileManagerRevision>)>,
 }
 
+#[derive(
+  Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+enum JournalHistorySide {
+  #[default]
+  Undo,
+  Redo,
+}
+
+#[derive(
+  Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+enum JournalTransition {
+  Undo,
+  Redo,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct JournalSnapshot {
   path: String,
   existed: bool,
   backup_name: String,
+  #[serde(default)]
+  before_metadata: Vec<JournalEntryMetadata>,
+  #[serde(default)]
+  after_metadata: Vec<JournalEntryMetadata>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct JournalEntryMetadata {
+  path: String,
+  mode: u32,
+  uid: u32,
+  gid: u32,
 }
 
 #[derive(Debug, Default)]
 struct JournalHistory {
   undo: Vec<JournalRecord>,
   redo: Vec<JournalRecord>,
+}
+
+impl JournalHistory {
+  fn insert_loaded(&mut self, record: JournalRecord) {
+    if record.recovery
+      || record.history_side == JournalHistorySide::Undo
+    {
+      self.undo.push(record);
+    } else {
+      // Records are loaded oldest-first. Redo is a stack whose newest
+      // element must be replayed last, so insert older redo records at the
+      // back-facing end in reverse order.
+      self.redo.insert(0, record);
+    }
+  }
+}
+
+#[derive(Debug)]
+struct RetainedJournalError {
+  message: String,
+  record: JournalRecord,
+}
+
+impl std::fmt::Display for RetainedJournalError {
+  fn fmt(
+    &self,
+    formatter: &mut std::fmt::Formatter<'_>,
+  ) -> std::fmt::Result {
+    formatter.write_str(&self.message)
+  }
+}
+
+impl std::error::Error for RetainedJournalError {}
+
+struct TemporaryJournalDirectory {
+  path: PathBuf,
+  retained: bool,
+}
+
+impl Drop for TemporaryJournalDirectory {
+  fn drop(&mut self) {
+    if !self.retained {
+      let _ = fs::remove_dir_all(&self.path);
+    }
+  }
 }
 
 struct TemporaryUpload<'a> {
@@ -437,18 +546,37 @@ struct TemporaryUpload<'a> {
 
 struct StreamingUpload {
   parent: Dir,
-  destination_name: OsString,
+  staging: Dir,
   temporary_name: String,
   file: Option<tokio::fs::File>,
+  identity_file: cap_std::fs::File,
+  staging_identity: FileIdentity,
+  identity: FileIdentity,
+  publish_metadata: Option<JournalEntryMetadata>,
   initial_revision: Option<FileManagerRevision>,
   committed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+  device: u64,
+  inode: u64,
 }
 
 impl Drop for StreamingUpload {
   fn drop(&mut self) {
     self.file.take();
-    if !self.committed {
-      let _ = self.parent.remove_file(&self.temporary_name);
+    let _ = self.staging.remove_file("payload");
+    if self
+      .parent
+      .symlink_metadata(&self.temporary_name)
+      .is_ok_and(|metadata| {
+        metadata.is_dir()
+          && !metadata.file_type().is_symlink()
+          && file_identity(&metadata) == self.staging_identity
+      })
+    {
+      let _ = self.parent.remove_dir(&self.temporary_name);
     }
   }
 }
@@ -466,6 +594,14 @@ fn plans() -> &'static Mutex<HashMap<String, OperationPlan>> {
   static PLANS: OnceLock<Mutex<HashMap<String, OperationPlan>>> =
     OnceLock::new();
   PLANS.get_or_init(Default::default)
+}
+
+fn managed_transactions()
+-> &'static Mutex<HashMap<String, ManagedTransactionRecord>> {
+  static TRANSACTIONS: OnceLock<
+    Mutex<HashMap<String, ManagedTransactionRecord>>,
+  > = OnceLock::new();
+  TRANSACTIONS.get_or_init(Default::default)
 }
 
 fn statuses() -> &'static Mutex<HashMap<String, OperationStatusRecord>>
@@ -521,24 +657,58 @@ async fn root_lock(key: &str) -> Arc<Mutex<()>> {
 
 pub async fn initialize() -> anyhow::Result<()> {
   let root = journal_root();
-  let mut records = run_heavy_blocking(move || {
-    fs::create_dir_all(&root)?;
+  let (mut records, transactions) = run_heavy_blocking(move || {
+    ensure_private_directory(&root)?;
     let _ = fs::remove_dir_all(root.join("transfers"));
+    recover_redo_invalidation_batches(&root)?;
+    let managed_root = root.join("managed-transactions");
+    ensure_private_directory(&managed_root)?;
+    let mut transactions = Vec::new();
+    for entry in fs::read_dir(&managed_root)? {
+      let entry = entry?;
+      if !entry.file_type()?.is_file()
+        || entry.path().extension().and_then(|value| value.to_str())
+          != Some("json")
+      {
+        continue;
+      }
+      if let Ok(bytes) = fs::read(entry.path()) {
+        match serde_json::from_slice::<ManagedTransactionRecord>(
+          &bytes,
+        ) {
+          Ok(record)
+            if managed_transaction_is_prunable(
+              &record,
+              komodo_timestamp(),
+            ) =>
+          {
+            let _ = fs::remove_file(entry.path());
+          }
+          Ok(record) => transactions.push(record),
+          Err(error) => warn!(
+            "Retaining unreadable managed transaction marker {}: {error:#}",
+            entry.path().display()
+          ),
+        }
+      }
+    }
     let mut records = Vec::new();
     for entry in fs::read_dir(&root)? {
       let entry = entry?;
       if !entry.file_type()?.is_dir() {
         continue;
       }
-      let manifest = entry.path().join("manifest.json");
-      let record = fs::read(&manifest).ok().and_then(|manifest| {
-        serde_json::from_slice::<JournalRecord>(&manifest).ok()
-      });
+      if entry.file_name() == "managed-transactions" {
+        continue;
+      }
+      if entry.file_name().to_string_lossy().starts_with(".retired-")
+      {
+        let _ = fs::remove_dir_all(entry.path());
+        continue;
+      }
+      let record = read_active_journal_record(&entry.path());
       match record {
-        Some(record)
-          if !record.managed
-            && record.expires_at > komodo_timestamp() =>
-        {
+        Some(record) if journal_is_unexpired(&record) => {
           records.push(record);
         }
         _ => {
@@ -546,19 +716,24 @@ pub async fn initialize() -> anyhow::Result<()> {
         }
       }
     }
-    Ok(records)
+    Ok((records, transactions))
   })
   .await?;
   records.sort_by_key(|record| record.created_at);
   let mut loaded = histories().lock().await;
   for record in records {
-    loaded
+    let history = loaded
       .entry(history_key(&record.root_key, &record.actor))
-      .or_default()
-      .undo
-      .push(record);
+      .or_default();
+    history.insert_loaded(record);
   }
   drop(loaded);
+  let mut loaded_transactions = managed_transactions().lock().await;
+  for transaction in transactions {
+    loaded_transactions
+      .insert(transaction.operation_id.clone(), transaction);
+  }
+  drop(loaded_transactions);
 
   tokio::spawn(async {
     let mut interval =
@@ -571,6 +746,7 @@ pub async fn initialize() -> anyhow::Result<()> {
         histories.values_mut().flat_map(prune_history).collect()
       };
       schedule_journal_cleanup(expired);
+      prune_finalized_managed_transactions().await;
     }
   });
   Ok(())
@@ -587,8 +763,14 @@ pub fn limits() -> FileManagerLimits {
   }
 }
 
+#[cfg(not(test))]
 pub(super) fn max_entries() -> u64 {
   periphery_config().file_manager_max_entries.get()
+}
+
+#[cfg(test)]
+pub(super) fn max_entries() -> u64 {
+  1_000_000
 }
 
 pub(super) fn ensure_entry_limit(entries: u64) -> anyhow::Result<()> {
@@ -736,6 +918,145 @@ fn journal_root() -> PathBuf {
     .join("file-manager-journal")
 }
 
+fn managed_transaction_root() -> PathBuf {
+  journal_root().join("managed-transactions")
+}
+
+fn managed_transaction_path(operation_id: &str) -> anyhow::Result<PathBuf> {
+  let id = Uuid::parse_str(operation_id)
+    .context("Managed transaction id is invalid")?;
+  Ok(managed_transaction_root().join(format!("{id}.json")))
+}
+
+fn persist_managed_transaction(
+  record: &ManagedTransactionRecord,
+) -> anyhow::Result<()> {
+  let root = managed_transaction_root();
+  ensure_private_directory(&root)?;
+  let destination = managed_transaction_path(&record.operation_id)?;
+  let temporary = root.join(format!(
+    ".{}.{}.tmp",
+    record.operation_id,
+    Uuid::new_v4()
+  ));
+  write_private_file(&temporary, &serde_json::to_vec_pretty(record)?)?;
+  fs::rename(&temporary, &destination)?;
+  #[cfg(unix)]
+  fs::File::open(&root)?.sync_all()?;
+  Ok(())
+}
+
+fn managed_transaction_status_from_record(
+  record: &ManagedTransactionRecord,
+) -> FileManagerManagedTransactionStatus {
+  FileManagerManagedTransactionStatus {
+    operation_id: record.operation_id.clone(),
+    state: record.state,
+  }
+}
+
+fn managed_transaction_is_open(
+  state: FileManagerManagedTransactionState,
+) -> bool {
+  !matches!(
+    state,
+    FileManagerManagedTransactionState::RolledBack
+      | FileManagerManagedTransactionState::Committed
+  )
+}
+
+fn managed_transaction_is_prunable(
+  record: &ManagedTransactionRecord,
+  now: i64,
+) -> bool {
+  matches!(
+    record.state,
+    FileManagerManagedTransactionState::RolledBack
+      | FileManagerManagedTransactionState::Committed
+  ) && record.finalized_at.is_some_and(|finalized_at| {
+    finalized_at + FINALIZED_MANAGED_TRANSACTION_TTL_MS < now
+  })
+}
+
+fn ensure_private_directory(path: &Path) -> anyhow::Result<()> {
+  #[cfg(unix)]
+  {
+    use std::os::unix::fs::{
+      DirBuilderExt as _, PermissionsExt as _,
+    };
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true).mode(0o700).create(path)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+  }
+  #[cfg(not(unix))]
+  fs::create_dir_all(path)?;
+  Ok(())
+}
+
+fn create_private_directory(path: &Path) -> anyhow::Result<()> {
+  #[cfg(unix)]
+  {
+    use std::os::unix::fs::{
+      DirBuilderExt as _, PermissionsExt as _,
+    };
+    let mut builder = fs::DirBuilder::new();
+    builder.mode(0o700).create(path)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+  }
+  #[cfg(not(unix))]
+  fs::create_dir(path)?;
+  Ok(())
+}
+
+fn create_private_capability_directory(
+  parent: &Dir,
+  name: &str,
+) -> anyhow::Result<()> {
+  let mut builder = cap_std::fs::DirBuilder::new();
+  #[cfg(unix)]
+  {
+    use cap_std::fs::DirBuilderExt as _;
+    builder.mode(0o700);
+  }
+  parent.create_dir_with(name, &builder)?;
+  Ok(())
+}
+
+pub(super) fn create_private_file(
+  path: &Path,
+) -> anyhow::Result<fs::File> {
+  let mut options = fs::OpenOptions::new();
+  options.write(true).create_new(true);
+  #[cfg(unix)]
+  {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    options.mode(0o600);
+  }
+  options.open(path).map_err(Into::into)
+}
+
+fn write_private_file(
+  path: &Path,
+  contents: &[u8],
+) -> anyhow::Result<()> {
+  let mut options = fs::OpenOptions::new();
+  options.write(true).create(true).truncate(true);
+  #[cfg(unix)]
+  {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    options.mode(0o600);
+  }
+  let mut file = options.open(path)?;
+  #[cfg(unix)]
+  {
+    use std::os::unix::fs::PermissionsExt as _;
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+  }
+  file.write_all(contents)?;
+  file.sync_all()?;
+  Ok(())
+}
+
 const PRIVATE_JOURNAL_OVERLAP_REASON: &str = "File Manager target overlaps protected Periphery private journal data and cannot be opened";
 
 fn ensure_outside_private_journal(
@@ -791,6 +1112,34 @@ fn path_identity(path: &Path) -> anyhow::Result<Option<(u64, u64)>> {
     cap_fs_ext::MetadataExt::dev(&metadata),
     cap_fs_ext::MetadataExt::ino(&metadata),
   )))
+}
+
+fn file_identity(metadata: &Metadata) -> FileIdentity {
+  FileIdentity {
+    device: metadata.dev(),
+    inode: metadata.ino(),
+  }
+}
+
+fn verify_upload_staging_identity(
+  parent: &Dir,
+  name: impl AsRef<Path>,
+  expected: FileIdentity,
+) -> anyhow::Result<()> {
+  let name = name.as_ref();
+  let metadata = parent.symlink_metadata(name).map_err(|error| {
+    anyhow!(error)
+      .context("Upload staging file moved while streaming")
+  })?;
+  if !metadata.is_file()
+    || metadata.file_type().is_symlink()
+    || file_identity(&metadata) != expected
+  {
+    return Err(anyhow!(
+      "Upload staging file changed while streaming"
+    ));
+  }
+  Ok(())
 }
 
 fn open_root(
@@ -867,7 +1216,9 @@ pub async fn list_directory(
       let name = entry.file_name().into_string().map_err(|_| {
         anyhow!("Non-UTF-8 filenames are unsupported")
       })?;
-      if name.starts_with(".komodo-file-manager-staging-") {
+      if name.starts_with(".komodo-file-manager-staging-")
+        || name.starts_with(".komodo-upload-")
+      {
         continue;
       }
       ensure_entry_limit(entries.len() as u64 + 1)?;
@@ -914,7 +1265,10 @@ pub async fn read_text(
     let relative = relative_path(&path, false)?;
     let root_dir = open_root(&root, false)?;
     let (parent, name) = open_parent_nofollow(&root_dir, &relative)?;
-    let metadata = parent.symlink_metadata(&name)?;
+    let mut options = OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    let mut file = parent.open_with(&name, &options)?;
+    let metadata = file.metadata()?;
     if !metadata.is_file() {
       return Err(anyhow!("Path is not a regular file"));
     }
@@ -923,11 +1277,7 @@ pub async fn read_text(
         "File is too large for the editor; download it instead"
       ));
     }
-    let mut options = OpenOptions::new();
-    options.read(true).follow(FollowSymlinks::No);
-    let mut file = parent.open_with(&name, &options)?;
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.read_to_end(&mut bytes)?;
+    let bytes = read_bounded(&mut file, MAX_TEXT_BYTES)?;
     if bytes.contains(&0) {
       return Err(anyhow!(
         "Binary files cannot be opened in the editor"
@@ -944,6 +1294,22 @@ pub async fn read_text(
   .await
 }
 
+fn read_bounded(
+  reader: &mut impl std::io::Read,
+  maximum: u64,
+) -> anyhow::Result<Vec<u8>> {
+  let mut bytes = Vec::new();
+  reader
+    .take(maximum.saturating_add(1))
+    .read_to_end(&mut bytes)?;
+  if bytes.len() as u64 > maximum {
+    return Err(anyhow!(
+      "File is too large for the editor; download it instead"
+    ));
+  }
+  Ok(bytes)
+}
+
 pub async fn preflight(
   target: &PeripheryFileManagerTarget,
   actor: String,
@@ -953,7 +1319,7 @@ pub async fn preflight(
   if root.read_only {
     return Err(anyhow!("This File Manager root is read-only"));
   }
-  let operation = normalize_operation(operation);
+  let operation = normalize_operation(operation)?;
   validate_operation(&root, &operation)?;
   let root_key = root.key.clone();
   let plan_root_key = root.key.clone();
@@ -1009,7 +1375,477 @@ pub async fn preflight(
     expires_at,
     conflicts,
     confirmation_required,
+    supports_durable_managed_transactions: true,
   })
+}
+
+pub async fn begin_managed_transaction(
+  target: &PeripheryFileManagerTarget,
+  actor: &str,
+  operation_id: &str,
+  plan_id: &str,
+) -> anyhow::Result<FileManagerManagedTransactionStatus> {
+  Uuid::parse_str(operation_id)
+    .context("Managed transaction id is invalid")?;
+  let root = resolve_root(target).await?;
+  if root.read_only || root.managed_file.is_none() {
+    return Err(anyhow!(
+      "Crash-durable coordination is available only for managed files"
+    ));
+  }
+  let plan = {
+    let plans = plans().lock().await;
+    let plan = plans.get(plan_id).context(
+      "Preflight plan is missing, expired, or already consumed",
+    )?;
+    if plan.actor != actor {
+      return Err(anyhow!("Preflight plan belongs to another user"));
+    }
+    if plan.root_key != root.key {
+      return Err(anyhow!(
+        "Preflight plan belongs to another File Manager target"
+      ));
+    }
+    if plan.expires_at < komodo_timestamp() {
+      return Err(anyhow!("Preflight plan has expired"));
+    }
+    if !operation_edits_managed_file(&root, &plan.operation) {
+      return Err(anyhow!(
+        "Crash-durable coordination requires a managed-file write"
+      ));
+    }
+    plan.clone()
+  };
+  let mut transactions = managed_transactions().lock().await;
+  if let Some(existing) = transactions.get(operation_id) {
+    if existing.actor != actor
+      || existing.root_key != root.key
+      || existing.plan_id != plan_id
+    {
+      return Err(anyhow!(
+        "Managed transaction id belongs to another operation"
+      ));
+    }
+    return Ok(managed_transaction_status_from_record(existing));
+  }
+  if transactions.values().any(|transaction| {
+    transaction.root_key == root.key
+      && managed_transaction_is_open(transaction.state)
+  }) {
+    return Err(anyhow!(
+      "Another managed save is still being reconciled for this stack"
+    ));
+  }
+  let record = ManagedTransactionRecord {
+    operation_id: operation_id.to_string(),
+    actor: actor.to_string(),
+    root_key: root.key,
+    plan_id: plan_id.to_string(),
+    state: FileManagerManagedTransactionState::Prepared,
+    affected_paths: affected_paths_planned(
+      &plan.operation,
+      &plan.copy_targets,
+    ),
+    finalized_at: None,
+  };
+  persist_managed_transaction(&record)?;
+  let status = managed_transaction_status_from_record(&record);
+  transactions.insert(operation_id.to_string(), record);
+  Ok(status)
+}
+
+pub async fn managed_transaction_status(
+  target: &PeripheryFileManagerTarget,
+  actor: &str,
+  operation_id: &str,
+) -> anyhow::Result<Option<FileManagerManagedTransactionStatus>> {
+  Uuid::parse_str(operation_id)
+    .context("Managed transaction id is invalid")?;
+  let root = resolve_root(target).await?;
+  let transactions = managed_transactions().lock().await;
+  let Some(record) = transactions.get(operation_id) else {
+    return Ok(None);
+  };
+  if record.actor != actor || record.root_key != root.key {
+    return Err(anyhow!("Managed transaction was not found"));
+  }
+  Ok(Some(managed_transaction_status_from_record(record)))
+}
+
+async fn take_exact_managed_journal(
+  root_key: &str,
+  actor: &str,
+  operation_id: &str,
+) -> anyhow::Result<Option<JournalRecord>> {
+  let key = history_key(root_key, actor);
+  {
+    let mut histories = histories().lock().await;
+    if let Some(history) = histories.get_mut(&key) {
+      if let Some(position) = history
+        .undo
+        .iter()
+        .rposition(|record| record.id == operation_id)
+      {
+        return Ok(Some(history.undo.remove(position)));
+      }
+      if let Some(position) = history
+        .redo
+        .iter()
+        .rposition(|record| record.id == operation_id)
+      {
+        return Ok(Some(history.redo.remove(position)));
+      }
+    }
+  }
+  let directory = journal_root().join(operation_id);
+  if !directory.exists() {
+    return Ok(None);
+  }
+  read_active_journal_record(&directory)
+    .map(Some)
+    .context(
+      "Managed transaction journal exists but is unreadable; state is indeterminate",
+    )
+}
+
+fn validate_exact_managed_journal(
+  record: &JournalRecord,
+  root: &ResolvedRoot,
+  actor: &str,
+  operation_id: &str,
+) -> anyhow::Result<()> {
+  if record.id != operation_id
+    || record.actor != actor
+    || record.root_key != root.key
+    || !record.managed
+    || !record.durable_managed
+  {
+    return Err(anyhow!(
+      "Managed transaction journal does not match the requested operation"
+    ));
+  }
+  Ok(())
+}
+
+async fn persist_managed_transaction_state(
+  operation_id: &str,
+  state: FileManagerManagedTransactionState,
+) -> anyhow::Result<FileManagerManagedTransactionStatus> {
+  let mut transactions = managed_transactions().lock().await;
+  let record = transactions
+    .get_mut(operation_id)
+    .context("Managed transaction disappeared while finalizing")?;
+  let previous_state = record.state;
+  let previous_finalized_at = record.finalized_at;
+  record.state = state;
+  record.finalized_at = matches!(
+    state,
+    FileManagerManagedTransactionState::RolledBack
+      | FileManagerManagedTransactionState::Committed
+  )
+  .then(komodo_timestamp);
+  if let Err(error) = persist_managed_transaction(record) {
+    record.state = previous_state;
+    record.finalized_at = previous_finalized_at;
+    return Err(error);
+  }
+  Ok(managed_transaction_status_from_record(record))
+}
+
+pub async fn finalize_managed_transaction(
+  target: &PeripheryFileManagerTarget,
+  actor: &str,
+  operation_id: &str,
+  action: FileManagerManagedTransactionFinalizeAction,
+) -> anyhow::Result<FileManagerManagedTransactionStatus> {
+  Uuid::parse_str(operation_id)
+    .context("Managed transaction id is invalid")?;
+  let root = resolve_root(target).await?;
+  let lock = root_lock(&root.key).await;
+  let _guard = lock.lock_owned().await;
+  let initial_state = {
+    let transactions = managed_transactions().lock().await;
+    let record = transactions
+      .get(operation_id)
+      .context("Managed transaction was not found")?;
+    if record.actor != actor || record.root_key != root.key {
+      return Err(anyhow!("Managed transaction was not found"));
+    }
+    record.state
+  };
+
+  match action {
+    FileManagerManagedTransactionFinalizeAction::Commit => {
+      if initial_state == FileManagerManagedTransactionState::Committed
+      {
+        return Ok(FileManagerManagedTransactionStatus {
+          operation_id: operation_id.to_string(),
+          state: initial_state,
+        });
+      }
+      if !matches!(
+        initial_state,
+        FileManagerManagedTransactionState::Applied
+          | FileManagerManagedTransactionState::CommitRequested
+      ) {
+        return Err(anyhow!(
+          "Managed transaction is not ready to commit"
+        ));
+      }
+      let retrying = initial_state
+        == FileManagerManagedTransactionState::CommitRequested;
+      if !retrying {
+        persist_managed_transaction_state(
+          operation_id,
+          FileManagerManagedTransactionState::CommitRequested,
+        )
+        .await?;
+      }
+      let journal = take_exact_managed_journal(
+        &root.key,
+        actor,
+        operation_id,
+      )
+      .await?;
+      match journal {
+        Some(record) => {
+          validate_exact_managed_journal(
+            &record,
+            &root,
+            actor,
+            operation_id,
+          )?;
+          if record.recovery || record.transition.is_some() {
+            store_journal_by_side(
+              &history_key(&root.key, actor),
+              record,
+            )
+            .await;
+            return Err(anyhow!(
+              "Managed transaction journal is not fully applied"
+            ));
+          }
+          let id = record.id.clone();
+          if let Err(error) =
+            run_heavy_blocking(move || retire_journal_directory(&id))
+              .await
+          {
+            store_journal_by_side(
+              &history_key(&root.key, actor),
+              record,
+            )
+            .await;
+            return Err(error);
+          }
+        }
+        None if !retrying => {
+          return Err(anyhow!(
+            "Managed transaction journal is missing; state is indeterminate"
+          ));
+        }
+        None => {}
+      }
+      persist_managed_transaction_state(
+        operation_id,
+        FileManagerManagedTransactionState::Committed,
+      )
+      .await
+    }
+    FileManagerManagedTransactionFinalizeAction::Rollback => {
+      if initial_state == FileManagerManagedTransactionState::RolledBack
+      {
+        return Ok(FileManagerManagedTransactionStatus {
+          operation_id: operation_id.to_string(),
+          state: initial_state,
+        });
+      }
+      if matches!(
+        initial_state,
+        FileManagerManagedTransactionState::CommitRequested
+          | FileManagerManagedTransactionState::Committed
+      ) {
+        return Err(anyhow!(
+          "Committed managed transaction cannot be rolled back"
+        ));
+      }
+      persist_managed_transaction_state(
+        operation_id,
+        FileManagerManagedTransactionState::RollbackRequested,
+      )
+      .await?;
+      let journal = take_exact_managed_journal(
+        &root.key,
+        actor,
+        operation_id,
+      )
+      .await?;
+      if let Some(record) = journal {
+        validate_exact_managed_journal(
+          &record,
+          &root,
+          actor,
+          operation_id,
+        )?;
+        let rollback_root = root.clone();
+        let outcome = run_heavy_blocking(move || {
+          let mut record = record;
+          let result = (|| {
+            let root_dir = open_root(&rollback_root, true)?;
+            if !record.recovery && record.transition.is_none() {
+              verify_revisions(
+                &root_dir,
+                &record.after_revisions,
+                "Managed rollback is unsafe because files changed after the operation",
+              )?;
+              begin_journal_transition(
+                &mut record,
+                JournalTransition::Undo,
+              )?;
+            }
+            restore_journal(&root_dir, &record, None)?;
+            retire_journal_directory(&record.id)
+          })();
+          Ok((record, result))
+        })
+        .await?;
+        if let (record, Err(error)) = outcome {
+          store_journal_by_side(
+            &history_key(&root.key, actor),
+            record,
+          )
+          .await;
+          return Err(error);
+        }
+      } else if initial_state
+        == FileManagerManagedTransactionState::Applied
+      {
+        return Err(anyhow!(
+          "Applied managed transaction journal is missing; state is indeterminate"
+        ));
+      }
+      persist_managed_transaction_state(
+        operation_id,
+        FileManagerManagedTransactionState::RolledBack,
+      )
+      .await
+    }
+  }
+}
+
+enum DurableCommitDisposition {
+  Start,
+  Existing(
+    periphery_client::api::file_manager::FileManagerCommitResponse,
+  ),
+}
+
+async fn prepare_durable_managed_commit(
+  root: &ResolvedRoot,
+  actor: &str,
+  operation_id: &str,
+  plan_id: &str,
+) -> anyhow::Result<DurableCommitDisposition> {
+  let mut transactions = managed_transactions().lock().await;
+  let record = transactions
+    .get_mut(operation_id)
+    .context("Managed transaction handshake is missing")?;
+  if record.actor != actor
+    || record.root_key != root.key
+    || record.plan_id != plan_id
+  {
+    return Err(anyhow!(
+      "Managed transaction belongs to another operation"
+    ));
+  }
+  match record.state {
+    FileManagerManagedTransactionState::Prepared => {
+      let previous = record.state;
+      record.state = FileManagerManagedTransactionState::Applying;
+      if let Err(error) = persist_managed_transaction(record) {
+        record.state = previous;
+        return Err(error);
+      }
+      Ok(DurableCommitDisposition::Start)
+    }
+    FileManagerManagedTransactionState::Applying
+    | FileManagerManagedTransactionState::Applied => {
+      Ok(DurableCommitDisposition::Existing(
+        periphery_client::api::file_manager::FileManagerCommitResponse {
+          operation_id: operation_id.to_string(),
+          affected_paths: record.affected_paths.clone(),
+          undoable: false,
+        },
+      ))
+    }
+    FileManagerManagedTransactionState::RollbackRequested
+    | FileManagerManagedTransactionState::RolledBack => Err(anyhow!(
+      "Managed transaction has already been rolled back"
+    )),
+    FileManagerManagedTransactionState::CommitRequested
+    | FileManagerManagedTransactionState::Committed => {
+      Err(anyhow!(
+        "Managed transaction has already been committed"
+      ))
+    }
+  }
+}
+
+async fn finish_durable_managed_apply(
+  operation_id: &str,
+  succeeded: bool,
+  rollback_retained: bool,
+) -> anyhow::Result<()> {
+  let mut transactions = managed_transactions().lock().await;
+  let record = transactions
+    .get_mut(operation_id)
+    .context("Managed transaction disappeared while applying")?;
+  let previous = record.state;
+  let previous_finalized_at = record.finalized_at;
+  record.state = if succeeded {
+    match record.state {
+      FileManagerManagedTransactionState::Applying => {
+        FileManagerManagedTransactionState::Applied
+      }
+      FileManagerManagedTransactionState::RollbackRequested => {
+        return Err(anyhow!(
+          "Managed transaction rollback was requested while applying"
+        ));
+      }
+      state => {
+        return Err(anyhow!(
+          "Managed transaction reached invalid apply state {state:?}"
+        ));
+      }
+    }
+  } else if rollback_retained {
+    FileManagerManagedTransactionState::RollbackRequested
+  } else {
+    FileManagerManagedTransactionState::RolledBack
+  };
+  record.finalized_at = (record.state
+    == FileManagerManagedTransactionState::RolledBack)
+    .then(komodo_timestamp);
+  if let Err(error) = persist_managed_transaction(record) {
+    record.state = previous;
+    record.finalized_at = previous_finalized_at;
+    return Err(error);
+  }
+  Ok(())
+}
+
+async fn ensure_durable_managed_apply_is_current(
+  operation_id: &str,
+) -> anyhow::Result<()> {
+  let transactions = managed_transactions().lock().await;
+  let record = transactions
+    .get(operation_id)
+    .context("Managed transaction disappeared before apply")?;
+  if record.state != FileManagerManagedTransactionState::Applying {
+    return Err(anyhow!(
+      "Managed transaction is no longer authorized to apply"
+    ));
+  }
+  Ok(())
 }
 
 pub async fn commit(
@@ -1019,15 +1855,44 @@ pub async fn commit(
   plan_id: &str,
   decisions: &[FileManagerConflictDecision],
   confirmed: bool,
+  durable_managed: bool,
 ) -> anyhow::Result<
   periphery_client::api::file_manager::FileManagerCommitResponse,
 > {
-  let plan = plans().lock().await.remove(plan_id).context(
-    "Preflight plan is missing, expired, or already consumed",
-  )?;
-  if plan.actor != actor {
-    return Err(anyhow!("Preflight plan belongs to another user"));
+  let root = resolve_root(target).await?;
+  if durable_managed {
+    match prepare_durable_managed_commit(
+      &root,
+      actor,
+      operation_id,
+      plan_id,
+    )
+    .await?
+    {
+      DurableCommitDisposition::Start => {}
+      DurableCommitDisposition::Existing(response) => {
+        return Ok(response);
+      }
+    }
   }
+  let plan = {
+    let mut plans = plans().lock().await;
+    match take_owned_plan(&mut plans, plan_id, actor) {
+      Ok(plan) => plan,
+      Err(error) => {
+        drop(plans);
+        if durable_managed {
+          let _ = finish_durable_managed_apply(
+            operation_id,
+            false,
+            false,
+          )
+          .await;
+        }
+        return Err(error);
+      }
+    }
+  };
   if plan.expires_at < komodo_timestamp() {
     return Err(anyhow!("Preflight plan has expired"));
   }
@@ -1036,10 +1901,24 @@ pub async fn commit(
   }
   validate_conflict_decisions(&plan.conflicts, decisions)?;
 
-  let root = resolve_root(target).await?;
   if root.key != plan.root_key || root.read_only {
     return Err(anyhow!(
       "File Manager target changed after preflight"
+    ));
+  }
+  if !durable_managed
+    && operation_edits_managed_file(&root, &plan.operation)
+    && managed_transactions()
+      .lock()
+      .await
+      .values()
+      .any(|transaction| {
+        transaction.root_key == root.key
+          && managed_transaction_is_open(transaction.state)
+      })
+  {
+    return Err(anyhow!(
+      "Another managed save is still being reconciled for this stack"
     ));
   }
   let progress = register_status(
@@ -1052,6 +1931,7 @@ pub async fn commit(
   let root_key = root.key.clone();
   let actor = actor.to_string();
   let operation_id = operation_id.to_string();
+  let durable_operation_id = operation_id.clone();
   let decisions = decisions.to_vec();
   let job_progress = progress.clone();
   let response =
@@ -1085,6 +1965,14 @@ pub async fn commit(
     };
     let lock = root_lock(&root_key).await;
     let guard = lock.lock_owned().await;
+    if durable_managed
+      && let Err(error) =
+        ensure_durable_managed_apply_is_current(&operation_id).await
+    {
+      progress.fail(&error);
+      return;
+    }
+    let rollback_root = root.clone();
     let result = run_heavy_blocking(move || {
       job_progress.check_cancelled()?;
       job_progress.phase(
@@ -1092,15 +1980,11 @@ pub async fn commit(
         WorkTotal::default(),
       );
       let root_dir = open_root(&root, true)?;
-      for (path, expected) in &plan.revisions {
-        job_progress.check_cancelled()?;
-        let actual = metadata_tree_revision(&root_dir, path)?;
-        if &actual != expected {
-          return Err(anyhow!(
-            "File Manager contents changed after preflight; retry the operation"
-          ));
-        }
-      }
+      verify_plan_revisions(
+        &root_dir,
+        &plan.revisions,
+        Some(&job_progress),
+      )?;
       ensure_operation_capacity(
         &root,
         &root_dir,
@@ -1122,86 +2006,159 @@ pub async fn commit(
         &operation_id,
         &plan.operation,
         &plan.copy_targets,
+        durable_managed,
         Some(&job_progress),
       )?;
       job_progress.add_temporary_storage_bytes(snapshot_total.bytes);
-      job_progress.check_cancelled()?;
-      job_progress.phase(
-        FileManagerOperationPhase::Applying,
-        operation_work(
+      if let Err(error) = job_progress.check_cancelled() {
+        retire_journal_directory(&journal.id).context(
+          "Cancelled snapshot journal could not be retired",
+        )?;
+        return Err(error);
+      }
+      let operation_total = match operation_work(
+        &root_dir,
+        &plan.operation,
+        &plan.copy_targets,
+      ) {
+        Ok(total) => total,
+        Err(error) => {
+          retire_journal_directory(&journal.id).context(
+            "Unused snapshot journal could not be retired",
+          )?;
+          return Err(error);
+        }
+      };
+      job_progress
+        .phase(FileManagerOperationPhase::Applying, operation_total);
+      if let Err(error) = verify_plan_revisions(
+        &root_dir,
+        &plan.revisions,
+        Some(&job_progress),
+      ) {
+        retire_journal_directory(&journal.id).context(
+          "Stale preflight snapshot journal could not be retired",
+        )?;
+        return Err(error);
+      }
+      let operation_result = (|| {
+        apply_operation_planned(
           &root_dir,
           &plan.operation,
           &plan.copy_targets,
-        )?,
-      );
-      let apply_result = apply_operation_planned(
-        &root_dir,
-        Some(&root.path),
-        &plan.operation,
-        &plan.copy_targets,
-        &decisions,
-        Some(&job_progress),
-      );
-      match apply_result {
-        Ok(()) => {
-          job_progress.check_cancelled()?;
-          if plan.operation.is_undoable() || journal.managed {
-            job_progress.phase(
-              FileManagerOperationPhase::Finalizing,
-              work_for_paths(
-                &root_dir,
-                &watched_paths_planned(
-                  &plan.operation,
-                  &plan.copy_targets,
-                )?,
-              )?,
-            );
-            let journal = match finish_journal(
-              &root_dir,
-              journal.clone(),
-              Some(&job_progress),
-            ) {
-              Ok(journal) => journal,
-              Err(error) => {
-                job_progress.phase(
-                  FileManagerOperationPhase::RollingBack,
-                  WorkTotal::default(),
-                );
-                let _ = restore_journal(&root_dir, &journal, None);
-                let _ = fs::remove_dir_all(
-                  journal_root().join(&journal.id),
-                );
-                return Err(error);
-              }
-            };
-            Ok((Some(journal), guard))
-          } else {
-            let _ =
-              fs::remove_dir_all(journal_root().join(&journal.id));
-            Ok((None, guard))
-          }
+          &decisions,
+          Some(&job_progress),
+        )?;
+        job_progress.check_cancelled()?;
+        if plan.operation.is_undoable() || journal.managed {
+          let finalizing_total = work_for_paths(
+            &root_dir,
+            &watched_paths_planned(
+              &plan.operation,
+              &plan.copy_targets,
+            )?,
+          )?;
+          job_progress.phase(
+            FileManagerOperationPhase::Finalizing,
+            finalizing_total,
+          );
+          Ok(Some(finish_journal(
+            &root_dir,
+            journal.clone(),
+            Some(&job_progress),
+          )?))
+        } else {
+          retire_journal_directory(&journal.id)?;
+          Ok(None)
         }
+      })();
+      match operation_result {
+        Ok(journal) => Ok((journal, guard)),
         Err(error) => {
           job_progress.phase(
             FileManagerOperationPhase::RollingBack,
             snapshot_total,
           );
-          let _ = restore_journal(
-            &root_dir,
-            &journal,
-            Some(&job_progress),
-          );
-          let _ =
-            fs::remove_dir_all(journal_root().join(&journal.id));
-          Err(error)
+          Err(rollback_or_retain(&root_dir, journal, error))
         }
       }
     })
     .await;
     let result = match result {
-      Ok((Some(journal), _guard)) => push_journal(journal).await,
+      Ok((Some(journal), _guard)) => {
+        let rollback_record = journal.clone();
+        match push_journal(journal).await {
+          Ok(()) => Ok(()),
+          Err(error) => {
+            remove_journal_from_history(&rollback_record).await;
+            let rollback_record_for_failure = rollback_record.clone();
+            let rollback_record_for_runner = rollback_record.clone();
+            let registration_error = format!("{error:#}");
+            let rollback_error = match run_heavy_blocking(move || {
+              let error = match open_root(&rollback_root, true) {
+                Ok(root_dir) => rollback_or_retain(
+                  &root_dir,
+                  rollback_record,
+                  error,
+                ),
+                Err(restore_error) => retain_after_rollback_failure(
+                  rollback_record_for_failure,
+                  error,
+                  restore_error,
+                ),
+              };
+              Ok(error)
+            })
+            .await
+            {
+              Ok(error) => error,
+              Err(error) => retain_after_rollback_failure(
+                rollback_record_for_runner,
+                anyhow!(registration_error),
+                error,
+              ),
+            };
+            if let Some(record) = retained_journal(&rollback_error) {
+              store_journal_by_side(
+                &history_key(&record.root_key, &record.actor),
+                record,
+              )
+              .await;
+            }
+            Err(rollback_error)
+          }
+        }
+      }
       Ok((None, _guard)) => Ok(()),
-      Err(error) => Err(error),
+      Err(error) => {
+        if let Some(record) = retained_journal(&error) {
+          store_journal_by_side(
+            &history_key(&record.root_key, &record.actor),
+            record,
+          )
+          .await;
+        }
+        Err(error)
+      }
+    };
+    let rollback_retained = result
+      .as_ref()
+      .err()
+      .and_then(retained_journal)
+      .is_some();
+    let result = if durable_managed {
+      match finish_durable_managed_apply(
+        &durable_operation_id,
+        result.is_ok(),
+        rollback_retained,
+      )
+      .await
+      {
+        Ok(()) => result,
+        Err(error) => Err(error),
+      }
+    } else {
+      result
     };
     match &result {
       Ok(()) => progress.complete(),
@@ -1209,6 +2166,22 @@ pub async fn commit(
     }
   });
   Ok(response)
+}
+
+fn take_owned_plan(
+  plans: &mut HashMap<String, OperationPlan>,
+  plan_id: &str,
+  actor: &str,
+) -> anyhow::Result<OperationPlan> {
+  let plan = plans.get(plan_id).context(
+    "Preflight plan is missing, expired, or already consumed",
+  )?;
+  if plan.actor != actor {
+    return Err(anyhow!("Preflight plan belongs to another user"));
+  }
+  plans.remove(plan_id).context(
+    "Preflight plan is missing, expired, or already consumed",
+  )
 }
 
 pub async fn operation_status(
@@ -1336,10 +2309,16 @@ pub async fn journal_status(
     let mut histories = histories().lock().await;
     let history = histories.entry(key).or_default();
     let expired = prune_history(history);
-    let visible_undo =
-      history.undo.iter().rev().find(|record| !record.managed);
-    let visible_redo =
-      history.redo.iter().rev().find(|record| !record.managed);
+    let visible_undo = history
+      .undo
+      .iter()
+      .rev()
+      .find(|record| journal_is_visible(record));
+    let visible_redo = history
+      .redo
+      .iter()
+      .rev()
+      .find(|record| journal_is_visible(record));
     let status = FileManagerJournalStatus {
       can_undo: visible_undo.is_some(),
       can_redo: visible_redo.is_some(),
@@ -1347,15 +2326,17 @@ pub async fn journal_status(
         .undo
         .iter()
         .rev()
-        .find(|record| !record.managed)
+        .find(|record| journal_is_visible(record))
         .map(|r| r.description.clone()),
       redo_description: history
         .redo
         .iter()
         .rev()
-        .find(|record| !record.managed)
+        .find(|record| journal_is_visible(record))
         .map(|record| record.description.clone()),
-      expires_at: visible_undo.map(|record| record.expires_at),
+      expires_at: visible_undo
+        .filter(|record| !record.recovery)
+        .map(|record| record.expires_at),
       retained_storage_bytes: 0,
       storage_description: match target {
         PeripheryFileManagerTarget::Stack { .. } => "Stack files resolve beneath PERIPHERY_STACK_DIR, or PERIPHERY_ROOT_DIRECTORY/stacks by default. Recovery records use private File Manager journal storage. Absolute host paths remain server-side.".into(),
@@ -1412,16 +2393,21 @@ pub async fn undo(
     let mut histories = histories().lock().await;
     let history = histories.entry(key.clone()).or_default();
     let expired = prune_history(history);
-    let position = rollback_operation_id
-      .and_then(|id| {
+    let position = match rollback_operation_id {
+      Some(id) => {
         history.undo.iter().rposition(|record| record.id == id)
-      })
-      .or_else(|| {
-        history.undo.iter().rposition(|record| !record.managed)
-      });
+      }
+      None => history.undo.iter().rposition(journal_is_visible),
+    };
     let record = position
       .map(|position| history.undo.remove(position))
-      .context("Nothing is available to undo");
+      .with_context(|| {
+        if rollback_operation_id.is_some() {
+          "Requested File Manager rollback is unavailable"
+        } else {
+          "Nothing is available to undo"
+        }
+      });
     (record, expired)
   };
   schedule_journal_cleanup(expired);
@@ -1443,7 +2429,7 @@ pub async fn undo(
         .iter()
         .map(|snapshot| snapshot.path.clone())
         .collect(),
-      undoable: true,
+      undoable: !record.recovery,
     };
   tokio::spawn(async move {
     let lock = root_lock(&root_key).await;
@@ -1455,6 +2441,19 @@ pub async fn undo(
           .unwrap_or_default();
       let result = (|| {
         let root_dir = open_root(&root, true)?;
+        if record.recovery {
+          job_progress.phase(
+            FileManagerOperationPhase::Applying,
+            restore_total,
+          );
+          ensure_free_space(
+            &root.path,
+            restore_total.bytes.saturating_add(MINIMUM_FREE_BYTES),
+          )?;
+          restore_journal(&root_dir, &record, Some(&job_progress))?;
+          retire_journal_directory(&record.id)?;
+          return Ok(());
+        }
         let redo_total = work_for_paths(
           &root_dir,
           &record
@@ -1476,8 +2475,12 @@ pub async fn undo(
         )?;
         capture_redo_journal(
           &root_dir,
-          &record,
+          &mut record,
           Some(&job_progress),
+        )?;
+        begin_journal_transition(
+          &mut record,
+          JournalTransition::Undo,
         )?;
         job_progress
           .phase(FileManagerOperationPhase::Applying, restore_total);
@@ -1488,6 +2491,10 @@ pub async fn undo(
         restore_journal(&root_dir, &record, Some(&job_progress))?;
         record.before_revisions =
           capture_snapshot_revisions(&root_dir, &record.snapshots)?;
+        complete_journal_transition(
+          &mut record,
+          JournalHistorySide::Redo,
+        )?;
         Ok(())
       })();
       Ok((record, result, guard))
@@ -1496,26 +2503,18 @@ pub async fn undo(
     let (record, result, _guard) = match outcome {
       Ok(outcome) => outcome,
       Err(error) => {
-        histories()
-          .lock()
-          .await
-          .entry(key)
-          .or_default()
-          .undo
-          .push(fallback_record);
+        store_journal_by_side(&key, fallback_record).await;
         progress.fail(&error);
         return;
       }
     };
     if let Err(error) = result {
-      histories()
-        .lock()
-        .await
-        .entry(key)
-        .or_default()
-        .undo
-        .push(record);
+      store_journal_by_side(&key, record).await;
       progress.fail(&error);
+      return;
+    }
+    if record.recovery {
+      progress.complete();
       return;
     }
     histories()
@@ -1560,7 +2559,7 @@ pub async fn redo(
     let record = history
       .redo
       .iter()
-      .rposition(|record| !record.managed)
+      .rposition(journal_is_visible)
       .map(|position| history.redo.remove(position))
       .context("Nothing is available to redo");
     (record, expired)
@@ -1606,6 +2605,10 @@ pub async fn redo(
           &record.before_revisions,
           "Redo is unsafe because files changed after undo",
         )?;
+        begin_journal_transition(
+          &mut record,
+          JournalTransition::Redo,
+        )?;
         restore_after_journal(
           &root_dir,
           &record,
@@ -1613,6 +2616,10 @@ pub async fn redo(
         )?;
         record.after_revisions =
           capture_snapshot_revisions(&root_dir, &record.snapshots)?;
+        complete_journal_transition(
+          &mut record,
+          JournalHistorySide::Undo,
+        )?;
         Ok(())
       })();
       Ok((record, result, guard))
@@ -1621,25 +2628,13 @@ pub async fn redo(
     let (record, result, _guard) = match outcome {
       Ok(outcome) => outcome,
       Err(error) => {
-        histories()
-          .lock()
-          .await
-          .entry(key)
-          .or_default()
-          .redo
-          .push(fallback_record);
+        store_journal_by_side(&key, fallback_record).await;
         progress.fail(&error);
         return;
       }
     };
     if let Err(error) = result {
-      histories()
-        .lock()
-        .await
-        .entry(key)
-        .or_default()
-        .redo
-        .push(record);
+      store_journal_by_side(&key, record).await;
       progress.fail(&error);
       return;
     }
@@ -1674,6 +2669,35 @@ pub async fn handle_transfer_message(
   if sender.send(message).await.is_err() {
     file_transfer_channels().remove(&channel).await;
   }
+}
+
+async fn send_file_transfer_final_with_timeout(
+  sender: &transport::channel::Sender<EncodedTransportMessage>,
+  channel: Uuid,
+  data: anyhow::Result<Vec<u8>>,
+  timeout: Duration,
+) {
+  let _ = tokio::time::timeout(
+    timeout,
+    sender.send_file_transfer(channel, data),
+  )
+  .await;
+}
+
+fn spawn_file_transfer_final(
+  sender: transport::channel::Sender<EncodedTransportMessage>,
+  channel: Uuid,
+  data: anyhow::Result<Vec<u8>>,
+) {
+  tokio::spawn(async move {
+    send_file_transfer_final_with_timeout(
+      &sender,
+      channel,
+      data,
+      FILE_TRANSFER_FINAL_SEND_TIMEOUT,
+    )
+    .await;
+  });
 }
 
 pub async fn start_upload(
@@ -1726,13 +2750,11 @@ pub async fn start_upload(
       if begin != FileTransferMessage::Begin {
         return Err(anyhow!("Upload did not begin correctly"));
       }
-      let lock = root_lock(&root.key).await;
-      let guard = lock.lock_owned().await;
       let prepare_root = root.clone();
       let prepare_relative = relative.clone();
       let prepare_path = path.clone();
       let prepare_expected_revision = expected_revision.clone();
-      let (guard, mut upload) = run_heavy_blocking(move || {
+      let mut upload = run_heavy_blocking(move || {
         let root_dir = open_root(&prepare_root, true)?;
         let (parent, destination_name) =
           open_parent_nofollow(&root_dir, &prepare_relative)?;
@@ -1747,6 +2769,29 @@ pub async fn start_upload(
         if !overwrite && initial_revision.is_some() {
           return Err(anyhow!("Upload destination already exists"));
         }
+        let publish_metadata = match parent
+          .symlink_metadata(&destination_name)
+        {
+          Ok(metadata)
+            if metadata.is_file()
+              && !metadata.file_type().is_symlink() =>
+          {
+            if initial_revision.as_ref() != Some(&revision(&metadata))
+            {
+              return Err(anyhow!(
+                "Upload destination changed while preparing"
+              ));
+            }
+            recorded_file_metadata(&metadata)
+          }
+          Ok(_) => None,
+          Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound =>
+          {
+            None
+          }
+          Err(error) => return Err(error.into()),
+        };
         let before_bytes = work_for_paths(
           &root_dir,
           std::slice::from_ref(&prepare_path),
@@ -1760,24 +2805,53 @@ pub async fn start_upload(
           },
         )?;
         let temporary_name =
-          format!(".komodo-upload-{}.tmp", Uuid::new_v4());
-        let mut options = OpenOptions::new();
-        options
-          .write(true)
-          .create_new(true)
-          .follow(FollowSymlinks::No);
-        let file = parent.open_with(&temporary_name, &options)?;
-        Ok((
-          guard,
-          StreamingUpload {
-            parent,
-            destination_name,
-            temporary_name,
-            file: Some(tokio::fs::File::from_std(file.into_std())),
-            initial_revision,
-            committed: false,
-          },
-        ))
+          format!(".komodo-upload-{}", Uuid::new_v4());
+        create_private_capability_directory(
+          &parent,
+          &temporary_name,
+        )?;
+        let prepared = (|| {
+          let staging = parent.open_dir_nofollow(&temporary_name)?;
+          let staging_identity =
+            file_identity(&staging.dir_metadata()?);
+          let mut options = OpenOptions::new();
+          options
+            .write(true)
+            .create_new(true)
+            .follow(FollowSymlinks::No);
+          let file = staging.open_with("payload", &options)?;
+          let identity = file_identity(&file.metadata()?);
+          let identity_file = file.try_clone()?;
+          anyhow::Ok((
+            staging,
+            staging_identity,
+            file,
+            identity_file,
+            identity,
+          ))
+        })();
+        if prepared.is_err() {
+          let _ = parent.remove_dir_all(&temporary_name);
+        }
+        let (
+          staging,
+          staging_identity,
+          file,
+          identity_file,
+          identity,
+        ) = prepared?;
+        Ok(StreamingUpload {
+          parent,
+          staging,
+          temporary_name,
+          file: Some(tokio::fs::File::from_std(file.into_std())),
+          identity_file,
+          staging_identity,
+          identity,
+          publish_metadata,
+          initial_revision,
+          committed: false,
+        })
       })
       .await?;
       progress.phase(
@@ -1829,13 +2903,12 @@ pub async fn start_upload(
               ));
             }
             use tokio::io::AsyncWriteExt as _;
-            let mut file = upload
+            let file = upload
               .file
-              .take()
+              .as_mut()
               .context("Upload staging file is unavailable")?;
             file.flush().await?;
             file.sync_all().await?;
-            drop(file);
             progress.phase(
               FileManagerOperationPhase::Finalizing,
               WorkTotal {
@@ -1846,7 +2919,13 @@ pub async fn start_upload(
             let finalize_root = root.clone();
             let finalize_actor = actor.clone();
             let finalize_path = path.clone();
+            let finalize_relative = relative.clone();
+            progress.check_cancelled()?;
+            let lock = root_lock(&root.key).await;
+            let guard = lock.lock_owned().await;
+            let finalize_progress = progress.clone();
             let (message, _guard) = run_heavy_blocking(move || {
+              finalize_progress.check_cancelled()?;
               let root_dir = open_root(&finalize_root, true)?;
               if metadata_tree_revision(&root_dir, &finalize_path)?
                 != upload.initial_revision
@@ -1855,6 +2934,29 @@ pub async fn start_upload(
                   "Upload destination changed while streaming"
                 ));
               }
+              let (publish_parent, destination_name) =
+                open_parent_nofollow(&root_dir, &finalize_relative)?;
+              let staging_metadata = publish_parent
+                .symlink_metadata(&upload.temporary_name)
+                .map_err(|error| {
+                  anyhow!(error).context(
+                    "Upload staging directory moved while streaming",
+                  )
+                })?;
+              if !staging_metadata.is_dir()
+                || staging_metadata.file_type().is_symlink()
+                || file_identity(&staging_metadata)
+                  != upload.staging_identity
+              {
+                return Err(anyhow!(
+                  "Upload staging directory changed while streaming"
+                ));
+              }
+              verify_upload_staging_identity(
+                &upload.staging,
+                "payload",
+                upload.identity,
+              )?;
               let operation = FileManagerOperation::CreateFile {
                 path: finalize_path.clone(),
               };
@@ -1864,41 +2966,86 @@ pub async fn start_upload(
                 &Uuid::new_v4().to_string(),
                 &operation,
                 &[],
+                false,
                 None,
               )?;
+              if metadata_tree_revision(&root_dir, &finalize_path)?
+                != upload.initial_revision
+              {
+                retire_journal_directory(&journal.id).context(
+                  "Unused upload journal could not be retired",
+                )?;
+                return Err(anyhow!(
+                  "Upload destination changed while finalizing"
+                ));
+              }
               let commit = (|| {
-                if upload
-                  .parent
-                  .symlink_metadata(&upload.destination_name)
-                  .is_ok()
+                if let Some(metadata) = &upload.publish_metadata {
+                  apply_recorded_file_metadata(
+                    &upload.identity_file,
+                    metadata,
+                    false,
+                  )?;
+                  upload.identity_file.sync_all()?;
+                }
+                let destination_metadata = match publish_parent
+                  .symlink_metadata(&destination_name)
                 {
+                  Ok(metadata) => Some(metadata),
+                  Err(error)
+                    if error.kind()
+                      == std::io::ErrorKind::NotFound =>
+                  {
+                    None
+                  }
+                  Err(error) => return Err(error.into()),
+                };
+                if let Some(metadata) = destination_metadata {
                   if !overwrite {
                     return Err(anyhow!(
                       "Upload destination changed while streaming"
                     ));
                   }
-                  remove_entry(
-                    &upload.parent,
-                    &upload.destination_name,
-                  )?;
+                  if !metadata.is_file()
+                    || metadata.file_type().is_symlink()
+                  {
+                    remove_entry(&publish_parent, &destination_name)?;
+                  }
                 }
-                upload.parent.rename(
-                  &upload.temporary_name,
-                  &upload.parent,
-                  &upload.destination_name,
+                verify_upload_staging_identity(
+                  &upload.staging,
+                  "payload",
+                  upload.identity,
+                )?;
+                upload.staging.rename(
+                  "payload",
+                  &publish_parent,
+                  &destination_name,
                 )?;
                 upload.committed = true;
+                verify_upload_staging_identity(
+                  &publish_parent,
+                  &destination_name,
+                  upload.identity,
+                )?;
                 anyhow::Ok(())
               })();
               if let Err(error) = commit {
-                let _ = restore_journal(&root_dir, &journal, None);
-                let _ = fs::remove_dir_all(
-                  journal_root().join(&journal.id),
-                );
-                return Err(error);
+                return Err(rollback_or_retain(
+                  &root_dir, journal, error,
+                ));
               }
-              let _ =
-                fs::remove_dir_all(journal_root().join(&journal.id));
+              if let Err(error) =
+                retire_journal_directory(&journal.id)
+              {
+                return Err(rollback_or_retain(
+                  &root_dir,
+                  journal,
+                  error.context(
+                    "Published upload journal could not be retired",
+                  ),
+                ));
+              }
               Ok((
                 FileTransferMessage::Complete {
                   bytes: received,
@@ -1914,13 +3061,26 @@ pub async fn start_upload(
           FileTransferMessage::Cancel => {
             return Err(anyhow!("Upload was cancelled"));
           }
-          FileTransferMessage::Begin => {
-            return Err(anyhow!("Duplicate upload begin message"));
+          FileTransferMessage::Begin
+          | FileTransferMessage::BeginWithCredit { .. }
+          | FileTransferMessage::BeginWithCreditAndHeartbeat { .. }
+          | FileTransferMessage::Credit { .. }
+          | FileTransferMessage::Heartbeat => {
+            return Err(anyhow!("Unexpected upload control message"));
           }
         }
       }
     }
     .await;
+    if let Some(record) =
+      result.as_ref().err().and_then(retained_journal)
+    {
+      store_journal_by_side(
+        &history_key(&record.root_key, &record.actor),
+        record,
+      )
+      .await;
+    }
     match &result {
       Ok(_) => progress.complete(),
       Err(error) if error.to_string().contains("cancel") => {
@@ -1929,13 +3089,11 @@ pub async fn start_upload(
       Err(error) => progress.fail(error),
     }
     file_transfer_channels().remove(&channel).await;
-    let _ = connection
-      .sender
-      .send_file_transfer(
-        channel,
-        result.map(FileTransferMessage::into_raw),
-      )
-      .await;
+    spawn_file_transfer_final(
+      connection.sender.clone(),
+      channel,
+      result.map(FileTransferMessage::into_raw),
+    );
   });
   Ok(channel)
 }
@@ -1946,6 +3104,7 @@ pub async fn start_download(
   actor: String,
   operation_id: String,
   paths: Vec<String>,
+  allow_managed: bool,
 ) -> anyhow::Result<StartFileManagerDownloadResponse> {
   if paths.is_empty() {
     return Err(anyhow!("Select at least one entry to download"));
@@ -1955,6 +3114,7 @@ pub async fn start_download(
     .managed_file
     .as_ref()
     .is_some_and(|managed| paths.iter().any(|path| path == managed))
+    && !allow_managed
   {
     return Err(anyhow!(
       "The managed compose file is available only through the editor"
@@ -1981,7 +3141,7 @@ pub async fn start_download(
     let staging = journal_root()
       .join("transfers")
       .join(Uuid::new_v4().to_string());
-    fs::create_dir_all(&staging)?;
+    ensure_private_directory(&staging)?;
     let result = (|| {
       ensure_free_space(
         &staging,
@@ -2068,29 +3228,53 @@ pub async fn start_download(
       .await
       .context("Download did not begin before timeout")?
       .context("Download channel closed")??;
-      if begin != FileTransferMessage::Begin {
-        return Err(anyhow!("Download did not begin correctly"));
-      }
+      let (mut available_credits, heartbeat_enabled) =
+        download_begin_mode(begin)?;
       let mut file = tokio::fs::File::open(&staged).await?;
       let mut buffer = vec![0_u8; 256 * 1024];
       let mut sent = 0_u64;
       use tokio::io::AsyncReadExt as _;
       loop {
-        match receiver.try_recv() {
-          Ok(Ok(FileTransferMessage::Cancel)) => {
-            return Err(anyhow!("Download was cancelled"));
-          }
-          Ok(Ok(_)) => {
-            return Err(anyhow!(
-              "Unexpected download control message"
-            ));
-          }
-          Ok(Err(error)) => return Err(error),
-          Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
-          Err(
-            tokio::sync::mpsc::error::TryRecvError::Disconnected,
-          ) => {
-            return Err(anyhow!("Download channel closed"));
+        progress.check_cancelled()?;
+        if available_credits == Some(0) {
+          available_credits = Some(
+            wait_for_download_credit(
+              &mut receiver,
+              &progress,
+              heartbeat_enabled,
+            )
+            .await?,
+          );
+        }
+        loop {
+          match receiver.try_recv() {
+            Ok(Ok(FileTransferMessage::Credit { credits }))
+              if available_credits.is_some() =>
+            {
+              available_credits = Some(add_download_credits(
+                available_credits.unwrap_or_default(),
+                credits,
+              )?);
+            }
+            Ok(Ok(FileTransferMessage::Cancel)) => {
+              return Err(anyhow!("Download was cancelled"));
+            }
+            Ok(Ok(FileTransferMessage::Heartbeat))
+              if heartbeat_enabled => {}
+            Ok(Ok(_)) => {
+              return Err(anyhow!(
+                "Unexpected download control message"
+              ));
+            }
+            Ok(Err(error)) => return Err(error),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+              break;
+            }
+            Err(
+              tokio::sync::mpsc::error::TryRecvError::Disconnected,
+            ) => {
+              return Err(anyhow!("Download channel closed"));
+            }
           }
         }
         let read = file.read(&mut buffer).await?;
@@ -2099,7 +3283,7 @@ pub async fn start_download(
         }
         sent += read as u64;
         progress.add_bytes(read as u64);
-        connection
+        let send = connection
           .sender
           .send_file_transfer(
             channel,
@@ -2107,28 +3291,30 @@ pub async fn start_download(
               FileTransferMessage::Chunk(buffer[..read].to_vec())
                 .into_raw(),
             ),
-          )
-          .await?;
+          );
+        if heartbeat_enabled {
+          tokio::time::timeout(DOWNLOAD_HEARTBEAT_LEASE, send)
+            .await
+            .context(
+              "Download connection liveness expired while sending",
+            )??;
+        } else {
+          send.await?;
+        }
+        if let Some(credits) = &mut available_credits {
+          *credits -= 1;
+        }
       }
       if sent != total_bytes {
         return Err(anyhow!(
           "Download byte count changed while streaming"
         ));
       }
-      connection
-        .sender
-        .send_file_transfer(
-          channel,
-          Ok(
-            FileTransferMessage::Complete {
-              bytes: sent,
-              sha256,
-            }
-            .into_raw(),
-          ),
-        )
-        .await?;
-      anyhow::Ok(())
+      progress.check_cancelled()?;
+      anyhow::Ok(FileTransferMessage::Complete {
+        bytes: sent,
+        sha256,
+      })
     }
     .await;
     match &result {
@@ -2138,25 +3324,107 @@ pub async fn start_download(
       }
       Err(error) => progress.fail(error),
     }
-    if let Err(error) = result {
-      let _ = connection
-        .sender
-        .send_file_transfer(channel, Err(error))
-        .await;
-    }
     file_transfer_channels().remove(&channel).await;
     let _ = run_heavy_blocking(move || {
       let _ = fs::remove_dir_all(staging);
       Ok(())
     })
     .await;
+    spawn_file_transfer_final(
+      connection.sender.clone(),
+      channel,
+      result.map(FileTransferMessage::into_raw),
+    );
   });
   Ok(StartFileManagerDownloadResponse {
     channel,
     file_name,
     total_bytes,
     sha256: hex::encode(sha256),
+    supports_download_credit: true,
+    supports_download_heartbeat: true,
   })
+}
+
+fn add_download_credits(
+  current: u32,
+  additional: u32,
+) -> anyhow::Result<u32> {
+  if additional == 0 {
+    return Err(anyhow!("Download credit must be greater than zero"));
+  }
+  Ok(current.saturating_add(additional).min(MAX_DOWNLOAD_CREDITS))
+}
+
+fn download_begin_mode(
+  begin: FileTransferMessage,
+) -> anyhow::Result<(Option<u32>, bool)> {
+  match begin {
+    FileTransferMessage::Begin => Ok((None, false)),
+    FileTransferMessage::BeginWithCredit { credits } => {
+      Ok((Some(add_download_credits(0, credits)?), false))
+    }
+    FileTransferMessage::BeginWithCreditAndHeartbeat { credits } => {
+      Ok((Some(add_download_credits(0, credits)?), true))
+    }
+    _ => Err(anyhow!("Download did not begin correctly")),
+  }
+}
+
+async fn wait_for_download_credit(
+  receiver: &mut tokio::sync::mpsc::Receiver<
+    anyhow::Result<FileTransferMessage>,
+  >,
+  progress: &OperationProgress,
+  heartbeat_enabled: bool,
+) -> anyhow::Result<u32> {
+  wait_for_download_credit_with_lease(
+    receiver,
+    progress,
+    heartbeat_enabled,
+    DOWNLOAD_HEARTBEAT_LEASE,
+  )
+  .await
+}
+
+async fn wait_for_download_credit_with_lease(
+  receiver: &mut tokio::sync::mpsc::Receiver<
+    anyhow::Result<FileTransferMessage>,
+  >,
+  progress: &OperationProgress,
+  heartbeat_enabled: bool,
+  lease: Duration,
+) -> anyhow::Result<u32> {
+  let mut deadline = tokio::time::Instant::now() + lease;
+  loop {
+    progress.check_cancelled()?;
+    let message = tokio::select! {
+      biased;
+      _ = tokio::time::sleep_until(deadline), if heartbeat_enabled => {
+        return Err(anyhow!("Download connection heartbeat expired"));
+      }
+      message = receiver.recv() => {
+        message.context("Download channel closed")??
+      }
+      _ = tokio::time::sleep(Duration::from_millis(250)) => {
+        continue;
+      }
+    };
+    match message {
+      FileTransferMessage::Credit { credits } => {
+        return add_download_credits(0, credits);
+      }
+      FileTransferMessage::Cancel => {
+        return Err(anyhow!("Download was cancelled"));
+      }
+      FileTransferMessage::Heartbeat if heartbeat_enabled => {
+        deadline = tokio::time::Instant::now() + lease;
+      }
+      _ => {
+        return Err(anyhow!("Unexpected download control message"));
+      }
+    }
+  }
 }
 
 fn hash_host_file(path: &Path) -> anyhow::Result<[u8; 32]> {
@@ -2198,7 +3466,7 @@ fn ensure_archive_extension(
 
 fn normalize_operation(
   mut operation: FileManagerOperation,
-) -> FileManagerOperation {
+) -> anyhow::Result<FileManagerOperation> {
   if let FileManagerOperation::CreateArchive {
     destination,
     format,
@@ -2207,7 +3475,34 @@ fn normalize_operation(
   {
     *destination = ensure_archive_extension(destination, *format);
   }
-  operation
+  match &mut operation {
+    FileManagerOperation::Delete { paths }
+    | FileManagerOperation::Move { paths, .. } => {
+      *paths = normalize_redundant_paths(paths)?;
+    }
+    _ => {}
+  }
+  Ok(operation)
+}
+
+fn normalize_redundant_paths(
+  paths: &[String],
+) -> anyhow::Result<Vec<String>> {
+  let parsed = paths
+    .iter()
+    .map(|path| relative_path(path, false))
+    .collect::<anyhow::Result<Vec<_>>>()?;
+  let mut normalized = Vec::new();
+  for (index, path) in parsed.iter().enumerate() {
+    let duplicate = parsed[..index].contains(path);
+    let has_selected_ancestor = parsed
+      .iter()
+      .any(|other| other != path && path.starts_with(other));
+    if !duplicate && !has_selected_ancestor {
+      normalized.push(path_string(path)?);
+    }
+  }
+  Ok(normalized)
 }
 
 fn duplicate_name(
@@ -2614,7 +3909,6 @@ fn apply_operation(
   let copy_targets = direct_copy_targets(operation)?;
   apply_operation_planned(
     root,
-    None,
     operation,
     &copy_targets,
     decisions,
@@ -2624,7 +3918,6 @@ fn apply_operation(
 
 fn apply_operation_planned(
   root: &Dir,
-  root_path: Option<&Path>,
   operation: &FileManagerOperation,
   copy_targets: &[CopyTarget],
   decisions: &[FileManagerConflictDecision],
@@ -2753,7 +4046,7 @@ fn apply_operation_planned(
     } => {
       let path = relative_path(path, false)?;
       let (parent, name) = open_parent_nofollow(root, &path)?;
-      match parent.symlink_metadata(&name) {
+      let existing_metadata = match parent.symlink_metadata(&name) {
         Ok(metadata) => {
           if !metadata.is_file() || metadata.file_type().is_symlink()
           {
@@ -2762,6 +4055,7 @@ fn apply_operation_planned(
           let mut read_options = OpenOptions::new();
           read_options.read(true).follow(FollowSymlinks::No);
           let mut current = parent.open_with(&name, &read_options)?;
+          let metadata = current.metadata()?;
           let mut current_bytes = Vec::new();
           current.read_to_end(&mut current_bytes)?;
           if content_revision(&metadata, &current_bytes)
@@ -2771,12 +4065,16 @@ fn apply_operation_planned(
               "File changed since it was opened; reload before saving"
             ));
           }
+          Some(metadata)
         }
         Err(error)
           if error.kind() == std::io::ErrorKind::NotFound
-            && expected_revision.id.is_empty() => {}
+            && expected_revision.id.is_empty() =>
+        {
+          None
+        }
         Err(error) => return Err(error.into()),
-      }
+      };
 
       let temporary =
         format!(".komodo-file-manager-{}.tmp", Uuid::new_v4());
@@ -2792,11 +4090,24 @@ fn apply_operation_planned(
         file: Some(file),
         committed: false,
       };
-      temporary_write
-        .file
-        .as_mut()
-        .context("Text staging file is unavailable")?
-        .write_all(contents.as_bytes())?;
+      {
+        let file = temporary_write
+          .file
+          .as_mut()
+          .context("Text staging file is unavailable")?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_data()?;
+      }
+      if let Some(metadata) = existing_metadata.as_ref() {
+        apply_capability_file_metadata(
+          temporary_write
+            .file
+            .as_ref()
+            .context("Text staging file is unavailable")?,
+          metadata,
+          false,
+        )?;
+      }
       temporary_write
         .file
         .take()
@@ -2822,14 +4133,7 @@ fn apply_operation_planned(
       progress,
     )?,
     FileManagerOperation::ExtractArchive { path, destination } => {
-      archive::extract(
-        root,
-        root_path.context("Extraction root path is unavailable")?,
-        path,
-        destination,
-        decisions,
-        progress,
-      )?
+      archive::extract(root, path, destination, decisions, progress)?
     }
   }
   Ok(())
@@ -2957,6 +4261,7 @@ fn copy_entry(
     read_options.read(true).follow(FollowSymlinks::No);
     let mut source =
       source_parent.open_with(source_name, &read_options)?;
+    let source_metadata = source.metadata()?;
     let mut write_options = OpenOptions::new();
     write_options
       .write(true)
@@ -2977,6 +4282,11 @@ fn copy_entry(
         progress.add_bytes(read as u64);
       }
     }
+    apply_capability_file_metadata(
+      &destination,
+      &source_metadata,
+      false,
+    )?;
     destination.sync_all()?;
     let mut destination = destination_parent
       .open_with(destination_name, &read_options)?;
@@ -2995,8 +4305,9 @@ fn copy_entry(
       ));
     }
   } else if metadata.is_dir() {
-    destination_parent.create_dir(destination_name)?;
     let source = source_parent.open_dir_nofollow(source_name)?;
+    let source_metadata = source.dir_metadata()?;
+    destination_parent.create_dir(destination_name)?;
     let destination =
       destination_parent.open_dir_nofollow(destination_name)?;
     for entry in source.entries()? {
@@ -3004,6 +4315,13 @@ fn copy_entry(
       let name = entry.file_name();
       copy_entry(&source, &name, &destination, &name, progress)?;
     }
+    let destination_file = destination.open(".")?;
+    apply_capability_file_metadata(
+      &destination_file,
+      &source_metadata,
+      true,
+    )?;
+    destination_file.sync_all()?;
   } else {
     return Err(anyhow!(
       "Special filesystem entries cannot be copied"
@@ -3012,6 +4330,52 @@ fn copy_entry(
   if let Some(progress) = progress {
     progress.add_entry();
   }
+  Ok(())
+}
+
+#[cfg(unix)]
+fn apply_capability_file_metadata(
+  file: &cap_std::fs::File,
+  metadata: &Metadata,
+  preserve_privilege_bits: bool,
+) -> anyhow::Result<()> {
+  use cap_std::fs::PermissionsExt as _;
+  use std::os::fd::AsRawFd as _;
+
+  let current = file.metadata()?;
+  let uid = cap_std::fs::MetadataExt::uid(metadata);
+  let gid = cap_std::fs::MetadataExt::gid(metadata);
+  if cap_std::fs::MetadataExt::uid(&current) != uid
+    || cap_std::fs::MetadataExt::gid(&current) != gid
+  {
+    let result = unsafe {
+      libc::fchown(
+        file.as_raw_fd(),
+        uid as libc::uid_t,
+        gid as libc::gid_t,
+      )
+    };
+    if result != 0 {
+      return Err(std::io::Error::last_os_error())
+        .context("Failed to preserve filesystem ownership");
+    }
+  }
+  let mode = cap_std::fs::MetadataExt::mode(metadata)
+    & if preserve_privilege_bits {
+      0o7777
+    } else {
+      0o1777
+    };
+  file.set_permissions(cap_std::fs::Permissions::from_mode(mode))?;
+  Ok(())
+}
+
+#[cfg(not(unix))]
+fn apply_capability_file_metadata(
+  _file: &cap_std::fs::File,
+  _metadata: &Metadata,
+  _preserve_privilege_bits: bool,
+) -> anyhow::Result<()> {
   Ok(())
 }
 
@@ -3139,12 +4503,7 @@ fn journal_paths_planned(
   operation: &FileManagerOperation,
   copy_targets: &[CopyTarget],
 ) -> anyhow::Result<Vec<String>> {
-  if matches!(operation, FileManagerOperation::ExtractArchive { .. })
-  {
-    Ok(Vec::new())
-  } else {
-    watched_paths_planned(operation, copy_targets)
-  }
+  watched_paths_planned(operation, copy_targets)
 }
 
 fn operation_work(
@@ -3363,6 +4722,25 @@ fn revision_paths_planned(
   Ok(paths)
 }
 
+fn verify_plan_revisions(
+  root: &Dir,
+  revisions: &[(String, Option<FileManagerRevision>)],
+  progress: Option<&OperationProgress>,
+) -> anyhow::Result<()> {
+  for (path, expected) in revisions {
+    if let Some(progress) = progress {
+      progress.check_cancelled()?;
+    }
+    let actual = metadata_tree_revision(root, path)?;
+    if &actual != expected {
+      return Err(anyhow!(
+        "File Manager contents changed after preflight; retry the operation"
+      ));
+    }
+  }
+  Ok(())
+}
+
 fn affected_paths_planned(
   operation: &FileManagerOperation,
   copy_targets: &[CopyTarget],
@@ -3387,48 +4765,108 @@ fn create_journal(
   id: &str,
   operation: &FileManagerOperation,
   copy_targets: &[CopyTarget],
+  durable_managed: bool,
   progress: Option<&OperationProgress>,
 ) -> anyhow::Result<JournalRecord> {
-  let directory = journal_root().join(id).join("before");
-  fs::create_dir_all(&directory)?;
-  let root_dir = open_root(root, true)?;
-  let mut snapshots = Vec::new();
-  let mut before_revisions = Vec::new();
-  let mut watched = journal_paths_planned(operation, copy_targets)?;
-  watched.sort();
-  watched.dedup();
-  for (index, path) in watched.into_iter().enumerate() {
-    let relative = relative_path(&path, false)?;
-    let backup_name = index.to_string();
-    let backup = directory.join(&backup_name);
-    let before_revision = tree_revision(&root_dir, &path)?;
-    let existed = before_revision.is_some();
-    if existed {
-      backup_from_capability(
-        &root_dir, &relative, &backup, progress,
-      )?;
+  let journal_root = journal_root();
+  ensure_private_directory(&journal_root)?;
+  let operation_directory = journal_root.join(id);
+  create_private_directory(&operation_directory)?;
+  let mut cleanup = TemporaryJournalDirectory {
+    path: operation_directory.clone(),
+    retained: false,
+  };
+  let result = (|| {
+    let directory = operation_directory.join("before");
+    create_private_directory(&directory)?;
+    let root_dir = open_root(root, true)?;
+    let mut snapshots = Vec::new();
+    let mut before_revisions = Vec::new();
+    let mut watched = journal_paths_planned(operation, copy_targets)?;
+    watched.sort();
+    watched.dedup();
+    for (index, path) in watched.into_iter().enumerate() {
+      let relative = relative_path(&path, false)?;
+      let backup_name = index.to_string();
+      let backup = directory.join(&backup_name);
+      let before_revision = tree_revision(&root_dir, &path)?;
+      let existed = before_revision.is_some();
+      let before_metadata = if existed {
+        capture_journal_metadata(&root_dir, &relative)?
+      } else {
+        Vec::new()
+      };
+      if existed {
+        backup_from_capability(
+          &root_dir, &relative, &backup, progress,
+        )?;
+      }
+      snapshots.push(JournalSnapshot {
+        path: path.clone(),
+        existed,
+        backup_name,
+        before_metadata,
+        after_metadata: Vec::new(),
+      });
+      before_revisions.push((path, before_revision));
     }
-    snapshots.push(JournalSnapshot {
-      path: path.clone(),
-      existed,
-      backup_name,
-    });
-    before_revisions.push((path, before_revision));
+    let created_at = komodo_timestamp();
+    let record = JournalRecord {
+      id: id.to_string(),
+      actor: actor.to_string(),
+      root_key: root.key.clone(),
+      root_path: root.path.clone(),
+      managed: operation_edits_managed_file(root, operation),
+      durable_managed: durable_managed
+        && operation_edits_managed_file(root, operation),
+      recovery: true,
+      history_side: JournalHistorySide::Undo,
+      transition: None,
+      created_at,
+      expires_at: created_at + JOURNAL_TTL_MS,
+      description: operation_description(operation),
+      snapshots,
+      before_revisions,
+      after_revisions: Vec::new(),
+    };
+    let mut recovery_record = record.clone();
+    recovery_record.description =
+      format!("Recover interrupted {}", record.description);
+    persist_journal_record(&recovery_record)?;
+    Ok(record)
+  })();
+  match result {
+    Ok(record) => {
+      cleanup.retained = true;
+      Ok(record)
+    }
+    Err(error) => match fs::remove_dir_all(&operation_directory) {
+      Ok(()) => {
+        cleanup.retained = true;
+        Err(error)
+      }
+      Err(cleanup_error)
+        if cleanup_error.kind() == std::io::ErrorKind::NotFound =>
+      {
+        cleanup.retained = true;
+        Err(error)
+      }
+      Err(cleanup_error) => Err(error.context(format!(
+        "Partial snapshot journal could not be removed: {cleanup_error:#}"
+      ))),
+    },
   }
-  let created_at = komodo_timestamp();
-  Ok(JournalRecord {
-    id: id.to_string(),
-    actor: actor.to_string(),
-    root_key: root.key.clone(),
-    root_path: root.path.clone(),
-    managed: root.managed_file.is_some(),
-    created_at,
-    expires_at: created_at + JOURNAL_TTL_MS,
-    description: operation_description(operation),
-    snapshots,
-    before_revisions,
-    after_revisions: Vec::new(),
-  })
+}
+
+fn operation_edits_managed_file(
+  root: &ResolvedRoot,
+  operation: &FileManagerOperation,
+) -> bool {
+  matches!(
+    operation,
+    FileManagerOperation::WriteText { path, .. }
+      if root.managed_file.as_deref() == Some(path.as_str())
+  )
 }
 
 fn finish_journal(
@@ -3436,41 +4874,227 @@ fn finish_journal(
   mut record: JournalRecord,
   _progress: Option<&OperationProgress>,
 ) -> anyhow::Result<JournalRecord> {
-  let directory = journal_root().join(&record.id);
   let mut after_revisions = Vec::new();
   for snapshot in &record.snapshots {
     let revision = tree_revision(root, &snapshot.path)?;
     after_revisions.push((snapshot.path.clone(), revision));
   }
   record.after_revisions = after_revisions;
-  let manifest = serde_json::to_vec_pretty(&record)?;
-  let temporary = directory.join("manifest.json.tmp");
-  fs::write(&temporary, manifest)?;
-  fs::rename(temporary, directory.join("manifest.json"))?;
+  record.recovery = false;
+  record.history_side = JournalHistorySide::Undo;
+  persist_journal_record(&record)?;
   Ok(record)
+}
+
+fn persist_journal_record(
+  record: &JournalRecord,
+) -> anyhow::Result<()> {
+  let directory = journal_root().join(&record.id);
+  let manifest = serde_json::to_vec_pretty(record)?;
+  let temporary = directory.join("manifest.json.tmp");
+  write_private_file(&temporary, &manifest)?;
+  fs::rename(&temporary, directory.join("manifest.json"))?;
+  #[cfg(unix)]
+  fs::File::open(&directory)?.sync_all()?;
+  Ok(())
+}
+
+fn begin_journal_transition(
+  record: &mut JournalRecord,
+  transition: JournalTransition,
+) -> anyhow::Result<()> {
+  let mut durable = record.clone();
+  durable.transition = Some(transition);
+  persist_journal_record(&durable)?;
+  record.transition = Some(transition);
+  Ok(())
+}
+
+fn complete_journal_transition(
+  record: &mut JournalRecord,
+  side: JournalHistorySide,
+) -> anyhow::Result<()> {
+  let transition = record.transition;
+  record.transition = None;
+  record.history_side = side;
+  record.recovery = false;
+  if let Err(error) = persist_journal_record(record) {
+    record.transition = transition;
+    *record = normalize_loaded_journal(record.clone());
+    return Err(error);
+  }
+  Ok(())
+}
+
+fn remove_journal_directory(id: &str) -> anyhow::Result<()> {
+  match fs::remove_dir_all(journal_root().join(id)) {
+    Ok(()) => Ok(()),
+    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+      Ok(())
+    }
+    Err(error) => Err(error.into()),
+  }
+}
+
+fn retire_journal_directory(id: &str) -> anyhow::Result<()> {
+  let directory = journal_root().join(id);
+  if !directory.exists() {
+    return Ok(());
+  }
+  let retired =
+    journal_root().join(format!(".retired-{}", Uuid::new_v4()));
+  match fs::rename(&directory, &retired) {
+    Ok(()) => {
+      #[cfg(unix)]
+      if let Err(error) = fs::File::open(journal_root())
+        .and_then(|directory| directory.sync_all())
+      {
+        match fs::rename(&retired, &directory) {
+          Ok(()) => {
+            let _ = fs::File::open(journal_root())
+              .and_then(|directory| directory.sync_all());
+            return Err(anyhow!(error).context(
+              "Retired File Manager journal directory metadata could not be synced",
+            ));
+          }
+          Err(restore_error) => {
+            warn!(
+              "Retired File Manager journal directory metadata could not be synced, but its startup-invisible name could not be reverted: {error:#}; revert failed: {restore_error:#}"
+            );
+          }
+        }
+      }
+      if let Err(error) = fs::remove_dir_all(&retired) {
+        warn!(
+          "Retired File Manager journal awaits cleanup: {error:#}"
+        );
+      }
+      return Ok(());
+    }
+    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+      return Ok(());
+    }
+    Err(_) => {}
+  }
+  let tombstone = directory.join("retired");
+  match write_private_file(&tombstone, b"retired\n") {
+    Ok(()) => {
+      #[cfg(unix)]
+      if let Err(error) = fs::File::open(&directory)
+        .and_then(|directory| directory.sync_all())
+      {
+        return Err(anyhow!(error).context(
+          "Retired File Manager journal tombstone metadata could not be synced",
+        ));
+      }
+      if let Err(error) = remove_journal_directory(id) {
+        warn!(
+          "Retired File Manager journal {id} awaits cleanup: {error:#}"
+        );
+      }
+      Ok(())
+    }
+    Err(tombstone_error) => match remove_journal_directory(id) {
+      Ok(()) => Ok(()),
+      Err(cleanup_error) => Err(anyhow!(
+        "Could not retire File Manager journal {id}: tombstone failed: {tombstone_error:#}; cleanup failed: {cleanup_error:#}"
+      )),
+    },
+  }
+}
+
+fn rollback_or_retain(
+  root: &Dir,
+  record: JournalRecord,
+  operation_error: anyhow::Error,
+) -> anyhow::Error {
+  match restore_journal(root, &record, None) {
+    Ok(()) => {
+      if let Err(error) = retire_journal_directory(&record.id) {
+        warn!(
+          "Failed to retire rolled-back File Manager journal {}: {error:#}",
+          record.id
+        );
+      }
+      operation_error
+    }
+    Err(rollback_error) => retain_after_rollback_failure(
+      record,
+      operation_error,
+      rollback_error,
+    ),
+  }
+}
+
+fn retain_after_rollback_failure(
+  mut record: JournalRecord,
+  operation_error: anyhow::Error,
+  rollback_error: anyhow::Error,
+) -> anyhow::Error {
+  let tombstone = journal_root().join(&record.id).join("retired");
+  let reactivation_error = match fs::remove_file(&tombstone) {
+    Ok(()) => fs::File::open(journal_root().join(&record.id))
+      .and_then(|directory| directory.sync_all())
+      .err(),
+    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+      None
+    }
+    Err(error) => Some(error),
+  };
+  record.recovery = true;
+  record.history_side = JournalHistorySide::Undo;
+  record.transition = None;
+  if !record.description.starts_with("Recover interrupted ") {
+    record.description =
+      format!("Recover interrupted {}", record.description);
+  }
+  let persistence_error = persist_journal_record(&record).err();
+  let mut message = format!(
+    "{operation_error:#}; automatic rollback failed: {rollback_error:#}. A recovery record was retained for manual undo"
+  );
+  if let Some(error) = reactivation_error {
+    message.push_str(&format!(
+      "; the recovery journal could not be reactivated: {error:#}"
+    ));
+  }
+  if let Some(error) = persistence_error {
+    message.push_str(&format!(
+      "; the recovery manifest could not be refreshed: {error:#}"
+    ));
+  }
+  RetainedJournalError { message, record }.into()
+}
+
+fn retained_journal(error: &anyhow::Error) -> Option<JournalRecord> {
+  error
+    .downcast_ref::<RetainedJournalError>()
+    .map(|error| error.record.clone())
 }
 
 fn capture_redo_journal(
   root: &Dir,
-  record: &JournalRecord,
+  record: &mut JournalRecord,
   progress: Option<&OperationProgress>,
 ) -> anyhow::Result<()> {
   let after_directory = journal_root().join(&record.id).join("after");
   if after_directory.exists() {
     fs::remove_dir_all(&after_directory)?;
   }
-  fs::create_dir(&after_directory)?;
+  create_private_directory(&after_directory)?;
   let result = (|| {
-    for snapshot in &record.snapshots {
+    for snapshot in &mut record.snapshots {
       let has_after = record
         .after_revisions
         .iter()
         .find(|(path, _)| path == &snapshot.path)
         .is_some_and(|(_, revision)| revision.is_some());
       if has_after {
+        let relative = relative_path(&snapshot.path, false)?;
+        snapshot.after_metadata =
+          capture_journal_metadata(root, &relative)?;
         backup_from_capability(
           root,
-          &relative_path(&snapshot.path, false)?,
+          &relative,
           &after_directory.join(&snapshot.backup_name),
           progress,
         )?;
@@ -3484,22 +5108,246 @@ fn capture_redo_journal(
   result
 }
 
+#[derive(Debug)]
+struct RedoInvalidationBatch {
+  path: PathBuf,
+}
+
+fn recover_redo_invalidation_batches(
+  journal_root: &Path,
+) -> anyhow::Result<()> {
+  for entry in fs::read_dir(journal_root)? {
+    let entry = entry?;
+    if !entry.file_type()?.is_dir()
+      || !entry
+        .file_name()
+        .to_string_lossy()
+        .starts_with(".redo-invalidation-")
+    {
+      continue;
+    }
+    let batch = RedoInvalidationBatch { path: entry.path() };
+    if batch.path.join("committed").exists() {
+      cleanup_redo_invalidation_batch(batch);
+    } else {
+      restore_redo_invalidation_batch(journal_root, &batch)?;
+    }
+  }
+  Ok(())
+}
+
+fn restore_redo_invalidation_batch(
+  journal_root: &Path,
+  batch: &RedoInvalidationBatch,
+) -> anyhow::Result<()> {
+  if !batch.path.exists() {
+    return Ok(());
+  }
+  let mut entries = fs::read_dir(&batch.path)?
+    .collect::<std::io::Result<Vec<_>>>()?;
+  entries.sort_by_key(|entry| entry.file_name());
+  for entry in entries {
+    if !entry.file_type()?.is_dir() {
+      continue;
+    }
+    let destination = journal_root.join(entry.file_name());
+    if destination.exists() {
+      return Err(anyhow!(
+        "Cannot restore staged redo journal because its original path exists"
+      ));
+    }
+    fs::rename(entry.path(), destination)?;
+  }
+  fs::remove_dir_all(&batch.path)?;
+  #[cfg(unix)]
+  fs::File::open(journal_root)?.sync_all()?;
+  Ok(())
+}
+
+fn stage_redo_invalidation_at(
+  journal_root: &Path,
+  new_operation_id: &str,
+  redo_ids: &[String],
+  fail_before_index: Option<usize>,
+) -> anyhow::Result<RedoInvalidationBatch> {
+  let batch = RedoInvalidationBatch {
+    path: journal_root.join(format!(
+      ".redo-invalidation-{}",
+      Uuid::new_v4()
+    )),
+  };
+  create_private_directory(&batch.path)?;
+  let result = (|| {
+    write_private_file(
+      &batch.path.join("new-operation-id"),
+      new_operation_id.as_bytes(),
+    )?;
+    for (index, id) in redo_ids.iter().enumerate() {
+      if fail_before_index == Some(index) {
+        return Err(anyhow!(
+          "Injected redo invalidation failure before index {index}"
+        ));
+      }
+      fs::rename(journal_root.join(id), batch.path.join(id))?;
+    }
+    #[cfg(unix)]
+    {
+      fs::File::open(&batch.path)?.sync_all()?;
+      fs::File::open(journal_root)?.sync_all()?;
+    }
+    Ok(())
+  })();
+  match result {
+    Ok(()) => Ok(batch),
+    Err(error) => match restore_redo_invalidation_batch(
+      journal_root,
+      &batch,
+    ) {
+      Ok(()) => Err(error),
+      Err(restore_error) => Err(error.context(format!(
+        "Staged redo journals could not be fully restored: {restore_error:#}"
+      ))),
+    },
+  }
+}
+
+fn commit_redo_invalidation_batch(
+  batch: &RedoInvalidationBatch,
+) -> anyhow::Result<()> {
+  write_private_file(&batch.path.join("committed"), b"committed\n")?;
+  #[cfg(unix)]
+  {
+    fs::File::open(&batch.path)?.sync_all()?;
+    fs::File::open(journal_root())?.sync_all()?;
+  }
+  Ok(())
+}
+
+fn cleanup_redo_invalidation_batch(batch: RedoInvalidationBatch) {
+  if let Err(error) = fs::remove_dir_all(&batch.path) {
+    warn!(
+      "Committed redo invalidation awaits cleanup at {}: {error:#}",
+      batch.path.display()
+    );
+  }
+}
+
 async fn push_journal(record: JournalRecord) -> anyhow::Result<()> {
   let key = history_key(&record.root_key, &record.actor);
+  let redo_ids = {
+    let mut histories = histories().lock().await;
+    let history = histories.entry(key.clone()).or_default();
+    history
+      .redo
+      .iter()
+      .map(|record| record.id.clone())
+      .collect::<Vec<_>>()
+  };
+  let batch = if redo_ids.is_empty() {
+    None
+  } else {
+    let new_operation_id = record.id.clone();
+    let staged_redo_ids = redo_ids.clone();
+    Some(
+      run_heavy_blocking(move || {
+        stage_redo_invalidation_at(
+          &journal_root(),
+          &new_operation_id,
+          &staged_redo_ids,
+          None,
+        )
+      })
+      .await
+      .context("Redo journals could not be staged for invalidation")?,
+    )
+  };
   let expired = {
     let mut histories = histories().lock().await;
-    let history = histories.entry(key).or_default();
-    let mut expired = history
+    let history = histories
+      .entry(key)
+      .or_default();
+    let current_redo_ids = history
       .redo
-      .drain(..)
-      .map(|record| record.id)
+      .iter()
+      .map(|record| record.id.as_str())
       .collect::<Vec<_>>();
+    let expected_redo_ids = redo_ids
+      .iter()
+      .map(String::as_str)
+      .collect::<Vec<_>>();
+    if current_redo_ids != expected_redo_ids {
+      drop(histories);
+      if let Some(batch) = &batch {
+        run_heavy_blocking({
+          let path = batch.path.clone();
+          move || {
+            restore_redo_invalidation_batch(
+              &journal_root(),
+              &RedoInvalidationBatch { path },
+            )
+          }
+        })
+        .await?;
+      }
+      return Err(anyhow!(
+        "Redo history changed while registering the new operation"
+      ));
+    }
+    if let Some(batch) = &batch
+      && let Err(error) = commit_redo_invalidation_batch(batch)
+    {
+      drop(histories);
+      run_heavy_blocking({
+        let path = batch.path.clone();
+        move || {
+          restore_redo_invalidation_batch(
+            &journal_root(),
+            &RedoInvalidationBatch { path },
+          )
+        }
+      })
+      .await?;
+      return Err(error.context(
+        "Redo invalidation could not be committed durably",
+      ));
+    }
+    history.redo.clear();
     history.undo.push(record);
-    expired.extend(prune_history(history));
-    expired
+    prune_history(history)
   };
+  if let Some(batch) = batch {
+    tokio::spawn(async move {
+      let _ = run_heavy_blocking(move || {
+        cleanup_redo_invalidation_batch(batch);
+        Ok(())
+      })
+      .await;
+    });
+  }
   schedule_journal_cleanup(expired);
   Ok(())
+}
+
+async fn store_journal_by_side(key: &str, record: JournalRecord) {
+  let record = normalize_loaded_journal(record);
+  let mut histories = histories().lock().await;
+  let history = histories.entry(key.to_string()).or_default();
+  if record.recovery
+    || record.history_side == JournalHistorySide::Undo
+  {
+    history.undo.push(record);
+  } else {
+    history.redo.push(record);
+  }
+}
+
+async fn remove_journal_from_history(record: &JournalRecord) {
+  let key = history_key(&record.root_key, &record.actor);
+  let mut histories = histories().lock().await;
+  if let Some(history) = histories.get_mut(&key) {
+    history.undo.retain(|entry| entry.id != record.id);
+    history.redo.retain(|entry| entry.id != record.id);
+  }
 }
 
 fn restore_journal(
@@ -3520,6 +5368,11 @@ fn restore_journal(
         .join("before")
         .join(&snapshot.backup_name);
       restore_to_capability(root, &relative, &source, progress)?;
+      restore_journal_metadata(
+        root,
+        &relative,
+        &snapshot.before_metadata,
+      )?;
     }
   }
   Ok(())
@@ -3548,6 +5401,11 @@ fn restore_after_journal(
         .join("after")
         .join(&snapshot.backup_name);
       restore_to_capability(root, &relative, &source, progress)?;
+      restore_journal_metadata(
+        root,
+        &relative,
+        &snapshot.after_metadata,
+      )?;
     }
   }
   Ok(())
@@ -3581,6 +5439,192 @@ fn capture_snapshot_revisions(
     .collect()
 }
 
+#[cfg(unix)]
+fn capture_journal_metadata(
+  root: &Dir,
+  relative: &Path,
+) -> anyhow::Result<Vec<JournalEntryMetadata>> {
+  fn visit(
+    parent: &Dir,
+    name: &std::ffi::OsStr,
+    relative: &Path,
+    entries: &mut Vec<JournalEntryMetadata>,
+  ) -> anyhow::Result<()> {
+    let metadata = parent.symlink_metadata(name)?;
+    entries.push(JournalEntryMetadata {
+      path: if relative.as_os_str().is_empty() {
+        String::new()
+      } else {
+        path_string(relative)?
+      },
+      mode: cap_std::fs::MetadataExt::mode(&metadata),
+      uid: cap_std::fs::MetadataExt::uid(&metadata),
+      gid: cap_std::fs::MetadataExt::gid(&metadata),
+    });
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+      let directory = parent.open_dir_nofollow(name)?;
+      let mut children = directory
+        .entries()?
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+      children.sort();
+      for child in children {
+        visit(&directory, &child, &relative.join(&child), entries)?;
+      }
+    }
+    Ok(())
+  }
+
+  let (parent, name) = open_parent_nofollow(root, relative)?;
+  let mut entries = Vec::new();
+  visit(&parent, &name, Path::new(""), &mut entries)?;
+  Ok(entries)
+}
+
+#[cfg(not(unix))]
+fn capture_journal_metadata(
+  _root: &Dir,
+  _relative: &Path,
+) -> anyhow::Result<Vec<JournalEntryMetadata>> {
+  Ok(Vec::new())
+}
+
+#[cfg(unix)]
+fn restore_journal_metadata(
+  root: &Dir,
+  relative: &Path,
+  entries: &[JournalEntryMetadata],
+) -> anyhow::Result<()> {
+  use std::{
+    ffi::CString,
+    os::{fd::AsRawFd as _, unix::ffi::OsStrExt as _},
+  };
+
+  for entry in entries.iter().rev() {
+    let path = if entry.path.is_empty() {
+      relative.to_path_buf()
+    } else {
+      relative.join(relative_path(&entry.path, false)?)
+    };
+    let (parent, name) = open_parent_nofollow(root, &path)?;
+    let metadata = parent.symlink_metadata(&name)?;
+    if metadata.file_type().is_symlink() {
+      let current_uid = cap_std::fs::MetadataExt::uid(&metadata);
+      let current_gid = cap_std::fs::MetadataExt::gid(&metadata);
+      if current_uid != entry.uid || current_gid != entry.gid {
+        let name = CString::new(name.as_bytes())?;
+        let result = unsafe {
+          libc::fchownat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            entry.uid as libc::uid_t,
+            entry.gid as libc::gid_t,
+            libc::AT_SYMLINK_NOFOLLOW,
+          )
+        };
+        if result != 0 {
+          return Err(std::io::Error::last_os_error())
+            .context("Failed to restore symlink ownership");
+        }
+      }
+      continue;
+    }
+    let file = if metadata.is_dir() {
+      parent.open_dir_nofollow(&name)?.open(".")?
+    } else if metadata.is_file() {
+      let mut options = OpenOptions::new();
+      options.read(true).follow(FollowSymlinks::No);
+      parent.open_with(&name, &options)?
+    } else {
+      return Err(anyhow!(
+        "Special journal entries cannot have metadata restored"
+      ));
+    };
+    let expected = JournalEntryMetadata {
+      path: entry.path.clone(),
+      mode: entry.mode,
+      uid: entry.uid,
+      gid: entry.gid,
+    };
+    apply_recorded_file_metadata(&file, &expected, true)?;
+    file.sync_all()?;
+  }
+  Ok(())
+}
+
+#[cfg(not(unix))]
+fn restore_journal_metadata(
+  _root: &Dir,
+  _relative: &Path,
+  _entries: &[JournalEntryMetadata],
+) -> anyhow::Result<()> {
+  Ok(())
+}
+
+#[cfg(unix)]
+fn apply_recorded_file_metadata(
+  file: &cap_std::fs::File,
+  metadata: &JournalEntryMetadata,
+  preserve_privilege_bits: bool,
+) -> anyhow::Result<()> {
+  use cap_std::fs::PermissionsExt as _;
+  use std::os::fd::AsRawFd as _;
+
+  let current = file.metadata()?;
+  if cap_std::fs::MetadataExt::uid(&current) != metadata.uid
+    || cap_std::fs::MetadataExt::gid(&current) != metadata.gid
+  {
+    let result = unsafe {
+      libc::fchown(
+        file.as_raw_fd(),
+        metadata.uid as libc::uid_t,
+        metadata.gid as libc::gid_t,
+      )
+    };
+    if result != 0 {
+      return Err(std::io::Error::last_os_error())
+        .context("Failed to restore filesystem ownership");
+    }
+  }
+  file.set_permissions(cap_std::fs::Permissions::from_mode(
+    metadata.mode
+      & if preserve_privilege_bits {
+        0o7777
+      } else {
+        0o1777
+      },
+  ))?;
+  Ok(())
+}
+
+#[cfg(not(unix))]
+fn apply_recorded_file_metadata(
+  _file: &cap_std::fs::File,
+  _metadata: &JournalEntryMetadata,
+  _preserve_privilege_bits: bool,
+) -> anyhow::Result<()> {
+  Ok(())
+}
+
+#[cfg(unix)]
+fn recorded_file_metadata(
+  metadata: &Metadata,
+) -> Option<JournalEntryMetadata> {
+  Some(JournalEntryMetadata {
+    path: String::new(),
+    mode: cap_std::fs::MetadataExt::mode(metadata),
+    uid: cap_std::fs::MetadataExt::uid(metadata),
+    gid: cap_std::fs::MetadataExt::gid(metadata),
+  })
+}
+
+#[cfg(not(unix))]
+fn recorded_file_metadata(
+  _metadata: &Metadata,
+) -> Option<JournalEntryMetadata> {
+  None
+}
+
 fn backup_from_capability(
   root: &Dir,
   relative: &Path,
@@ -3605,11 +5649,11 @@ fn copy_capability_to_host(
     let mut options = OpenOptions::new();
     options.read(true).follow(FollowSymlinks::No);
     let mut source = parent.open_with(name, &options)?;
-    let mut destination = fs::File::create(destination)?;
+    let mut destination = create_private_file(destination)?;
     copy_with_progress(&mut source, &mut destination, progress)?;
     destination.sync_all()?;
   } else if metadata.is_dir() {
-    fs::create_dir(destination)?;
+    create_private_directory(destination)?;
     let source = parent.open_dir_nofollow(name)?;
     for entry in source.entries()? {
       let entry = entry?;
@@ -3737,18 +5781,63 @@ fn history_key(root: &str, actor: &str) -> String {
   format!("{root}:{actor}")
 }
 
+fn journal_is_visible(record: &JournalRecord) -> bool {
+  !record.managed || record.recovery
+}
+
+fn journal_is_unexpired(record: &JournalRecord) -> bool {
+  record.durable_managed
+    || record.recovery
+    || record.transition.is_some()
+    || record.expires_at > komodo_timestamp()
+}
+
+fn normalize_loaded_journal(
+  mut record: JournalRecord,
+) -> JournalRecord {
+  if record.transition.is_some() {
+    record.recovery = true;
+    record.history_side = JournalHistorySide::Undo;
+    if !record.description.starts_with("Recover interrupted ") {
+      record.description =
+        format!("Recover interrupted {}", record.description);
+    }
+  }
+  record
+}
+
+fn read_active_journal_record(
+  directory: &Path,
+) -> Option<JournalRecord> {
+  if directory.join("retired").exists() {
+    return None;
+  }
+  fs::read(directory.join("manifest.json"))
+    .ok()
+    .and_then(|manifest| {
+      serde_json::from_slice::<JournalRecord>(&manifest).ok()
+    })
+    .map(normalize_loaded_journal)
+}
+
 fn prune_history(history: &mut JournalHistory) -> Vec<String> {
   let now = komodo_timestamp();
   let mut expired = Vec::new();
   history.undo.retain(|record| {
-    let keep = record.expires_at > now;
+    let keep = record.durable_managed
+      || record.recovery
+      || record.transition.is_some()
+      || record.expires_at > now;
     if !keep {
       expired.push(record.id.clone());
     }
     keep
   });
   history.redo.retain(|record| {
-    let keep = record.expires_at > now;
+    let keep = record.durable_managed
+      || record.recovery
+      || record.transition.is_some()
+      || record.expires_at > now;
     if !keep {
       expired.push(record.id.clone());
     }
@@ -3773,6 +5862,55 @@ fn schedule_journal_cleanup(ids: Vec<String>) {
       warn!("Failed to clean up File Manager journals: {error:#}");
     }
   });
+}
+
+async fn prune_finalized_managed_transactions() {
+  let now = komodo_timestamp();
+  let candidates = {
+    let transactions = managed_transactions().lock().await;
+    transactions
+      .values()
+      .filter(|record| managed_transaction_is_prunable(record, now))
+      .map(|record| record.operation_id.clone())
+      .collect::<Vec<_>>()
+  };
+  if candidates.is_empty() {
+    return;
+  }
+  let removed = match run_heavy_blocking(move || {
+    let mut removed = Vec::new();
+    for operation_id in candidates {
+      let path = managed_transaction_path(&operation_id)?;
+      match fs::remove_file(path) {
+        Ok(()) => removed.push(operation_id),
+        Err(error)
+          if error.kind() == std::io::ErrorKind::NotFound =>
+        {
+          removed.push(operation_id)
+        }
+        Err(error) => warn!(
+          "Failed to prune finalized managed transaction {operation_id}: {error:#}"
+        ),
+      }
+    }
+    #[cfg(unix)]
+    fs::File::open(managed_transaction_root())?.sync_all()?;
+    Ok(removed)
+  })
+  .await
+  {
+    Ok(removed) => removed,
+    Err(error) => {
+      warn!(
+        "Failed to prune finalized managed transactions: {error:#}"
+      );
+      return;
+    }
+  };
+  let mut transactions = managed_transactions().lock().await;
+  for operation_id in removed {
+    transactions.remove(&operation_id);
+  }
 }
 
 fn operation_description(operation: &FileManagerOperation) -> String {
@@ -3971,6 +6109,15 @@ fn revision(metadata: &Metadata) -> FileManagerRevision {
   hash.update(metadata.dev().to_le_bytes());
   hash.update(metadata.ino().to_le_bytes());
   hash.update(metadata.len().to_le_bytes());
+  #[cfg(unix)]
+  {
+    hash
+      .update(cap_std::fs::MetadataExt::mode(metadata).to_le_bytes());
+    hash
+      .update(cap_std::fs::MetadataExt::uid(metadata).to_le_bytes());
+    hash
+      .update(cap_std::fs::MetadataExt::gid(metadata).to_le_bytes());
+  }
   match metadata
     .modified()
     .ok()
@@ -4064,10 +6211,612 @@ fn path_string(path: &Path) -> anyhow::Result<String> {
 mod tests {
   use super::*;
 
+  fn test_journal_record(
+    id: &str,
+    created_at: i64,
+    side: JournalHistorySide,
+  ) -> JournalRecord {
+    JournalRecord {
+      id: id.into(),
+      actor: "actor".into(),
+      root_key: "root".into(),
+      root_path: PathBuf::from("/unused"),
+      managed: false,
+      durable_managed: false,
+      recovery: false,
+      history_side: side,
+      transition: None,
+      created_at,
+      expires_at: created_at + JOURNAL_TTL_MS,
+      description: id.into(),
+      snapshots: Vec::new(),
+      before_revisions: Vec::new(),
+      after_revisions: Vec::new(),
+    }
+  }
+
   #[test]
   fn file_manager_entry_limit_accepts_exact_boundary() {
     assert!(ensure_entry_limit_with_max(5, 5).is_ok());
     assert!(ensure_entry_limit_with_max(6, 5).is_err());
+  }
+
+  #[test]
+  fn wrong_actor_cannot_consume_a_preflight_plan() {
+    let mut plans = HashMap::new();
+    plans.insert(
+      "plan".into(),
+      OperationPlan {
+        actor: "owner".into(),
+        root_key: "root".into(),
+        operation: FileManagerOperation::CreateFile {
+          path: "file.txt".into(),
+        },
+        expires_at: komodo_timestamp() + PLAN_TTL_MS,
+        conflicts: Vec::new(),
+        confirmation_required: false,
+        revisions: Vec::new(),
+        copy_targets: Vec::new(),
+      },
+    );
+
+    assert!(take_owned_plan(&mut plans, "plan", "attacker").is_err());
+    assert!(plans.contains_key("plan"));
+    assert!(take_owned_plan(&mut plans, "plan", "owner").is_ok());
+    assert!(!plans.contains_key("plan"));
+  }
+
+  #[test]
+  fn bounded_text_read_rejects_growth_past_the_limit() {
+    let mut exact = std::io::Cursor::new(b"four".to_vec());
+    assert_eq!(read_bounded(&mut exact, 4).unwrap(), b"four");
+
+    let mut grown = std::io::Cursor::new(b"five!".to_vec());
+    assert!(read_bounded(&mut grown, 4).is_err());
+  }
+
+  #[test]
+  fn redundant_delete_and_move_paths_are_normalized_only_once() {
+    let delete = normalize_operation(FileManagerOperation::Delete {
+      paths: vec![
+        "folder/child.txt".into(),
+        "folder".into(),
+        "folder".into(),
+      ],
+    })
+    .unwrap();
+    assert!(matches!(
+      delete,
+      FileManagerOperation::Delete { paths }
+        if paths == vec!["folder"]
+    ));
+
+    let copy = normalize_operation(FileManagerOperation::Copy {
+      paths: vec!["folder".into(), "folder/child.txt".into()],
+      destination: "copies".into(),
+    })
+    .unwrap();
+    assert!(matches!(
+      copy,
+      FileManagerOperation::Copy { paths, .. }
+        if paths == vec!["folder", "folder/child.txt"]
+    ));
+  }
+
+  #[test]
+  fn parent_and_child_delete_completes_without_order_dependent_loss()
+  {
+    let directory =
+      std::env::temp_dir().join(Uuid::new_v4().to_string());
+    fs::create_dir_all(directory.join("folder")).unwrap();
+    fs::write(directory.join("folder/child.txt"), "contents")
+      .unwrap();
+    let root =
+      Dir::open_ambient_dir(&directory, ambient_authority()).unwrap();
+    let operation =
+      normalize_operation(FileManagerOperation::Delete {
+        paths: vec!["folder/child.txt".into(), "folder".into()],
+      })
+      .unwrap();
+
+    apply_operation(&root, &operation, &[]).unwrap();
+    assert!(!directory.join("folder").exists());
+    fs::remove_dir_all(directory).unwrap();
+  }
+
+  #[test]
+  fn extract_destination_is_snapshotted_for_failure_rollback() {
+    let operation = FileManagerOperation::ExtractArchive {
+      path: "archive.zip".into(),
+      destination: "destination".into(),
+    };
+    assert_eq!(
+      journal_paths_planned(&operation, &[]).unwrap(),
+      vec!["destination"]
+    );
+  }
+
+  #[test]
+  fn managed_journal_classification_is_limited_to_its_text_edit() {
+    let root = ResolvedRoot {
+      path: PathBuf::from("/unused"),
+      key: "root".into(),
+      read_only: false,
+      managed_file: Some("compose.yaml".into()),
+      create_if_missing: false,
+    };
+    assert!(operation_edits_managed_file(
+      &root,
+      &FileManagerOperation::WriteText {
+        path: "compose.yaml".into(),
+        contents: String::new(),
+        expected_revision: Default::default(),
+      }
+    ));
+    assert!(!operation_edits_managed_file(
+      &root,
+      &FileManagerOperation::Delete {
+        paths: vec!["notes.txt".into()],
+      }
+    ));
+  }
+
+  #[test]
+  fn loaded_redo_records_keep_stack_order() {
+    let mut records = vec![
+      test_journal_record("C", 3, JournalHistorySide::Redo),
+      test_journal_record("B", 2, JournalHistorySide::Redo),
+    ];
+    records.sort_by_key(|record| record.created_at);
+    let mut history = JournalHistory::default();
+    for record in records {
+      history.insert_loaded(record);
+    }
+    assert_eq!(history.redo.pop().unwrap().id, "B");
+    assert_eq!(history.redo.pop().unwrap().id, "C");
+  }
+
+  #[test]
+  fn interrupted_history_transition_reloads_as_recovery_undo() {
+    let mut record =
+      test_journal_record("transition", 1, JournalHistorySide::Redo);
+    record.managed = true;
+    record.transition = Some(JournalTransition::Redo);
+    let record = normalize_loaded_journal(record);
+    assert!(record.recovery);
+    assert_eq!(record.history_side, JournalHistorySide::Undo);
+    assert!(journal_is_visible(&record));
+    assert!(record.description.starts_with("Recover interrupted "));
+  }
+
+  #[test]
+  fn hidden_managed_journal_remains_loadable_for_exact_rollback() {
+    let mut record = test_journal_record(
+      "managed-host-rollback",
+      komodo_timestamp(),
+      JournalHistorySide::Undo,
+    );
+    record.managed = true;
+    record.expires_at = komodo_timestamp() + JOURNAL_TTL_MS;
+
+    assert!(!journal_is_visible(&record));
+    assert!(journal_is_unexpired(&record));
+    let mut history = JournalHistory::default();
+    history.insert_loaded(record);
+    assert!(history.undo.iter().any(|record| {
+      record.id == "managed-host-rollback"
+        && !journal_is_visible(record)
+    }));
+  }
+
+  #[test]
+  fn hidden_managed_journal_does_not_displace_visible_undo() {
+    let ordinary = test_journal_record(
+      "ordinary-A",
+      komodo_timestamp(),
+      JournalHistorySide::Undo,
+    );
+    let mut managed = test_journal_record(
+      "managed-B",
+      komodo_timestamp() + 1,
+      JournalHistorySide::Undo,
+    );
+    managed.managed = true;
+    let history = JournalHistory {
+      undo: vec![ordinary, managed],
+      redo: Vec::new(),
+    };
+
+    let visible = history
+      .undo
+      .iter()
+      .rposition(journal_is_visible)
+      .map(|position| &history.undo[position]);
+    assert_eq!(visible.unwrap().id, "ordinary-A");
+  }
+
+  #[test]
+  fn redo_invalidation_failure_restores_the_complete_stack() {
+    for fail_before in [0, 1] {
+      let directory =
+        std::env::temp_dir().join(Uuid::new_v4().to_string());
+      fs::create_dir_all(&directory).unwrap();
+      let ids = vec!["redo-a".to_string(), "redo-b".to_string()];
+      for id in &ids {
+        fs::create_dir(directory.join(id)).unwrap();
+        fs::write(directory.join(id).join("payload"), id).unwrap();
+      }
+
+      let error = stage_redo_invalidation_at(
+        &directory,
+        "new-operation",
+        &ids,
+        Some(fail_before),
+      )
+      .unwrap_err();
+      assert!(error.to_string().contains("Injected"));
+      for id in &ids {
+        assert_eq!(
+          fs::read_to_string(directory.join(id).join("payload"))
+            .unwrap(),
+          id.as_str()
+        );
+      }
+      assert!(
+        fs::read_dir(&directory)
+          .unwrap()
+          .all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".redo-invalidation-"))
+      );
+      fs::remove_dir_all(directory).unwrap();
+    }
+  }
+
+  #[test]
+  fn committed_redo_invalidation_is_completed_on_restart() {
+    let directory =
+      std::env::temp_dir().join(Uuid::new_v4().to_string());
+    fs::create_dir_all(&directory).unwrap();
+    let ids = vec!["redo-a".to_string(), "redo-b".to_string()];
+    for id in &ids {
+      fs::create_dir(directory.join(id)).unwrap();
+    }
+    let batch = stage_redo_invalidation_at(
+      &directory,
+      "new-operation",
+      &ids,
+      None,
+    )
+    .unwrap();
+    commit_redo_invalidation_batch(&batch).unwrap();
+
+    recover_redo_invalidation_batches(&directory).unwrap();
+
+    for id in ids {
+      assert!(!directory.join(id).exists());
+    }
+    assert!(!batch.path.exists());
+    fs::remove_dir_all(directory).unwrap();
+  }
+
+  #[test]
+  fn recovery_and_transition_journals_do_not_expire() {
+    let mut expired = test_journal_record(
+      "expired",
+      komodo_timestamp() - JOURNAL_TTL_MS - 1,
+      JournalHistorySide::Undo,
+    );
+    expired.expires_at = komodo_timestamp() - 1;
+    let mut recovery = expired.clone();
+    recovery.id = "recovery".into();
+    recovery.recovery = true;
+    let mut transition = expired.clone();
+    transition.id = "transition".into();
+    transition.transition = Some(JournalTransition::Undo);
+    let mut durable = expired.clone();
+    durable.id = "durable-managed".into();
+    durable.managed = true;
+    durable.durable_managed = true;
+
+    assert!(!journal_is_unexpired(&expired));
+    assert!(journal_is_unexpired(&recovery));
+    assert!(journal_is_unexpired(&transition));
+    assert!(journal_is_unexpired(&durable));
+    let mut history = JournalHistory {
+      undo: vec![expired, recovery, transition, durable],
+      redo: Vec::new(),
+    };
+    let removed = prune_history(&mut history);
+    assert_eq!(removed, vec!["expired"]);
+    assert_eq!(history.undo.len(), 3);
+  }
+
+  #[test]
+  fn retired_journal_manifest_is_never_reloaded() {
+    let directory =
+      std::env::temp_dir().join(Uuid::new_v4().to_string());
+    fs::create_dir(&directory).unwrap();
+    let record = test_journal_record(
+      "retired",
+      komodo_timestamp(),
+      JournalHistorySide::Undo,
+    );
+    fs::write(
+      directory.join("manifest.json"),
+      serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+    assert!(read_active_journal_record(&directory).is_some());
+    fs::write(directory.join("retired"), b"retired").unwrap();
+    assert!(read_active_journal_record(&directory).is_none());
+    fs::remove_dir_all(directory).unwrap();
+  }
+
+  #[test]
+  fn partial_snapshot_directory_is_removed_by_its_guard() {
+    let directory =
+      std::env::temp_dir().join(Uuid::new_v4().to_string());
+    fs::create_dir(&directory).unwrap();
+    {
+      let _cleanup = TemporaryJournalDirectory {
+        path: directory.clone(),
+        retained: false,
+      };
+      fs::write(directory.join("partial"), b"secret").unwrap();
+    }
+    assert!(!directory.exists());
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn journal_directories_and_files_are_private() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let directory =
+      std::env::temp_dir().join(Uuid::new_v4().to_string());
+    ensure_private_directory(&directory).unwrap();
+    let child = directory.join("before");
+    create_private_directory(&child).unwrap();
+    let file = child.join("0");
+    create_private_file(&file).unwrap().sync_all().unwrap();
+
+    assert_eq!(
+      fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+      0o700
+    );
+    assert_eq!(
+      fs::metadata(&child).unwrap().permissions().mode() & 0o777,
+      0o700
+    );
+    assert_eq!(
+      fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+      0o600
+    );
+    fs::remove_dir_all(directory).unwrap();
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn private_upload_staging_preserves_default_published_mode() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let directory =
+      std::env::temp_dir().join(Uuid::new_v4().to_string());
+    fs::create_dir(&directory).unwrap();
+    fs::write(directory.join("reference"), b"").unwrap();
+    let root =
+      Dir::open_ambient_dir(&directory, ambient_authority()).unwrap();
+    create_private_capability_directory(&root, ".komodo-upload-test")
+      .unwrap();
+    let staging =
+      root.open_dir_nofollow(".komodo-upload-test").unwrap();
+    let mut options = OpenOptions::new();
+    options
+      .write(true)
+      .create_new(true)
+      .follow(FollowSymlinks::No);
+    staging.open_with("payload", &options).unwrap();
+
+    assert_eq!(
+      fs::metadata(directory.join(".komodo-upload-test"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777,
+      0o700
+    );
+    assert_eq!(
+      fs::metadata(directory.join(".komodo-upload-test/payload"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777,
+      fs::metadata(directory.join("reference"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777
+    );
+
+    fs::write(directory.join("existing"), b"old").unwrap();
+    fs::set_permissions(
+      directory.join("existing"),
+      fs::Permissions::from_mode(0o6750),
+    )
+    .unwrap();
+    let existing = root.symlink_metadata("existing").unwrap();
+    let recorded = recorded_file_metadata(&existing).unwrap();
+    let replacement =
+      staging.open_with("replacement", &options).unwrap();
+    apply_recorded_file_metadata(&replacement, &recorded, false)
+      .unwrap();
+    assert_eq!(
+      fs::metadata(directory.join(".komodo-upload-test/replacement"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o7777,
+      0o750
+    );
+    fs::remove_dir_all(directory).unwrap();
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn upload_publish_replaces_regular_file_with_one_rename() {
+    let directory =
+      std::env::temp_dir().join(Uuid::new_v4().to_string());
+    fs::create_dir(&directory).unwrap();
+    fs::write(directory.join("destination"), b"old").unwrap();
+    fs::create_dir(directory.join("staging")).unwrap();
+    fs::write(directory.join("staging/payload"), b"new").unwrap();
+    let root =
+      Dir::open_ambient_dir(&directory, ambient_authority()).unwrap();
+    let staging = root.open_dir_nofollow("staging").unwrap();
+    let payload_identity =
+      file_identity(&staging.symlink_metadata("payload").unwrap());
+
+    staging.rename("payload", &root, "destination").unwrap();
+
+    assert_eq!(
+      fs::read(directory.join("destination")).unwrap(),
+      b"new"
+    );
+    assert_eq!(
+      file_identity(&root.symlink_metadata("destination").unwrap()),
+      payload_identity
+    );
+    fs::remove_dir_all(directory).unwrap();
+  }
+
+  #[test]
+  fn download_credit_is_positive_and_bounded() {
+    assert!(add_download_credits(0, 0).is_err());
+    assert_eq!(add_download_credits(0, 4).unwrap(), 4);
+    assert_eq!(
+      add_download_credits(31, u32::MAX).unwrap(),
+      MAX_DOWNLOAD_CREDITS
+    );
+  }
+
+  #[test]
+  fn download_heartbeat_requires_the_additive_begin_variant() {
+    assert_eq!(
+      download_begin_mode(FileTransferMessage::BeginWithCredit {
+        credits: 4
+      })
+      .unwrap(),
+      (Some(4), false)
+    );
+    assert_eq!(
+      download_begin_mode(
+        FileTransferMessage::BeginWithCreditAndHeartbeat { credits: 4 }
+      )
+      .unwrap(),
+      (Some(4), true)
+    );
+  }
+
+  #[tokio::test]
+  async fn cancellation_interrupts_a_download_waiting_for_credit() {
+    let progress = OperationProgress::new(
+      "credit-cancel".into(),
+      "Download files".into(),
+    );
+    let (_sender, mut receiver) = tokio::sync::mpsc::channel(1);
+    progress.request_cancel();
+    let error = tokio::time::timeout(
+      std::time::Duration::from_secs(1),
+      wait_for_download_credit(&mut receiver, &progress, false),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(error.to_string().contains("cancelled"));
+  }
+
+  #[tokio::test]
+  async fn heartbeat_download_expires_when_core_disappears() {
+    let progress = OperationProgress::new(
+      "heartbeat-expiry".into(),
+      "Download files".into(),
+    );
+    let (_sender, mut receiver) = tokio::sync::mpsc::channel(1);
+
+    let error = wait_for_download_credit_with_lease(
+      &mut receiver,
+      &progress,
+      true,
+      Duration::from_millis(20),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(error.to_string().contains("heartbeat expired"));
+  }
+
+  #[tokio::test]
+  async fn heartbeat_renews_a_paused_download_lease() {
+    let progress = OperationProgress::new(
+      "heartbeat-renewal".into(),
+      "Download files".into(),
+    );
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(2);
+    tokio::spawn(async move {
+      tokio::time::sleep(Duration::from_millis(100)).await;
+      sender
+        .send(Ok(FileTransferMessage::Heartbeat))
+        .await
+        .unwrap();
+      tokio::time::sleep(Duration::from_millis(100)).await;
+      sender
+        .send(Ok(FileTransferMessage::Credit { credits: 1 }))
+        .await
+        .unwrap();
+    });
+
+    let credits = wait_for_download_credit_with_lease(
+      &mut receiver,
+      &progress,
+      true,
+      Duration::from_millis(150),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(credits, 1);
+  }
+
+  #[tokio::test]
+  async fn file_transfer_final_send_is_bounded_when_outgoing_stalls()
+  {
+    let channel = Uuid::new_v4();
+    let (sender, _receiver) =
+      transport::channel::channel_with_capacity::<
+        EncodedTransportMessage,
+      >(1);
+    sender
+      .send_file_transfer(
+        Uuid::new_v4(),
+        Ok(FileTransferMessage::Cancel.into_raw()),
+      )
+      .await
+      .unwrap();
+
+    tokio::time::timeout(
+      Duration::from_millis(100),
+      send_file_transfer_final_with_timeout(
+        &sender,
+        channel,
+        Ok(FileTransferMessage::Cancel.into_raw()),
+        Duration::from_millis(10),
+      ),
+    )
+    .await
+    .unwrap();
   }
 
   #[test]
@@ -4319,6 +7068,160 @@ mod tests {
     fs::remove_dir_all(directory).unwrap();
   }
 
+  #[cfg(unix)]
+  #[test]
+  fn text_write_and_copy_preserve_mode_and_ownership() {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let directory =
+      std::env::temp_dir().join(Uuid::new_v4().to_string());
+    fs::create_dir(&directory).unwrap();
+    let edited = directory.join("editable.sh");
+    fs::write(&edited, "old").unwrap();
+    fs::set_permissions(&edited, fs::Permissions::from_mode(0o6750))
+      .unwrap();
+    let root =
+      Dir::open_ambient_dir(&directory, ambient_authority()).unwrap();
+    let before = fs::metadata(&edited).unwrap();
+    let expected = content_revision(
+      &root.symlink_metadata("editable.sh").unwrap(),
+      b"old",
+    );
+    apply_operation(
+      &root,
+      &FileManagerOperation::WriteText {
+        path: "editable.sh".into(),
+        contents: "new".into(),
+        expected_revision: expected,
+      },
+      &[],
+    )
+    .unwrap();
+    let edited_after = fs::metadata(&edited).unwrap();
+    assert_eq!(edited_after.mode() & 0o7777, 0o750);
+    assert_eq!(edited_after.uid(), before.uid());
+    assert_eq!(edited_after.gid(), before.gid());
+
+    fs::create_dir(directory.join("source")).unwrap();
+    fs::set_permissions(
+      directory.join("source"),
+      fs::Permissions::from_mode(0o711),
+    )
+    .unwrap();
+    fs::write(directory.join("source/secret"), "contents").unwrap();
+    fs::set_permissions(
+      directory.join("source/secret"),
+      fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    fs::write(directory.join("source/privileged"), "same bytes")
+      .unwrap();
+    fs::set_permissions(
+      directory.join("source/privileged"),
+      fs::Permissions::from_mode(0o6750),
+    )
+    .unwrap();
+    copy_entry(
+      &root,
+      std::ffi::OsStr::new("source"),
+      &root,
+      std::ffi::OsStr::new("copied"),
+      None,
+    )
+    .unwrap();
+    assert_eq!(
+      fs::metadata(directory.join("copied")).unwrap().mode() & 0o7777,
+      0o711
+    );
+    assert_eq!(
+      fs::metadata(directory.join("copied/secret"))
+        .unwrap()
+        .mode()
+        & 0o7777,
+      0o600
+    );
+    assert_eq!(
+      fs::metadata(directory.join("copied/privileged"))
+        .unwrap()
+        .mode()
+        & 0o7777,
+      0o750
+    );
+    fs::remove_dir_all(directory).unwrap();
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn journal_backup_stays_private_and_restores_nested_metadata() {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let directory =
+      std::env::temp_dir().join(Uuid::new_v4().to_string());
+    let managed = directory.join("managed");
+    let backup = directory.join("backup");
+    fs::create_dir_all(managed.join("nested")).unwrap();
+    fs::write(managed.join("nested/tool"), "contents").unwrap();
+    fs::set_permissions(&managed, fs::Permissions::from_mode(0o751))
+      .unwrap();
+    fs::set_permissions(
+      managed.join("nested"),
+      fs::Permissions::from_mode(0o711),
+    )
+    .unwrap();
+    fs::set_permissions(
+      managed.join("nested/tool"),
+      fs::Permissions::from_mode(0o6750),
+    )
+    .unwrap();
+    let original = fs::metadata(managed.join("nested/tool")).unwrap();
+    let root =
+      Dir::open_ambient_dir(&directory, ambient_authority()).unwrap();
+    let metadata =
+      capture_journal_metadata(&root, Path::new("managed")).unwrap();
+    backup_from_capability(
+      &root,
+      Path::new("managed"),
+      &backup,
+      None,
+    )
+    .unwrap();
+    assert_eq!(
+      fs::metadata(&backup).unwrap().permissions().mode() & 0o777,
+      0o700
+    );
+    assert_eq!(
+      fs::metadata(backup.join("nested/tool"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777,
+      0o600
+    );
+
+    root.remove_dir_all("managed").unwrap();
+    restore_to_capability(&root, Path::new("managed"), &backup, None)
+      .unwrap();
+    restore_journal_metadata(&root, Path::new("managed"), &metadata)
+      .unwrap();
+    assert_eq!(
+      fs::metadata(&managed).unwrap().permissions().mode() & 0o7777,
+      0o751
+    );
+    assert_eq!(
+      fs::metadata(managed.join("nested"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o7777,
+      0o711
+    );
+    let restored = fs::metadata(managed.join("nested/tool")).unwrap();
+    assert_eq!(restored.mode() & 0o7777, 0o6750);
+    assert_eq!(restored.uid(), original.uid());
+    assert_eq!(restored.gid(), original.gid());
+    fs::remove_dir_all(directory).unwrap();
+  }
+
   #[test]
   fn tree_revision_detects_nested_content_changes() {
     let directory =
@@ -4353,6 +7256,55 @@ mod tests {
     fs::remove_dir_all(directory).unwrap();
   }
 
+  #[cfg(unix)]
+  #[test]
+  fn metadata_revision_detects_permission_changes() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let directory =
+      std::env::temp_dir().join(Uuid::new_v4().to_string());
+    fs::create_dir(&directory).unwrap();
+    let path = directory.join("config.txt");
+    fs::write(&path, "contents").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+      .unwrap();
+    let root =
+      Dir::open_ambient_dir(&directory, ambient_authority()).unwrap();
+    let before = metadata_tree_revision(&root, "config.txt").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644))
+      .unwrap();
+    let after = metadata_tree_revision(&root, "config.txt").unwrap();
+
+    assert_ne!(before, after);
+    fs::remove_dir_all(directory).unwrap();
+  }
+
+  #[test]
+  fn upload_staging_identity_rejects_regular_file_replacement() {
+    let directory =
+      std::env::temp_dir().join(Uuid::new_v4().to_string());
+    fs::create_dir(&directory).unwrap();
+    let root =
+      Dir::open_ambient_dir(&directory, ambient_authority()).unwrap();
+    fs::write(directory.join("upload.tmp"), "verified bytes")
+      .unwrap();
+    let expected =
+      file_identity(&root.symlink_metadata("upload.tmp").unwrap());
+
+    fs::rename(
+      directory.join("upload.tmp"),
+      directory.join("original.tmp"),
+    )
+    .unwrap();
+    fs::write(directory.join("upload.tmp"), "replacement").unwrap();
+
+    assert!(
+      verify_upload_staging_identity(&root, "upload.tmp", expected)
+        .is_err()
+    );
+    fs::remove_dir_all(directory).unwrap();
+  }
+
   #[test]
   fn metadata_tree_revision_detects_nested_metadata_changes() {
     let directory =
@@ -4373,6 +7325,31 @@ mod tests {
 
     assert_ne!(before, changed_file);
     assert_ne!(changed_file, changed_structure);
+    fs::remove_dir_all(directory).unwrap();
+  }
+
+  #[test]
+  fn planned_revision_recheck_rejects_post_snapshot_change() {
+    let directory =
+      std::env::temp_dir().join(Uuid::new_v4().to_string());
+    fs::create_dir(&directory).unwrap();
+    let path = directory.join("config.txt");
+    fs::write(&path, "accepted").unwrap();
+    let root =
+      Dir::open_ambient_dir(&directory, ambient_authority()).unwrap();
+    let revisions = vec![(
+      "config.txt".into(),
+      metadata_tree_revision(&root, "config.txt").unwrap(),
+    )];
+
+    verify_plan_revisions(&root, &revisions, None).unwrap();
+    fs::write(&path, "changed after snapshot").unwrap();
+    let error =
+      verify_plan_revisions(&root, &revisions, None).unwrap_err();
+    assert_eq!(
+      error.to_string(),
+      "File Manager contents changed after preflight; retry the operation"
+    );
     fs::remove_dir_all(directory).unwrap();
   }
 
@@ -4419,7 +7396,7 @@ mod tests {
   }
 
   #[test]
-  fn extraction_capacity_uses_target_local_staging_only() {
+  fn extraction_capacity_includes_outer_rollback_and_local_staging() {
     let directory =
       std::env::temp_dir().join(Uuid::new_v4().to_string());
     fs::create_dir(&directory).unwrap();
@@ -4447,7 +7424,7 @@ mod tests {
     assert_eq!(
       operation_space_requirements(&root, &operation, &[]).unwrap(),
       SpaceRequirements {
-        journal_bytes: 0,
+        journal_bytes: b"keep".len() as u64,
         target_bytes: b"expanded".len() as u64,
       }
     );
@@ -4536,15 +7513,8 @@ mod tests {
           .unwrap()
           .is_empty()
       );
-      apply_operation_planned(
-        &root,
-        None,
-        &operation,
-        &targets,
-        &[],
-        None,
-      )
-      .unwrap();
+      apply_operation_planned(&root, &operation, &targets, &[], None)
+        .unwrap();
       assert!(directory.join(expected).exists());
     }
 
@@ -4589,6 +7559,8 @@ mod tests {
       path: "config.txt".into(),
       existed: true,
       backup_name: "0".into(),
+      before_metadata: Vec::new(),
+      after_metadata: Vec::new(),
     }];
     let refreshed =
       capture_snapshot_revisions(&root, &snapshots).unwrap();

@@ -179,6 +179,9 @@ enum ReadRequest {
   GetFileManagerCapabilities(GetFileManagerCapabilities),
   ListFileManagerDirectory(ListFileManagerDirectory),
   ReadFileManagerText(ReadFileManagerText),
+  ReadManagedFileManagerRenderedText(
+    ReadManagedFileManagerRenderedText,
+  ),
   GetFileManagerOperationStatus(GetFileManagerOperationStatus),
   ListActiveFileManagerOperations(ListActiveFileManagerOperations),
   GetFileManagerJournalStatus(GetFileManagerJournalStatus),

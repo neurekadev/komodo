@@ -84,6 +84,7 @@ export type ReadResponses = {
   GetFileManagerCapabilities: Types.FileManagerCapabilities;
   ListFileManagerDirectory: Types.FileManagerDirectory;
   ReadFileManagerText: Types.FileManagerTextFile;
+  ReadManagedFileManagerRenderedText: Types.FileManagerTextFile;
   GetFileManagerOperationStatus: Types.FileManagerOperationStatus;
   ListActiveFileManagerOperations: Types.FileManagerActiveOperations;
   GetFileManagerJournalStatus: Types.FileManagerJournalStatus;
@@ -244,6 +245,7 @@ export type WriteResponses = {
   CancelFileManagerOperation: Types.FileManagerOperationStatus;
   PrepareFileManagerUpload: Types.FileManagerTransferTicket;
   PrepareFileManagerDownload: Types.FileManagerTransferTicket;
+  PrepareManagedFileManagerRenderedDownload: Types.FileManagerTransferTicket;
   UndoFileManagerOperation: Types.FileManagerOperationTicket;
   RedoFileManagerOperation: Types.FileManagerOperationTicket;
 

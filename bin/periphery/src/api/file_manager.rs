@@ -46,6 +46,50 @@ impl Resolve<Args> for PreflightFileManagerOperation {
   }
 }
 
+impl Resolve<Args> for BeginManagedFileManagerTransaction {
+  async fn resolve(
+    self,
+    _: &Args,
+  ) -> anyhow::Result<FileManagerManagedTransactionStatus> {
+    file_manager::begin_managed_transaction(
+      &self.target,
+      &self.actor,
+      &self.operation_id,
+      &self.plan_id,
+    )
+    .await
+  }
+}
+
+impl Resolve<Args> for GetManagedFileManagerTransaction {
+  async fn resolve(
+    self,
+    _: &Args,
+  ) -> anyhow::Result<Option<FileManagerManagedTransactionStatus>> {
+    file_manager::managed_transaction_status(
+      &self.target,
+      &self.actor,
+      &self.operation_id,
+    )
+    .await
+  }
+}
+
+impl Resolve<Args> for FinalizeManagedFileManagerTransaction {
+  async fn resolve(
+    self,
+    _: &Args,
+  ) -> anyhow::Result<FileManagerManagedTransactionStatus> {
+    file_manager::finalize_managed_transaction(
+      &self.target,
+      &self.actor,
+      &self.operation_id,
+      self.action,
+    )
+    .await
+  }
+}
+
 impl Resolve<Args> for CommitFileManagerOperation {
   async fn resolve(
     self,
@@ -58,6 +102,7 @@ impl Resolve<Args> for CommitFileManagerOperation {
       &self.plan_id,
       &self.decisions,
       self.confirmed,
+      self.durable_managed,
     )
     .await
   }
@@ -175,6 +220,7 @@ impl Resolve<Args> for StartFileManagerDownload {
       self.actor,
       self.operation_id,
       self.paths,
+      self.allow_managed,
     )
     .await
   }

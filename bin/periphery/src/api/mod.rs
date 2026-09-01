@@ -63,6 +63,15 @@ pub enum PeripheryRequest {
   ListFileManagerDirectory(ListFileManagerDirectory),
   ReadFileManagerText(ReadFileManagerText),
   PreflightFileManagerOperation(PreflightFileManagerOperation),
+  BeginManagedFileManagerTransaction(
+    BeginManagedFileManagerTransaction,
+  ),
+  GetManagedFileManagerTransaction(
+    GetManagedFileManagerTransaction,
+  ),
+  FinalizeManagedFileManagerTransaction(
+    FinalizeManagedFileManagerTransaction,
+  ),
   CommitFileManagerOperation(CommitFileManagerOperation),
   GetFileManagerOperationStatus(GetFileManagerOperationStatus),
   ListActiveFileManagerOperations(ListActiveFileManagerOperations),

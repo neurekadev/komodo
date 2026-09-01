@@ -100,6 +100,16 @@ pub struct PrepareFileManagerDownload {
 #[derive(Serialize, Deserialize, Debug, Clone, Resolve)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[empty_traits(KomodoWriteRequest)]
+#[response(FileManagerTransferTicket)]
+#[error(mogh_error::Error)]
+pub struct PrepareManagedFileManagerRenderedDownload {
+  pub target: FileManagerTarget,
+}
+
+#[typeshare]
+#[derive(Serialize, Deserialize, Debug, Clone, Resolve)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[empty_traits(KomodoWriteRequest)]
 #[response(FileManagerOperationTicket)]
 #[error(mogh_error::Error)]
 pub struct UndoFileManagerOperation {

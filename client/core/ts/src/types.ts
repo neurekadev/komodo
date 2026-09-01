@@ -8063,6 +8063,7 @@ export interface FileManagerPreflight {
 	expires_at: I64;
 	conflicts: FileManagerConflict[];
 	confirmation_required: boolean;
+	supports_durable_managed_transactions: boolean;
 }
 
 export interface FileManagerTextFile {
@@ -10586,6 +10587,10 @@ export interface PrepareFileManagerDownload {
 	paths: string[];
 }
 
+export interface PrepareManagedFileManagerRenderedDownload {
+	target: FileManagerTarget;
+}
+
 export interface PrepareFileManagerUpload {
 	target: FileManagerTarget;
 	destination: string;
@@ -10714,6 +10719,10 @@ export interface PushoverAlerterEndpoint {
 export interface ReadFileManagerText {
 	target: FileManagerTarget;
 	path: string;
+}
+
+export interface ReadManagedFileManagerRenderedText {
+	target: FileManagerTarget;
 }
 
 export interface RedoFileManagerOperation {
@@ -12338,6 +12347,7 @@ export type ReadRequest =
 	| { type: "GetFileManagerCapabilities", params: GetFileManagerCapabilities }
 	| { type: "ListFileManagerDirectory", params: ListFileManagerDirectory }
 	| { type: "ReadFileManagerText", params: ReadFileManagerText }
+	| { type: "ReadManagedFileManagerRenderedText", params: ReadManagedFileManagerRenderedText }
 	| { type: "GetFileManagerOperationStatus", params: GetFileManagerOperationStatus }
 	| { type: "ListActiveFileManagerOperations", params: ListActiveFileManagerOperations }
 	| { type: "GetFileManagerJournalStatus", params: GetFileManagerJournalStatus }
@@ -12510,6 +12520,7 @@ export type WriteRequest =
 	| { type: "CancelFileManagerOperation", params: CancelFileManagerOperation }
 	| { type: "PrepareFileManagerUpload", params: PrepareFileManagerUpload }
 	| { type: "PrepareFileManagerDownload", params: PrepareFileManagerDownload }
+	| { type: "PrepareManagedFileManagerRenderedDownload", params: PrepareManagedFileManagerRenderedDownload }
 	| { type: "UndoFileManagerOperation", params: UndoFileManagerOperation }
 	| { type: "RedoFileManagerOperation", params: RedoFileManagerOperation }
 	| { type: "CreateDeployment", params: CreateDeployment }

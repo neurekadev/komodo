@@ -21,6 +21,7 @@ import {
   Select,
   Stack,
   Table,
+  Tabs,
   Text,
   TextInput,
   Tooltip,
@@ -74,6 +75,7 @@ import {
 } from "react";
 
 type SortKey = "name" | "size" | "modified_at";
+type EditorView = "source" | "deployed";
 type ClipboardState = {
   mode: "copy" | "move";
   paths: string[];
@@ -96,6 +98,8 @@ type FileVisual = {
   color: string;
   opacity?: number;
 };
+
+const ACTIVE_DIRECTORY_POLL_INTERVAL_MS = 10_000;
 
 const joinPath = (...parts: string[]) =>
   parts
@@ -382,13 +386,18 @@ const operationLabel = (operation: Types.FileManagerOperation) => {
   }
 };
 
-export default function FileManager({
-  target,
-  titleOther,
-}: {
+type FileManagerProps = {
   target: Types.FileManagerTarget;
   titleOther?: ReactNode;
-}) {
+};
+
+export default function FileManager(props: FileManagerProps) {
+  return (
+    <TargetFileManager key={fileManagerTargetKey(props.target)} {...props} />
+  );
+}
+
+function TargetFileManager({ target, titleOther }: FileManagerProps) {
   const queryClient = useQueryClient();
   const operations = useFileOperations();
   const desktop = useMediaQuery("(min-width: 62em)");
@@ -402,7 +411,9 @@ export default function FileManager({
   const [sortKey, setSortKey] = useState<SortKey>("name");
   const [sortAscending, setSortAscending] = useState(true);
   const [editorPath, setEditorPath] = useState<string>();
+  const [editorView, setEditorView] = useState<EditorView>("source");
   const [draft, setDraft] = useState("");
+  const [deployedDownloadPending, setDeployedDownloadPending] = useState(false);
   const editorSource = useRef<{ path: string; contents: string } | undefined>(
     undefined,
   );
@@ -424,7 +435,11 @@ export default function FileManager({
   const directory = useRead(
     "ListFileManagerDirectory",
     { target, path },
-    { enabled: capabilities?.available === true },
+    {
+      enabled: capabilities?.available === true,
+      refetchInterval: ACTIVE_DIRECTORY_POLL_INTERVAL_MS,
+      refetchIntervalInBackground: false,
+    },
   );
   const journal = useRead(
     "GetFileManagerJournalStatus",
@@ -435,6 +450,19 @@ export default function FileManager({
     "ReadFileManagerText",
     { target, path: editorPath ?? "" },
     { enabled: !!editorPath && capabilities?.available === true },
+  );
+  const editorManaged =
+    !!editorPath && capabilities?.managed_file === editorPath;
+  const deployedTextFile = useRead(
+    "ReadManagedFileManagerRenderedText",
+    { target },
+    {
+      enabled:
+        editorManaged &&
+        editorView === "deployed" &&
+        capabilities?.available === true,
+      retry: false,
+    },
   );
 
   useEffect(() => {
@@ -458,6 +486,12 @@ export default function FileManager({
   });
   const { mutateAsync: prepareDownload } = useWrite(
     "PrepareFileManagerDownload",
+    {
+      onError: () => undefined,
+    },
+  );
+  const { mutateAsync: prepareManagedRenderedDownload } = useWrite(
+    "PrepareManagedFileManagerRenderedDownload",
     {
       onError: () => undefined,
     },
@@ -511,7 +545,8 @@ export default function FileManager({
   const editorDirty = !!textFile.data && draft !== textFile.data.contents;
 
   const refresh = useCallback(
-    async (forceEditor = false) => {
+    async (forceEditor = false, writtenTextPath?: string) => {
+      const textPath = writtenTextPath ?? editorPath;
       const matchesTarget = (queryKey: readonly unknown[]) => {
         const params = queryKey[1];
         return (
@@ -532,14 +567,19 @@ export default function FileManager({
         queryClient.invalidateQueries({
           queryKey: ["GetFileManagerJournalStatus", { target }],
         }),
-        editorPath && (!editorDirty || forceEditor)
+        textPath && (!editorDirty || forceEditor)
           ? queryClient.invalidateQueries({
-              queryKey: ["ReadFileManagerText", { target, path: editorPath }],
+              queryKey: ["ReadFileManagerText", { target, path: textPath }],
+            })
+          : Promise.resolve(),
+        forceEditor && writtenTextPath === capabilities?.managed_file
+          ? queryClient.invalidateQueries({
+              queryKey: ["ReadManagedFileManagerRenderedText", { target }],
             })
           : Promise.resolve(),
       ]);
     },
-    [editorDirty, editorPath, queryClient, target],
+    [capabilities?.managed_file, editorDirty, editorPath, queryClient, target],
   );
 
   useEffect(() => {
@@ -600,7 +640,11 @@ export default function FileManager({
           plan.notificationId,
         );
         if (status.state !== Types.FileManagerOperationState.Complete) return;
-        await refresh(plan.operation.type === "WriteText");
+        const writtenTextPath =
+          plan.operation.type === "WriteText"
+            ? plan.operation.params.path
+            : undefined;
+        await refresh(!!writtenTextPath, writtenTextPath);
         if (plan.clearClipboardOnSuccess) setClipboard(undefined);
         setSelected([]);
       } catch (error) {
@@ -642,6 +686,7 @@ export default function FileManager({
 
   const runHistoryOperation = useCallback(
     async (kind: "undo" | "redo") => {
+      if (busy) return;
       const label =
         kind === "undo" ? "Undo file operation" : "Redo file operation";
       const notificationId = operations.begin(label);
@@ -665,7 +710,7 @@ export default function FileManager({
         operations.failPending(notificationId, label, error);
       }
     },
-    [operations, redo, refresh, target, undo],
+    [busy, operations, redo, refresh, target, undo],
   );
 
   const cancelPendingCommit = useCallback(() => {
@@ -711,6 +756,7 @@ export default function FileManager({
     if (entry.kind === Types.FileManagerEntryKind.Directory) {
       setPath(entry.path);
     } else if (entry.kind === Types.FileManagerEntryKind.File) {
+      setEditorView("source");
       setEditorPath(entry.path);
     }
   };
@@ -1010,6 +1056,65 @@ export default function FileManager({
     }
   };
 
+  const downloadManagedRendered = async () => {
+    if (!editorManaged || !editorPath || deployedDownloadPending) return;
+    const controller = new AbortController();
+    const label = "Download deployed compose";
+    const notificationId = operations.begin(label);
+    let operationId: string | undefined;
+    setDeployedDownloadPending(true);
+    try {
+      const ticket = await prepareManagedRenderedDownload({ target });
+      operationId = ticket.operation_id;
+      const statusPromise = operations.track(
+        ticket.operation_id,
+        target,
+        label,
+        false,
+        notificationId,
+      );
+      operations.setCancel(notificationId, () => controller.abort());
+      const jwt = MoghAuth.LOGIN_TOKENS.jwt();
+      const response = await fetch(KOMODO_BASE_URL + ticket.url, {
+        headers: jwt ? { authorization: jwt } : {},
+        credentials: "include",
+        signal: controller.signal,
+      });
+      if (!response.ok) throw new Error(await response.text());
+      const disposition = response.headers.get("content-disposition") ?? "";
+      const downloadName =
+        disposition.match(/filename="?([^";]+)"?/i)?.[1] ??
+        `deployed-${fileName(editorPath)}`;
+      const pickerWindow = window as Window & {
+        showSaveFilePicker?: (options: unknown) => Promise<{
+          createWritable: () => Promise<WritableStream>;
+        }>;
+      };
+      if (pickerWindow.showSaveFilePicker && response.body) {
+        const handle = await pickerWindow.showSaveFilePicker({
+          suggestedName: downloadName,
+        });
+        await response.body.pipeTo(await handle.createWritable());
+      } else {
+        const blob = await response.blob();
+        const link = document.createElement("a");
+        link.href = URL.createObjectURL(blob);
+        link.download = downloadName;
+        link.click();
+        URL.revokeObjectURL(link.href);
+      }
+      await statusPromise;
+    } catch (error) {
+      if (operationId) operations.untrack(operationId);
+      if ((error as DOMException)?.name === "AbortError")
+        operations.cancelPending(notificationId, label);
+      else operations.failPending(notificationId, label, error);
+    } finally {
+      operations.setCancel(notificationId);
+      setDeployedDownloadPending(false);
+    }
+  };
+
   const onDrop = async (event: React.DragEvent, destination = path) => {
     event.preventDefault();
     event.stopPropagation();
@@ -1247,6 +1352,104 @@ export default function FileManager({
     </Table.Th>
   );
 
+  const sourceEditorContent = textFile.isPending ? (
+    <Loader />
+  ) : textFile.data ? (
+    <Stack>
+      <Text size="xs" c="dimmed" ff="monospace">
+        {textFile.data.path}
+      </Text>
+      <MonacoEditor
+        value={draft}
+        onValueChange={setDraft}
+        filename={textFile.data.path}
+        language={languageFromPath(textFile.data.path)}
+        readOnly={readOnly}
+        maxHeightProportion={0.65}
+      />
+      {!readOnly && (
+        <Group justify="end">
+          <Button
+            leftSection={<ICONS.Save size={16} />}
+            loading={busy}
+            disabled={draft === textFile.data.contents}
+            onClick={async () => {
+              await runOperation({
+                type: "WriteText",
+                params: {
+                  path: textFile.data.path,
+                  contents: draft,
+                  expected_revision: textFile.data.revision,
+                },
+              });
+            }}
+          >
+            Save
+          </Button>
+        </Group>
+      )}
+    </Stack>
+  ) : (
+    <Alert color="red">This file cannot be opened as editable text.</Alert>
+  );
+
+  const deployedEditorContent = (
+    <Stack>
+      <Alert
+        color="orange"
+        title="Deployed compose may contain resolved secrets"
+      >
+        This is the exact compose file currently on the host. It may contain
+        resolved secret values, so treat its contents and downloads as
+        sensitive.
+      </Alert>
+      <Group justify="end">
+        <Button
+          leftSection={<ICONS.Download size={16} />}
+          loading={deployedDownloadPending}
+          disabled={deployedDownloadPending || busy}
+          onClick={() => void downloadManagedRendered()}
+        >
+          Download deployed compose
+        </Button>
+      </Group>
+      {deployedTextFile.isPending ? (
+        <Loader />
+      ) : deployedTextFile.isError || !deployedTextFile.data ? (
+        <Alert color="red" title="Deployed compose unavailable">
+          <Stack gap="xs">
+            <Text size="sm">
+              Komodo could not read a deployed compose file from the host. It
+              may not exist yet. Source and any unsaved draft remain available.
+            </Text>
+            <Group>
+              <Button
+                size="compact-sm"
+                variant="light"
+                onClick={() => void deployedTextFile.refetch()}
+              >
+                Retry
+              </Button>
+            </Group>
+          </Stack>
+        </Alert>
+      ) : (
+        <Stack>
+          <Text size="xs" c="dimmed" ff="monospace">
+            {deployedTextFile.data.path}
+          </Text>
+          <MonacoEditor
+            value={deployedTextFile.data.contents}
+            filename={deployedTextFile.data.path}
+            language={languageFromPath(deployedTextFile.data.path)}
+            readOnly
+            maxHeightProportion={0.65}
+          />
+        </Stack>
+      )}
+    </Stack>
+  );
+
   const breadcrumbs = path ? path.split("/") : [];
 
   return (
@@ -1413,14 +1616,9 @@ export default function FileManager({
             </Text>
           )}
           {!!journal.data?.retained_storage_bytes && (
-            <Text
-              size="xs"
-              c="dimmed"
-              title={journal.data.storage_description}
-            >
-              File Manager recovery storage: {formatBytes(
-                journal.data.retained_storage_bytes ?? 0,
-              )}
+            <Text size="xs" c="dimmed" title={journal.data.storage_description}>
+              File Manager recovery storage:{" "}
+              {formatBytes(journal.data.retained_storage_bytes ?? 0)}
             </Text>
           )}
           <Box
@@ -1684,47 +1882,30 @@ export default function FileManager({
         title={editorPath ? fileName(editorPath) : "File editor"}
         size="min(92vw, 1600px)"
       >
-        {textFile.isPending ? (
-          <Loader />
-        ) : textFile.data ? (
-          <Stack>
-            <Text size="xs" c="dimmed" ff="monospace">
-              {textFile.data.path}
-            </Text>
-            <MonacoEditor
-              value={draft}
-              onValueChange={setDraft}
-              filename={textFile.data.path}
-              language={languageFromPath(textFile.data.path)}
-              readOnly={readOnly}
-              maxHeightProportion={0.65}
-            />
-            {!readOnly && (
-              <Group justify="end">
-                <Button
-                  leftSection={<ICONS.Save size={16} />}
-                  loading={busy}
-                  disabled={draft === textFile.data.contents}
-                  onClick={async () => {
-                    await runOperation({
-                      type: "WriteText",
-                      params: {
-                        path: textFile.data.path,
-                        contents: draft,
-                        expected_revision: textFile.data.revision,
-                      },
-                    });
-                  }}
-                >
-                  Save
-                </Button>
-              </Group>
-            )}
-          </Stack>
+        {editorManaged ? (
+          <Tabs
+            value={editorView}
+            onChange={(value) => {
+              if (value === "source" || value === "deployed") {
+                setEditorView(value);
+              }
+            }}
+          >
+            <Tabs.List>
+              <Tabs.Tab value="source">
+                Source{editorDirty ? " · Unsaved" : ""}
+              </Tabs.Tab>
+              <Tabs.Tab value="deployed">Deployed / On disk</Tabs.Tab>
+            </Tabs.List>
+            <Tabs.Panel value="source" pt="md">
+              {sourceEditorContent}
+            </Tabs.Panel>
+            <Tabs.Panel value="deployed" pt="md">
+              {deployedEditorContent}
+            </Tabs.Panel>
+          </Tabs>
         ) : (
-          <Alert color="red">
-            This file cannot be opened as editable text.
-          </Alert>
+          sourceEditorContent
         )}
       </Modal>
 

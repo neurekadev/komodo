@@ -266,6 +266,10 @@ pub struct FileManagerPreflight {
   pub expires_at: I64,
   pub conflicts: Vec<FileManagerConflict>,
   pub confirmation_required: bool,
+  /// Whether this Periphery supports crash-durable coordination for writes to
+  /// database-managed files. Older Periphery versions omit this field.
+  #[serde(default)]
+  pub supports_durable_managed_transactions: bool,
 }
 
 #[typeshare]

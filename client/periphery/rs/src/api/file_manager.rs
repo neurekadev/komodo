@@ -58,6 +58,63 @@ pub struct PreflightFileManagerOperation {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Resolve)]
+#[response(FileManagerManagedTransactionStatus)]
+#[error(anyhow::Error)]
+pub struct BeginManagedFileManagerTransaction {
+  pub target: PeripheryFileManagerTarget,
+  pub actor: String,
+  pub operation_id: String,
+  pub plan_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Resolve)]
+#[response(Option<FileManagerManagedTransactionStatus>)]
+#[error(anyhow::Error)]
+pub struct GetManagedFileManagerTransaction {
+  pub target: PeripheryFileManagerTarget,
+  pub actor: String,
+  pub operation_id: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileManagerManagedTransactionFinalizeAction {
+  Commit,
+  Rollback,
+}
+
+#[derive(
+  Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum FileManagerManagedTransactionState {
+  #[default]
+  Prepared,
+  Applying,
+  Applied,
+  CommitRequested,
+  RollbackRequested,
+  RolledBack,
+  Committed,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FileManagerManagedTransactionStatus {
+  pub operation_id: String,
+  pub state: FileManagerManagedTransactionState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Resolve)]
+#[response(FileManagerManagedTransactionStatus)]
+#[error(anyhow::Error)]
+pub struct FinalizeManagedFileManagerTransaction {
+  pub target: PeripheryFileManagerTarget,
+  pub actor: String,
+  pub operation_id: String,
+  pub action: FileManagerManagedTransactionFinalizeAction,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Resolve)]
 #[response(FileManagerCommitResponse)]
 #[error(anyhow::Error)]
 pub struct CommitFileManagerOperation {
@@ -67,6 +124,11 @@ pub struct CommitFileManagerOperation {
   pub plan_id: String,
   pub decisions: Vec<FileManagerConflictDecision>,
   pub confirmed: bool,
+  /// Enables the crash-durable managed-file protocol after a successful
+  /// `BeginManagedFileManagerTransaction` handshake. Older Core versions omit
+  /// this field and keep the legacy behavior.
+  #[serde(default)]
+  pub durable_managed: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -169,6 +231,8 @@ pub struct StartFileManagerDownload {
   pub actor: String,
   pub operation_id: String,
   pub paths: Vec<String>,
+  #[serde(default)]
+  pub allow_managed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -177,4 +241,8 @@ pub struct StartFileManagerDownloadResponse {
   pub file_name: String,
   pub total_bytes: u64,
   pub sha256: String,
+  #[serde(default)]
+  pub supports_download_credit: bool,
+  #[serde(default)]
+  pub supports_download_heartbeat: bool,
 }

@@ -47,6 +47,16 @@ pub struct ReadFileManagerText {
 #[derive(Serialize, Deserialize, Debug, Clone, Resolve)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[empty_traits(KomodoReadRequest)]
+#[response(FileManagerTextFile)]
+#[error(mogh_error::Error)]
+pub struct ReadManagedFileManagerRenderedText {
+  pub target: FileManagerTarget,
+}
+
+#[typeshare]
+#[derive(Serialize, Deserialize, Debug, Clone, Resolve)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[empty_traits(KomodoReadRequest)]
 #[response(FileManagerOperationStatus)]
 #[error(mogh_error::Error)]
 pub struct GetFileManagerOperationStatus {

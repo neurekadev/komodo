@@ -27,6 +27,7 @@ import {
 const STORAGE_KEY = "komodo-file-manager-operations-v1";
 const STATUS_REQUEST_TIMEOUT_MS = 10_000;
 const STATUS_TIMEOUT_WARNING_THRESHOLD = 30;
+const OPERATION_NOT_FOUND_ERROR = "File Manager operation was not found";
 
 type TrackedOperation = {
   operationId: string;
@@ -123,16 +124,24 @@ const errorParts = (value: unknown): string[] => {
     .map(updateLogToText);
 };
 
-const errorText = (error: unknown) => {
+const apiErrorParts = (error: unknown) => {
   const structured = errorParts(error);
+  if (structured.length) return structured;
+  if (!(error instanceof Error)) return [];
+  try {
+    return errorParts({ result: JSON.parse(error.message) });
+  } catch {
+    return [];
+  }
+};
+
+const isOperationNotFoundError = (error: unknown) =>
+  apiErrorParts(error).some((part) => part.includes(OPERATION_NOT_FOUND_ERROR));
+
+const errorText = (error: unknown) => {
+  const structured = apiErrorParts(error);
   if (structured.length) return structured.join(" | ");
   const message = error instanceof Error ? error.message : String(error);
-  try {
-    const parsed = errorParts({ result: JSON.parse(message) });
-    if (parsed.length) return parsed.join(" | ");
-  } catch {
-    // The message is plain text, not a serialized API error.
-  }
   return updateLogToText(message);
 };
 
@@ -192,10 +201,7 @@ function StatusMessage({
   cancel?: () => void;
 }) {
   const percent = progressValue(status);
-  const elapsed = Math.max(
-    1,
-    Date.now() - (status.started_at ?? Date.now()),
-  );
+  const elapsed = Math.max(1, Date.now() - (status.started_at ?? Date.now()));
   const phaseElapsed = Math.max(
     1,
     Date.now() - (status.phase_started_at ?? status.started_at ?? Date.now()),
@@ -351,6 +357,47 @@ export function FileOperationProvider({ children }: { children: ReactNode }) {
     [queryClient, removeOperation],
   );
 
+  const retireMissingOperation = useCallback(
+    (operation: TrackedOperation) => {
+      const unavailableStatus: Types.FileManagerOperationStatus = {
+        operation_id: operation.operationId,
+        state: Types.FileManagerOperationState.Failed,
+        description: operation.label,
+        started_at: operation.startedAt,
+        completed_entries: 0,
+        total_entries: 0,
+        completed_bytes: 0,
+        total_bytes: 0,
+        error:
+          "The operation is no longer active and its final status is unavailable.",
+      };
+      notifications.update({
+        id: operation.notificationId,
+        title: `${operation.label} no longer active`,
+        message:
+          "The server no longer reports this operation as active. Its final status is unavailable, so local tracking was cleared.",
+        color: "gray",
+        loading: false,
+        withCloseButton: true,
+        autoClose: 4_000,
+      });
+      removeOperation(operation.operationId);
+      failures.current.delete(operation.operationId);
+      timeouts.current.delete(operation.operationId);
+      cancellations.current.delete(operation.notificationId);
+      setPendingConflict((current) =>
+        current?.operation.operationId === operation.operationId
+          ? undefined
+          : current,
+      );
+      for (const resolve of waiters.current.get(operation.operationId) ?? []) {
+        resolve(unavailableStatus);
+      }
+      waiters.current.delete(operation.operationId);
+    },
+    [removeOperation],
+  );
+
   const poll = useCallback(async () => {
     if (polling.current || operationsRef.current.length === 0) return;
     polling.current = true;
@@ -430,6 +477,26 @@ export function FileOperationProvider({ children }: { children: ReactNode }) {
               }
               return;
             }
+            if (isOperationNotFoundError(error)) {
+              try {
+                const active = await withTimeout(
+                  komodo_client().read("ListActiveFileManagerOperations", {
+                    target: operation.target,
+                  }),
+                  STATUS_REQUEST_TIMEOUT_MS,
+                );
+                if (
+                  !active.operations.some(
+                    (status) => status.operation_id === operation.operationId,
+                  )
+                ) {
+                  retireMissingOperation(operation);
+                  return;
+                }
+              } catch {
+                // A failed confirmation is transient; keep polling the operation.
+              }
+            }
             timeouts.current.delete(operation.operationId);
             const count =
               (failures.current.get(operation.operationId) ?? 0) + 1;
@@ -452,7 +519,7 @@ export function FileOperationProvider({ children }: { children: ReactNode }) {
     } finally {
       polling.current = false;
     }
-  }, [settle]);
+  }, [retireMissingOperation, settle]);
 
   useEffect(() => {
     for (const operation of operations) {
@@ -581,29 +648,26 @@ export function FileOperationProvider({ children }: { children: ReactNode }) {
     [begin],
   );
 
-  const discover = useCallback(
-    async (target: Types.FileManagerTarget) => {
-      const response = await komodo_client().read(
-        "ListActiveFileManagerOperations",
-        { target },
-      );
-      setOperations((current) => {
-        const known = new Set(current.map((item) => item.operationId));
-        const restored = response.operations
-          .filter((status) => !known.has(status.operation_id))
-          .map((status) => ({
-            operationId: status.operation_id,
-            notificationId: status.operation_id,
-            target,
-            label: status.description || "File operation",
-            write: true,
-            startedAt: status.started_at || Date.now(),
-          }));
-        return restored.length ? [...current, ...restored] : current;
-      });
-    },
-    [],
-  );
+  const discover = useCallback(async (target: Types.FileManagerTarget) => {
+    const response = await komodo_client().read(
+      "ListActiveFileManagerOperations",
+      { target },
+    );
+    setOperations((current) => {
+      const known = new Set(current.map((item) => item.operationId));
+      const restored = response.operations
+        .filter((status) => !known.has(status.operation_id))
+        .map((status) => ({
+          operationId: status.operation_id,
+          notificationId: status.operation_id,
+          target,
+          label: status.description || "File operation",
+          write: true,
+          startedAt: status.started_at || Date.now(),
+        }));
+      return restored.length ? [...current, ...restored] : current;
+    });
+  }, []);
 
   const untrack = useCallback(
     (operationId: string) => {
@@ -676,8 +740,10 @@ export function FileOperationProvider({ children }: { children: ReactNode }) {
                 {pendingConflict.status.pending_conflict.conflict.path}
               </Text>
               <Text size="xs" c="dimmed">
-                Existing {pendingConflict.status.pending_conflict.conflict.existing_kind};
-                incoming {pendingConflict.status.pending_conflict.conflict.incoming_kind}
+                Existing{" "}
+                {pendingConflict.status.pending_conflict.conflict.existing_kind}
+                ; incoming{" "}
+                {pendingConflict.status.pending_conflict.conflict.incoming_kind}
               </Text>
             </Stack>
             <Checkbox
@@ -700,46 +766,45 @@ export function FileOperationProvider({ children }: { children: ReactNode }) {
                 Cancel operation
               </Button>
               <Group>
-                {[Types.FileManagerConflictAction.Skip, Types.FileManagerConflictAction.Overwrite].map(
-                  (action) => (
-                    <Button
-                      key={action}
-                      color={
-                        action === Types.FileManagerConflictAction.Overwrite
-                          ? "red"
-                          : undefined
-                      }
-                      variant={
-                        action === Types.FileManagerConflictAction.Skip
-                          ? "default"
-                          : "filled"
-                      }
-                      onClick={() => {
-                        const pending =
-                          pendingConflict.status.pending_conflict;
-                        if (!pending) return;
-                        const applyToAllRemaining = applyToAll;
-                        setPendingConflict(undefined);
-                        setApplyToAll(false);
-                        void komodo_client().write(
-                          "ResolveFileManagerOperationConflict",
-                          {
-                            target: pendingConflict.operation.target,
-                            operation_id:
-                              pendingConflict.operation.operationId,
-                            decision_id: pending.decision_id,
-                            action,
-                            apply_to_all: applyToAllRemaining,
-                          },
-                        );
-                      }}
-                    >
-                      {action === Types.FileManagerConflictAction.Skip
-                        ? "Skip"
-                        : "Overwrite"}
-                    </Button>
-                  ),
-                )}
+                {[
+                  Types.FileManagerConflictAction.Skip,
+                  Types.FileManagerConflictAction.Overwrite,
+                ].map((action) => (
+                  <Button
+                    key={action}
+                    color={
+                      action === Types.FileManagerConflictAction.Overwrite
+                        ? "red"
+                        : undefined
+                    }
+                    variant={
+                      action === Types.FileManagerConflictAction.Skip
+                        ? "default"
+                        : "filled"
+                    }
+                    onClick={() => {
+                      const pending = pendingConflict.status.pending_conflict;
+                      if (!pending) return;
+                      const applyToAllRemaining = applyToAll;
+                      setPendingConflict(undefined);
+                      setApplyToAll(false);
+                      void komodo_client().write(
+                        "ResolveFileManagerOperationConflict",
+                        {
+                          target: pendingConflict.operation.target,
+                          operation_id: pendingConflict.operation.operationId,
+                          decision_id: pending.decision_id,
+                          action,
+                          apply_to_all: applyToAllRemaining,
+                        },
+                      );
+                    }}
+                  >
+                    {action === Types.FileManagerConflictAction.Skip
+                      ? "Skip"
+                      : "Overwrite"}
+                  </Button>
+                ))}
               </Group>
             </Group>
           </Stack>

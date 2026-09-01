@@ -20,7 +20,7 @@ use crate::{
   file_manager::{
     can_write, get_core_operation_status,
     list_core_active_operations, managed_entry, managed_text,
-    resolve_target,
+    require_managed_file, resolve_target,
   },
   helpers::periphery_client,
 };
@@ -119,6 +119,27 @@ impl Resolve<ReadArgs> for ReadFileManagerText {
         .request(periphery::ReadFileManagerText {
           target: resolved.periphery,
           path: self.path,
+        })
+        .await?,
+    )
+  }
+}
+
+impl Resolve<ReadArgs> for ReadManagedFileManagerRenderedText {
+  async fn resolve(
+    self,
+    ReadArgs { user }: &ReadArgs,
+  ) -> mogh_error::Result<FileManagerTextFile> {
+    let resolved =
+      resolve_target(&self.target, user, PermissionLevel::Read)
+        .await?;
+    let path = require_managed_file(&resolved)?;
+    Ok(
+      periphery_client(&resolved.server)
+        .await?
+        .request(periphery::ReadFileManagerText {
+          target: resolved.periphery,
+          path,
         })
         .await?,
     )
