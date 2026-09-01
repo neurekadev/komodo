@@ -862,6 +862,13 @@ impl Resolve<Args> for TransactionalVykarRestore {
         self.selected_paths.is_empty(),
       )?;
     }
+    // Persist the complete pre-restore running set before the first stop. If
+    // Periphery exits mid-restore, startup recovery can restart every affected
+    // container after repairing the filesystem journal.
+    let container_journal = persist_restore_container_journal(
+      &self.journal_id,
+      &running_containers,
+    )?;
     let mut stopped_containers: Vec<String> = Vec::new();
     for container in &running_containers {
       if let Err(stop_error) =
@@ -874,6 +881,11 @@ impl Resolve<Args> for TransactionalVykarRestore {
           {
             restart_errors.push(format!("{stopped}: {error:#}"));
           }
+        }
+        if restart_errors.is_empty() {
+          remove_restore_container_journal(
+            container_journal.as_deref(),
+          )?;
         }
         return Ok(TransactionalVykarRestoreResponse {
           complete: false,
@@ -917,6 +929,11 @@ impl Resolve<Args> for TransactionalVykarRestore {
             }
           }
         }
+        if restart_errors.is_empty() {
+          remove_restore_container_journal(
+            container_journal.as_deref(),
+          )?;
+        }
         return Ok(TransactionalVykarRestoreResponse {
           complete: false,
           rolled_back: true,
@@ -955,6 +972,7 @@ impl Resolve<Args> for TransactionalVykarRestore {
       }
     }
     if restart_errors.is_empty() {
+      remove_restore_container_journal(container_journal.as_deref())?;
       Ok(TransactionalVykarRestoreResponse {
         complete: !rolled_back,
         rolled_back,
@@ -1267,6 +1285,11 @@ struct RestoreJournal {
   committed: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RestoreContainerJournal {
+  containers: Vec<String>,
+}
+
 #[derive(Default)]
 struct RemovePathsOnDrop(Vec<PathBuf>);
 
@@ -1287,9 +1310,47 @@ fn restore_journal_dir() -> anyhow::Result<PathBuf> {
   Ok(directory)
 }
 
+fn restore_container_journal_dir() -> anyhow::Result<PathBuf> {
+  let directory = periphery_config()
+    .stack_dir()
+    .join(".komodo-vykar")
+    .join("restore-container-journals");
+  std::fs::create_dir_all(&directory)?;
+  Ok(directory)
+}
+
+fn persist_restore_container_journal(
+  journal_id: &str,
+  containers: &[String],
+) -> anyhow::Result<Option<PathBuf>> {
+  if containers.is_empty() {
+    return Ok(None);
+  }
+  let path = restore_container_journal_dir()?
+    .join(format!("{journal_id}.json"));
+  persist_journal(
+    &path,
+    &RestoreContainerJournal {
+      containers: containers.to_vec(),
+    },
+  )?;
+  Ok(Some(path))
+}
+
+fn remove_restore_container_journal(
+  path: Option<&Path>,
+) -> anyhow::Result<()> {
+  let Some(path) = path else {
+    return Ok(());
+  };
+  remove_path(path)?;
+  fsync_parent(path)
+}
+
 /// Roll back any publication interrupted after its durable journal was
-/// written. This runs before Periphery accepts requests.
-pub(crate) fn recover_restore_journals() -> anyhow::Result<()> {
+/// written, then restart containers quiesced by an interrupted restore. This
+/// runs before Periphery accepts requests.
+pub(crate) async fn recover_restore_journals() -> anyhow::Result<()> {
   let directory = restore_journal_dir()?;
   for entry in std::fs::read_dir(&directory)? {
     let path = entry?.path();
@@ -1320,6 +1381,42 @@ pub(crate) fn recover_restore_journals() -> anyhow::Result<()> {
     remove_path(&path)?;
     fsync_parent(&path)?;
     warn!("Recovered interrupted restore journal {}", path.display());
+  }
+  let directory = restore_container_journal_dir()?;
+  for entry in std::fs::read_dir(&directory)? {
+    let path = entry?.path();
+    if path.extension().and_then(|value| value.to_str())
+      != Some("json")
+    {
+      continue;
+    }
+    let bytes = std::fs::read(&path).with_context(|| {
+      format!(
+        "Failed to read restore container journal {}",
+        path.display()
+      )
+    })?;
+    let journal: RestoreContainerJournal =
+      serde_json::from_slice(&bytes).with_context(|| {
+        format!(
+          "Failed to decode restore container journal {}",
+          path.display()
+        )
+      })?;
+    let (_, errors) = restart_containers(&journal.containers).await;
+    if !errors.is_empty() {
+      return Err(anyhow!(
+        "Failed to recover containers from interrupted restore {}: {}",
+        path.display(),
+        errors.join("; ")
+      ));
+    }
+    remove_path(&path)?;
+    fsync_parent(&path)?;
+    warn!(
+      "Restarted containers from interrupted restore journal {}",
+      path.display()
+    );
   }
   Ok(())
 }
@@ -1452,18 +1549,22 @@ fn publish_restore_in(
   publication_started.store(true, Ordering::SeqCst);
 
   for index in 0..journal.entries.len() {
-    if path_lexists(&journal.entries[index].destination)
-      && let Err(error) = std::fs::rename(
+    if path_lexists(&journal.entries[index].destination) {
+      if let Err(error) = std::fs::rename(
         &journal.entries[index].destination,
         &journal.entries[index].rollback,
-      )
-    {
-      rollback_published(&mut journal, &journal_path)?;
-      warn!(
-        "Restore rollback preparation failed and earlier publications were rolled back: {error:#}"
-      );
-      cleanup_rolled_back_restore(&journal, &journal_path)?;
-      return Ok(true);
+      ) {
+        rollback_published(&mut journal, &journal_path)?;
+        warn!(
+          "Restore rollback preparation failed and earlier publications were rolled back: {error:#}"
+        );
+        cleanup_rolled_back_restore(&journal, &journal_path)?;
+        return Ok(true);
+      }
+      // Make destination -> rollback durable before the journal claims this
+      // entry was published. Recovery must never remove original data after a
+      // power loss that discarded the rename.
+      fsync_parent(&journal.entries[index].destination)?;
     }
     // Persist publication intent before source -> destination. On recovery,
     // this distinguishes a newly-created destination (which has no rollback
@@ -1625,9 +1726,9 @@ fn rollback_published(
   Ok(())
 }
 
-fn persist_journal(
+fn persist_journal<T: Serialize>(
   path: &Path,
-  journal: &RestoreJournal,
+  journal: &T,
 ) -> anyhow::Result<()> {
   let temporary = path.with_extension("tmp");
   let bytes = serde_json::to_vec(journal)?;

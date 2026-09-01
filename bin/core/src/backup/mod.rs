@@ -70,6 +70,7 @@ const RUNS_COLLECTION: &str = "BackupRun";
 const PLANS_COLLECTION: &str = "BackupRestorePlan";
 const CORE_RECOVERY_COLLECTION: &str = "CoreRecoveryPlan";
 const HEALTH_COLLECTION: &str = "BackupRepositoryHealth";
+const CORE_STAGING_PATH: &str = "/data/backups/.komodo-core-staging";
 const CORE_INSTANCE_ID_PATH: &str = "/data/keys/backup-instance-id";
 const LEGACY_CORE_INSTANCE_ID_PATH: &str =
   "/config/keys/backup-instance-id";
@@ -137,6 +138,9 @@ struct RepositoryHealthRecord {
   checked_at: i64,
   #[serde(default)]
   last_full_verification_at: i64,
+  /// Remains set after an integrity check fails until a later check succeeds.
+  #[serde(default)]
+  verification_failed: bool,
 }
 
 fn settings_collection() -> Collection<SealedBackupSettings> {
@@ -192,11 +196,47 @@ pub async fn get_redacted_settings() -> anyhow::Result<BackupSettings>
 }
 
 pub async fn save_settings(
+  proposed: BackupSettings,
+) -> anyhow::Result<BackupSettings> {
+  let _repository_roles =
+    repository_role_barrier().clone().write_owned().await;
+  save_settings_inner(proposed, false).await
+}
+
+async fn save_settings_after_promotion(
+  proposed: BackupSettings,
+) -> anyhow::Result<BackupSettings> {
+  save_settings_inner(proposed, true).await
+}
+
+async fn save_settings_inner(
   mut proposed: BackupSettings,
+  allow_primary_location_change: bool,
 ) -> anyhow::Result<BackupSettings> {
   validate_settings(&proposed)?;
-  let existing = get_settings().await.ok();
+  let existing = match settings_collection()
+    .find_one(doc! { "_id": SETTINGS_ID })
+    .await
+    .context("Failed to load existing backup settings")?
+  {
+    Some(record) => {
+      let bytes = crypto::open(&record.sealed)?;
+      Some(
+        serde_json::from_slice::<BackupSettings>(&bytes)
+          .context("Failed to decode sealed backup settings")?,
+      )
+    }
+    None => None,
+  };
   if let Some(existing) = &existing {
+    if !allow_primary_location_change
+      && repository_location(&proposed.primary)
+        != repository_location(&existing.primary)
+    {
+      return Err(anyhow!(
+        "Primary repository location cannot be changed after initialization; configure a mirror and use verified promotion"
+      ));
+    }
     merge_repository_secrets(
       &mut proposed.primary,
       &existing.primary,
@@ -790,6 +830,18 @@ pub async fn status() -> anyhow::Result<BackupStatus> {
       )
     })
     .cloned();
+  let previous_primary = health_collection()
+    .find_one(doc! { "_id": "primary" })
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or_default();
+  let previous_mirror = health_collection()
+    .find_one(doc! { "_id": "mirror" })
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or_default();
   let settings = get_settings().await?;
   let primary_settings = settings.clone();
   let primary_repository = settings.primary.clone();
@@ -809,8 +861,10 @@ pub async fn status() -> anyhow::Result<BackupStatus> {
   })
   .await
   .context("Primary health worker failed")?;
-  let primary_healthy =
+  let primary_inventory_healthy =
     primary.as_ref().is_ok_and(|(_, healthy)| *healthy);
+  let primary_healthy = primary_inventory_healthy
+    && !previous_primary.verification_failed;
   let primary_names =
     primary.map(|(names, _)| names).unwrap_or_default();
   let (mirror_healthy, mirror_lagging_snapshots) =
@@ -834,7 +888,7 @@ pub async fn status() -> anyhow::Result<BackupStatus> {
       .context("Mirror health worker failed")?;
       match mirror {
         Ok((mirror_snapshots, healthy)) => (
-          Some(healthy),
+          Some(healthy && !previous_mirror.verification_failed),
           primary_names
             .iter()
             .filter(|(name, primary_partial)| {
@@ -850,12 +904,6 @@ pub async fn status() -> anyhow::Result<BackupStatus> {
     } else {
       (None, 0)
     };
-  let previous_primary = health_collection()
-    .find_one(doc! { "_id": "primary" })
-    .await
-    .ok()
-    .flatten()
-    .unwrap_or_default();
   let checked_at = komodo_timestamp();
   let _ = health_collection()
     .update_one(
@@ -1091,6 +1139,33 @@ fn queue_maintenance() {
   let _ = maintenance_sender().try_send(());
 }
 
+async fn record_repository_verification(
+  health_id: &str,
+  succeeded: bool,
+  full: bool,
+) -> anyhow::Result<()> {
+  let now = komodo_timestamp();
+  let update = if succeeded && full {
+    doc! { "$set": {
+      "healthy": true,
+      "checked_at": now,
+      "last_full_verification_at": now,
+      "verification_failed": false,
+    } }
+  } else {
+    doc! { "$set": {
+      "healthy": succeeded,
+      "checked_at": now,
+      "verification_failed": !succeeded,
+    } }
+  };
+  health_collection()
+    .update_one(doc! { "_id": health_id }, update)
+    .with_options(UpdateOptions::builder().upsert(true).build())
+    .await?;
+  Ok(())
+}
+
 async fn run_maintenance(
   settings: BackupSettings,
 ) -> anyhow::Result<()> {
@@ -1113,19 +1188,42 @@ async fn run_maintenance(
           * 60
           * 60
           * 1000;
+    let verification_repository = repository.clone();
+    let verification_settings = settings.clone();
+    let verification = tokio::task::spawn_blocking(move || {
+      core_repository(
+        &verification_repository,
+        &verification_settings,
+      )?
+      .verify(
+        full_due,
+        verification_settings.advanced.verify_sample_percent,
+      )
+    })
+    .await
+    .context("Vykar verification worker failed")
+    .and_then(|result| result);
+    let verification = match verification {
+      Ok(verification) => verification,
+      Err(error) => {
+        let _ =
+          record_repository_verification(health_id, false, full_due)
+            .await;
+        return Err(error);
+      }
+    };
+    if !verification.errors.is_empty() {
+      record_repository_verification(health_id, false, full_due)
+        .await?;
+      return Err(anyhow!(
+        "Integrity sampling found errors; prune and compaction were not started: {}",
+        verification.errors.join("; ")
+      ));
+    }
+    record_repository_verification(health_id, true, full_due).await?;
     let settings_for_worker = settings.clone();
     tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
       let vykar = core_repository(&repository, &settings_for_worker)?;
-      let verification = vykar.verify(
-        full_due,
-        settings_for_worker.advanced.verify_sample_percent,
-      )?;
-      if !verification.errors.is_empty() {
-        return Err(anyhow!(
-          "Integrity sampling found errors; prune and compaction were not started: {}",
-          verification.errors.join("; ")
-        ));
-      }
       let inventory = vykar.list_snapshots()?;
       if inventory.hidden > 0 {
         return Err(anyhow!(
@@ -1163,23 +1261,6 @@ async fn run_maintenance(
     })
     .await
     .context("Vykar maintenance worker failed")??;
-    let now = komodo_timestamp();
-    let update = if full_due {
-      doc! { "$set": {
-        "healthy": true,
-        "checked_at": now,
-        "last_full_verification_at": now,
-      } }
-    } else {
-      doc! { "$set": {
-        "healthy": true,
-        "checked_at": now,
-      } }
-    };
-    health_collection()
-      .update_one(doc! { "_id": health_id }, update)
-      .with_options(UpdateOptions::builder().upsert(true).build())
-      .await?;
   }
   Ok(())
 }
@@ -2031,10 +2112,11 @@ async fn backup_core(
   if let Some(retry) = repository_retry {
     return retry_core_repositories(settings, run, retry).await;
   }
-  let staging =
-    PathBuf::from("/data/backups/.komodo-core-staging").join(&run.id);
+  let staging = PathBuf::from(CORE_STAGING_PATH).join(&run.id);
   let _ = tokio::fs::remove_dir_all(&staging).await;
   tokio::fs::create_dir_all(&staging).await?;
+  let mut staging_cleanup =
+    RemoveDirectoryOnDrop::new(staging.clone());
   // A versioned logical dump is produced before upload. Mongo writes resume as
   // soon as the immutable export file is complete.
   {
@@ -2119,6 +2201,7 @@ async fn backup_core(
       .lock()
       .unwrap()
       .insert(run.id.clone(), retry);
+    staging_cleanup.disarm();
     return Ok(true);
   }
   let _ = tokio::fs::remove_dir_all(&staging).await;
@@ -2331,7 +2414,7 @@ async fn snapshot_stack_source(
   let staging = PathBuf::from("/data/backups/.komodo-stack-manifest")
     .join(Uuid::new_v4().to_string());
   tokio::fs::create_dir_all(&staging).await?;
-  let _staging_cleanup = RemoveDirectoryOnDrop(staging.clone());
+  let _staging_cleanup = RemoveDirectoryOnDrop::new(staging.clone());
   let destination = staging.clone();
   let settings = get_settings().await?;
   let repository = settings.primary.clone();
@@ -2394,6 +2477,7 @@ pub async fn plan_restore(
   user: &User,
   request: PlanBackupRestore,
 ) -> anyhow::Result<BackupRestorePlan> {
+  cleanup_expired_restore_plans().await?;
   let _repository_roles =
     repository_role_barrier().clone().read_owned().await;
   let PlanBackupRestore {
@@ -3026,12 +3110,52 @@ pub async fn restore_plan(
     .context("Restore plan does not exist")
 }
 
-struct RemoveDirectoryOnDrop(PathBuf);
+struct RemoveDirectoryOnDrop {
+  path: PathBuf,
+  armed: bool,
+}
+
+impl RemoveDirectoryOnDrop {
+  fn new(path: PathBuf) -> Self {
+    Self { path, armed: true }
+  }
+
+  fn disarm(&mut self) {
+    self.armed = false;
+  }
+}
 
 impl Drop for RemoveDirectoryOnDrop {
   fn drop(&mut self) {
-    let _ = std::fs::remove_dir_all(&self.0);
+    if self.armed {
+      let _ = std::fs::remove_dir_all(&self.path);
+    }
   }
+}
+
+fn purge_abandoned_core_staging() -> anyhow::Result<()> {
+  let path = Path::new(CORE_STAGING_PATH);
+  match std::fs::remove_dir_all(path) {
+    Ok(()) => {}
+    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+    Err(error) => {
+      return Err(
+        error.context("Failed to purge abandoned Core staging"),
+      );
+    }
+  }
+  std::fs::create_dir_all(path)
+    .context("Failed to create Core staging directory")?;
+  Ok(())
+}
+
+async fn cleanup_expired_restore_plans() -> anyhow::Result<()> {
+  plans_collection()
+    .delete_many(
+      doc! { "plan.expires_at": { "$lt": komodo_timestamp() } },
+    )
+    .await?;
+  Ok(())
 }
 
 async fn cleanup_expired_core_recovery_plans() -> anyhow::Result<()> {
@@ -3091,7 +3215,7 @@ pub async fn plan_core_recovery(
   let staging = PathBuf::from("/data/backups/.komodo-core-recovery")
     .join(Uuid::new_v4().to_string());
   tokio::fs::create_dir_all(&staging).await?;
-  let _staging_cleanup = RemoveDirectoryOnDrop(staging.clone());
+  let _staging_cleanup = RemoveDirectoryOnDrop::new(staging.clone());
   let worker_staging = staging.clone();
   let snapshot_for_worker = snapshot.name.clone();
   let settings_for_worker = settings.clone();
@@ -3362,6 +3486,7 @@ async fn verify_repository(
   } else {
     settings.primary.clone()
   };
+  let health_id = if mirror { "mirror" } else { "primary" };
   let run = new_run(None, "Repository verification running").await?;
   let operation = async {
     let settings_for_worker = settings.clone();
@@ -3374,21 +3499,7 @@ async fn verify_repository(
     .await
     .context("Vykar verification worker failed")??;
     if result.errors.is_empty() {
-      if full {
-        let id = if mirror { "mirror" } else { "primary" };
-        let now = komodo_timestamp();
-        health_collection()
-          .update_one(
-            doc! { "_id": id },
-            doc! { "$set": {
-              "healthy": true,
-              "checked_at": now,
-              "last_full_verification_at": now,
-            } },
-          )
-          .with_options(UpdateOptions::builder().upsert(true).build())
-          .await?;
-      }
+      record_repository_verification(health_id, true, full).await?;
       finish_run(
         run.clone(),
         BackupRunState::Complete,
@@ -3396,6 +3507,7 @@ async fn verify_repository(
       )
       .await
     } else {
+      record_repository_verification(health_id, false, full).await?;
       finish_run(
         run.clone(),
         BackupRunState::Failed,
@@ -3408,6 +3520,8 @@ async fn verify_repository(
   match operation {
     Ok(run) => Ok(run),
     Err(error) => {
+      let _ =
+        record_repository_verification(health_id, false, full).await;
       let message = format!("{error:#}");
       let _ = finish_run(run, BackupRunState::Failed, message).await;
       Err(error)
@@ -3489,7 +3603,7 @@ pub async fn promote_mirror() -> anyhow::Result<BackupSettings> {
     settings.mirror.take().context("Mirror is not configured")?;
   settings.mirror =
     Some(std::mem::replace(&mut settings.primary, mirror));
-  save_settings(settings).await
+  save_settings_after_promotion(settings).await
 }
 
 pub async fn cancel_run(run_id: &str) -> anyhow::Result<BackupRun> {
@@ -3632,8 +3746,14 @@ fn compute_next_run(
 
 pub fn spawn_scheduler() {
   let _ = maintenance_sender();
+  if let Err(error) = purge_abandoned_core_staging() {
+    error!("Failed to purge abandoned Core staging: {error:#}");
+  }
   tokio::spawn(async {
     loop {
+      if let Err(error) = cleanup_expired_restore_plans().await {
+        error!("Failed to clean expired restore plans: {error:#}");
+      }
       if let Err(error) = cleanup_expired_core_recovery_plans().await
       {
         error!(
