@@ -37,6 +37,12 @@ const Sidebar = ({ close }: { close: () => void }) => {
             to="/stats"
             {...linkProps}
           />
+          <SidebarLink
+            label="Backups"
+            icon={<ICONS.Backup size="1rem" />}
+            to="/backups"
+            {...linkProps}
+          />
 
           <Divider
             label={

@@ -21,6 +21,7 @@ use super::Variant;
 mod action;
 mod alert;
 mod alerter;
+mod backup;
 mod build;
 mod builder;
 mod deployment;
@@ -62,6 +63,18 @@ pub struct WriteArgs {
 #[error(mogh_error::Error)]
 #[serde(tag = "type", content = "params")]
 pub enum WriteRequest {
+  // ==== BACKUPS ====
+  UpdateBackupSettings(UpdateBackupSettings),
+  InitializeBackupRepositories(InitializeBackupRepositories),
+  RunBackup(RunBackup),
+  PlanBackupRestore(PlanBackupRestore),
+  ExecuteBackupRestore(ExecuteBackupRestore),
+  VerifyBackupRepository(VerifyBackupRepository),
+  PromoteBackupMirror(PromoteBackupMirror),
+  CancelBackupRun(CancelBackupRun),
+  PlanCoreRecovery(PlanCoreRecovery),
+  ExecuteCoreRecovery(ExecuteCoreRecovery),
+
   // ==== RESOURCE ====
   UpdateResourceMeta(UpdateResourceMeta),
 
@@ -276,6 +289,12 @@ async fn task(
   request: WriteRequest,
   user: User,
 ) -> mogh_error::Result<axum::response::Response> {
+  let _mutation_guard =
+    if matches!(&request, WriteRequest::RunBackup(_)) {
+      None
+    } else {
+      Some(crate::backup::mutation_barrier().read().await)
+    };
   let task_id = Uuid::new_v4();
   let method: WriteRequestMethod = (&request).into();
 

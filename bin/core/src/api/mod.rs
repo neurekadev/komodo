@@ -25,27 +25,60 @@ struct Variant {
   variant: String,
 }
 
-pub fn app() -> Router {
+pub async fn app() -> anyhow::Result<Router> {
   let config = core_config();
-  Router::new()
-    .merge(openapi::serve_docs())
-    .route("/version", get(|| async { env!("CARGO_PKG_VERSION") }))
-    .nest("/auth", mogh_auth_server::api::router::<KomodoAuthImpl>())
-    .nest("/user", user_router())
-    .nest("/read", read::router())
-    .nest("/write", write::router())
-    .nest("/execute", execute::router())
-    .nest("/terminal", terminal::router())
-    .nest("/file-manager", file_manager::router())
-    .nest("/listener", listener::router())
-    .nest("/ws", ws::router())
-    .nest("/client", ts_client::router())
-    .layer(memory_session_layer(config))
-    .fallback_service(serve_static_ui(
-      &config.ui_path,
-      config.ui_index_force_no_cache,
-    ))
-    .layer(cors_layer(config))
+  let settings = crate::backup::get_settings().await?;
+  let mut vykar_router = Router::new();
+  if let komodo_client::entities::backup::BackupRepositoryBackend::CoreLocal {
+    path,
+  } = &settings.primary.backend
+  {
+    vykar_router = vykar_router.nest(
+      "/vykar/primary",
+      crate::backup::embedded_vykar_router(
+        std::path::Path::new(path),
+        false,
+      )?,
+    );
+  }
+  if let Some(mirror) = &settings.mirror
+    && let komodo_client::entities::backup::BackupRepositoryBackend::CoreLocal {
+      path,
+    } = &mirror.backend
+  {
+    vykar_router = vykar_router.nest(
+      "/vykar/mirror",
+      crate::backup::embedded_vykar_router(
+        std::path::Path::new(path),
+        true,
+      )?,
+    );
+  }
+  Ok(
+    Router::new()
+      .merge(openapi::serve_docs())
+      .route("/version", get(|| async { env!("CARGO_PKG_VERSION") }))
+      .nest(
+        "/auth",
+        mogh_auth_server::api::router::<KomodoAuthImpl>(),
+      )
+      .nest("/user", user_router())
+      .nest("/read", read::router())
+      .nest("/write", write::router())
+      .nest("/execute", execute::router())
+      .nest("/terminal", terminal::router())
+      .nest("/file-manager", file_manager::router())
+      .nest("/listener", listener::router())
+      .nest("/ws", ws::router())
+      .nest("/client", ts_client::router())
+      .merge(vykar_router)
+      .layer(memory_session_layer(config))
+      .fallback_service(serve_static_ui(
+        &config.ui_path,
+        config.ui_index_force_no_cache,
+      ))
+      .layer(cors_layer(config)),
+  )
 }
 
 fn user_router() -> Router {

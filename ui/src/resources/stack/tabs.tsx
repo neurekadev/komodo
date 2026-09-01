@@ -14,12 +14,14 @@ import StackServices from "./services";
 import StackLog from "./log";
 import TerminalSection from "@/components/terminal/section";
 import FileManager from "@/components/file-manager";
+import ResourceBackups from "@/components/backups/resource";
 
 type StackTabsView =
   | "Config"
   | "Info"
   | "Services"
   | "Files"
+  | "Backups"
   | "Log"
   | "Terminals";
 
@@ -33,6 +35,8 @@ export default function StackTabs({ id }: { id: string }) {
     specificLogs,
     specificTerminal,
     specificFileManager,
+    specificBackups,
+    canExecute,
     permissionsLoaded,
   } = usePermissions({ type: "Stack", id });
 
@@ -65,6 +69,7 @@ export default function StackTabs({ id }: { id: string }) {
     (_view === "Info" && hideInfo) ||
     (_view === "Terminals" && terminalDisabled) ||
     (_view === "Files" && hideFiles) ||
+    (_view === "Backups" && !specificBackups) ||
     (_view === "Log" && hideLogs)
       ? "Config"
       : _view;
@@ -90,6 +95,11 @@ export default function StackTabs({ id }: { id: string }) {
         icon: ICONS.FileManager,
       },
       {
+        value: "Backups",
+        hidden: !specificBackups,
+        icon: ICONS.Backup,
+      },
+      {
         value: "Log",
         disabled: hideLogs,
         icon: ICONS.Log,
@@ -104,6 +114,7 @@ export default function StackTabs({ id }: { id: string }) {
     [
       hideInfo,
       hideFiles,
+      specificBackups,
       specificLogs,
       hideLogs,
       specificTerminal,
@@ -115,7 +126,10 @@ export default function StackTabs({ id }: { id: string }) {
     if (permissionsLoaded && _view === "Files" && hideFiles) {
       setView("Config");
     }
-  }, [_view, hideFiles, permissionsLoaded, setView]);
+    if (permissionsLoaded && _view === "Backups" && !specificBackups) {
+      setView("Config");
+    }
+  }, [_view, hideFiles, permissionsLoaded, setView, specificBackups]);
 
   const Selector = (
     <MobileFriendlyTabsSelector
@@ -150,6 +164,16 @@ export default function StackTabs({ id }: { id: string }) {
       View = (
         <FileManager
           target={{ type: "Stack", params: { stack: id } }}
+          titleOther={Selector}
+        />
+      );
+      break;
+    case "Backups":
+      View = (
+        <ResourceBackups
+          target={{ type: "Stack", params: { stack_id: id } }}
+          sourceServerId={info?.server_id ?? ""}
+          canExecute={canExecute && specificBackups}
           titleOther={Selector}
         />
       );

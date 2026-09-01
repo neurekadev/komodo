@@ -32,6 +32,11 @@ use crate::{
 
 static DB_CLIENT: OnceLock<database::Client> = OnceLock::new();
 
+/// A recovery-selected database name, read before the global database client
+/// is initialized. The previous database is deliberately retained.
+pub const ACTIVE_DATABASE_POINTER: &str =
+  "/config/backup-active-database";
+
 pub fn db_client() -> &'static database::Client {
   DB_CLIENT.get().unwrap_or_else(|| {
     error!(
@@ -44,7 +49,25 @@ pub fn db_client() -> &'static database::Client {
 /// Must be called in app startup sequence.
 pub async fn init_db_client() {
   let init = async {
-    let client = database::Client::new(&core_config().database)
+    let mut database = core_config().database.clone();
+    if let Ok(name) = std::fs::read_to_string(ACTIVE_DATABASE_POINTER)
+    {
+      let name = name.trim();
+      if !name.is_empty()
+        && name.chars().all(|character| {
+          character.is_ascii_alphanumeric()
+            || matches!(character, '_' | '-')
+        })
+      {
+        info!("Using recovered active database '{name}'");
+        database.db_name = name.to_string();
+      } else {
+        return Err(anyhow!(
+          "Invalid active database recovery pointer"
+        ));
+      }
+    }
+    let client = database::Client::new(&database)
       .await
       .context("failed to initialize database client")?;
     DB_CLIENT.set(client).map_err(|_| {

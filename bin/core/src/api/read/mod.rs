@@ -41,6 +41,7 @@ use super::Variant;
 mod action;
 mod alert;
 mod alerter;
+mod backup;
 mod build;
 mod builder;
 mod deployment;
@@ -86,6 +87,10 @@ fn list_limit(limit: Option<u64>) -> u64 {
 enum ReadRequest {
   GetVersion(GetVersion),
   GetCoreInfo(GetCoreInfo),
+  GetBackupSettings(GetBackupSettings),
+  GetBackupStatus(GetBackupStatus),
+  ListBackupSnapshots(ListBackupSnapshots),
+  ListBackupSnapshotDirectory(ListBackupSnapshotDirectory),
   ListSecrets(ListSecrets),
   ListGitProvidersFromConfig(ListGitProvidersFromConfig),
   #[serde(alias = "ListDockerRegistriesFromConfig")]

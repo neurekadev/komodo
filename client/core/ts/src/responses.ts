@@ -3,6 +3,10 @@ import * as Types from "./types.js";
 export type ReadResponses = {
   GetVersion: Types.GetVersionResponse;
   GetCoreInfo: Types.GetCoreInfoResponse;
+  GetBackupSettings: Types.BackupSettings;
+  GetBackupStatus: Types.BackupStatus;
+  ListBackupSnapshots: Types.BackupSnapshotList;
+  ListBackupSnapshotDirectory: Types.BackupSnapshotDirectory;
   ListSecrets: Types.ListSecretsResponse;
   ListGitProvidersFromConfig: Types.ListGitProvidersFromConfigResponse;
   ListImageRegistriesFromConfig: Types.ListImageRegistriesFromConfigResponse;
@@ -201,6 +205,18 @@ export type ReadResponses = {
 };
 
 export type WriteResponses = {
+  // ==== BACKUP ====
+  UpdateBackupSettings: Types.BackupSettings;
+  InitializeBackupRepositories: Types.BackupRun;
+  RunBackup: Types.BackupRun;
+  PlanBackupRestore: Types.BackupRestorePlan;
+  ExecuteBackupRestore: Types.BackupRun;
+  VerifyBackupRepository: Types.BackupRun;
+  PromoteBackupMirror: Types.BackupSettings;
+  CancelBackupRun: Types.BackupRun;
+  PlanCoreRecovery: Types.CoreRecoveryPlan;
+  ExecuteCoreRecovery: Types.BackupRun;
+
   // ==== RESOURCE ====
   UpdateResourceMeta: Types.UpdateResourceMetaResponse;
 

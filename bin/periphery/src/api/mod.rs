@@ -7,9 +7,9 @@ use komodo_client::entities::{
 };
 use mogh_resolver::Resolve;
 use periphery_client::api::{
-  build::*, compose::*, container::*, docker::*, file_manager::*,
-  git::*, keys::*, poll::*, stack::*, stats::*, swarm::*,
-  terminal::*, *,
+  backup::*, build::*, compose::*, container::*, docker::*,
+  file_manager::*, git::*, keys::*, poll::*, stack::*, stats::*,
+  swarm::*, terminal::*, *,
 };
 use serde::{Deserialize, Serialize};
 use strum::EnumDiscriminants;
@@ -19,6 +19,7 @@ use crate::{config::periphery_config, state::stats_client};
 
 pub mod terminal;
 
+mod backup;
 mod build;
 mod compose;
 mod container;
@@ -58,6 +59,14 @@ pub enum PeripheryRequest {
   ListGitProviders(ListGitProviders),
   ListImageRegistries(ListImageRegistries),
   ListSecrets(ListSecrets),
+
+  // Backup and transactional restore
+  DiscoverBackupSource(DiscoverBackupSource),
+  RunVykarBackup(RunVykarBackup),
+  RunVykarBackupBatch(RunVykarBackupBatch),
+  PreflightVykarRestore(PreflightVykarRestore),
+  TransactionalVykarRestore(TransactionalVykarRestore),
+  CancelVykarOperation(CancelVykarOperation),
 
   // File Manager
   GetFileManagerCapabilities(GetFileManagerCapabilities),

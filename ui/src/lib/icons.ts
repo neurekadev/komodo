@@ -19,6 +19,7 @@ import {
   Container,
   Cpu,
   Database,
+  DatabaseBackup,
   Diamond,
   DiamondPlus,
   Download,
@@ -100,6 +101,7 @@ export const ICONS = {
   Provider: CloudCog,
   // PAGES
   Dashboard: LayoutDashboard,
+  Backup: DatabaseBackup,
   Terminal: Terminal,
   Schedule: CalendarDays,
   // DOCKER

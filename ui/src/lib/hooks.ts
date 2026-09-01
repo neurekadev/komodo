@@ -686,6 +686,7 @@ export function usePermissions({ type, id }: Types.ResourceTarget) {
       specificTerminal: true,
       specificAttach: true,
       specificProcesses: true,
+      specificBackups: true,
       permissionsLoaded: true,
     };
   }
@@ -714,6 +715,7 @@ export function usePermissions({ type, id }: Types.ResourceTarget) {
     specificTerminal,
     specificAttach,
     specificProcesses,
+    specificBackups,
   ] = [
     specific.includes(Types.SpecificPermission.Logs),
     specific.includes(Types.SpecificPermission.FileManager),
@@ -721,6 +723,7 @@ export function usePermissions({ type, id }: Types.ResourceTarget) {
     specific.includes(Types.SpecificPermission.Terminal),
     specific.includes(Types.SpecificPermission.Attach),
     specific.includes(Types.SpecificPermission.Processes),
+    specific.includes(Types.SpecificPermission.Backups),
   ];
 
   const canCreate =
@@ -748,6 +751,7 @@ export function usePermissions({ type, id }: Types.ResourceTarget) {
     specificTerminal,
     specificAttach,
     specificProcesses,
+    specificBackups,
     permissionsLoaded: !permissionQuery.isPending,
   };
 }

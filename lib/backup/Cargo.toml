@@ -1,0 +1,20 @@
+[package]
+name = "komodo_backup"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[dependencies]
+komodo_client.workspace = true
+vykar-core.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+tempfile.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+vykar-server.workspace = true
+tokio.workspace = true
+axum.workspace = true

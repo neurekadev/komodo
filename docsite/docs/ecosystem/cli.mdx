@@ -3,12 +3,16 @@
 The Komodo CLI, `km`, can be used to:
   - Quickly **run executions** and update **resources** and **variables**.
   - **Reset user passwords** and elevate users to **Super Admin**.
-  - Perform Database **backup**, **restore**, and **copy**.
+  - Perform legacy Database **backup**, **restore**, and **copy**.
   - **Connect to server / container shell** via Komodo Terminals.
 
 The Komodo Core image comes packaged with the Komodo CLI,
 and is available for usage inside running container with `docker exec -it komodo-core km ...`.
 This way, it inherits the Core database config in order to easily perform backups with `km db backup -y`.
+
+:::note
+These database commands use the legacy on-disk Core export format. The encrypted, repository-backed Core/Stack/Volume feature is managed from [Backups](/docs/backups); the legacy API remains available for compatibility.
+:::
 
 ### Examples
 

@@ -224,6 +224,8 @@ pub fn inner_handler(
   >,
 > {
   Box::pin(async move {
+    let mutation_guard =
+      crate::backup::mutation_barrier().clone().read_owned().await;
     let task_id = Uuid::new_v4();
 
     // Need to validate no cancel is active before any update is created.
@@ -239,15 +241,18 @@ pub fn inner_handler(
     // and in their case will spawn tasks, so that isn't necessary
     // here either.
     if update.operation == Operation::None {
-      return Ok(ExecutionResult::Batch(
-        task(task_id, request, user, update).await?,
-      ));
+      let response = task(task_id, request, user, update).await?;
+      drop(mutation_guard);
+      return Ok(ExecutionResult::Batch(response));
     }
 
     // Spawn a task for the execution which continues
     // running after this method returns.
-    let handle =
-      tokio::spawn(task(task_id, request, user, update.clone()));
+    let task_update = update.clone();
+    let handle = tokio::spawn(async move {
+      let _mutation_guard = mutation_guard;
+      task(task_id, request, user, task_update).await
+    });
 
     // Spawns another task to monitor the first for failures,
     // and add the log to Update about it (which primary task can't do because it errored out)

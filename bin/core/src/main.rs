@@ -11,6 +11,7 @@ use crate::config::{core_config, core_keys};
 mod alert;
 mod api;
 mod auth;
+mod backup;
 mod cloud;
 mod config;
 mod connection;
@@ -80,6 +81,10 @@ async fn app() -> anyhow::Result<()> {
   .instrument(startup_span)
   .await;
 
+  // Register embedded repository routes before the backup scheduler can run.
+  let api = api::app().await?;
+  backup::spawn_scheduler();
+
   let handle = Handle::new();
   tokio::spawn({
     // Cannot run actions until the server is available.
@@ -92,7 +97,7 @@ async fn app() -> anyhow::Result<()> {
     }
   });
 
-  mogh_server::serve_app(api::app(), config, handle).await
+  mogh_server::serve_app(api, config, handle).await
 }
 
 #[tokio::main]

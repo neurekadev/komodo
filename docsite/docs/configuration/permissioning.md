@@ -28,6 +28,11 @@ There are 4 permission levels a user / group can be given on a Resource:
 Permission levels alone are not quite enough to provide granular access control.
 Some features are additionally gated behind a specific permission for that feature.
 
+- **`Backups`**: User can access encrypted snapshots for the associated Stack or Server-backed Volume.
+  - Read permits listing snapshots and browsing their file trees. Execute or Write permits manual backup and same-target restore.
+  - A Stack accepts `Backups` directly or inherits it from its attached Server. A Volume uses the Server grant.
+  - Cross-node restore also requires Execute plus `Backups` on the destination Server. A recovered cross-node Stack requires the existing Stack-create permission.
+  - Fleet schedule, repositories, retention, Core recovery, mirror promotion, unbound snapshots, and maintenance remain admin-only. See [Backups](/docs/backups#permissions).
 - **`FileManager`**: User can access the [File Manager](/docs/file-manager) on the associated resource.
   - Valid on `Server` and `Stack`.
   - The base level still controls the allowed operation: Read or Execute permits browsing and downloads, while Write permits changes when the target is writable.

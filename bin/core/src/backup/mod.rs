@@ -1,0 +1,2694 @@
+use std::{
+  collections::{HashMap, HashSet},
+  fs::OpenOptions,
+  io::Write,
+  os::unix::fs::OpenOptionsExt,
+  path::{Path, PathBuf},
+  sync::{Arc, OnceLock, RwLock},
+};
+
+use anyhow::{Context, anyhow};
+use database::{
+  bson::{doc, to_document},
+  mungos::{
+    find::find_collect,
+    mongodb::{
+      Collection,
+      options::{FindOptions, UpdateOptions},
+    },
+  },
+};
+use futures_util::{StreamExt, stream::FuturesUnordered};
+use komodo_backup::{
+  SnapshotDirectoryPage, VykarRepository, normalize_selected_paths,
+  snapshot_name,
+};
+use komodo_client::{
+  api::write::PlanBackupRestore,
+  entities::{
+    backup::{
+      BackupRepository, BackupRepositoryBackend, BackupRestorePlan,
+      BackupRun, BackupRunState, BackupSecret, BackupSettings,
+      BackupSnapshot, BackupStatus, BackupTarget, BackupVolumeTarget,
+      CoreRecoveryPlan, selection_includes,
+    },
+    komodo_timestamp,
+    repo::Repo,
+    server::Server,
+    stack::Stack,
+    user::User,
+  },
+};
+use periphery_client::api::backup::{
+  CancelVykarOperation, PeripheryBackupTarget, PreflightVykarRestore,
+  RunVykarBackup, RunVykarBackupBatch, TransactionalVykarRestore,
+  VykarBackupTask,
+};
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use crate::{
+  config::core_config,
+  helpers::periphery_client,
+  permission::get_check_permissions,
+  resource::{self, KomodoResource},
+  state::db_client,
+};
+
+mod crypto;
+
+const SETTINGS_ID: &str = "singleton";
+const SETTINGS_COLLECTION: &str = "BackupSettings";
+const RUNS_COLLECTION: &str = "BackupRun";
+const PLANS_COLLECTION: &str = "BackupRestorePlan";
+const CORE_RECOVERY_COLLECTION: &str = "CoreRecoveryPlan";
+const HEALTH_COLLECTION: &str = "BackupRepositoryHealth";
+const CORE_INSTANCE_ID_PATH: &str = "/config/keys/backup-instance-id";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SealedBackupSettings {
+  #[serde(rename = "_id")]
+  id: String,
+  sealed: String,
+  updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredRestorePlan {
+  #[serde(rename = "_id")]
+  id: String,
+  /// Restore plans are capabilities scoped to the user who confirmed them.
+  #[serde(default)]
+  created_by: String,
+  plan: BackupRestorePlan,
+  publish: Vec<periphery_client::api::backup::RestorePublishPath>,
+  #[serde(default)]
+  recovered_stack_name: Option<String>,
+  #[serde(default)]
+  recovered_stack_run_directory: Option<String>,
+  #[serde(default)]
+  destination_volume_name: Option<String>,
+  #[serde(default)]
+  create_volume_if_missing: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredCoreRecoveryPlan {
+  #[serde(rename = "_id")]
+  id: String,
+  #[serde(default)]
+  created_by: String,
+  recovered_core_instance_id: String,
+  plan: CoreRecoveryPlan,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct RepositoryHealthRecord {
+  #[serde(rename = "_id")]
+  id: String,
+  healthy: bool,
+  checked_at: i64,
+  #[serde(default)]
+  last_full_verification_at: i64,
+}
+
+fn settings_collection() -> Collection<SealedBackupSettings> {
+  db_client().db.collection(SETTINGS_COLLECTION)
+}
+
+fn runs_collection() -> Collection<BackupRun> {
+  db_client().db.collection(RUNS_COLLECTION)
+}
+
+fn plans_collection() -> Collection<StoredRestorePlan> {
+  db_client().db.collection(PLANS_COLLECTION)
+}
+
+fn core_recovery_collection() -> Collection<StoredCoreRecoveryPlan> {
+  db_client().db.collection(CORE_RECOVERY_COLLECTION)
+}
+
+fn health_collection() -> Collection<RepositoryHealthRecord> {
+  db_client().db.collection(HEALTH_COLLECTION)
+}
+
+fn core_export_includes_collection(name: &str) -> bool {
+  name != SETTINGS_COLLECTION
+}
+
+pub async fn get_settings() -> anyhow::Result<BackupSettings> {
+  let Some(record) = settings_collection()
+    .find_one(doc! { "_id": SETTINGS_ID })
+    .await
+    .context("Failed to load backup settings")?
+  else {
+    let settings = BackupSettings {
+      timezone: if core_config().timezone.is_empty() {
+        "UTC".into()
+      } else {
+        core_config().timezone.clone()
+      },
+      ..Default::default()
+    };
+    return Ok(settings);
+  };
+  let bytes = crypto::open(&record.sealed)?;
+  serde_json::from_slice(&bytes)
+    .context("Failed to decode sealed backup settings")
+}
+
+pub async fn get_redacted_settings() -> anyhow::Result<BackupSettings>
+{
+  let mut settings = get_settings().await?;
+  settings.redact();
+  Ok(settings)
+}
+
+pub async fn save_settings(
+  mut proposed: BackupSettings,
+) -> anyhow::Result<BackupSettings> {
+  validate_settings(&proposed)?;
+  let existing = get_settings().await.ok();
+  if let Some(existing) = &existing {
+    merge_repository_secrets(
+      &mut proposed.primary,
+      &existing.primary,
+    )?;
+    match (&mut proposed.mirror, &existing.mirror) {
+      (Some(proposed), Some(existing)) => {
+        merge_repository_secrets(proposed, existing)?
+      }
+      (Some(proposed), None) => require_repository_secrets(proposed)?,
+      _ => {}
+    }
+  } else {
+    require_repository_secrets(&proposed.primary)?;
+    if let Some(mirror) = &proposed.mirror {
+      require_repository_secrets(mirror)?;
+    }
+  }
+  proposed.updated_at = komodo_timestamp();
+  let bytes = serde_json::to_vec(&proposed)?;
+  let record = SealedBackupSettings {
+    id: SETTINGS_ID.into(),
+    sealed: crypto::seal(&bytes)?,
+    updated_at: proposed.updated_at,
+  };
+  settings_collection()
+    .update_one(
+      doc! { "_id": SETTINGS_ID },
+      doc! { "$set": to_document(&record)? },
+    )
+    .with_options(UpdateOptions::builder().upsert(true).build())
+    .await
+    .context("Failed to persist sealed backup settings")?;
+  let mut redacted = proposed;
+  redacted.redact();
+  Ok(redacted)
+}
+
+fn validate_settings(
+  settings: &BackupSettings,
+) -> anyhow::Result<()> {
+  if settings.schedule.trim().is_empty() {
+    return Err(anyhow!("Backup schedule cannot be empty"));
+  }
+  settings
+    .timezone
+    .parse::<chrono_tz::Tz>()
+    .context("Backup timezone must be a valid IANA timezone")?;
+  compute_next_run(settings)
+    .context("Backup schedule is not valid")?;
+  for (name, keep) in [
+    ("Core", settings.core_keep_last),
+    ("Stack", settings.stack_keep_last),
+    ("Volume", settings.volume_keep_last),
+  ] {
+    if keep == 0 {
+      return Err(anyhow!("{name} retention must be at least one"));
+    }
+  }
+  if !(1..=100).contains(&settings.advanced.compact_threshold_percent)
+  {
+    return Err(anyhow!(
+      "Compaction threshold must be between 1 and 100"
+    ));
+  }
+  if !(1..=64).contains(&settings.advanced.node_concurrency) {
+    return Err(anyhow!("Node concurrency must be between 1 and 64"));
+  }
+  if settings.advanced.client_repack_limit_bytes == 0 {
+    return Err(anyhow!(
+      "Client-side repack limit must be greater than zero"
+    ));
+  }
+  if settings.advanced.full_verify_every_days == 0
+    || !(1..=100).contains(&settings.advanced.verify_sample_percent)
+  {
+    return Err(anyhow!(
+      "Verification interval must be positive and sample percentage must be between 1 and 100"
+    ));
+  }
+  validate_repository_definition(&settings.primary)?;
+  if let Some(mirror) = &settings.mirror {
+    validate_repository_definition(mirror)?;
+    if repository_location(&settings.primary)
+      == repository_location(mirror)
+    {
+      return Err(anyhow!(
+        "Primary and mirror must use different repository locations"
+      ));
+    }
+  }
+  Ok(())
+}
+
+fn validate_repository_definition(
+  repository: &BackupRepository,
+) -> anyhow::Result<()> {
+  if repository.name.trim().is_empty() {
+    return Err(anyhow!("Repository name cannot be empty"));
+  }
+  match &repository.backend {
+    BackupRepositoryBackend::CoreLocal { path } => {
+      if !Path::new(path).is_absolute() {
+        return Err(anyhow!(
+          "Core-local repository path must be absolute"
+        ));
+      }
+    }
+    BackupRepositoryBackend::S3 { url, region, .. } => {
+      if url.trim().is_empty() || region.trim().is_empty() {
+        return Err(anyhow!(
+          "S3 repository URL and region are required"
+        ));
+      }
+    }
+    BackupRepositoryBackend::Sftp {
+      url, known_hosts, ..
+    } => {
+      if url.trim().is_empty() || known_hosts.trim().is_empty() {
+        return Err(anyhow!(
+          "SFTP repository URL and known-hosts entry are required"
+        ));
+      }
+    }
+    BackupRepositoryBackend::Rest {
+      url,
+      allow_insecure_http,
+      ..
+    } => {
+      if url.trim().is_empty() {
+        return Err(anyhow!("REST repository URL is required"));
+      }
+      if url.starts_with("http://") && !allow_insecure_http {
+        return Err(anyhow!(
+          "Plain HTTP REST repositories require explicit insecure-HTTP approval"
+        ));
+      }
+    }
+  }
+  Ok(())
+}
+
+fn repository_location(repository: &BackupRepository) -> String {
+  match &repository.backend {
+    BackupRepositoryBackend::CoreLocal { path } => {
+      format!("core-local:{path}")
+    }
+    BackupRepositoryBackend::S3 { url, .. } => format!("s3:{url}"),
+    BackupRepositoryBackend::Sftp { url, .. } => {
+      format!("sftp:{url}")
+    }
+    BackupRepositoryBackend::Rest { url, .. } => {
+      format!("rest:{url}")
+    }
+  }
+}
+
+fn merge_repository_secrets(
+  proposed: &mut BackupRepository,
+  existing: &BackupRepository,
+) -> anyhow::Result<()> {
+  preserve_secret(&mut proposed.passphrase, &existing.passphrase);
+  match (&mut proposed.backend, &existing.backend) {
+    (
+      BackupRepositoryBackend::S3 {
+        access_key_id,
+        secret_access_key,
+        ..
+      },
+      BackupRepositoryBackend::S3 {
+        access_key_id: old_access,
+        secret_access_key: old_secret,
+        ..
+      },
+    ) => {
+      preserve_secret(access_key_id, old_access);
+      preserve_secret(secret_access_key, old_secret);
+    }
+    (
+      BackupRepositoryBackend::Sftp { private_key, .. },
+      BackupRepositoryBackend::Sftp {
+        private_key: old_key,
+        ..
+      },
+    ) => preserve_secret(private_key, old_key),
+    (
+      BackupRepositoryBackend::Rest { access_token, .. },
+      BackupRepositoryBackend::Rest {
+        access_token: old_token,
+        ..
+      },
+    ) => preserve_secret(access_token, old_token),
+    (BackupRepositoryBackend::CoreLocal { .. }, _) => {}
+    _ => require_repository_secrets(proposed)?,
+  }
+  require_repository_secrets(proposed)
+}
+
+fn preserve_secret(
+  proposed: &mut BackupSecret,
+  existing: &BackupSecret,
+) {
+  if proposed.value.is_empty() {
+    proposed.value = existing.value.clone();
+  }
+  proposed.configured = false;
+}
+
+fn require_repository_secrets(
+  repository: &BackupRepository,
+) -> anyhow::Result<()> {
+  if repository.passphrase.value.is_empty() {
+    return Err(anyhow!(
+      "Repository encryption passphrase is required"
+    ));
+  }
+  let valid = match &repository.backend {
+    BackupRepositoryBackend::CoreLocal { .. } => true,
+    BackupRepositoryBackend::S3 {
+      access_key_id,
+      secret_access_key,
+      ..
+    } => {
+      !access_key_id.value.is_empty()
+        && !secret_access_key.value.is_empty()
+    }
+    BackupRepositoryBackend::Sftp { private_key, .. } => {
+      !private_key.value.is_empty()
+    }
+    BackupRepositoryBackend::Rest { access_token, .. } => {
+      !access_token.value.is_empty()
+    }
+  };
+  if valid {
+    Ok(())
+  } else {
+    Err(anyhow!("Repository credentials are required"))
+  }
+}
+
+fn core_instance_id() -> anyhow::Result<&'static str> {
+  static ID: OnceLock<Result<String, String>> = OnceLock::new();
+  match ID.get_or_init(|| {
+    load_or_create_core_instance_id().map_err(|error| {
+      format!("Failed to load stable Core backup identity: {error:#}")
+    })
+  }) {
+    Ok(id) => Ok(id),
+    Err(error) => Err(anyhow!(error.clone())),
+  }
+}
+
+fn load_or_create_core_instance_id() -> anyhow::Result<String> {
+  let path = Path::new(CORE_INSTANCE_ID_PATH);
+  if let Ok(id) = std::fs::read_to_string(path) {
+    let id = id.trim();
+    if id.len() == 32
+      && id.chars().all(|character| character.is_ascii_hexdigit())
+    {
+      return Ok(id.to_string());
+    }
+    return Err(anyhow!("Persisted Core backup identity is invalid"));
+  }
+  let parent = path
+    .parent()
+    .context("Core backup identity path has no parent")?;
+  std::fs::create_dir_all(parent)?;
+  let id = Uuid::new_v4().simple().to_string();
+  match OpenOptions::new()
+    .create_new(true)
+    .write(true)
+    .mode(0o600)
+    .open(path)
+  {
+    Ok(mut file) => {
+      file.write_all(id.as_bytes())?;
+      file.sync_all()?;
+      std::fs::File::open(parent)?.sync_all()?;
+      Ok(id)
+    }
+    Err(error)
+      if error.kind() == std::io::ErrorKind::AlreadyExists =>
+    {
+      let id = std::fs::read_to_string(path)?;
+      let id = id.trim();
+      if id.len() == 32
+        && id.chars().all(|character| character.is_ascii_hexdigit())
+      {
+        Ok(id.to_string())
+      } else {
+        Err(anyhow!("Persisted Core backup identity is invalid"))
+      }
+    }
+    Err(error) => Err(error.into()),
+  }
+}
+
+fn persist_core_instance_id(id: &str) -> anyhow::Result<()> {
+  if id.len() != 32
+    || !id.chars().all(|character| character.is_ascii_hexdigit())
+  {
+    return Err(anyhow!("Recovered Core backup identity is invalid"));
+  }
+  let destination = Path::new(CORE_INSTANCE_ID_PATH);
+  let parent = destination
+    .parent()
+    .context("Core backup identity path has no parent")?;
+  std::fs::create_dir_all(parent)?;
+  let temporary = parent.join(format!(
+    ".backup-instance-id-{}.tmp",
+    Uuid::new_v4().simple()
+  ));
+  let mut file = OpenOptions::new()
+    .create_new(true)
+    .write(true)
+    .mode(0o600)
+    .open(&temporary)?;
+  file.write_all(id.as_bytes())?;
+  file.sync_all()?;
+  std::fs::rename(temporary, destination)?;
+  std::fs::File::open(parent)?.sync_all()?;
+  Ok(())
+}
+
+fn core_cache_dir() -> anyhow::Result<PathBuf> {
+  let directory = PathBuf::from("/backups/.komodo-vykar-cache");
+  std::fs::create_dir_all(&directory)?;
+  Ok(directory)
+}
+
+fn core_repository(
+  repository: &BackupRepository,
+  settings: &BackupSettings,
+) -> anyhow::Result<VykarRepository> {
+  VykarRepository::new(
+    repository,
+    &format!("komodo-core-{}", core_instance_id()?),
+    &core_cache_dir()?,
+    &settings.advanced,
+  )
+}
+
+/// Convert Core-local storage to the embedded authenticated REST endpoint for
+/// Periphery. Other backends are used directly on the worker.
+fn repository_for_periphery(
+  repository: &BackupRepository,
+  mirror: bool,
+) -> anyhow::Result<BackupRepository> {
+  let BackupRepositoryBackend::CoreLocal { path } =
+    &repository.backend
+  else {
+    return Ok(repository.clone());
+  };
+  let registered = embedded_repository_paths()
+    .read()
+    .unwrap()
+    .get(usize::from(mirror))
+    .cloned()
+    .flatten()
+    .context(
+      "Core-local repository was added after startup; restart Core before using it",
+    )?;
+  if registered.as_path() != Path::new(path) {
+    return Err(anyhow!(
+      "Core-local repository path changed after startup; restart Core before running backups"
+    ));
+  }
+  Ok(BackupRepository {
+    name: repository.name.clone(),
+    backend: BackupRepositoryBackend::Rest {
+      url: format!(
+        "{}/vykar/{}",
+        core_config().host.trim_end_matches('/'),
+        if mirror { "mirror" } else { "primary" }
+      ),
+      access_token: BackupSecret {
+        value: crypto::embedded_server_token()?,
+        configured: false,
+      },
+      allow_insecure_http: core_config().host.starts_with("http://"),
+    },
+    passphrase: repository.passphrase.clone(),
+  })
+}
+
+pub async fn initialize_repositories() -> anyhow::Result<BackupRun> {
+  let _repository_roles =
+    repository_role_barrier().clone().read_owned().await;
+  let settings = get_settings().await?;
+  let run = new_run(None, "Initializing repositories").await?;
+  for repository in
+    std::iter::once(&settings.primary).chain(settings.mirror.iter())
+  {
+    let repository = repository.clone();
+    let settings = settings.clone();
+    tokio::task::spawn_blocking(move || {
+      core_repository(&repository, &settings)?.init()
+    })
+    .await
+    .context("Vykar initialization worker failed")??;
+  }
+  finish_run(run, BackupRunState::Complete, "Repositories ready")
+    .await
+}
+
+async fn new_run(
+  target: Option<BackupTarget>,
+  message: &str,
+) -> anyhow::Result<BackupRun> {
+  let run = BackupRun {
+    id: Uuid::new_v4().to_string(),
+    target,
+    state: BackupRunState::Running,
+    message: message.into(),
+    started_at: komodo_timestamp(),
+    ..Default::default()
+  };
+  runs_collection().insert_one(&run).await?;
+  Ok(run)
+}
+
+async fn finish_run(
+  mut run: BackupRun,
+  state: BackupRunState,
+  message: impl Into<String>,
+) -> anyhow::Result<BackupRun> {
+  run.state = state;
+  run.message = message.into();
+  run.finished_at = komodo_timestamp();
+  runs_collection()
+    .update_one(
+      doc! { "id": &run.id },
+      doc! { "$set": to_document(&run)? },
+    )
+    .await?;
+  Ok(run)
+}
+
+pub async fn status() -> anyhow::Result<BackupStatus> {
+  let recent_runs = find_collect(
+    &runs_collection(),
+    None,
+    FindOptions::builder()
+      .sort(doc! { "started_at": -1 })
+      .limit(20)
+      .build(),
+  )
+  .await
+  .unwrap_or_default();
+  let active_run = recent_runs
+    .iter()
+    .find(|run| {
+      matches!(
+        run.state,
+        BackupRunState::Queued | BackupRunState::Running
+      )
+    })
+    .cloned();
+  let settings = get_settings().await?;
+  let primary_settings = settings.clone();
+  let primary_repository = settings.primary.clone();
+  let primary = tokio::task::spawn_blocking(move || {
+    core_repository(&primary_repository, &primary_settings)?
+      .list_snapshots()
+      .map(|inventory| {
+        inventory
+          .snapshots
+          .into_iter()
+          .map(|snapshot| snapshot.name)
+          .collect::<HashSet<_>>()
+      })
+  })
+  .await
+  .context("Primary health worker failed")?;
+  let primary_healthy = primary.is_ok();
+  let primary_names = primary.unwrap_or_default();
+  let (mirror_healthy, mirror_lagging_snapshots) =
+    if let Some(mirror) = settings.mirror.clone() {
+      let mirror_settings = settings.clone();
+      let mirror = tokio::task::spawn_blocking(move || {
+        core_repository(&mirror, &mirror_settings)?
+          .list_snapshots()
+          .map(|inventory| {
+            inventory
+              .snapshots
+              .into_iter()
+              .map(|snapshot| snapshot.name)
+              .collect::<HashSet<_>>()
+          })
+      })
+      .await
+      .context("Mirror health worker failed")?;
+      match mirror {
+        Ok(mirror_names) => (
+          Some(true),
+          primary_names.difference(&mirror_names).count() as u64,
+        ),
+        Err(_) => (Some(false), primary_names.len() as u64),
+      }
+    } else {
+      (None, 0)
+    };
+  let previous_primary = health_collection()
+    .find_one(doc! { "_id": "primary" })
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or_default();
+  let checked_at = komodo_timestamp();
+  let _ = health_collection()
+    .update_one(
+      doc! { "_id": "primary" },
+      doc! { "$set": {
+        "healthy": primary_healthy,
+        "checked_at": checked_at,
+      } },
+    )
+    .with_options(UpdateOptions::builder().upsert(true).build())
+    .await;
+  if let Some(healthy) = mirror_healthy {
+    let _ = health_collection()
+      .update_one(
+        doc! { "_id": "mirror" },
+        doc! { "$set": {
+          "healthy": healthy,
+          "checked_at": checked_at,
+        } },
+      )
+      .with_options(UpdateOptions::builder().upsert(true).build())
+      .await;
+  }
+  Ok(BackupStatus {
+    active_run,
+    recent_runs,
+    next_run_at: next_scheduled_run().unwrap_or_default(),
+    primary_healthy,
+    mirror_healthy,
+    mirror_lagging_snapshots,
+    last_full_verification_at: previous_primary
+      .last_full_verification_at,
+    critical_alert: critical_alert().read().unwrap().clone(),
+  })
+}
+
+fn critical_alert() -> &'static RwLock<Option<String>> {
+  static ALERT: OnceLock<RwLock<Option<String>>> = OnceLock::new();
+  ALERT.get_or_init(Default::default)
+}
+
+/// Blocks application mutations only while Core creates immutable export
+/// staging. Uploads happen after the write guard is released.
+pub fn mutation_barrier() -> &'static Arc<tokio::sync::RwLock<()>> {
+  static BARRIER: OnceLock<Arc<tokio::sync::RwLock<()>>> =
+    OnceLock::new();
+  BARRIER.get_or_init(|| Arc::new(tokio::sync::RwLock::new(())))
+}
+
+/// Keeps a primary/mirror role change from racing repository operations while
+/// still allowing normal fleet-wide repository concurrency.
+fn repository_role_barrier() -> &'static Arc<tokio::sync::RwLock<()>>
+{
+  static BARRIER: OnceLock<Arc<tokio::sync::RwLock<()>>> =
+    OnceLock::new();
+  BARRIER.get_or_init(|| Arc::new(tokio::sync::RwLock::new(())))
+}
+
+pub async fn list_snapshots()
+-> anyhow::Result<(Vec<BackupSnapshot>, u64)> {
+  let settings = get_settings().await?;
+  tokio::task::spawn_blocking(move || {
+    let inventory = core_repository(&settings.primary, &settings)?
+      .list_snapshots()?;
+    Ok((inventory.snapshots, inventory.hidden))
+  })
+  .await
+  .context("Vykar inventory worker failed")?
+}
+
+pub async fn list_directory(
+  snapshot: String,
+  parent: String,
+  search: String,
+  page: u64,
+  limit: u64,
+) -> anyhow::Result<SnapshotDirectoryPage> {
+  let settings = get_settings().await?;
+  tokio::task::spawn_blocking(move || {
+    core_repository(&settings.primary, &settings)?
+      .list_directory(&snapshot, &parent, &search, page, limit)
+  })
+  .await
+  .context("Vykar tree worker failed")?
+}
+
+pub async fn run_backup(
+  target: Option<BackupTarget>,
+) -> anyhow::Result<BackupRun> {
+  let _repository_roles =
+    repository_role_barrier().clone().read_owned().await;
+  let run = new_run(target.clone(), "Backup running").await?;
+  let settings = get_settings().await?;
+  let result = match target {
+    Some(target) => run_target(&settings, &run, target).await,
+    None => run_fleet(&settings, &run).await,
+  };
+  let finished = match result {
+    Ok(partial) if partial => {
+      finish_run(
+        run,
+        BackupRunState::Partial,
+        "Backup completed partially",
+      )
+      .await
+    }
+    Ok(_) => {
+      finish_run(run, BackupRunState::Complete, "Backup complete")
+        .await
+    }
+    Err(error) => {
+      finish_run(run, BackupRunState::Failed, format!("{error:#}"))
+        .await
+    }
+  }?;
+  if finished.state == BackupRunState::Complete {
+    queue_maintenance();
+  }
+  Ok(finished)
+}
+
+fn maintenance_sender() -> &'static tokio::sync::mpsc::Sender<()> {
+  static SENDER: OnceLock<tokio::sync::mpsc::Sender<()>> =
+    OnceLock::new();
+  SENDER.get_or_init(|| {
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+    tokio::spawn(async move {
+      while receiver.recv().await.is_some() {
+        // Manual backups close together share one prune/check/compact cycle.
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        while receiver.try_recv().is_ok() {}
+        match get_settings().await {
+          Ok(settings) => {
+            if let Err(error) = run_maintenance(settings).await {
+              error!(
+                "Backup repository maintenance failed: {error:#}"
+              );
+              *critical_alert().write().unwrap() = Some(format!(
+                "Backup maintenance blocked: {error:#}"
+              ));
+            }
+          }
+          Err(error) => error!(
+            "Failed to load backup maintenance settings: {error:#}"
+          ),
+        }
+      }
+    });
+    sender
+  })
+}
+
+fn queue_maintenance() {
+  let _ = maintenance_sender().try_send(());
+}
+
+async fn run_maintenance(
+  settings: BackupSettings,
+) -> anyhow::Result<()> {
+  let _repository_roles =
+    repository_role_barrier().clone().read_owned().await;
+  let repositories =
+    std::iter::once(("primary", settings.primary.clone()))
+      .chain(settings.mirror.clone().map(|mirror| ("mirror", mirror)))
+      .collect::<Vec<_>>();
+  for (health_id, repository) in repositories {
+    let previous = health_collection()
+      .find_one(doc! { "_id": health_id })
+      .await?
+      .unwrap_or_default();
+    let full_due = previous.last_full_verification_at == 0
+      || komodo_timestamp() - previous.last_full_verification_at
+        >= settings.advanced.full_verify_every_days.max(1) as i64
+          * 24
+          * 60
+          * 60
+          * 1000;
+    let settings_for_worker = settings.clone();
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+      let vykar = core_repository(&repository, &settings_for_worker)?;
+      let verification = vykar.verify(
+        full_due,
+        settings_for_worker.advanced.verify_sample_percent,
+      )?;
+      if !verification.errors.is_empty() {
+        return Err(anyhow!(
+          "Integrity sampling found errors; prune and compaction were not started: {}",
+          verification.errors.join("; ")
+        ));
+      }
+      let inventory = vykar.list_snapshots()?;
+      if inventory.hidden > 0 {
+        return Err(anyhow!(
+          "Vykar hid {} unreadable snapshot(s); destructive maintenance is blocked",
+          inventory.hidden
+        ));
+      }
+      let mut retention = HashMap::new();
+      for snapshot in inventory.snapshots {
+          let keep = match snapshot.target {
+            BackupTarget::Core => settings_for_worker.core_keep_last,
+            BackupTarget::Stack { .. } => settings_for_worker.stack_keep_last,
+            BackupTarget::Volume { .. } => settings_for_worker.volume_keep_last,
+          BackupTarget::Unbound { .. } => continue,
+        };
+        retention.insert(snapshot.source_label, keep);
+      }
+      let pruned = vykar.prune_complete_snapshots(&retention)?;
+      if pruned.snapshots_deleted == 0 {
+        return Ok(());
+      }
+      let max_repack = match repository.backend {
+        BackupRepositoryBackend::S3 { .. }
+        | BackupRepositoryBackend::Sftp { .. } => {
+            Some(settings_for_worker.advanced.client_repack_limit_bytes)
+        }
+        BackupRepositoryBackend::CoreLocal { .. }
+        | BackupRepositoryBackend::Rest { .. } => None,
+      };
+      vykar.compact(
+        settings_for_worker.advanced.compact_threshold_percent,
+        max_repack,
+      )?;
+      Ok(())
+    })
+    .await
+    .context("Vykar maintenance worker failed")??;
+    let now = komodo_timestamp();
+    let update = if full_due {
+      doc! { "$set": {
+        "healthy": true,
+        "checked_at": now,
+        "last_full_verification_at": now,
+      } }
+    } else {
+      doc! { "$set": {
+        "healthy": true,
+        "checked_at": now,
+      } }
+    };
+    health_collection()
+      .update_one(doc! { "_id": health_id }, update)
+      .with_options(UpdateOptions::builder().upsert(true).build())
+      .await?;
+  }
+  Ok(())
+}
+
+async fn run_fleet(
+  settings: &BackupSettings,
+  run: &BackupRun,
+) -> anyhow::Result<bool> {
+  *fleet_generation().write().unwrap() = run.id.clone();
+  let mut targets = Vec::new();
+  let mut discovery_retry_servers = HashSet::new();
+  let mut partial = false;
+  if settings.core_enabled {
+    targets.push(BackupTarget::Core);
+  }
+  if settings.stacks_enabled {
+    let stacks =
+      find_collect(&db_client().stacks, None, None).await?;
+    targets.extend(stacks.into_iter().filter_map(|stack| {
+      (stack.config.swarm_id.is_empty()
+        && selection_includes(
+          settings.stack_selection.mode,
+          &settings.stack_selection.stack_ids,
+          &stack.id,
+        ))
+      .then_some(BackupTarget::Stack { stack_id: stack.id })
+    }));
+  }
+  if settings.volumes_enabled {
+    // Volume inventory comes from every configured Periphery at run time, so
+    // unmanaged local named volumes participate automatically.
+    let servers =
+      find_collect(&db_client().servers, None, None).await?;
+    for server in servers {
+      let client = match periphery_client(&server).await {
+        Ok(client) => client,
+        Err(error) => {
+          warn!(
+            "Backup discovery could not connect to {}: {error:#}",
+            server.name
+          );
+          partial = true;
+          discovery_retry_servers.insert(server.id.clone());
+          continue;
+        }
+      };
+      let poll = client
+        .request(periphery_client::api::poll::PollStatus {
+          include_stats: false,
+          include_docker: true,
+        })
+        .await;
+      let Ok(poll) = poll else {
+        partial = true;
+        discovery_retry_servers.insert(server.id.clone());
+        targets.extend(
+          settings
+            .volume_selection
+            .volumes
+            .iter()
+            .filter(|volume| volume.server_id == server.id)
+            .cloned()
+            .map(
+              |BackupVolumeTarget {
+                 server_id,
+                 volume_name,
+               }| BackupTarget::Volume {
+                server_id,
+                volume_name,
+              },
+            ),
+        );
+        continue;
+      };
+      for volume in poll
+        .docker
+        .into_iter()
+        .flat_map(|docker| docker.volumes)
+        .filter(|volume| volume.driver == "local")
+      {
+        let identity = BackupVolumeTarget {
+          server_id: server.id.clone(),
+          volume_name: volume.name,
+        };
+        if selection_includes(
+          settings.volume_selection.mode,
+          &settings.volume_selection.volumes,
+          &identity,
+        ) {
+          targets.push(BackupTarget::Volume {
+            server_id: identity.server_id,
+            volume_name: identity.volume_name,
+          });
+        }
+      }
+    }
+  }
+  if targets.contains(&BackupTarget::Core) {
+    match backup_core(settings, run).await {
+      Ok(false) => {}
+      Ok(true) => {
+        partial = true;
+        spawn_core_retry(settings.clone(), run.clone());
+      }
+      Err(error) => {
+        warn!("Core backup failed: {error:#}");
+        partial = true;
+        spawn_core_retry(settings.clone(), run.clone());
+      }
+    }
+  }
+
+  let mut by_server: HashMap<String, Vec<BackupTarget>> =
+    HashMap::new();
+  for target in targets
+    .into_iter()
+    .filter(|target| *target != BackupTarget::Core)
+  {
+    let server_id = match &target {
+      BackupTarget::Stack { stack_id } => {
+        resource::get::<Stack>(stack_id).await?.config.server_id
+      }
+      BackupTarget::Volume { server_id, .. } => server_id.clone(),
+      BackupTarget::Core | BackupTarget::Unbound { .. } => continue,
+    };
+    by_server.entry(server_id).or_default().push(target);
+  }
+  for server_id in discovery_retry_servers {
+    by_server.entry(server_id).or_default();
+  }
+  let semaphore = Arc::new(tokio::sync::Semaphore::new(
+    settings.advanced.node_concurrency.max(1) as usize,
+  ));
+  let mut batches = FuturesUnordered::new();
+  for (server_id, targets) in by_server {
+    let semaphore = semaphore.clone();
+    let settings = settings.clone();
+    let run = run.clone();
+    batches.push(async move {
+      let _permit = semaphore.acquire_owned().await?;
+      let targets =
+        refresh_node_targets(&settings, &server_id, targets).await?;
+      let result =
+        run_node_batch(&settings, &run, &server_id, &targets).await;
+      anyhow::Ok((server_id, targets, result))
+    });
+  }
+  while let Some(result) = batches.next().await {
+    let (server_id, targets, result) = result?;
+    match result {
+      Ok(false) => {}
+      Ok(true) => {
+        partial = true;
+        spawn_node_retry(
+          settings.clone(),
+          run.clone(),
+          server_id,
+          targets,
+        );
+      }
+      Err(error) => {
+        warn!("Backup node {server_id} failed: {error:#}");
+        partial = true;
+        spawn_node_retry(
+          settings.clone(),
+          run.clone(),
+          server_id,
+          targets,
+        );
+      }
+    }
+  }
+  Ok(partial)
+}
+
+fn fleet_generation() -> &'static RwLock<String> {
+  static GENERATION: OnceLock<RwLock<String>> = OnceLock::new();
+  GENERATION.get_or_init(Default::default)
+}
+
+fn spawn_node_retry(
+  settings: BackupSettings,
+  run: BackupRun,
+  server_id: String,
+  targets: Vec<BackupTarget>,
+) {
+  tokio::spawn(async move {
+    let mut retry = 0_u64;
+    loop {
+      if *fleet_generation().read().unwrap() != run.id {
+        return;
+      }
+      let seconds =
+        2_u64.saturating_pow(retry.min(8) as u32).min(300);
+      tokio::time::sleep(std::time::Duration::from_secs(seconds))
+        .await;
+      if *fleet_generation().read().unwrap() != run.id {
+        return;
+      }
+      retry += 1;
+      let _ = runs_collection()
+        .update_one(
+          doc! { "id": &run.id },
+          doc! { "$set": { "retry_count": retry as i64 } },
+        )
+        .await;
+      let targets = match refresh_node_targets(
+        &settings,
+        &server_id,
+        targets.clone(),
+      )
+      .await
+      {
+        Ok(targets) => targets,
+        Err(error) => {
+          warn!(
+            "Backup retry {retry} could not rediscover node {server_id}: {error:#}"
+          );
+          continue;
+        }
+      };
+      let _repository_roles =
+        repository_role_barrier().clone().read_owned().await;
+      match run_node_batch(&settings, &run, &server_id, &targets)
+        .await
+      {
+        Ok(false) => {
+          queue_maintenance();
+          return;
+        }
+        Ok(true) => warn!(
+          "Backup retry {retry} for node {server_id} remained partial"
+        ),
+        Err(error) => warn!(
+          "Backup retry {retry} for node {server_id} failed: {error:#}"
+        ),
+      }
+    }
+  });
+}
+
+fn spawn_core_retry(settings: BackupSettings, run: BackupRun) {
+  tokio::spawn(async move {
+    let mut retry = 0_u32;
+    loop {
+      if *fleet_generation().read().unwrap() != run.id {
+        return;
+      }
+      let seconds = 2_u64.saturating_pow(retry.min(8)).min(300);
+      tokio::time::sleep(std::time::Duration::from_secs(seconds))
+        .await;
+      if *fleet_generation().read().unwrap() != run.id {
+        return;
+      }
+      retry = retry.saturating_add(1);
+      let _repository_roles =
+        repository_role_barrier().clone().read_owned().await;
+      match backup_core(&settings, &run).await {
+        Ok(false) => {
+          queue_maintenance();
+          return;
+        }
+        Ok(true) => {
+          warn!("Core backup retry {retry} remained partial")
+        }
+        Err(error) => {
+          warn!("Core backup retry {retry} failed: {error:#}")
+        }
+      }
+    }
+  });
+}
+
+async fn refresh_node_targets(
+  settings: &BackupSettings,
+  server_id: &str,
+  targets: Vec<BackupTarget>,
+) -> anyhow::Result<Vec<BackupTarget>> {
+  let mut targets = targets
+    .into_iter()
+    .filter(|target| matches!(target, BackupTarget::Stack { .. }))
+    .collect::<HashSet<_>>();
+  if !settings.volumes_enabled {
+    return Ok(targets.into_iter().collect());
+  }
+  let server = resource::get::<Server>(server_id).await?;
+  let poll = periphery_client(&server)
+    .await?
+    .request(periphery_client::api::poll::PollStatus {
+      include_stats: false,
+      include_docker: true,
+    })
+    .await?;
+  for volume in poll
+    .docker
+    .into_iter()
+    .flat_map(|docker| docker.volumes)
+    .filter(|volume| volume.driver == "local")
+  {
+    let identity = BackupVolumeTarget {
+      server_id: server_id.to_string(),
+      volume_name: volume.name,
+    };
+    if selection_includes(
+      settings.volume_selection.mode,
+      &settings.volume_selection.volumes,
+      &identity,
+    ) {
+      targets.insert(BackupTarget::Volume {
+        server_id: identity.server_id,
+        volume_name: identity.volume_name,
+      });
+    }
+  }
+  if settings.volume_selection.mode
+    == komodo_client::entities::backup::BackupSelectionMode::Include
+  {
+    targets.extend(
+      settings
+        .volume_selection
+        .volumes
+        .iter()
+        .filter(|volume| volume.server_id == server_id)
+        .map(|volume| BackupTarget::Volume {
+          server_id: volume.server_id.clone(),
+          volume_name: volume.volume_name.clone(),
+        }),
+    );
+  }
+  Ok(targets.into_iter().collect())
+}
+
+async fn run_node_batch(
+  settings: &BackupSettings,
+  run: &BackupRun,
+  server_id: &str,
+  targets: &[BackupTarget],
+) -> anyhow::Result<bool> {
+  let server = resource::get::<Server>(server_id).await?;
+  let mut tasks = Vec::new();
+  for target in targets {
+    let periphery_target = match target {
+      BackupTarget::Stack { stack_id } => {
+        let stack = resource::get::<Stack>(stack_id).await?;
+        let repo = if stack.config.linked_repo.is_empty() {
+          None
+        } else {
+          Some(
+            resource::get::<Repo>(&stack.config.linked_repo).await?,
+          )
+        };
+        PeripheryBackupTarget::Stack {
+          stack: Box::new(stack),
+          repo: repo.map(Box::new),
+        }
+      }
+      BackupTarget::Volume { volume_name, .. } => {
+        PeripheryBackupTarget::Volume {
+          volume_name: volume_name.clone(),
+        }
+      }
+      BackupTarget::Core | BackupTarget::Unbound { .. } => continue,
+    };
+    tasks.push(VykarBackupTask {
+      target: periphery_target,
+      source_label: target.source_label(core_instance_id()?),
+      snapshot_name: snapshot_name(match target {
+        BackupTarget::Stack { .. } => "stack",
+        BackupTarget::Volume { .. } => "volume",
+        _ => "backup",
+      }),
+    });
+  }
+  let expected = tasks.len();
+  let response = periphery_client(&server)
+    .await?
+    .request(RunVykarBackupBatch {
+      tasks,
+      primary: repository_for_periphery(&settings.primary, false)?,
+      mirror: settings
+        .mirror
+        .as_ref()
+        .map(|repository| repository_for_periphery(repository, true))
+        .transpose()?,
+      advanced: settings.advanced.clone(),
+      hostname: format!("komodo-periphery-{}", server.id),
+      run_id: run.id.clone(),
+      komodo_version: env!("CARGO_PKG_VERSION").into(),
+      stop_containers: settings.stop_containers,
+    })
+    .await?;
+  if !response.restart_errors.is_empty() {
+    *critical_alert().write().unwrap() = Some(format!(
+      "Backup restart failed on {}: {}",
+      server.name,
+      response.restart_errors.join("; ")
+    ));
+  }
+  let repositories_partial = response.results.iter().any(|task| {
+    !task.result.primary.complete
+      || settings.mirror.is_some()
+        && !task
+          .result
+          .mirror
+          .as_ref()
+          .is_some_and(|mirror| mirror.complete)
+  });
+  Ok(
+    response.results.len() != expected
+      || !response.discovery_errors.is_empty()
+      || !response.restart_errors.is_empty()
+      || repositories_partial,
+  )
+}
+
+async fn run_target(
+  settings: &BackupSettings,
+  run: &BackupRun,
+  target: BackupTarget,
+) -> anyhow::Result<bool> {
+  match target {
+    BackupTarget::Core => backup_core(settings, run).await,
+    BackupTarget::Stack { stack_id } => {
+      backup_stack(settings, run, &stack_id).await
+    }
+    BackupTarget::Volume {
+      server_id,
+      volume_name,
+    } => backup_volume(settings, run, &server_id, &volume_name).await,
+    BackupTarget::Unbound { .. } => {
+      Err(anyhow!("Unbound snapshots cannot be backed up"))
+    }
+  }
+}
+
+async fn backup_core(
+  settings: &BackupSettings,
+  run: &BackupRun,
+) -> anyhow::Result<bool> {
+  let staging =
+    PathBuf::from("/backups/.komodo-core-staging").join(&run.id);
+  let _ = tokio::fs::remove_dir_all(&staging).await;
+  tokio::fs::create_dir_all(&staging).await?;
+  // A versioned logical dump is produced before upload. Mongo writes resume as
+  // soon as the immutable export file is complete.
+  {
+    let _barrier = mutation_barrier().write().await;
+    database::utils::backup_excluding(
+      &db_client().db,
+      &staging,
+      &[SETTINGS_COLLECTION],
+    )
+    .await?;
+  }
+  let exported_collections = db_client()
+    .db
+    .list_collection_names()
+    .await?
+    .into_iter()
+    .filter(|name| core_export_includes_collection(name))
+    .collect::<Vec<_>>();
+  let manifest = serde_json::json!({
+    "schema": "komodo.core-export/v1",
+    "version": env!("CARGO_PKG_VERSION"),
+    "core_instance_id": core_instance_id()?,
+    "collections": exported_collections,
+    "created_at": komodo_timestamp(),
+  });
+  tokio::fs::write(
+    staging.join("komodo-core-manifest.json"),
+    serde_json::to_vec_pretty(&manifest)?,
+  )
+  .await?;
+  let primary = settings.primary.clone();
+  let mirror = settings.mirror.clone();
+  let settings = settings.clone();
+  let label = BackupTarget::Core.source_label(core_instance_id()?);
+  let name = snapshot_name("core");
+  let path = staging.to_string_lossy().into_owned();
+  let result =
+    tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+      let primary_result = core_repository(&primary, &settings)?
+        .backup(&name, &label, std::slice::from_ref(&path))?;
+      let mut partial = primary_result.partial;
+      if let Some(mirror) = mirror {
+        partial |= core_repository(&mirror, &settings)?
+          .backup(&name, &label, std::slice::from_ref(&path))?
+          .partial;
+      }
+      Ok(partial)
+    })
+    .await
+    .context("Core backup worker failed")??;
+  let _ = tokio::fs::remove_dir_all(staging).await;
+  Ok(result)
+}
+
+async fn backup_stack(
+  settings: &BackupSettings,
+  run: &BackupRun,
+  stack_id: &str,
+) -> anyhow::Result<bool> {
+  let stack = resource::get::<Stack>(stack_id).await?;
+  if !stack.config.swarm_id.is_empty() {
+    return Err(anyhow!(
+      "Swarm stacks are not supported by backup v1"
+    ));
+  }
+  let server =
+    resource::get::<Server>(&stack.config.server_id).await?;
+  let repo = if stack.config.linked_repo.is_empty() {
+    None
+  } else {
+    Some(resource::get::<Repo>(&stack.config.linked_repo).await?)
+  };
+  let response = periphery_client(&server)
+    .await?
+    .request(RunVykarBackup {
+      target: PeripheryBackupTarget::Stack {
+        stack: Box::new(stack),
+        repo: repo.map(Box::new),
+      },
+      primary: repository_for_periphery(&settings.primary, false)?,
+      mirror: settings
+        .mirror
+        .as_ref()
+        .map(|repository| repository_for_periphery(repository, true))
+        .transpose()?,
+      advanced: settings.advanced.clone(),
+      hostname: format!("komodo-periphery-{}", server.id),
+      source_label: BackupTarget::Stack {
+        stack_id: stack_id.into(),
+      }
+      .source_label(core_instance_id()?),
+      snapshot_name: snapshot_name("stack"),
+      run_id: run.id.clone(),
+      komodo_version: env!("CARGO_PKG_VERSION").into(),
+      stop_containers: settings.stop_containers,
+    })
+    .await?;
+  if !response.restart_errors.is_empty() {
+    *critical_alert().write().unwrap() = Some(format!(
+      "Containers could not be restarted after stack backup: {}",
+      response.restart_errors.join("; ")
+    ));
+  }
+  if let Some(error) = response.primary.error {
+    return Err(anyhow!(error));
+  }
+  Ok(
+    response.primary.partial
+      || response.mirror.as_ref().is_some_and(|result| {
+        result.partial || result.error.is_some()
+      })
+      || !response.restart_errors.is_empty(),
+  )
+}
+
+async fn backup_volume(
+  settings: &BackupSettings,
+  run: &BackupRun,
+  server_id: &str,
+  volume_name: &str,
+) -> anyhow::Result<bool> {
+  let server = resource::get::<Server>(server_id).await?;
+  let response = periphery_client(&server)
+    .await?
+    .request(RunVykarBackup {
+      target: PeripheryBackupTarget::Volume {
+        volume_name: volume_name.into(),
+      },
+      primary: repository_for_periphery(&settings.primary, false)?,
+      mirror: settings
+        .mirror
+        .as_ref()
+        .map(|repository| repository_for_periphery(repository, true))
+        .transpose()?,
+      advanced: settings.advanced.clone(),
+      hostname: format!("komodo-periphery-{}", server.id),
+      source_label: BackupTarget::Volume {
+        server_id: server_id.into(),
+        volume_name: volume_name.into(),
+      }
+      .source_label(core_instance_id()?),
+      snapshot_name: snapshot_name("volume"),
+      run_id: run.id.clone(),
+      komodo_version: env!("CARGO_PKG_VERSION").into(),
+      stop_containers: settings.stop_containers,
+    })
+    .await?;
+  if !response.restart_errors.is_empty() {
+    *critical_alert().write().unwrap() = Some(format!(
+      "Containers could not be restarted after volume backup: {}",
+      response.restart_errors.join("; ")
+    ));
+  }
+  if let Some(error) = response.primary.error {
+    return Err(anyhow!(error));
+  }
+  Ok(
+    response.primary.partial
+      || response.mirror.as_ref().is_some_and(|result| {
+        result.partial || result.error.is_some()
+      })
+      || !response.restart_errors.is_empty(),
+  )
+}
+
+pub async fn authorize_target(
+  target: &BackupTarget,
+  user: &User,
+  level: komodo_client::entities::permission::PermissionLevel,
+) -> anyhow::Result<()> {
+  match target {
+    BackupTarget::Core => {
+      if user.admin {
+        Ok(())
+      } else {
+        Err(anyhow!("Core backup operations are admin only"))
+      }
+    }
+    BackupTarget::Stack { stack_id } => {
+      get_check_permissions::<Stack>(stack_id, user, level.backups())
+        .await
+        .map(|_| ())
+    }
+    BackupTarget::Volume { server_id, .. } => {
+      get_check_permissions::<Server>(
+        server_id,
+        user,
+        level.backups(),
+      )
+      .await
+      .map(|_| ())
+    }
+    BackupTarget::Unbound { .. } => {
+      if user.admin {
+        Ok(())
+      } else {
+        Err(anyhow!("Unbound snapshot recovery is admin only"))
+      }
+    }
+  }
+}
+
+pub async fn authorize_snapshot(
+  snapshot_name: &str,
+  user: &User,
+  level: komodo_client::entities::permission::PermissionLevel,
+) -> anyhow::Result<BackupSnapshot> {
+  let (snapshots, _) = list_snapshots().await?;
+  let snapshot = snapshots
+    .into_iter()
+    .find(|snapshot| snapshot.name == snapshot_name)
+    .context("Snapshot does not exist in the primary repository")?;
+  authorize_target(&snapshot.target, user, level).await?;
+  Ok(snapshot)
+}
+
+pub async fn plan_restore(
+  snapshot: BackupSnapshot,
+  user: &User,
+  request: PlanBackupRestore,
+) -> anyhow::Result<BackupRestorePlan> {
+  let _repository_roles =
+    repository_role_barrier().clone().read_owned().await;
+  let PlanBackupRestore {
+    destination_server_id,
+    selected_paths,
+    recovered_stack_name,
+    bind_path_mappings,
+    destination_volume_name,
+    confirm_existing_volume,
+    ..
+  } = request;
+  if snapshot.partial {
+    return Err(anyhow!(
+      "Partial snapshots are diagnostic-only and cannot be restored"
+    ));
+  }
+  let selected_paths = normalize_selected_paths(&selected_paths)?;
+  let destination_server_id = match destination_server_id {
+    Some(destination) => Some(destination),
+    None => match &snapshot.target {
+      BackupTarget::Volume { server_id, .. } => {
+        Some(server_id.clone())
+      }
+      BackupTarget::Stack { stack_id } => {
+        Some(resource::get::<Stack>(stack_id).await?.config.server_id)
+      }
+      BackupTarget::Core => None,
+      BackupTarget::Unbound { .. } => None,
+    },
+  };
+  let mut publish = Vec::new();
+  match &snapshot.target {
+    BackupTarget::Core => {
+      return Err(anyhow!(
+        "Core recovery is available only from the initial setup recovery flow"
+      ));
+    }
+    BackupTarget::Unbound { .. } => {
+      return Err(anyhow!(
+        "Unbound snapshot recovery requires the administrator recovery flow"
+      ));
+    }
+    BackupTarget::Stack { stack_id } => {
+      let stack = resource::get::<Stack>(stack_id).await?;
+      let destination = destination_server_id
+        .clone()
+        .unwrap_or_else(|| stack.config.server_id.clone());
+      if destination != stack.config.server_id
+        && recovered_stack_name
+          .as_deref()
+          .unwrap_or_default()
+          .is_empty()
+      {
+        return Err(anyhow!(
+          "Cross-node stack restore requires a new unique stack name"
+        ));
+      }
+      if destination != stack.config.server_id {
+        let recovered_name = recovered_stack_name
+          .as_deref()
+          .context("Recovered Stack name is missing")?;
+        let recovered_name = Stack::validated_name(recovered_name);
+        if recovered_name.is_empty() {
+          return Err(anyhow!(
+            "Recovered Stack name must contain Docker-compatible characters"
+          ));
+        }
+        if Stack::coll()
+          .find_one(doc! { "name": &recovered_name })
+          .await?
+          .is_some()
+        {
+          return Err(anyhow!(
+            "A Stack named '{recovered_name}' already exists"
+          ));
+        }
+      }
+      if destination != stack.config.server_id
+        && bind_path_mappings.is_empty()
+      {
+        return Err(anyhow!(
+          "Cross-node stack restore requires explicit bind path mappings"
+        ));
+      }
+      let source_paths = snapshot
+        .source_paths
+        .iter()
+        .filter(|path| !path.contains("komodo-backup-manifest-"))
+        .cloned()
+        .collect::<Vec<_>>();
+      if source_paths.is_empty() {
+        return Err(anyhow!(
+          "Snapshot does not contain a Stack run directory"
+        ));
+      }
+      for source in source_paths {
+        let destination_path = if destination
+          == stack.config.server_id
+        {
+          source.clone()
+        } else {
+          bind_path_mappings
+            .get(&source)
+            .with_context(|| {
+              format!(
+                "Cross-node Stack restore is missing a destination mapping for '{source}'"
+              )
+            })?
+            .clone()
+        };
+        if !Path::new(&destination_path).is_absolute() {
+          return Err(anyhow!(
+            "Restore destination must be absolute: {destination_path}"
+          ));
+        }
+        publish.push(
+          periphery_client::api::backup::RestorePublishPath {
+            snapshot_path: source.trim_start_matches('/').into(),
+            destination: destination_path,
+          },
+        );
+      }
+    }
+    BackupTarget::Volume {
+      server_id,
+      volume_name,
+    } => {
+      let destination_server = destination_server_id
+        .clone()
+        .unwrap_or_else(|| server_id.clone());
+      let destination_name = destination_volume_name
+        .clone()
+        .unwrap_or_else(|| volume_name.clone());
+      if destination_server != *server_id
+        && destination_name == *volume_name
+      {
+        return Err(anyhow!(
+          "Cross-node volume restore must use a new destination volume name"
+        ));
+      }
+      // Periphery validates the actual local volume mountpoint immediately
+      // before execution; this logical destination is resolved there.
+      let source_path = snapshot
+        .source_paths
+        .iter()
+        .find(|path| !path.contains("komodo-backup-manifest-"))
+        .context("Snapshot does not contain a volume source path")?;
+      publish.push(
+        periphery_client::api::backup::RestorePublishPath {
+          snapshot_path: source_path.trim_start_matches('/').into(),
+          destination: format!(
+            "/var/lib/docker/volumes/{destination_name}/_data"
+          ),
+        },
+      );
+    }
+  }
+  let recovered_stack_run_directory =
+    if let BackupTarget::Stack { stack_id } = &snapshot.target {
+      let source_server =
+        resource::get::<Stack>(stack_id).await?.config.server_id;
+      (Some(source_server.as_str())
+        != destination_server_id.as_deref())
+      .then(|| publish.first().map(|path| path.destination.clone()))
+      .flatten()
+    } else {
+      None
+    };
+  if let BackupTarget::Stack { stack_id } = &snapshot.target {
+    let stack = resource::get::<Stack>(stack_id).await?;
+    if Some(stack.config.server_id.as_str())
+      != destination_server_id.as_deref()
+    {
+      let name = recovered_stack_name
+        .as_deref()
+        .context("Recovered Stack name is missing")?;
+      let mut config: komodo_client::entities::stack::PartialStackConfig =
+        stack.config.into();
+      config.server_id = destination_server_id.clone();
+      config.swarm_id = Some(String::new());
+      config.project_name = Some(name.to_string());
+      config.files_on_host = Some(true);
+      config.run_directory = recovered_stack_run_directory.clone();
+      config.repo = Some(String::new());
+      config.linked_repo = Some(String::new());
+      Stack::validate_create_config(&mut config, user).await?;
+    }
+  }
+  if !selected_paths.is_empty() {
+    publish = selected_publish_paths(&selected_paths, &publish)?;
+    if publish.is_empty() {
+      return Err(anyhow!(
+        "Selected paths do not belong to a restorable Stack or Volume source"
+      ));
+    }
+  }
+  let create_volume_if_missing = matches!(
+    &snapshot.target,
+    BackupTarget::Volume {
+      server_id,
+      volume_name,
+    } if destination_server_id.as_deref() != Some(server_id)
+      || destination_volume_name.as_ref().is_some_and(|name| name != volume_name)
+  );
+  let destination_server = destination_server_id
+    .clone()
+    .context("Restore destination server is missing")?;
+  let server = resource::get::<Server>(&destination_server).await?;
+  let target = restore_periphery_target(
+    &snapshot.target,
+    &destination_server,
+    recovered_stack_name.as_deref(),
+    destination_volume_name.as_deref(),
+    publish.first().map(|path| path.destination.as_str()),
+  )
+  .await?;
+  let settings = get_settings().await?;
+  let preflight = periphery_client(&server)
+    .await?
+    .request(PreflightVykarRestore {
+      target,
+      repository: repository_for_periphery(&settings.primary, false)?,
+      advanced: settings.advanced,
+      hostname: format!("komodo-periphery-{}", server.id),
+      snapshot_name: snapshot.name.clone(),
+      selected_paths: selected_paths.clone(),
+      publish: publish.clone(),
+    })
+    .await?;
+  if matches!(
+    &snapshot.target,
+    BackupTarget::Volume { server_id, .. } if server_id != &destination_server
+  ) && !confirm_existing_volume
+    && preflight.destination_exists
+  {
+    return Err(anyhow!(
+      "Cross-node restore into an existing volume requires explicit confirmation"
+    ));
+  }
+  let plan = BackupRestorePlan {
+    id: Uuid::new_v4().to_string(),
+    snapshot: snapshot.name,
+    source: snapshot.target,
+    destination_server_id,
+    selected_paths,
+    created_paths: preflight.created_paths,
+    overwritten_paths: preflight.overwritten_paths,
+    deleted_paths: preflight.deleted_paths,
+    containers_to_stop: preflight.containers_to_stop,
+    expires_at: komodo_timestamp() + 15 * 60 * 1000,
+  };
+  plans_collection()
+    .insert_one(StoredRestorePlan {
+      id: plan.id.clone(),
+      created_by: user.id.clone(),
+      plan: plan.clone(),
+      publish,
+      recovered_stack_name,
+      recovered_stack_run_directory,
+      destination_volume_name: destination_volume_name.clone(),
+      create_volume_if_missing,
+    })
+    .await?;
+  Ok(plan)
+}
+
+fn selected_publish_paths(
+  selected: &[String],
+  roots: &[periphery_client::api::backup::RestorePublishPath],
+) -> anyhow::Result<
+  Vec<periphery_client::api::backup::RestorePublishPath>,
+> {
+  let mut publish = Vec::new();
+  for selected in selected {
+    let path = Path::new(selected);
+    if path.is_absolute()
+      || path.components().any(|component| {
+        matches!(component, std::path::Component::ParentDir)
+      })
+    {
+      return Err(anyhow!("Unsafe selected restore path"));
+    }
+    let Some((root, relative, _)) = roots
+      .iter()
+      .filter_map(|root| {
+        let source = Path::new(root.snapshot_path.trim_matches('/'));
+        path.strip_prefix(source).ok().map(|relative| {
+          (root, relative, source.components().count())
+        })
+      })
+      .max_by_key(|(_, _, depth)| *depth)
+    else {
+      continue;
+    };
+    let destination = Path::new(&root.destination).join(relative);
+    publish.push(periphery_client::api::backup::RestorePublishPath {
+      snapshot_path: selected.clone(),
+      destination: destination.to_string_lossy().into_owned(),
+    });
+  }
+  publish
+    .sort_by(|left, right| left.destination.cmp(&right.destination));
+  publish
+    .dedup_by(|left, right| left.destination == right.destination);
+  Ok(publish)
+}
+
+async fn restore_periphery_target(
+  source: &BackupTarget,
+  destination_server: &str,
+  recovered_stack_name: Option<&str>,
+  destination_volume_name: Option<&str>,
+  recovered_run_directory: Option<&str>,
+) -> anyhow::Result<PeripheryBackupTarget> {
+  match source {
+    BackupTarget::Stack { stack_id } => {
+      let mut stack = resource::get::<Stack>(stack_id).await?;
+      let cross_node = stack.config.server_id != destination_server;
+      if cross_node {
+        let name = recovered_stack_name
+          .filter(|name| !name.trim().is_empty())
+          .context("Recovered Stack name is missing")?;
+        stack.id.clear();
+        stack.name = name.to_string();
+        stack.config.server_id = destination_server.to_string();
+        stack.config.swarm_id.clear();
+        stack.config.project_name = name.to_string();
+        stack.config.files_on_host = true;
+        stack.config.run_directory = recovered_run_directory
+          .context("Recovered Stack run directory is missing")?
+          .to_string();
+        stack.config.repo.clear();
+        stack.config.linked_repo.clear();
+        Ok(PeripheryBackupTarget::Stack {
+          stack: Box::new(stack),
+          repo: None,
+        })
+      } else {
+        let repo = if stack.config.linked_repo.is_empty() {
+          None
+        } else {
+          Some(
+            resource::get::<Repo>(&stack.config.linked_repo).await?,
+          )
+        };
+        Ok(PeripheryBackupTarget::Stack {
+          stack: Box::new(stack),
+          repo: repo.map(Box::new),
+        })
+      }
+    }
+    BackupTarget::Volume { volume_name, .. } => {
+      Ok(PeripheryBackupTarget::Volume {
+        volume_name: destination_volume_name
+          .unwrap_or(volume_name)
+          .to_string(),
+      })
+    }
+    BackupTarget::Core | BackupTarget::Unbound { .. } => {
+      Err(anyhow!("Snapshot target cannot be restored on Periphery"))
+    }
+  }
+}
+
+pub async fn execute_restore(
+  plan_id: &str,
+  user: &User,
+) -> anyhow::Result<BackupRun> {
+  let _repository_roles =
+    repository_role_barrier().clone().read_owned().await;
+  let stored = plans_collection()
+    .find_one_and_delete(
+      doc! { "_id": plan_id, "created_by": &user.id },
+    )
+    .await?
+    .context("Restore plan does not exist")?;
+  if stored.plan.expires_at < komodo_timestamp() {
+    return Err(anyhow!("Restore plan has expired"));
+  }
+  authorize_target(
+    &stored.plan.source,
+    user,
+    komodo_client::entities::permission::PermissionLevel::Execute,
+  )
+  .await?;
+  let server_id = stored
+    .plan
+    .destination_server_id
+    .clone()
+    .or_else(|| match &stored.plan.source {
+      BackupTarget::Volume { server_id, .. } => {
+        Some(server_id.clone())
+      }
+      _ => None,
+    })
+    .context("Restore destination server is missing")?;
+  let server = resource::get::<Server>(&server_id).await?;
+  let source_server_id = match &stored.plan.source {
+    BackupTarget::Stack { stack_id } => {
+      Some(resource::get::<Stack>(stack_id).await?.config.server_id)
+    }
+    BackupTarget::Volume { server_id, .. } => Some(server_id.clone()),
+    BackupTarget::Core | BackupTarget::Unbound { .. } => None,
+  };
+  if source_server_id.as_deref() != Some(server_id.as_str()) {
+    authorize_target(
+      &BackupTarget::Volume {
+        server_id: server_id.clone(),
+        volume_name: String::new(),
+      },
+      user,
+      komodo_client::entities::permission::PermissionLevel::Execute,
+    )
+    .await?;
+    if matches!(stored.plan.source, BackupTarget::Stack { .. })
+      && !Stack::user_can_create(user)
+    {
+      return Err(anyhow!(
+        "Cross-node stack restore requires Stack-create permission"
+      ));
+    }
+  }
+  let cross_node_stack = match &stored.plan.source {
+    BackupTarget::Stack { stack_id } => {
+      let stack = resource::get::<Stack>(stack_id).await?;
+      (stack.config.server_id != server_id).then_some(stack)
+    }
+    _ => None,
+  };
+  if cross_node_stack.is_some() {
+    let recovered_name = stored
+      .recovered_stack_name
+      .as_deref()
+      .context("Recovered Stack name is missing")?;
+    let recovered_name = Stack::validated_name(recovered_name);
+    if Stack::coll()
+      .find_one(doc! { "name": &recovered_name })
+      .await?
+      .is_some()
+    {
+      return Err(anyhow!(
+        "A Stack named '{recovered_name}' now exists; create a new preflight"
+      ));
+    }
+  }
+  let target = restore_periphery_target(
+    &stored.plan.source,
+    &server_id,
+    stored.recovered_stack_name.as_deref(),
+    stored.destination_volume_name.as_deref(),
+    stored.recovered_stack_run_directory.as_deref().or_else(|| {
+      stored.publish.first().map(|path| path.destination.as_str())
+    }),
+  )
+  .await?;
+  let run =
+    new_run(Some(stored.plan.source.clone()), "Restore running")
+      .await?;
+  let settings = get_settings().await?;
+  let recovered_run_directory =
+    stored.recovered_stack_run_directory.clone().or_else(|| {
+      stored.publish.first().map(|path| path.destination.clone())
+    });
+  let response = periphery_client(&server)
+    .await?
+    .request(TransactionalVykarRestore {
+      target,
+      repository: repository_for_periphery(&settings.primary, false)?,
+      advanced: settings.advanced,
+      hostname: format!("komodo-periphery-{}", server.id),
+      snapshot_name: stored.plan.snapshot,
+      selected_paths: stored.plan.selected_paths,
+      publish: stored.publish,
+      journal_id: run.id.clone(),
+      create_volume_if_missing: stored.create_volume_if_missing,
+    })
+    .await?;
+  if let Some(error) = response.critical_error {
+    *critical_alert().write().unwrap() = Some(error.clone());
+    return finish_run(run, BackupRunState::Failed, error).await;
+  }
+  if !response.complete {
+    return finish_run(
+      run,
+      BackupRunState::Failed,
+      if response.rolled_back {
+        "Restore failed and was rolled back"
+      } else {
+        "Restore did not complete"
+      },
+    )
+    .await;
+  }
+  if let Some(stack) = cross_node_stack {
+    let name = stored
+      .recovered_stack_name
+      .context("Recovered stack name is missing")?;
+    let mut config: komodo_client::entities::stack::PartialStackConfig =
+      stack.config.into();
+    config.server_id = Some(server_id);
+    config.swarm_id = Some(String::new());
+    config.project_name = Some(name.clone());
+    config.files_on_host = Some(true);
+    config.run_directory = recovered_run_directory;
+    config.repo = Some(String::new());
+    config.linked_repo = Some(String::new());
+    resource::create::<Stack>(&name, config, None, user)
+      .await
+      .map_err(|error| error.error)?;
+  }
+  finish_run(run, BackupRunState::Complete, "Restore complete").await
+}
+
+pub async fn restore_plan(
+  plan_id: &str,
+) -> anyhow::Result<BackupRestorePlan> {
+  plans_collection()
+    .find_one(doc! { "_id": plan_id })
+    .await?
+    .map(|stored| stored.plan)
+    .context("Restore plan does not exist")
+}
+
+pub async fn plan_core_recovery(
+  snapshot_name: &str,
+  created_by: String,
+) -> anyhow::Result<CoreRecoveryPlan> {
+  let _repository_roles =
+    repository_role_barrier().clone().read_owned().await;
+  let snapshot = list_snapshots()
+    .await?
+    .0
+    .into_iter()
+    .find(|snapshot| snapshot.name == snapshot_name)
+    .context(
+      "Core snapshot does not exist in the active primary repository",
+    )?;
+  if snapshot.target != BackupTarget::Core {
+    return Err(anyhow!("Selected snapshot is not a Core backup"));
+  }
+  if snapshot.partial {
+    return Err(anyhow!(
+      "Partial Core snapshots cannot be recovered"
+    ));
+  }
+
+  let settings = get_settings().await?;
+  let repository = settings.primary.clone();
+  let staging = PathBuf::from("/backups/.komodo-core-recovery")
+    .join(Uuid::new_v4().to_string());
+  tokio::fs::create_dir_all(&staging).await?;
+  let worker_staging = staging.clone();
+  let snapshot_for_worker = snapshot.name.clone();
+  let settings_for_worker = settings.clone();
+  tokio::task::spawn_blocking(move || {
+    core_repository(&repository, &settings_for_worker)?.restore(
+      &snapshot_for_worker,
+      &worker_staging,
+      &[],
+    )
+  })
+  .await
+  .context("Core recovery restore worker failed")??;
+
+  let manifest_path =
+    find_file_named(&staging, "komodo-core-manifest.json")
+      .context("Core snapshot manifest is missing")?;
+  let manifest: serde_json::Value =
+    serde_json::from_slice(&tokio::fs::read(&manifest_path).await?)?;
+  let backup_schema = manifest
+    .get("schema")
+    .and_then(serde_json::Value::as_str)
+    .context("Core snapshot manifest has no schema")?
+    .to_string();
+  if backup_schema != "komodo.core-export/v1" {
+    return Err(anyhow!(
+      "Unsupported Core backup schema '{backup_schema}'"
+    ));
+  }
+  let backup_version = manifest
+    .get("version")
+    .and_then(serde_json::Value::as_str)
+    .context("Core snapshot manifest has no Komodo version")?
+    .to_string();
+  if backup_version.split('.').next()
+    != env!("CARGO_PKG_VERSION").split('.').next()
+  {
+    return Err(anyhow!(
+      "Core backup major version {backup_version} is incompatible with {}",
+      env!("CARGO_PKG_VERSION")
+    ));
+  }
+  let recovered_core_instance_id = manifest
+    .get("core_instance_id")
+    .and_then(serde_json::Value::as_str)
+    .context("Core snapshot manifest has no stable Core identity")?
+    .to_string();
+  if recovered_core_instance_id.len() != 32
+    || !recovered_core_instance_id
+      .chars()
+      .all(|character| character.is_ascii_hexdigit())
+  {
+    return Err(anyhow!(
+      "Core snapshot manifest contains an invalid Core identity"
+    ));
+  }
+
+  let (backup_root, restore_folder) =
+    find_core_restore_layout(&staging)?;
+  let current_database = db_client().db.name().to_string();
+  let validation_database = format!(
+    "{}_recovery_{}",
+    current_database,
+    &Uuid::new_v4().simple().to_string()[..12]
+  );
+  let validation =
+    db_client().db.client().database(&validation_database);
+  database::utils::restore(
+    &validation,
+    &backup_root,
+    Some(Path::new(&restore_folder)),
+  )
+  .await
+  .context("Failed to restore the Core validation database")?;
+  // Repository credentials are deliberately excluded from Core snapshots.
+  // Carry forward the freshly configured, locally sealed repository settings
+  // so recovery can still access its primary after the database switch.
+  if let Some(active_settings) = settings_collection()
+    .find_one(doc! { "_id": SETTINGS_ID })
+    .await?
+  {
+    validation
+      .collection::<SealedBackupSettings>(SETTINGS_COLLECTION)
+      .update_one(
+        doc! { "_id": SETTINGS_ID },
+        doc! { "$set": to_document(&active_settings)? },
+      )
+      .with_options(UpdateOptions::builder().upsert(true).build())
+      .await
+      .context(
+        "Failed to carry active repository settings into recovery database",
+      )?;
+  }
+  let enabled_admins = validation
+    .collection::<komodo_client::entities::user::User>("User")
+    .count_documents(doc! { "enabled": true, "admin": true })
+    .await?;
+  if enabled_admins == 0 {
+    validation.drop().await.ok();
+    return Err(anyhow!(
+      "Recovered Core database has no enabled administrator; activation blocked"
+    ));
+  }
+
+  let plan = CoreRecoveryPlan {
+    id: Uuid::new_v4().to_string(),
+    snapshot: snapshot.name,
+    current_database,
+    validation_database,
+    backup_schema,
+    backup_version,
+    expires_at: komodo_timestamp() + 30 * 60 * 1000,
+  };
+  core_recovery_collection()
+    .insert_one(StoredCoreRecoveryPlan {
+      id: plan.id.clone(),
+      created_by,
+      recovered_core_instance_id,
+      plan: plan.clone(),
+    })
+    .await?;
+  let _ = tokio::fs::remove_dir_all(staging).await;
+  Ok(plan)
+}
+
+pub async fn execute_core_recovery(
+  plan_id: &str,
+  user_id: &str,
+) -> anyhow::Result<BackupRun> {
+  let stored = core_recovery_collection()
+    .find_one_and_delete(
+      doc! { "_id": plan_id, "created_by": user_id },
+    )
+    .await?
+    .context("Core recovery plan does not exist")?;
+  if stored.plan.expires_at < komodo_timestamp() {
+    return Err(anyhow!("Core recovery plan has expired"));
+  }
+  let validation = db_client()
+    .db
+    .client()
+    .database(&stored.plan.validation_database);
+  let enabled_admins = validation
+    .collection::<komodo_client::entities::user::User>("User")
+    .count_documents(doc! { "enabled": true, "admin": true })
+    .await?;
+  if enabled_admins == 0 {
+    return Err(anyhow!(
+      "Validation database no longer has an enabled administrator"
+    ));
+  }
+  persist_core_instance_id(&stored.recovered_core_instance_id)?;
+  persist_active_database_pointer(&stored.plan.validation_database)?;
+  // Once the durable pointer is published, restart even if recording the
+  // final audit result encounters a transient database error.
+  tokio::spawn(async {
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    std::process::exit(75);
+  });
+  let run =
+    new_run(Some(BackupTarget::Core), "Core recovery activating")
+      .await?;
+  let run = finish_run(
+    run,
+    BackupRunState::Complete,
+    format!(
+      "Core recovery validated; restarting into database '{}' (previous database '{}' retained)",
+      stored.plan.validation_database, stored.plan.current_database
+    ),
+  )
+  .await?;
+  Ok(run)
+}
+
+fn persist_active_database_pointer(
+  database: &str,
+) -> anyhow::Result<()> {
+  if database.is_empty()
+    || !database.chars().all(|character| {
+      character.is_ascii_alphanumeric()
+        || matches!(character, '_' | '-')
+    })
+  {
+    return Err(anyhow!("Unsafe active database name"));
+  }
+  let destination = Path::new(crate::state::ACTIVE_DATABASE_POINTER);
+  let parent = destination
+    .parent()
+    .context("Database pointer has no parent")?;
+  std::fs::create_dir_all(parent)?;
+  let temporary = parent.join(format!(
+    ".backup-active-database-{}.tmp",
+    Uuid::new_v4().simple()
+  ));
+  let mut file = std::fs::OpenOptions::new()
+    .create_new(true)
+    .write(true)
+    .open(&temporary)?;
+  file.write_all(database.as_bytes())?;
+  file.sync_all()?;
+  std::fs::rename(&temporary, destination)?;
+  std::fs::File::open(parent)?.sync_all()?;
+  Ok(())
+}
+
+fn find_file_named(root: &Path, name: &str) -> Option<PathBuf> {
+  let entries = std::fs::read_dir(root).ok()?;
+  for entry in entries.flatten() {
+    let path = entry.path();
+    let file_type = entry.file_type().ok()?;
+    if file_type.is_file() && entry.file_name() == name {
+      return Some(path);
+    }
+    if file_type.is_dir()
+      && let Some(found) = find_file_named(&path, name)
+    {
+      return Some(found);
+    }
+  }
+  None
+}
+
+fn find_core_restore_layout(
+  root: &Path,
+) -> anyhow::Result<(PathBuf, String)> {
+  fn find_dated(root: &Path) -> Option<PathBuf> {
+    for entry in std::fs::read_dir(root).ok()?.flatten() {
+      let path = entry.path();
+      let file_type = entry.file_type().ok()?;
+      if file_type.is_dir() {
+        if std::fs::read_dir(&path).ok()?.flatten().any(|child| {
+          child
+            .path()
+            .extension()
+            .is_some_and(|extension| extension == "gz")
+            && child.file_name() != "Stats.gz"
+        }) {
+          return Some(path);
+        }
+        if let Some(found) = find_dated(&path) {
+          return Some(found);
+        }
+      }
+    }
+    None
+  }
+  let dated = find_dated(root)
+    .context("Core snapshot contains no database export")?;
+  let backup_root = dated
+    .parent()
+    .context("Core database export has no parent")?
+    .to_path_buf();
+  let restore_folder = dated
+    .file_name()
+    .and_then(|name| name.to_str())
+    .context("Core database export path is not valid UTF-8")?
+    .to_string();
+  Ok((backup_root, restore_folder))
+}
+
+pub async fn verify(
+  mirror: bool,
+  full: bool,
+) -> anyhow::Result<BackupRun> {
+  let _repository_roles =
+    repository_role_barrier().clone().read_owned().await;
+  let settings = get_settings().await?;
+  let repository = if mirror {
+    settings
+      .mirror
+      .clone()
+      .context("Mirror is not configured")?
+  } else {
+    settings.primary.clone()
+  };
+  let run = new_run(None, "Repository verification running").await?;
+  let settings_for_worker = settings.clone();
+  let result = tokio::task::spawn_blocking(move || {
+    core_repository(&repository, &settings_for_worker)?.verify(
+      full,
+      settings_for_worker.advanced.verify_sample_percent,
+    )
+  })
+  .await
+  .context("Vykar verification worker failed")??;
+  if result.errors.is_empty() {
+    if full {
+      let id = if mirror { "mirror" } else { "primary" };
+      let now = komodo_timestamp();
+      health_collection()
+        .update_one(
+          doc! { "_id": id },
+          doc! { "$set": {
+            "healthy": true,
+            "checked_at": now,
+            "last_full_verification_at": now,
+          } },
+        )
+        .with_options(UpdateOptions::builder().upsert(true).build())
+        .await?;
+    }
+    finish_run(run, BackupRunState::Complete, "Repository verified")
+      .await
+  } else {
+    finish_run(
+      run,
+      BackupRunState::Failed,
+      format!("Integrity errors: {}", result.errors.join("; ")),
+    )
+    .await
+  }
+}
+
+pub async fn promote_mirror() -> anyhow::Result<BackupSettings> {
+  let verification = verify(true, true).await?;
+  if verification.state != BackupRunState::Complete {
+    return Err(anyhow!(
+      "Mirror verification failed; promotion blocked"
+    ));
+  }
+  let _repository_roles =
+    repository_role_barrier().clone().write_owned().await;
+  let mut settings = get_settings().await?;
+  let primary = settings.primary.clone();
+  let mirror_for_inventory = settings
+    .mirror
+    .clone()
+    .context("Mirror is not configured")?;
+  let inventory_settings = settings.clone();
+  let missing = tokio::task::spawn_blocking(move || {
+    let primary = core_repository(&primary, &inventory_settings)?
+      .list_snapshots()?;
+    let mirror = core_repository(
+      &mirror_for_inventory,
+      &inventory_settings,
+    )?
+    .list_snapshots()?;
+    if primary.hidden > 0 || mirror.hidden > 0 {
+      return Err(anyhow!(
+        "Promotion blocked because a repository inventory is incomplete"
+      ));
+    }
+    let mirror_names = mirror
+      .snapshots
+      .into_iter()
+      .map(|snapshot| snapshot.name)
+      .collect::<HashSet<_>>();
+    Ok::<_, anyhow::Error>(
+      primary
+        .snapshots
+        .into_iter()
+        .filter(|snapshot| !mirror_names.contains(&snapshot.name))
+        .map(|snapshot| snapshot.name)
+        .collect::<Vec<_>>(),
+    )
+  })
+  .await
+  .context("Mirror comparison worker failed")??;
+  if !missing.is_empty() {
+    return Err(anyhow!(
+      "Mirror promotion blocked because it is missing {} primary snapshot(s)",
+      missing.len()
+    ));
+  }
+  let mirror =
+    settings.mirror.take().context("Mirror is not configured")?;
+  settings.mirror =
+    Some(std::mem::replace(&mut settings.primary, mirror));
+  save_settings(settings).await
+}
+
+pub async fn cancel_run(run_id: &str) -> anyhow::Result<BackupRun> {
+  let run = runs_collection()
+    .find_one(doc! { "id": run_id })
+    .await?
+    .context("Backup run does not exist")?;
+  if *fleet_generation().read().unwrap() == run_id {
+    fleet_generation().write().unwrap().clear();
+  }
+  let servers = find_collect(&db_client().servers, None, None)
+    .await
+    .unwrap_or_default();
+  futures_util::future::join_all(servers.iter().map(
+    |server| async move {
+      if let Ok(client) = periphery_client(server).await {
+        let _ = client
+          .request(CancelVykarOperation {
+            operation_id: run_id.to_string(),
+          })
+          .await;
+      }
+    },
+  ))
+  .await;
+  finish_run(run, BackupRunState::Cancelled, "Cancellation requested")
+    .await
+}
+
+fn embedded_repository_paths() -> &'static RwLock<[Option<PathBuf>; 2]>
+{
+  static PATHS: OnceLock<RwLock<[Option<PathBuf>; 2]>> =
+    OnceLock::new();
+  PATHS.get_or_init(Default::default)
+}
+
+pub fn embedded_vykar_router(
+  path: &Path,
+  mirror: bool,
+) -> anyhow::Result<axum::Router> {
+  std::fs::create_dir_all(path)?;
+  embedded_repository_paths().write().unwrap()[usize::from(mirror)] =
+    Some(path.to_path_buf());
+  let config = vykar_server::config::ServerSection {
+    listen: String::new(),
+    data_dir: path.to_string_lossy().into_owned(),
+    token: crypto::embedded_server_token()?,
+    append_only: false,
+    log_format: "json".into(),
+  };
+  Ok(vykar_server::handlers::router(
+    vykar_server::state::AppState::new(config, None),
+  ))
+}
+
+fn next_scheduled_run() -> anyhow::Result<i64> {
+  // The background loop refreshes this after settings changes and runs.
+  Ok(*next_run_cache().read().unwrap())
+}
+
+fn next_run_cache() -> &'static RwLock<i64> {
+  static NEXT: OnceLock<RwLock<i64>> = OnceLock::new();
+  NEXT.get_or_init(Default::default)
+}
+
+fn compute_next_run(
+  settings: &BackupSettings,
+) -> anyhow::Result<i64> {
+  use croner::parser::{CronParser, Seconds};
+  let expression =
+    if settings.schedule.split_whitespace().count() == 5 {
+      format!("0 {}", settings.schedule)
+    } else {
+      english_to_cron::str_cron_syntax(&settings.schedule)
+        .map_err(|error| {
+          anyhow!("Invalid English schedule: {error:?}")
+        })?
+        .split(' ')
+        .take(6)
+        .collect::<Vec<_>>()
+        .join(" ")
+    };
+  let cron = CronParser::builder()
+    .seconds(Seconds::Required)
+    .dom_and_dow(true)
+    .build()
+    .parse(&expression)?;
+  let timezone: chrono_tz::Tz = settings.timezone.parse()?;
+  Ok(
+    cron
+      .find_next_occurrence(
+        &chrono::Utc::now().with_timezone(&timezone),
+        false,
+      )?
+      .timestamp_millis(),
+  )
+}
+
+pub fn spawn_scheduler() {
+  let _ = maintenance_sender();
+  tokio::spawn(async {
+    loop {
+      let settings = match get_settings().await {
+        Ok(settings) => settings,
+        Err(error) => {
+          error!("Failed to load backup schedule: {error:#}");
+          tokio::time::sleep(std::time::Duration::from_secs(60))
+            .await;
+          continue;
+        }
+      };
+      if !settings.enabled {
+        *next_run_cache().write().unwrap() = 0;
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        continue;
+      }
+      let next = match compute_next_run(&settings) {
+        Ok(next) => next,
+        Err(error) => {
+          error!("Invalid backup schedule: {error:#}");
+          tokio::time::sleep(std::time::Duration::from_secs(60))
+            .await;
+          continue;
+        }
+      };
+      *next_run_cache().write().unwrap() = next;
+      let delay = (next - komodo_timestamp()).max(0) as u64;
+      tokio::time::sleep(std::time::Duration::from_millis(delay))
+        .await;
+      if let Err(error) = run_backup(None).await {
+        error!("Scheduled fleet backup failed: {error:#}");
+      }
+    }
+  });
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn blank_secret_preserves_sealed_value() {
+    let mut proposed = BackupSecret::default();
+    let existing = BackupSecret {
+      value: "sealed-plaintext".into(),
+      configured: false,
+    };
+    preserve_secret(&mut proposed, &existing);
+    assert_eq!(proposed.value, "sealed-plaintext");
+  }
+
+  #[test]
+  fn selected_restore_publishes_only_selected_subtrees() {
+    let roots =
+      vec![periphery_client::api::backup::RestorePublishPath {
+        snapshot_path: "srv/app".into(),
+        destination: "/restore/app".into(),
+      }];
+    let publish = selected_publish_paths(
+      &["srv/app/config".into(), "srv/app/data/file.db".into()],
+      &roots,
+    )
+    .unwrap();
+    assert_eq!(publish.len(), 2);
+    assert_eq!(publish[0].destination, "/restore/app/config");
+    assert_eq!(publish[1].destination, "/restore/app/data/file.db");
+  }
+
+  #[test]
+  fn core_recovery_layout_requires_a_database_export() {
+    let root = tempfile::tempdir().unwrap();
+    assert!(find_core_restore_layout(root.path()).is_err());
+    let dated = root.path().join("source/run/2026-01-01_01-00-00");
+    std::fs::create_dir_all(&dated).unwrap();
+    std::fs::write(dated.join("User.gz"), b"gzip-placeholder")
+      .unwrap();
+    let (backup_root, restore_folder) =
+      find_core_restore_layout(root.path()).unwrap();
+    assert_eq!(backup_root, dated.parent().unwrap());
+    assert_eq!(restore_folder, "2026-01-01_01-00-00");
+  }
+
+  #[test]
+  fn core_export_excludes_sealed_repository_settings() {
+    assert!(!core_export_includes_collection(SETTINGS_COLLECTION));
+    assert!(core_export_includes_collection("Stack"));
+  }
+}

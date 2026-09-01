@@ -15,16 +15,30 @@ use mungos::mongodb::{
 };
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio_util::codec::{FramedWrite, LinesCodec};
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 pub async fn backup(
   db: &Database,
   backups_folder: &Path,
 ) -> anyhow::Result<()> {
+  backup_excluding(db, backups_folder, &[]).await
+}
+
+/// Create a logical database backup without exporting explicitly excluded
+/// collections. Callers use this for sealed material that must not leave the
+/// active Core database.
+pub async fn backup_excluding(
+  db: &Database,
+  backups_folder: &Path,
+  excluded_collections: &[&str],
+) -> anyhow::Result<()> {
   let collections = db
     .list_collection_names()
     .await
-    .context("Failed to list collections on source db")?;
+    .context("Failed to list collections on source db")?
+    .into_iter()
+    .filter(|name| !excluded_collections.contains(&name.as_str()))
+    .collect::<Vec<_>>();
 
   let now_backups_folder = backups_folder
     .join(Local::now().format("%Y-%m-%d_%H-%M-%S").to_string());
@@ -72,39 +86,23 @@ pub async fn backup(
             .context("Failed to get next document")?
           {
             count += 1;
-            let str = match serde_json::to_string(&doc)
-              .context("Failed to serialize document")
-            {
-              Ok(str) => str,
-              Err(e) => {
-                warn!("{e:#}");
-                continue;
-              }
-            };
-            if let Err(e) = writer
+            let str = serde_json::to_string(&doc)
+              .context("Failed to serialize document")?;
+            writer
               .send(str)
               .await
-              .context("Failed to write document to file")
-            {
-              warn!("{e:#}");
-            }
+              .context("Failed to write document to file")?;
           }
 
-          if let Err(e) = <_ as SinkExt<String>>::flush(&mut writer)
+          <_ as SinkExt<String>>::flush(&mut writer)
             .await
-            .context("Failed to flush writer")
-          {
-            error!("{e:#}");
-          };
+            .context("Failed to flush writer")?;
 
-          if let Err(e) = writer
+          writer
             .into_inner()
             .shutdown()
             .await
-            .context("Failed to shutdown writer compression")
-          {
-            error!("{e:#}");
-          }
+            .context("Failed to shutdown writer compression")?;
 
           anyhow::Ok(count)
         }
@@ -129,6 +127,7 @@ pub async fn backup(
       Some(Ok(())) => {}
       Some(Err(e)) => {
         error!("{e:#}");
+        has_error.store(true, atomic::Ordering::Relaxed);
       }
       None => break,
     }

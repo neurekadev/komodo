@@ -29,6 +29,7 @@ mogh_logger.workspace = true
 mogh_cache.workspace = true
 mogh_pki.workspace = true
 git.workspace = true
+komodo_backup.workspace = true
 # mogh
 mogh_error = { workspace = true, features = ["axum"] }
 async_timing_util.workspace = true
@@ -71,3 +72,5 @@ uuid.workspace = true
 sha2.workspace = true
 hex.workspace = true
 libc.workspace = true
+tempfile.workspace = true
+xattr.workspace = true

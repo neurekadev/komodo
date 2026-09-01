@@ -1,0 +1,1151 @@
+use std::{
+  collections::{BTreeSet, HashSet},
+  fs::OpenOptions,
+  io::{Read, Write},
+  os::unix::fs::{MetadataExt, PermissionsExt},
+  path::{Path, PathBuf},
+  sync::{Mutex, OnceLock},
+};
+
+use anyhow::{Context, anyhow};
+use command::{CommandOptions, run_komodo_standard_command};
+use komodo_backup::VykarRepository;
+use komodo_client::entities::docker::{
+  container::ContainerStateStatusEnum, volume::VolumeScopeEnum,
+};
+use mogh_resolver::Resolve;
+use periphery_client::api::backup::*;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use shell_escape::unix::escape;
+
+use crate::{config::periphery_config, state::docker_client};
+
+use super::Args;
+
+const COMPOSE_PROJECT_LABEL: &str = "com.docker.compose.project";
+
+fn cancelled_operations() -> &'static Mutex<HashSet<String>> {
+  static CANCELLED: OnceLock<Mutex<HashSet<String>>> =
+    OnceLock::new();
+  CANCELLED.get_or_init(Default::default)
+}
+
+fn operation_cancelled(operation_id: &str) -> bool {
+  cancelled_operations()
+    .lock()
+    .unwrap()
+    .contains(operation_id)
+}
+
+impl Resolve<Args> for DiscoverBackupSource {
+  async fn resolve(
+    self,
+    _: &Args,
+  ) -> anyhow::Result<DiscoverBackupSourceResponse> {
+    discover_source(&self.target).await
+  }
+}
+
+impl Resolve<Args> for RunVykarBackup {
+  async fn resolve(
+    self,
+    _: &Args,
+  ) -> anyhow::Result<RunVykarBackupResponse> {
+    let discovered = discover_source(&self.target).await?;
+    let mut stopped: Vec<String> = Vec::new();
+    if self.stop_containers {
+      for container in &discovered.running_containers {
+        if let Err(error) =
+          run_container_command("stop", container).await
+        {
+          for stopped_container in &stopped {
+            let _ =
+              run_container_command("start", stopped_container).await;
+          }
+          return Err(error.context(
+            "Failed to quiesce every affected container; already stopped containers were restarted",
+          ));
+        }
+        stopped.push(container.clone());
+      }
+    }
+
+    let result = if operation_cancelled(&self.run_id) {
+      Err(anyhow!("Backup cancelled before repository write"))
+    } else {
+      run_backup_repositories(&self, &discovered.paths).await
+    };
+
+    let mut restarted = Vec::new();
+    let mut restart_errors = Vec::new();
+    for container in &stopped {
+      match run_container_command("start", container).await {
+        Ok(()) => restarted.push(container.clone()),
+        Err(error) => {
+          restart_errors.push(format!("{container}: {error:#}"))
+        }
+      }
+    }
+
+    cancelled_operations().lock().unwrap().remove(&self.run_id);
+    let (primary, mirror) = result?;
+    Ok(RunVykarBackupResponse {
+      primary,
+      mirror,
+      stopped_containers: stopped,
+      restarted_containers: restarted,
+      restart_errors,
+    })
+  }
+}
+
+impl Resolve<Args> for RunVykarBackupBatch {
+  async fn resolve(
+    self,
+    _: &Args,
+  ) -> anyhow::Result<RunVykarBackupBatchResponse> {
+    let mut discovered = Vec::new();
+    let mut discovery_errors = Vec::new();
+    let mut running = BTreeSet::new();
+    for task in self.tasks {
+      match discover_source(&task.target).await {
+        Ok(source) => {
+          running.extend(source.running_containers.iter().cloned());
+          discovered.push((task, source.paths));
+        }
+        Err(error) => discovery_errors
+          .push(format!("{}: {error:#}", task.source_label)),
+      }
+    }
+    let mut stopped: Vec<String> = Vec::new();
+    if self.stop_containers {
+      for container in running {
+        if let Err(error) =
+          run_container_command("stop", &container).await
+        {
+          for stopped_container in &stopped {
+            let _ =
+              run_container_command("start", stopped_container).await;
+          }
+          return Err(error.context(
+            "Failed to quiesce every affected container on the node",
+          ));
+        }
+        stopped.push(container);
+      }
+    }
+
+    let mut results = Vec::new();
+    for (task, paths) in discovered {
+      if operation_cancelled(&self.run_id) {
+        break;
+      }
+      let request = RunVykarBackup {
+        target: task.target,
+        primary: self.primary.clone(),
+        mirror: self.mirror.clone(),
+        advanced: self.advanced.clone(),
+        hostname: self.hostname.clone(),
+        source_label: task.source_label.clone(),
+        snapshot_name: task.snapshot_name,
+        run_id: self.run_id.clone(),
+        komodo_version: self.komodo_version.clone(),
+        stop_containers: false,
+      };
+      match run_backup_repositories(&request, &paths).await {
+        Ok((primary, mirror)) => {
+          results.push(VykarBackupTaskResult {
+            source_label: task.source_label,
+            result: RunVykarBackupResponse {
+              primary,
+              mirror,
+              ..Default::default()
+            },
+          })
+        }
+        Err(error) => discovery_errors
+          .push(format!("{}: {error:#}", task.source_label)),
+      }
+    }
+
+    let mut restart_errors = Vec::new();
+    for container in &stopped {
+      if let Err(error) =
+        run_container_command("start", container).await
+      {
+        restart_errors.push(format!("{container}: {error:#}"));
+      }
+    }
+    cancelled_operations().lock().unwrap().remove(&self.run_id);
+    Ok(RunVykarBackupBatchResponse {
+      results,
+      discovery_errors,
+      restart_errors,
+    })
+  }
+}
+
+async fn run_backup_repositories(
+  request: &RunVykarBackup,
+  source_paths: &[String],
+) -> anyhow::Result<(
+  VykarBackupRepositoryResult,
+  Option<VykarBackupRepositoryResult>,
+)> {
+  let manifest_dir = tempfile::Builder::new()
+    .prefix("komodo-backup-manifest-")
+    .tempdir()
+    .context("Failed to create backup manifest staging directory")?;
+  write_manifest(request, source_paths, manifest_dir.path())?;
+  let mut paths = source_paths.to_vec();
+  paths.push(manifest_dir.path().to_string_lossy().into_owned());
+
+  let primary = run_repository_backup(
+    request.primary.clone(),
+    request.advanced.clone(),
+    request.hostname.clone(),
+    request.snapshot_name.clone(),
+    request.source_label.clone(),
+    paths.clone(),
+  )
+  .await;
+  if operation_cancelled(&request.run_id) {
+    return Err(anyhow!("Backup cancelled before mirror write"));
+  }
+  let mirror = if let Some(repository) = request.mirror.clone() {
+    Some(
+      run_repository_backup(
+        repository,
+        request.advanced.clone(),
+        request.hostname.clone(),
+        request.snapshot_name.clone(),
+        request.source_label.clone(),
+        paths,
+      )
+      .await,
+    )
+  } else {
+    None
+  };
+  Ok((primary, mirror))
+}
+
+async fn run_repository_backup(
+  repository: komodo_client::entities::backup::BackupRepository,
+  advanced: komodo_client::entities::backup::BackupAdvancedSettings,
+  hostname: String,
+  snapshot_name: String,
+  source_label: String,
+  source_paths: Vec<String>,
+) -> VykarBackupRepositoryResult {
+  let result = tokio::task::spawn_blocking(move || {
+    let cache = vykar_cache_dir(&hostname)?;
+    let repository = VykarRepository::new(
+      &repository,
+      &hostname,
+      &cache,
+      &advanced,
+    )?;
+    repository.backup(&snapshot_name, &source_label, &source_paths)
+  })
+  .await;
+  match result {
+    Ok(Ok(result)) => VykarBackupRepositoryResult {
+      complete: !result.partial,
+      partial: result.partial,
+      files: result.files,
+      original_size: result.original_size,
+      stored_size: result.stored_size,
+      error: None,
+    },
+    Ok(Err(error)) => VykarBackupRepositoryResult {
+      error: Some(format!("{error:#}")),
+      ..Default::default()
+    },
+    Err(error) => VykarBackupRepositoryResult {
+      error: Some(format!("Vykar worker failed: {error}")),
+      ..Default::default()
+    },
+  }
+}
+
+#[derive(Serialize)]
+struct KomodoBackupManifest<'a> {
+  schema: &'static str,
+  version: u32,
+  run_id: &'a str,
+  source_label: &'a str,
+  hostname: &'a str,
+  komodo_version: &'a str,
+  paths: &'a [String],
+  target: &'a PeripheryBackupTarget,
+  configuration_sha256: String,
+  paths_sha256: String,
+}
+
+fn write_manifest(
+  request: &RunVykarBackup,
+  paths: &[String],
+  directory: &Path,
+) -> anyhow::Result<()> {
+  let target = serde_json::to_vec(&request.target)
+    .context("Failed to serialize backup source identity")?;
+  let manifest = KomodoBackupManifest {
+    schema: "komodo.backup-manifest/v1",
+    version: 1,
+    run_id: &request.run_id,
+    source_label: &request.source_label,
+    hostname: &request.hostname,
+    komodo_version: &request.komodo_version,
+    paths,
+    target: &request.target,
+    configuration_sha256: hex::encode(Sha256::digest(target)),
+    paths_sha256: hex::encode(Sha256::digest(
+      serde_json::to_vec(paths)
+        .context("Failed to serialize backup source paths")?,
+    )),
+  };
+  let bytes = serde_json::to_vec_pretty(&manifest)
+    .context("Failed to serialize backup manifest")?;
+  let path = directory.join("komodo-backup-manifest.json");
+  let mut file = OpenOptions::new()
+    .create_new(true)
+    .write(true)
+    .open(&path)
+    .with_context(|| {
+      format!("Failed to create {}", path.display())
+    })?;
+  file.write_all(&bytes)?;
+  file.sync_all()?;
+  Ok(())
+}
+
+async fn discover_source(
+  target: &PeripheryBackupTarget,
+) -> anyhow::Result<DiscoverBackupSourceResponse> {
+  let docker_guard = docker_client().load();
+  let docker = docker_guard
+    .as_ref()
+    .as_ref()
+    .context("Docker is unavailable")?;
+  let containers = docker.list_containers().await?;
+  match target {
+    PeripheryBackupTarget::Stack { stack, repo } => {
+      if !stack.config.swarm_id.is_empty() {
+        return Err(anyhow!(
+          "Swarm stacks are not supported by backup v1"
+        ));
+      }
+      let run_directory = validate_source_path(
+        &crate::stack::write::resolved_run_directory(
+          stack,
+          repo.as_deref(),
+        ),
+      )?;
+      let mut bind_paths = BTreeSet::new();
+      let mut running = Vec::new();
+      for container in containers.iter().filter(|container| {
+        container.labels.get(COMPOSE_PROJECT_LABEL)
+          == Some(&stack.config.project_name)
+      }) {
+        if container.state == ContainerStateStatusEnum::Running {
+          running.push(container.name.clone());
+        }
+        let inspected =
+          docker.inspect_container(&container.name).await?;
+        for mount in inspected
+          .mounts
+          .into_iter()
+          .filter(|mount| mount.typ.as_deref() == Some("bind"))
+        {
+          let source = mount
+            .source
+            .context("Bind mount did not report a source path")?;
+          let bind = validate_source_path(Path::new(&source))?;
+          if bind == run_directory || bind.starts_with(&run_directory)
+          {
+            // Vykar traverses mounts, so the Stack root already captures a
+            // bind located below it.
+            continue;
+          }
+          if run_directory.starts_with(&bind) {
+            return Err(anyhow!(
+              "Bind source '{}' contains the Stack run directory '{}'; overlapping backup roots cannot be restored atomically",
+              bind.display(),
+              run_directory.display()
+            ));
+          }
+          bind_paths.insert(bind);
+        }
+      }
+      let mut paths =
+        vec![run_directory.to_string_lossy().into_owned()];
+      paths.extend(
+        bind_paths
+          .into_iter()
+          .map(|path| path.to_string_lossy().into_owned()),
+      );
+      Ok(DiscoverBackupSourceResponse {
+        paths,
+        running_containers: running,
+      })
+    }
+    PeripheryBackupTarget::Volume { volume_name } => {
+      if volume_name.trim().is_empty() {
+        return Err(anyhow!("Volume name cannot be empty"));
+      }
+      let volume = docker.inspect_volume(volume_name).await?;
+      if volume.driver != "local"
+        || volume.scope != VolumeScopeEnum::Local
+      {
+        return Err(anyhow!(
+          "Backup v1 supports only local named volumes; '{}' uses driver '{}' with scope {:?}",
+          volume.name,
+          volume.driver,
+          volume.scope
+        ));
+      }
+      let running_containers = containers
+        .into_iter()
+        .filter(|container| {
+          container.state == ContainerStateStatusEnum::Running
+            && container.volumes.contains(volume_name)
+        })
+        .map(|container| container.name)
+        .collect();
+      Ok(DiscoverBackupSourceResponse {
+        paths: vec![
+          validate_source_path(Path::new(&volume.mountpoint))?
+            .to_string_lossy()
+            .into_owned(),
+        ],
+        running_containers,
+      })
+    }
+  }
+}
+
+async fn discover_running_containers(
+  target: &PeripheryBackupTarget,
+) -> anyhow::Result<Vec<String>> {
+  let docker_guard = docker_client().load();
+  let docker = docker_guard
+    .as_ref()
+    .as_ref()
+    .context("Docker is unavailable")?;
+  let containers = docker.list_containers().await?;
+  Ok(match target {
+    PeripheryBackupTarget::Stack { stack, .. } => containers
+      .into_iter()
+      .filter(|container| {
+        container.state == ContainerStateStatusEnum::Running
+          && container.labels.get(COMPOSE_PROJECT_LABEL)
+            == Some(&stack.config.project_name)
+      })
+      .map(|container| container.name)
+      .collect(),
+    PeripheryBackupTarget::Volume { volume_name } => containers
+      .into_iter()
+      .filter(|container| {
+        container.state == ContainerStateStatusEnum::Running
+          && container.volumes.contains(volume_name)
+      })
+      .map(|container| container.name)
+      .collect(),
+  })
+}
+
+fn validate_source_path(path: &Path) -> anyhow::Result<PathBuf> {
+  if !path.is_absolute() {
+    return Err(anyhow!(
+      "Backup source must be absolute: {}",
+      path.display()
+    ));
+  }
+  path.canonicalize().with_context(|| {
+    format!("Backup source is unavailable: {}", path.display())
+  })
+}
+
+async fn run_container_command(
+  action: &str,
+  container: &str,
+) -> anyhow::Result<()> {
+  let log = run_komodo_standard_command(
+    &format!("Backup {action} container {container}"),
+    &format!("docker {action} -- {}", escape(container.into())),
+    CommandOptions::default(),
+  )
+  .await;
+  if log.success {
+    Ok(())
+  } else {
+    Err(anyhow!("{}", log.stderr))
+  }
+}
+
+fn vykar_cache_dir(hostname: &str) -> anyhow::Result<PathBuf> {
+  let directory = periphery_config()
+    .stack_dir()
+    .join(".komodo-vykar")
+    .join(hex::encode(Sha256::digest(hostname.as_bytes())));
+  std::fs::create_dir_all(&directory).with_context(|| {
+    format!("Failed to create Vykar cache at {}", directory.display())
+  })?;
+  Ok(directory)
+}
+
+impl Resolve<Args> for TransactionalVykarRestore {
+  async fn resolve(
+    mut self,
+    _: &Args,
+  ) -> anyhow::Result<TransactionalVykarRestoreResponse> {
+    if self.create_volume_if_missing
+      && let PeripheryBackupTarget::Volume { volume_name } =
+        &self.target
+      && discover_source(&self.target).await.is_err()
+    {
+      run_container_command("volume create", volume_name).await?;
+    }
+    let running_containers =
+      discover_running_containers(&self.target).await?;
+    if matches!(self.target, PeripheryBackupTarget::Volume { .. }) {
+      let mountpoint = discover_source(&self.target)
+        .await?
+        .paths
+        .into_iter()
+        .next()
+        .context("Destination volume has no mountpoint")?;
+      for publish in &mut self.publish {
+        publish.destination = mountpoint.clone();
+      }
+    }
+    let mut stopped_containers: Vec<String> = Vec::new();
+    for container in &running_containers {
+      if let Err(stop_error) =
+        run_container_command("stop", container).await
+      {
+        let mut restart_errors = Vec::new();
+        for stopped in &stopped_containers {
+          if let Err(error) =
+            run_container_command("start", stopped).await
+          {
+            restart_errors.push(format!("{stopped}: {error:#}"));
+          }
+        }
+        return Ok(TransactionalVykarRestoreResponse {
+          complete: false,
+          rolled_back: true,
+          containers_restarted: if restart_errors.is_empty() {
+            stopped_containers
+          } else {
+            Vec::new()
+          },
+          critical_error: (!restart_errors.is_empty()).then(|| {
+            format!(
+              "Restore quiesce failed ({stop_error:#}) and container state is indeterminate: {}",
+              restart_errors.join("; ")
+            )
+          }),
+        });
+      }
+      stopped_containers.push(container.clone());
+    }
+
+    let restore_result = transactional_restore(&self).await;
+    cancelled_operations()
+      .lock()
+      .unwrap()
+      .remove(&self.journal_id);
+    let rolled_back = match restore_result {
+      Ok(rolled_back) => rolled_back,
+      Err(error) => {
+        return Ok(TransactionalVykarRestoreResponse {
+          complete: false,
+          rolled_back: false,
+          containers_restarted: Vec::new(),
+          critical_error: Some(format!(
+            "Restore state is indeterminate; affected containers remain stopped: {error:#}"
+          )),
+        });
+      }
+    };
+    let mut restarted = Vec::new();
+    let mut restart_errors = Vec::new();
+    for container in &stopped_containers {
+      match run_container_command("start", container).await {
+        Ok(()) => restarted.push(container.clone()),
+        Err(error) => {
+          restart_errors.push(format!("{container}: {error:#}"))
+        }
+      }
+    }
+    if restart_errors.is_empty() {
+      Ok(TransactionalVykarRestoreResponse {
+        complete: !rolled_back,
+        rolled_back,
+        containers_restarted: restarted,
+        critical_error: None,
+      })
+    } else {
+      for container in &restarted {
+        let _ = run_container_command("stop", container).await;
+      }
+      Ok(TransactionalVykarRestoreResponse {
+        complete: false,
+        rolled_back,
+        containers_restarted: Vec::new(),
+        critical_error: Some(format!(
+          "Container state is indeterminate; keep affected containers stopped: {}",
+          restart_errors.join("; ")
+        )),
+      })
+    }
+  }
+}
+
+impl Resolve<Args> for PreflightVykarRestore {
+  async fn resolve(
+    mut self,
+    _: &Args,
+  ) -> anyhow::Result<PreflightVykarRestoreResponse> {
+    let running_containers =
+      discover_running_containers(&self.target)
+        .await
+        .unwrap_or_default();
+    let discovered = discover_source(&self.target).await.ok();
+    let destination_exists = discovered.is_some();
+    if matches!(self.target, PeripheryBackupTarget::Volume { .. })
+      && let Some(mountpoint) =
+        discovered.as_ref().and_then(|source| source.paths.first())
+    {
+      for publish in &mut self.publish {
+        publish.destination = mountpoint.clone();
+      }
+    }
+    let repository = self.repository.clone();
+    let advanced = self.advanced.clone();
+    let hostname = self.hostname.clone();
+    let snapshot = self.snapshot_name.clone();
+    let selected = self.selected_paths.clone();
+    let snapshot_paths = tokio::task::spawn_blocking(move || {
+      let cache = vykar_cache_dir(&hostname)?;
+      VykarRepository::new(&repository, &hostname, &cache, &advanced)?
+        .snapshot_paths(&snapshot, &selected)
+    })
+    .await
+    .context("Vykar preflight worker failed")??;
+    let publish = self.publish;
+    let selected = self.selected_paths;
+    let (created_paths, overwritten_paths, deleted_paths) =
+      tokio::task::spawn_blocking(move || {
+        compare_restore_paths(&snapshot_paths, &publish, &selected)
+      })
+      .await
+      .context("Restore preflight filesystem worker failed")??;
+    Ok(PreflightVykarRestoreResponse {
+      destination_exists,
+      created_paths,
+      overwritten_paths,
+      deleted_paths,
+      containers_to_stop: running_containers,
+    })
+  }
+}
+
+fn compare_restore_paths(
+  snapshot_paths: &[komodo_backup::SnapshotPath],
+  publish: &[RestorePublishPath],
+  selected: &[String],
+) -> anyhow::Result<(Vec<String>, Vec<String>, Vec<String>)> {
+  let mut expected = HashSet::<PathBuf>::new();
+  let mut created = Vec::new();
+  let mut overwritten = Vec::new();
+  for item in snapshot_paths {
+    let Some((mapping, relative)) =
+      map_snapshot_path(&item.path, publish)?
+    else {
+      continue;
+    };
+    let destination = if relative.as_os_str().is_empty() {
+      PathBuf::from(&mapping.destination)
+    } else {
+      Path::new(&mapping.destination).join(relative)
+    };
+    expected.insert(destination.clone());
+    if !path_lexists(&destination) {
+      created.push(destination.to_string_lossy().into_owned());
+    } else if !item.directory || !destination.is_dir() {
+      overwritten.push(destination.to_string_lossy().into_owned());
+    }
+  }
+
+  let restore_roots = if selected.is_empty() {
+    publish
+      .iter()
+      .map(|mapping| PathBuf::from(&mapping.destination))
+      .collect::<Vec<_>>()
+  } else {
+    selected
+      .iter()
+      .map(|selection| {
+        map_snapshot_path(selection.trim_matches('/'), publish)
+      })
+      .collect::<anyhow::Result<Vec<_>>>()?
+      .into_iter()
+      .flatten()
+      .map(|(mapping, relative)| {
+        Path::new(&mapping.destination).join(relative)
+      })
+      .collect()
+  };
+  let mut deleted = Vec::new();
+  for root in restore_roots {
+    collect_unexpected_paths(&root, &expected, &mut deleted)?;
+  }
+  created.sort();
+  created.dedup();
+  overwritten.sort();
+  overwritten.dedup();
+  deleted.sort();
+  deleted.dedup();
+  Ok((created, overwritten, deleted))
+}
+
+fn map_snapshot_path<'a>(
+  snapshot_path: &str,
+  publish: &'a [RestorePublishPath],
+) -> anyhow::Result<Option<(&'a RestorePublishPath, PathBuf)>> {
+  let path = Path::new(snapshot_path);
+  if path.is_absolute()
+    || path.components().any(|component| {
+      matches!(component, std::path::Component::ParentDir)
+    })
+  {
+    return Err(anyhow!("Unsafe snapshot path in restore preflight"));
+  }
+  let best = publish
+    .iter()
+    .filter_map(|mapping| {
+      let root = Path::new(mapping.snapshot_path.trim_matches('/'));
+      path.strip_prefix(root).ok().map(|relative| {
+        (mapping, relative.to_path_buf(), root.components().count())
+      })
+    })
+    .max_by_key(|(_, _, depth)| *depth);
+  Ok(best.map(|(mapping, relative, _)| (mapping, relative)))
+}
+
+fn collect_unexpected_paths(
+  root: &Path,
+  expected: &HashSet<PathBuf>,
+  deleted: &mut Vec<String>,
+) -> anyhow::Result<()> {
+  if !path_lexists(root) {
+    return Ok(());
+  }
+  if !expected.contains(root) {
+    deleted.push(root.to_string_lossy().into_owned());
+  }
+  if root.is_dir() {
+    for entry in std::fs::read_dir(root)? {
+      let entry = entry?;
+      let path = entry.path();
+      let file_type = entry.file_type()?;
+      if !expected.contains(&path) {
+        deleted.push(path.to_string_lossy().into_owned());
+      }
+      if file_type.is_dir() {
+        collect_unexpected_paths(&path, expected, deleted)?;
+      }
+    }
+  }
+  Ok(())
+}
+
+async fn transactional_restore(
+  request: &TransactionalVykarRestore,
+) -> anyhow::Result<bool> {
+  if request.publish.is_empty() {
+    return Err(anyhow!("Restore publish plan is empty"));
+  }
+  if operation_cancelled(&request.journal_id) {
+    return Ok(true);
+  }
+  let first_destination =
+    PathBuf::from(&request.publish[0].destination);
+  let parent = first_destination
+    .parent()
+    .context("Restore destination has no parent")?
+    .to_path_buf();
+  let staging =
+    parent.join(format!(".komodo-restore-{}", request.journal_id));
+  if path_lexists(&staging) {
+    return Err(anyhow!("Restore staging path already exists"));
+  }
+
+  let repository = request.repository.clone();
+  let advanced = request.advanced.clone();
+  let hostname = request.hostname.clone();
+  let snapshot = request.snapshot_name.clone();
+  let selected = request.selected_paths.clone();
+  let restore_staging = staging.clone();
+  tokio::task::spawn_blocking(move || {
+    let cache = vykar_cache_dir(&hostname)?;
+    let repository = VykarRepository::new(
+      &repository,
+      &hostname,
+      &cache,
+      &advanced,
+    )?;
+    repository.restore(&snapshot, &restore_staging, &selected)
+  })
+  .await
+  .context("Vykar restore worker failed")??;
+
+  if operation_cancelled(&request.journal_id) {
+    let _ = std::fs::remove_dir_all(&staging);
+    return Ok(true);
+  }
+
+  let publish = request.publish.clone();
+  let journal_id = request.journal_id.clone();
+  tokio::task::spawn_blocking(move || {
+    publish_restore(&staging, &publish, &journal_id)
+  })
+  .await
+  .context("Restore publish worker failed")?
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RestoreJournalEntry {
+  source: PathBuf,
+  destination: PathBuf,
+  rollback: PathBuf,
+  published: bool,
+}
+
+fn publish_restore(
+  staging: &Path,
+  publish: &[RestorePublishPath],
+  journal_id: &str,
+) -> anyhow::Result<bool> {
+  let mut entries = Vec::new();
+  for (index, item) in publish.iter().enumerate() {
+    let relative = Path::new(&item.snapshot_path);
+    if relative.is_absolute()
+      || relative.components().any(|component| {
+        matches!(component, std::path::Component::ParentDir)
+      })
+    {
+      return Err(anyhow!("Unsafe snapshot publish path"));
+    }
+    let destination = PathBuf::from(&item.destination);
+    if !destination.is_absolute() {
+      return Err(anyhow!("Restore destination must be absolute"));
+    }
+    let rollback = destination
+      .with_extension(format!("komodo-rollback-{journal_id}"));
+    if path_lexists(&rollback) {
+      return Err(anyhow!(
+        "Rollback path already exists: {}",
+        rollback.display()
+      ));
+    }
+    let restored_source = staging.join(relative);
+    if !path_lexists(&restored_source) {
+      return Err(anyhow!(
+        "Restored snapshot path is missing: {}",
+        item.snapshot_path
+      ));
+    }
+    let destination_parent = destination
+      .parent()
+      .context("Restore destination has no parent")?;
+    std::fs::create_dir_all(destination_parent)?;
+    let source = destination_parent
+      .join(format!(".komodo-restore-{journal_id}-{index}"));
+    if path_lexists(&source) {
+      return Err(anyhow!(
+        "Same-filesystem restore staging path already exists: {}",
+        source.display()
+      ));
+    }
+    let copy = std::process::Command::new("cp")
+      .arg("-a")
+      .arg("--")
+      .arg(&restored_source)
+      .arg(&source)
+      .output()
+      .context("Failed to start metadata-preserving restore copy")?;
+    if !copy.status.success() {
+      return Err(anyhow!(
+        "Failed to stage restore on destination filesystem: {}",
+        String::from_utf8_lossy(&copy.stderr)
+      ));
+    }
+    if tree_digest(&restored_source)? != tree_digest(&source)? {
+      remove_path(&source)?;
+      return Err(anyhow!(
+        "Same-filesystem restore staging verification failed"
+      ));
+    }
+    entries.push(RestoreJournalEntry {
+      source,
+      destination,
+      rollback,
+      published: false,
+    });
+  }
+
+  let journal_path = entries[0]
+    .destination
+    .parent()
+    .context("Restore destination has no parent")?
+    .join(format!(".komodo-restore-{journal_id}.json"));
+  persist_journal(&journal_path, &entries)?;
+
+  for index in 0..entries.len() {
+    if path_lexists(&entries[index].destination) {
+      std::fs::rename(
+        &entries[index].destination,
+        &entries[index].rollback,
+      )
+      .context("Failed to prepare rollback path")?;
+    }
+    if let Err(error) = std::fs::rename(
+      &entries[index].source,
+      &entries[index].destination,
+    ) {
+      rollback_published(&mut entries, &journal_path)?;
+      warn!("Restore publish failed and was rolled back: {error:#}");
+      remove_path(&journal_path)?;
+      for entry in &entries {
+        remove_path(&entry.source)?;
+      }
+      let _ = std::fs::remove_dir_all(staging);
+      return Ok(true);
+    }
+    entries[index].published = true;
+    persist_journal(&journal_path, &entries)?;
+    fsync_parent(&entries[index].destination)?;
+  }
+
+  for entry in &entries {
+    if path_lexists(&entry.rollback) {
+      remove_path(&entry.rollback)?;
+    }
+    fsync_parent(&entry.destination)?;
+  }
+  std::fs::remove_file(&journal_path)?;
+  fsync_parent(&journal_path)?;
+  let _ = std::fs::remove_dir_all(staging);
+  Ok(false)
+}
+
+fn path_lexists(path: &Path) -> bool {
+  std::fs::symlink_metadata(path).is_ok()
+}
+
+fn remove_path(path: &Path) -> anyhow::Result<()> {
+  let Ok(metadata) = std::fs::symlink_metadata(path) else {
+    return Ok(());
+  };
+  if metadata.file_type().is_dir() {
+    std::fs::remove_dir_all(path)?;
+  } else {
+    std::fs::remove_file(path)?;
+  }
+  Ok(())
+}
+
+fn tree_digest(root: &Path) -> anyhow::Result<Vec<u8>> {
+  fn update(
+    path: &Path,
+    relative: &Path,
+    digest: &mut Sha256,
+  ) -> anyhow::Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    digest.update(relative.to_string_lossy().as_bytes());
+    digest.update(metadata.permissions().mode().to_le_bytes());
+    digest.update(metadata.len().to_le_bytes());
+    digest.update(metadata.uid().to_le_bytes());
+    digest.update(metadata.gid().to_le_bytes());
+    digest.update(metadata.mtime().to_le_bytes());
+    digest.update(metadata.mtime_nsec().to_le_bytes());
+    let mut attribute_names = xattr::list(path)?.collect::<Vec<_>>();
+    attribute_names.sort();
+    for name in attribute_names {
+      digest.update(name.as_encoded_bytes());
+      if let Some(value) = xattr::get(path, &name)? {
+        digest.update(value);
+      }
+    }
+    if metadata.file_type().is_symlink() {
+      digest.update(b"symlink");
+      digest.update(
+        std::fs::read_link(path)?.to_string_lossy().as_bytes(),
+      );
+    } else if metadata.is_dir() {
+      digest.update(b"directory");
+      let mut entries =
+        std::fs::read_dir(path)?.collect::<Result<Vec<_>, _>>()?;
+      entries.sort_by_key(|entry| entry.file_name());
+      for entry in entries {
+        update(
+          &entry.path(),
+          &relative.join(entry.file_name()),
+          digest,
+        )?;
+      }
+    } else if metadata.is_file() {
+      digest.update(b"file");
+      let mut file = std::fs::File::open(path)?;
+      let mut buffer = [0_u8; 1024 * 128];
+      loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+          break;
+        }
+        digest.update(&buffer[..read]);
+      }
+    }
+    Ok(())
+  }
+  let mut digest = Sha256::new();
+  update(root, Path::new(""), &mut digest)?;
+  Ok(digest.finalize().to_vec())
+}
+
+fn rollback_published(
+  entries: &mut [RestoreJournalEntry],
+  journal: &Path,
+) -> anyhow::Result<()> {
+  for entry in entries.iter_mut().rev() {
+    if entry.published && path_lexists(&entry.destination) {
+      remove_path(&entry.destination)?;
+    }
+    if path_lexists(&entry.rollback) {
+      std::fs::rename(&entry.rollback, &entry.destination)?;
+      fsync_parent(&entry.destination)?;
+    }
+    entry.published = false;
+  }
+  persist_journal(journal, entries)?;
+  Ok(())
+}
+
+fn persist_journal(
+  path: &Path,
+  entries: &[RestoreJournalEntry],
+) -> anyhow::Result<()> {
+  let temporary = path.with_extension("tmp");
+  let bytes = serde_json::to_vec(entries)?;
+  let mut file = OpenOptions::new()
+    .create(true)
+    .truncate(true)
+    .write(true)
+    .open(&temporary)?;
+  file.write_all(&bytes)?;
+  file.sync_all()?;
+  std::fs::rename(&temporary, path)?;
+  fsync_parent(path)
+}
+
+fn fsync_parent(path: &Path) -> anyhow::Result<()> {
+  let parent = path.parent().context("Path has no parent")?;
+  std::fs::File::open(parent)?.sync_all()?;
+  Ok(())
+}
+
+impl Resolve<Args> for CancelVykarOperation {
+  async fn resolve(
+    self,
+    _: &Args,
+  ) -> anyhow::Result<CancelVykarOperationResponse> {
+    cancelled_operations()
+      .lock()
+      .unwrap()
+      .insert(self.operation_id);
+    Ok(CancelVykarOperationResponse { cancelled: true })
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn source_validation_rejects_relative_paths() {
+    assert!(
+      validate_source_path(Path::new("relative/path")).is_err()
+    );
+  }
+
+  #[test]
+  fn exact_restore_preflight_reports_create_overwrite_and_delete() {
+    let destination = tempfile::tempdir().unwrap();
+    std::fs::write(destination.path().join("old.txt"), b"old")
+      .unwrap();
+    std::fs::write(destination.path().join("extra.txt"), b"extra")
+      .unwrap();
+    let root = "source/root";
+    let paths = vec![
+      komodo_backup::SnapshotPath {
+        path: root.into(),
+        directory: true,
+      },
+      komodo_backup::SnapshotPath {
+        path: format!("{root}/old.txt"),
+        directory: false,
+      },
+      komodo_backup::SnapshotPath {
+        path: format!("{root}/new.txt"),
+        directory: false,
+      },
+    ];
+    let publish = vec![RestorePublishPath {
+      snapshot_path: root.into(),
+      destination: destination.path().to_string_lossy().into_owned(),
+    }];
+    let (created, overwritten, deleted) =
+      compare_restore_paths(&paths, &publish, &[]).unwrap();
+    assert!(created.iter().any(|path| path.ends_with("new.txt")));
+    assert!(overwritten.iter().any(|path| path.ends_with("old.txt")));
+    assert!(deleted.iter().any(|path| path.ends_with("extra.txt")));
+  }
+
+  #[test]
+  fn publish_failure_restores_original_destination() {
+    let root = tempfile::tempdir().unwrap();
+    let download = root.path().join("download");
+    std::fs::create_dir_all(download.join("one")).unwrap();
+    std::fs::write(download.join("one/new.txt"), b"new").unwrap();
+    std::fs::write(download.join("two.txt"), b"two").unwrap();
+    let first = root.path().join("destination");
+    std::fs::create_dir_all(&first).unwrap();
+    std::fs::write(first.join("original.txt"), b"original").unwrap();
+    let publish = vec![
+      RestorePublishPath {
+        snapshot_path: "one".into(),
+        destination: first.to_string_lossy().into_owned(),
+      },
+      RestorePublishPath {
+        snapshot_path: "two.txt".into(),
+        destination: first
+          .join("child.txt")
+          .to_string_lossy()
+          .into_owned(),
+      },
+    ];
+    assert!(
+      publish_restore(&download, &publish, "rollback-test").unwrap()
+    );
+    assert_eq!(
+      std::fs::read(first.join("original.txt")).unwrap(),
+      b"original"
+    );
+    assert!(!first.join("new.txt").exists());
+  }
+}

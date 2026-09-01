@@ -19,6 +19,7 @@ const sidebars: SidebarsConfig = {
       ],
     },
     "resources",
+    "backups",
     {
       type: "category",
       label: "Deploy",

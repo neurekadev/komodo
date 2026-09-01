@@ -57,50 +57,72 @@ pub async fn restore(
 
               let file = tokio::fs::File::open(&restore_file)
                 .await
-                .with_context(|| format!("Failed to open file {restore_file:?}"))?;
+                .with_context(|| {
+                format!("Failed to open file {restore_file:?}")
+              })?;
 
               let mut reader = FramedRead::new(
                 GzipDecoder::new(BufReader::new(file)),
-                LinesCodec::new()
+                LinesCodec::new(),
               );
 
-              while let Some(line) = reader.try_next()
+              while let Some(line) = reader
+                .try_next()
                 .await
                 .context("Failed to get next line")?
               {
                 if line.is_empty() {
                   continue;
                 }
-                let document = match serde_json::from_str::<Document>(&line)
-                  .context("Failed to deserialize line")
-                {
-                  Ok(doc) => doc,
-                  Err(e) => {
-                    warn!("{e:#}");
-                    continue;
-                  }
-                };
-                let Some(id) = document.get("_id").and_then(|id| id.as_object_id()) else {
+                let document =
+                  match serde_json::from_str::<Document>(&line)
+                    .context("Failed to deserialize line")
+                  {
+                    Ok(doc) => doc,
+                    Err(e) => {
+                      warn!("{e:#}");
+                      continue;
+                    }
+                  };
+                let Some(id) = document
+                  .get("_id")
+                  .and_then(|id| id.as_object_id())
+                else {
                   continue;
                 };
                 count += 1;
-                buffer.push(BulkUpdate { query: doc! { "_id": id }, update: doc! { "$set": document } });
+                buffer.push(BulkUpdate {
+                  query: doc! { "_id": id },
+                  update: doc! { "$set": document },
+                });
                 if buffer.len() >= max_buffer {
-                  if let Err(e) = bulk_update_retry_too_big(&db, &collection, &buffer, true).await.context("Failed to flush documents")
-                  {
-                    error!("Failed to flush document batch in {collection} collection | {e:#}");
-                  };
+                  bulk_update_retry_too_big(
+                    &db,
+                    &collection,
+                    &buffer,
+                    true,
+                  )
+                  .await
+                  .context("Failed to flush documents")?;
                   buffer.clear();
                 }
               }
               if !buffer.is_empty() {
-                bulk_update_retry_too_big(&db, &collection, &buffer, true).await.context("Failed to flush documents")?;
+                bulk_update_retry_too_big(
+                  &db,
+                  &collection,
+                  &buffer,
+                  true,
+                )
+                .await
+                .context("Failed to flush documents")?;
               }
               anyhow::Ok(count)
-            }.await;
-            match res {
+            }
+            .await;
+            match &res {
               Ok(count) => {
-                if count > 0 {
+                if *count > 0 {
                   info!("[{collection}]: Restored {count} items");
                 }
               }
@@ -108,20 +130,32 @@ pub async fn restore(
                 error!("[{collection}]: {e:#}");
               }
             }
+            res.map(|_| ())
           })
         )
       }
     })
     .collect::<FuturesUnordered<_>>();
 
+  let mut failures = Vec::new();
   loop {
     match handles.next().await {
-      Some((_collection, Ok(()))) => {}
+      Some((_collection, Ok(Ok(())))) => {}
+      Some((collection, Ok(Err(error)))) => {
+        failures.push(format!("{collection}: {error:#}"));
+      }
       Some((collection, Err(e))) => {
-        error!("[{collection}]: {e:#}");
+        failures.push(format!("{collection}: worker failed: {e:#}"));
       }
       None => break,
     }
+  }
+
+  if !failures.is_empty() {
+    return Err(anyhow::anyhow!(
+      "Database restore failed: {}",
+      failures.join("; ")
+    ));
   }
 
   info!("Finished restoring database ✅");
