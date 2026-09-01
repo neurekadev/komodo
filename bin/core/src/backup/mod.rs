@@ -4,7 +4,10 @@ use std::{
   io::Write,
   os::unix::fs::OpenOptionsExt,
   path::{Path, PathBuf},
-  sync::{Arc, Mutex, OnceLock, RwLock},
+  sync::{
+    Arc, Mutex, OnceLock, RwLock,
+    atomic::{AtomicBool, Ordering},
+  },
 };
 
 use anyhow::{Context, anyhow};
@@ -157,7 +160,7 @@ fn health_collection() -> Collection<RepositoryHealthRecord> {
 }
 
 fn core_export_includes_collection(name: &str) -> bool {
-  name != SETTINGS_COLLECTION
+  !matches!(name, SETTINGS_COLLECTION | RUNS_COLLECTION)
 }
 
 pub async fn get_settings() -> anyhow::Result<BackupSettings> {
@@ -798,8 +801,8 @@ pub async fn status() -> anyhow::Result<BackupStatus> {
           inventory
             .snapshots
             .into_iter()
-            .map(|snapshot| snapshot.name)
-            .collect::<HashSet<_>>(),
+            .map(|snapshot| (snapshot.name, snapshot.partial))
+            .collect::<HashMap<_, _>>(),
           inventory.hidden == 0,
         )
       })
@@ -821,8 +824,8 @@ pub async fn status() -> anyhow::Result<BackupStatus> {
               inventory
                 .snapshots
                 .into_iter()
-                .map(|snapshot| snapshot.name)
-                .collect::<HashSet<_>>(),
+                .map(|snapshot| (snapshot.name, snapshot.partial))
+                .collect::<HashMap<_, _>>(),
               inventory.hidden == 0,
             )
           })
@@ -830,9 +833,17 @@ pub async fn status() -> anyhow::Result<BackupStatus> {
       .await
       .context("Mirror health worker failed")?;
       match mirror {
-        Ok((mirror_names, healthy)) => (
+        Ok((mirror_snapshots, healthy)) => (
           Some(healthy),
-          primary_names.difference(&mirror_names).count() as u64,
+          primary_names
+            .iter()
+            .filter(|(name, primary_partial)| {
+              !mirror_copy_is_sufficient(
+                **primary_partial,
+                mirror_snapshots.get(*name).copied(),
+              )
+            })
+            .count() as u64,
         ),
         Err(_) => (Some(false), primary_names.len() as u64),
       }
@@ -886,6 +897,17 @@ fn critical_alert() -> &'static RwLock<Option<String>> {
   ALERT.get_or_init(Default::default)
 }
 
+const MAINTENANCE_ALERT_PREFIX: &str = "Backup maintenance blocked:";
+
+fn clear_maintenance_alert() {
+  let mut alert = critical_alert().write().unwrap();
+  if alert.as_deref().is_some_and(|message| {
+    message.starts_with(MAINTENANCE_ALERT_PREFIX)
+  }) {
+    *alert = None;
+  }
+}
+
 /// Blocks application mutations only while Core creates immutable export
 /// staging. Uploads happen after the write guard is released.
 pub fn mutation_barrier() -> &'static Arc<tokio::sync::RwLock<()>> {
@@ -906,6 +928,39 @@ fn repository_role_barrier() -> &'static Arc<tokio::sync::RwLock<()>>
 fn backup_operation_lock() -> &'static tokio::sync::Mutex<()> {
   static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
   LOCK.get_or_init(Default::default)
+}
+
+fn cancellation_tokens()
+-> &'static Mutex<HashMap<String, Arc<AtomicBool>>> {
+  static TOKENS: OnceLock<Mutex<HashMap<String, Arc<AtomicBool>>>> =
+    OnceLock::new();
+  TOKENS.get_or_init(Default::default)
+}
+
+fn register_cancellation_token(run_id: &str) -> Arc<AtomicBool> {
+  let token = Arc::new(AtomicBool::new(false));
+  cancellation_tokens()
+    .lock()
+    .unwrap()
+    .insert(run_id.to_string(), token.clone());
+  token
+}
+
+fn cancellation_token(run_id: &str) -> Option<Arc<AtomicBool>> {
+  cancellation_tokens().lock().unwrap().get(run_id).cloned()
+}
+
+fn cancellation_requested(run_id: &str) -> bool {
+  cancellation_token(run_id)
+    .is_some_and(|token| token.load(Ordering::SeqCst))
+}
+
+fn ensure_not_cancelled(run_id: &str) -> anyhow::Result<()> {
+  if cancellation_requested(run_id) {
+    Err(anyhow!("Backup run was cancelled"))
+  } else {
+    Ok(())
+  }
 }
 
 fn core_recovery_operation_lock() -> &'static tokio::sync::Mutex<()> {
@@ -948,11 +1003,14 @@ pub async fn run_backup(
   let _repository_roles =
     repository_role_barrier().clone().read_owned().await;
   let run = new_run(target.clone(), "Backup running").await?;
+  let run_id = run.id.clone();
+  let _cancellation = register_cancellation_token(&run_id);
   let settings = match get_settings().await {
     Ok(settings) => settings,
     Err(error) => {
       let message = format!("{error:#}");
       let _ = finish_run(run, BackupRunState::Failed, message).await;
+      cancellation_tokens().lock().unwrap().remove(&run_id);
       return Err(error);
     }
   };
@@ -960,24 +1018,35 @@ pub async fn run_backup(
     Some(target) => run_target(&settings, &run, target).await,
     None => run_fleet(&settings, &run).await,
   };
-  let finished = match result {
-    Ok(partial) if partial => {
-      finish_run(
-        run,
-        BackupRunState::Partial,
-        "Backup completed partially",
-      )
-      .await
-    }
-    Ok(_) => {
-      finish_run(run, BackupRunState::Complete, "Backup complete")
+  let finished = if cancellation_requested(&run_id) {
+    finish_run(
+      run,
+      BackupRunState::Cancelled,
+      "Cancellation requested",
+    )
+    .await
+  } else {
+    match result {
+      Ok(partial) if partial => {
+        finish_run(
+          run,
+          BackupRunState::Partial,
+          "Backup completed partially",
+        )
         .await
+      }
+      Ok(_) => {
+        finish_run(run, BackupRunState::Complete, "Backup complete")
+          .await
+      }
+      Err(error) => {
+        finish_run(run, BackupRunState::Failed, format!("{error:#}"))
+          .await
+      }
     }
-    Err(error) => {
-      finish_run(run, BackupRunState::Failed, format!("{error:#}"))
-        .await
-    }
-  }?;
+  };
+  cancellation_tokens().lock().unwrap().remove(&run_id);
+  let finished = finished?;
   if matches!(
     finished.state,
     BackupRunState::Complete | BackupRunState::Partial
@@ -998,16 +1067,16 @@ fn maintenance_sender() -> &'static tokio::sync::mpsc::Sender<()> {
         tokio::time::sleep(std::time::Duration::from_secs(30)).await;
         while receiver.try_recv().is_ok() {}
         match get_settings().await {
-          Ok(settings) => {
-            if let Err(error) = run_maintenance(settings).await {
+          Ok(settings) => match run_maintenance(settings).await {
+            Ok(()) => clear_maintenance_alert(),
+            Err(error) => {
               error!(
                 "Backup repository maintenance failed: {error:#}"
               );
-              *critical_alert().write().unwrap() = Some(format!(
-                "Backup maintenance blocked: {error:#}"
-              ));
+              *critical_alert().write().unwrap() =
+                Some(format!("{MAINTENANCE_ALERT_PREFIX} {error:#}"));
             }
-          }
+          },
           Err(error) => error!(
             "Failed to load backup maintenance settings: {error:#}"
           ),
@@ -1119,6 +1188,7 @@ async fn run_fleet(
   settings: &BackupSettings,
   run: &BackupRun,
 ) -> anyhow::Result<bool> {
+  ensure_not_cancelled(&run.id)?;
   *fleet_generation().write().unwrap() = run.id.clone();
   let mut targets = Vec::new();
   let mut discovery_retry_servers = HashSet::new();
@@ -1222,6 +1292,7 @@ async fn run_fleet(
       }
     }
   }
+  ensure_not_cancelled(&run.id)?;
 
   let mut by_server: HashMap<String, Vec<BackupTarget>> =
     HashMap::new();
@@ -1250,7 +1321,9 @@ async fn run_fleet(
     let settings = settings.clone();
     let run = run.clone();
     batches.push(async move {
+      ensure_not_cancelled(&run.id)?;
       let _permit = semaphore.acquire_owned().await?;
+      ensure_not_cancelled(&run.id)?;
       let refreshed =
         refresh_node_targets(&settings, &server_id, targets.clone())
           .await;
@@ -1296,6 +1369,7 @@ async fn run_fleet(
     });
   }
   while let Some(result) = batches.next().await {
+    ensure_not_cancelled(&run.id)?;
     let (server_id, targets, tasks, refresh_targets, result) =
       result?;
     match result {
@@ -1459,7 +1533,7 @@ fn spawn_core_retry(settings: BackupSettings, run: BackupRun) {
     loop {
       if *fleet_generation().read().unwrap() != run.id {
         let retry =
-          { core_mirror_retries().lock().unwrap().remove(&run.id) };
+          core_repository_retries().lock().unwrap().remove(&run.id);
         if let Some(retry) = retry {
           let _ = tokio::fs::remove_dir_all(retry.staging).await;
         }
@@ -1470,7 +1544,7 @@ fn spawn_core_retry(settings: BackupSettings, run: BackupRun) {
         .await;
       if *fleet_generation().read().unwrap() != run.id {
         let retry =
-          { core_mirror_retries().lock().unwrap().remove(&run.id) };
+          core_repository_retries().lock().unwrap().remove(&run.id);
         if let Some(retry) = retry {
           let _ = tokio::fs::remove_dir_all(retry.staging).await;
         }
@@ -1485,7 +1559,7 @@ fn spawn_core_retry(settings: BackupSettings, run: BackupRun) {
         repository_role_barrier().clone().read_owned().await;
       if *fleet_generation().read().unwrap() != run.id {
         let retry =
-          { core_mirror_retries().lock().unwrap().remove(&run.id) };
+          core_repository_retries().lock().unwrap().remove(&run.id);
         if let Some(retry) = retry {
           let _ = tokio::fs::remove_dir_all(retry.staging).await;
         }
@@ -1621,6 +1695,7 @@ async fn build_node_backup_tasks(
         ),
         mirror_only: false,
         primary_only: false,
+        superseded_snapshot_names: Vec::new(),
       }))
     }
     .await;
@@ -1646,16 +1721,62 @@ struct NodeBatchOutcome {
   retry_blocked: bool,
 }
 
-fn repository_retry_state(
-  primary_complete: bool,
-  mirror_complete: bool,
-  has_mirror: bool,
-) -> (bool, bool, bool) {
-  (
-    primary_complete && !mirror_complete && has_mirror,
-    mirror_complete && !primary_complete && has_mirror,
-    !primary_complete && !mirror_complete,
+fn fresh_retry_snapshot_name(
+  task: &VykarBackupTask,
+  run_id: &str,
+) -> String {
+  snapshot_name(
+    match &task.target {
+      PeripheryBackupTarget::Stack { .. } => "stack",
+      PeripheryBackupTarget::Volume { .. } => "volume",
+    },
+    run_id,
   )
+}
+
+fn retry_tasks_after_unknown_result(
+  tasks: Vec<VykarBackupTask>,
+  run_id: &str,
+) -> Vec<VykarBackupTask> {
+  tasks
+    .into_iter()
+    .map(|mut task| {
+      task
+        .superseded_snapshot_names
+        .push(task.snapshot_name.clone());
+      task.mirror_only = false;
+      task.primary_only = false;
+      task.snapshot_name = fresh_retry_snapshot_name(&task, run_id);
+      task
+    })
+    .collect()
+}
+
+async fn delete_node_snapshot_copies(
+  settings: &BackupSettings,
+  snapshot_name: String,
+) {
+  let repositories = std::iter::once(settings.primary.clone())
+    .chain(settings.mirror.clone())
+    .collect::<Vec<_>>();
+  let settings = settings.clone();
+  let cleanup = tokio::task::spawn_blocking(move || {
+    for repository in repositories {
+      if let Err(error) = core_repository(&repository, &settings)
+        .and_then(|repository| {
+          repository.delete_snapshot_if_present(&snapshot_name)
+        })
+      {
+        warn!(
+          "Could not remove superseded node snapshot {snapshot_name}: {error:#}"
+        );
+      }
+    }
+  })
+  .await;
+  if let Err(error) = cleanup {
+    warn!("Node snapshot cleanup worker failed: {error}");
+  }
 }
 
 async fn run_node_batch(
@@ -1682,7 +1803,21 @@ async fn run_node_batch(
       komodo_version: env!("CARGO_PKG_VERSION").into(),
       stop_containers: settings.stop_containers,
     })
-    .await?;
+    .await;
+  let response = match response {
+    Ok(response) => response,
+    Err(error) => {
+      warn!(
+        "Backup node {} returned no authoritative result; the next attempt will use a fresh snapshot name: {error:#}",
+        server.name
+      );
+      return Ok(NodeBatchOutcome {
+        partial: true,
+        retry_tasks: retry_tasks_after_unknown_result(tasks, &run.id),
+        retry_blocked: false,
+      });
+    }
+  };
   if !response.restart_errors.is_empty() {
     *critical_alert().write().unwrap() = Some(format!(
       "Backup restart failed on {}: {}",
@@ -1702,31 +1837,41 @@ async fn run_node_batch(
       retry_tasks.push(task);
       continue;
     };
-    let primary_complete = task.mirror_only
-      || result.primary.complete && result.primary.error.is_none();
-    let mirror_complete = task.primary_only
-      || settings.mirror.is_none()
+    let primary_complete =
+      result.primary.complete && result.primary.error.is_none();
+    let mirror_complete = settings.mirror.is_none()
       || result.mirror.as_ref().is_some_and(|mirror| {
         mirror.complete && mirror.error.is_none()
       });
-    if !primary_complete || !mirror_complete {
-      let (mirror_only, primary_only, replace_snapshot_name) =
-        repository_retry_state(
-          primary_complete,
-          mirror_complete,
-          settings.mirror.is_some(),
-        );
-      task.mirror_only = mirror_only;
-      task.primary_only = primary_only;
-      if replace_snapshot_name {
-        task.snapshot_name = snapshot_name(
-          match &task.target {
-            PeripheryBackupTarget::Stack { .. } => "stack",
-            PeripheryBackupTarget::Volume { .. } => "volume",
-          },
-          &run.id,
-        );
+    let current_complete = primary_complete
+      || settings.mirror.is_some() && mirror_complete;
+    if primary_complete && mirror_complete {
+      for superseded in
+        std::mem::take(&mut task.superseded_snapshot_names)
+      {
+        delete_node_snapshot_copies(settings, superseded).await;
       }
+    } else {
+      let attempted = task.snapshot_name.clone();
+      if current_complete {
+        for superseded in
+          std::mem::take(&mut task.superseded_snapshot_names)
+        {
+          delete_node_snapshot_copies(settings, superseded).await;
+        }
+        task.superseded_snapshot_names.push(attempted);
+      } else {
+        // Neither repository has an authoritative copy. Remove any committed
+        // partials and retain the previous successful attempt, if one exists.
+        delete_node_snapshot_copies(settings, attempted).await;
+      }
+      // A repository-specific retry against rediscovered live paths could put
+      // different bytes under one name. Every retry is therefore a fresh,
+      // node-quiesced attempt against both repositories; the previous good
+      // attempt is retained until its replacement commits somewhere.
+      task.mirror_only = false;
+      task.primary_only = false;
+      task.snapshot_name = fresh_retry_snapshot_name(&task, &run.id);
       retry_tasks.push(task);
     }
   }
@@ -1751,6 +1896,7 @@ async fn run_target(
   run: &BackupRun,
   target: BackupTarget,
 ) -> anyhow::Result<bool> {
+  ensure_not_cancelled(&run.id)?;
   match target {
     BackupTarget::Core => backup_core(settings, run).await,
     BackupTarget::Stack { stack_id } => {
@@ -1767,17 +1913,20 @@ async fn run_target(
 }
 
 #[derive(Clone)]
-struct CoreMirrorRetry {
+struct CoreRepositoryRetry {
   snapshot_name: String,
   source_label: String,
   source_path: String,
   staging: PathBuf,
+  retry_primary: bool,
+  retry_mirror: bool,
 }
 
-fn core_mirror_retries()
--> &'static Mutex<HashMap<String, CoreMirrorRetry>> {
-  static RETRIES: OnceLock<Mutex<HashMap<String, CoreMirrorRetry>>> =
-    OnceLock::new();
+fn core_repository_retries()
+-> &'static Mutex<HashMap<String, CoreRepositoryRetry>> {
+  static RETRIES: OnceLock<
+    Mutex<HashMap<String, CoreRepositoryRetry>>,
+  > = OnceLock::new();
   RETRIES.get_or_init(Default::default)
 }
 
@@ -1785,30 +1934,86 @@ fn invalidate_fleet_retries() {
   fleet_generation().write().unwrap().clear();
 }
 
-async fn retry_core_mirror(
+async fn write_core_repository_snapshot(
+  repository: BackupRepository,
   settings: &BackupSettings,
-  run: &BackupRun,
-  retry: CoreMirrorRetry,
-) -> anyhow::Result<bool> {
-  let mirror = settings
-    .mirror
-    .clone()
-    .context("Mirror is no longer configured")?;
+  retry: &CoreRepositoryRetry,
+  cancellation: Arc<AtomicBool>,
+  remove_existing: bool,
+) -> anyhow::Result<komodo_backup::BackupResult> {
   let settings_for_worker = settings.clone();
   let retry_for_worker = retry.clone();
-  let result = tokio::task::spawn_blocking(move || {
-    core_repository(&mirror, &settings_for_worker)?.backup(
+  tokio::task::spawn_blocking(move || {
+    let repository =
+      core_repository(&repository, &settings_for_worker)?;
+    if remove_existing {
+      repository.delete_snapshot_if_present(
+        &retry_for_worker.snapshot_name,
+      )?;
+    }
+    repository.backup_cancellable(
       &retry_for_worker.snapshot_name,
       &retry_for_worker.source_label,
       std::slice::from_ref(&retry_for_worker.source_path),
+      Some(cancellation.as_ref()),
     )
   })
   .await
-  .context("Core mirror retry worker failed")??;
-  if result.partial {
+  .context("Core repository backup worker failed")?
+}
+
+async fn retry_core_repositories(
+  settings: &BackupSettings,
+  run: &BackupRun,
+  mut retry: CoreRepositoryRetry,
+) -> anyhow::Result<bool> {
+  ensure_not_cancelled(&run.id)?;
+  let cancellation = cancellation_token(&run.id)
+    .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+  if retry.retry_primary {
+    let result = write_core_repository_snapshot(
+      settings.primary.clone(),
+      settings,
+      &retry,
+      cancellation.clone(),
+      true,
+    )
+    .await;
+    retry.retry_primary =
+      !matches!(&result, Ok(result) if !result.partial);
+    if let Err(error) = result {
+      warn!("Core primary retry failed: {error:#}");
+    }
+  }
+  ensure_not_cancelled(&run.id)?;
+  if retry.retry_mirror {
+    let mirror = settings
+      .mirror
+      .clone()
+      .context("Mirror is no longer configured")?;
+    let result = write_core_repository_snapshot(
+      mirror,
+      settings,
+      &retry,
+      cancellation,
+      true,
+    )
+    .await;
+    retry.retry_mirror =
+      !matches!(&result, Ok(result) if !result.partial);
+    if let Err(error) = result {
+      warn!("Core mirror retry failed: {error:#}");
+    }
+  }
+  ensure_not_cancelled(&run.id)?;
+  if retry.retry_primary || retry.retry_mirror {
+    core_repository_retries()
+      .lock()
+      .unwrap()
+      .insert(run.id.clone(), retry);
     return Ok(true);
   }
-  core_mirror_retries().lock().unwrap().remove(&run.id);
+  core_repository_retries().lock().unwrap().remove(&run.id);
   let _ = tokio::fs::remove_dir_all(&retry.staging).await;
   Ok(false)
 }
@@ -1817,10 +2022,14 @@ async fn backup_core(
   settings: &BackupSettings,
   run: &BackupRun,
 ) -> anyhow::Result<bool> {
-  let mirror_retry =
-    core_mirror_retries().lock().unwrap().get(&run.id).cloned();
-  if let Some(retry) = mirror_retry {
-    return retry_core_mirror(settings, run, retry).await;
+  ensure_not_cancelled(&run.id)?;
+  let repository_retry = core_repository_retries()
+    .lock()
+    .unwrap()
+    .get(&run.id)
+    .cloned();
+  if let Some(retry) = repository_retry {
+    return retry_core_repositories(settings, run, retry).await;
   }
   let staging =
     PathBuf::from("/data/backups/.komodo-core-staging").join(&run.id);
@@ -1833,10 +2042,11 @@ async fn backup_core(
     database::utils::backup_excluding(
       &db_client().db,
       &staging,
-      &[SETTINGS_COLLECTION],
+      &[SETTINGS_COLLECTION, RUNS_COLLECTION],
     )
     .await?;
   }
+  ensure_not_cancelled(&run.id)?;
   let exported_collections = db_client()
     .db
     .list_collection_names()
@@ -1856,116 +2066,67 @@ async fn backup_core(
     serde_json::to_vec_pretty(&manifest)?,
   )
   .await?;
-  let primary = settings.primary.clone();
-  let mirror = settings.mirror.clone();
-  let settings_for_worker = settings.clone();
   let label = BackupTarget::Core.source_label(core_instance_id()?);
   let name = snapshot_name("core", &run.id);
   let path = staging.to_string_lossy().into_owned();
-  let primary_name = name.clone();
-  let primary_label = label.clone();
-  let primary_path = path.clone();
-  let primary_result = tokio::task::spawn_blocking(move || {
-    core_repository(&primary, &settings_for_worker)?.backup(
-      &primary_name,
-      &primary_label,
-      std::slice::from_ref(&primary_path),
-    )
-  })
-  .await
-  .context("Core primary backup worker failed");
-  let primary_result = match primary_result {
-    Ok(Ok(result)) => result,
-    Ok(Err(error)) => {
-      let _ = tokio::fs::remove_dir_all(&staging).await;
-      return Err(error);
-    }
-    Err(error) => {
-      let _ = tokio::fs::remove_dir_all(&staging).await;
-      return Err(error);
-    }
-  };
-  let Some(mirror) = mirror else {
-    let _ = tokio::fs::remove_dir_all(&staging).await;
-    return Ok(primary_result.partial);
-  };
-  let retry = CoreMirrorRetry {
+  let mut retry = CoreRepositoryRetry {
     snapshot_name: name,
     source_label: label,
     source_path: path,
     staging: staging.clone(),
+    retry_primary: true,
+    retry_mirror: settings.mirror.is_some(),
   };
-  let mirror_settings = settings.clone();
-  let mirror_retry = retry.clone();
-  let mirror_result = tokio::task::spawn_blocking(move || {
-    core_repository(&mirror, &mirror_settings)?.backup(
-      &mirror_retry.snapshot_name,
-      &mirror_retry.source_label,
-      std::slice::from_ref(&mirror_retry.source_path),
-    )
-  })
-  .await
-  .context("Core mirror backup worker failed");
-  match mirror_result {
-    Ok(Ok(result))
-      if result.partial
-        && !primary_result.partial
-        && *fleet_generation().read().unwrap() == run.id =>
-    {
-      core_mirror_retries()
-        .lock()
-        .unwrap()
-        .insert(run.id.clone(), retry);
-      warn!(
-        "Core primary snapshot committed but mirror was partial; retrying only the mirror"
-      );
-      Ok(true)
-    }
-    Ok(Ok(result)) => {
-      let _ = tokio::fs::remove_dir_all(&staging).await;
-      Ok(primary_result.partial || result.partial)
-    }
-    Ok(Err(error)) if !primary_result.partial => {
-      if *fleet_generation().read().unwrap() == run.id {
-        core_mirror_retries()
-          .lock()
-          .unwrap()
-          .insert(run.id.clone(), retry);
-        warn!(
-          "Core primary snapshot committed but mirror failed; retrying only the mirror: {error:#}"
-        );
-        Ok(true)
-      } else {
-        let _ = tokio::fs::remove_dir_all(&staging).await;
-        Err(error.context(
-          "Core primary snapshot committed but mirror backup failed",
-        ))
-      }
-    }
-    Err(error) if !primary_result.partial => {
-      if *fleet_generation().read().unwrap() == run.id {
-        core_mirror_retries()
-          .lock()
-          .unwrap()
-          .insert(run.id.clone(), retry);
-        warn!(
-          "Core primary snapshot committed but mirror worker failed; retrying only the mirror: {error:#}"
-        );
-        Ok(true)
-      } else {
-        let _ = tokio::fs::remove_dir_all(&staging).await;
-        Err(error.context(
-          "Core primary snapshot committed but mirror worker failed",
-        ))
-      }
-    }
-    Ok(Err(error)) => {
-      let _ = tokio::fs::remove_dir_all(&staging).await;
-      Err(error)
-    }
-    Err(error) => {
-      let _ = tokio::fs::remove_dir_all(&staging).await;
-      Err(error)
+  let cancellation = cancellation_token(&run.id)
+    .context("Core backup cancellation token is unavailable")?;
+  let primary_result = write_core_repository_snapshot(
+    settings.primary.clone(),
+    settings,
+    &retry,
+    cancellation.clone(),
+    false,
+  )
+  .await;
+  retry.retry_primary =
+    !matches!(&primary_result, Ok(result) if !result.partial);
+  ensure_not_cancelled(&run.id)?;
+  let Some(mirror) = settings.mirror.clone() else {
+    let _ = tokio::fs::remove_dir_all(&staging).await;
+    return primary_result.map(|result| result.partial);
+  };
+  let mirror_result = write_core_repository_snapshot(
+    mirror,
+    settings,
+    &retry,
+    cancellation,
+    false,
+  )
+  .await;
+  retry.retry_mirror =
+    !matches!(&mirror_result, Ok(result) if !result.partial);
+  ensure_not_cancelled(&run.id)?;
+  if !retry.retry_primary && !retry.retry_mirror {
+    let _ = tokio::fs::remove_dir_all(&staging).await;
+    return Ok(false);
+  }
+  if *fleet_generation().read().unwrap() == run.id {
+    warn!(
+      retry_primary = retry.retry_primary,
+      retry_mirror = retry.retry_mirror,
+      "Core repository retry retained the immutable database export"
+    );
+    core_repository_retries()
+      .lock()
+      .unwrap()
+      .insert(run.id.clone(), retry);
+    return Ok(true);
+  }
+  let _ = tokio::fs::remove_dir_all(&staging).await;
+  match (primary_result, mirror_result) {
+    (Err(error), _) => Err(error),
+    (_, Err(error)) => Err(error),
+    (Ok(primary), Ok(mirror)) => {
+      Ok(primary.partial || mirror.partial)
     }
   }
 }
@@ -2293,6 +2454,11 @@ pub async fn plan_restore(
         .unwrap_or_else(|| stack.config.server_id.clone());
       let recovering_stack =
         source_stack_missing || destination != stack.config.server_id;
+      if destination != stack.config.server_id && !user.admin {
+        return Err(anyhow!(
+          "Cross-node Stack restore with host path mappings is administrator only"
+        ));
+      }
       if recovering_stack {
         if !Stack::user_can_create(user) {
           return Err(anyhow!(
@@ -3331,12 +3497,23 @@ pub async fn cancel_run(run_id: &str) -> anyhow::Result<BackupRun> {
     .find_one(doc! { "id": run_id })
     .await?
     .context("Backup run does not exist")?;
+  if !matches!(
+    run.state,
+    BackupRunState::Queued | BackupRunState::Running
+  ) {
+    return Err(anyhow!(
+      "Only an active backup run can be cancelled"
+    ));
+  }
+  if let Some(token) = cancellation_token(run_id) {
+    token.store(true, Ordering::SeqCst);
+  }
   if *fleet_generation().read().unwrap() == run_id {
     fleet_generation().write().unwrap().clear();
   }
-  let mirror_retry =
-    { core_mirror_retries().lock().unwrap().remove(run_id) };
-  if let Some(retry) = mirror_retry {
+  let repository_retry =
+    core_repository_retries().lock().unwrap().remove(run_id);
+  if let Some(retry) = repository_retry {
     let _ = tokio::fs::remove_dir_all(retry.staging).await;
   }
   let servers = find_collect(&db_client().servers, None, None)
@@ -3354,6 +3531,20 @@ pub async fn cancel_run(run_id: &str) -> anyhow::Result<BackupRun> {
     },
   ))
   .await;
+  // The owner holds this lock for the complete backup operation. Waiting here
+  // guarantees Core export/repository workers and the initial fleet batch have
+  // observed cancellation before the audit record becomes Cancelled.
+  let _operation = backup_operation_lock().lock().await;
+  let current = runs_collection()
+    .find_one(doc! { "id": run_id })
+    .await?
+    .context("Backup run disappeared while cancelling")?;
+  if !matches!(
+    current.state,
+    BackupRunState::Queued | BackupRunState::Running
+  ) {
+    return Ok(current);
+  }
   finish_run(run, BackupRunState::Cancelled, "Cancellation requested")
     .await
 }
@@ -3606,8 +3797,9 @@ mod tests {
   }
 
   #[test]
-  fn core_export_excludes_sealed_repository_settings() {
+  fn core_export_excludes_control_and_in_flight_run_state() {
     assert!(!core_export_includes_collection(SETTINGS_COLLECTION));
+    assert!(!core_export_includes_collection(RUNS_COLLECTION));
     assert!(core_export_includes_collection("Stack"));
   }
 
@@ -3630,21 +3822,5 @@ mod tests {
     assert!(!mirror_copy_is_sufficient(false, Some(true)));
     assert!(mirror_copy_is_sufficient(false, Some(false)));
     assert!(mirror_copy_is_sufficient(true, Some(true)));
-  }
-
-  #[test]
-  fn repository_retry_preserves_the_successful_copy() {
-    assert_eq!(
-      repository_retry_state(false, true, true),
-      (false, true, false)
-    );
-    assert_eq!(
-      repository_retry_state(true, false, true),
-      (true, false, false)
-    );
-    assert_eq!(
-      repository_retry_state(false, false, true),
-      (false, false, true)
-    );
   }
 }

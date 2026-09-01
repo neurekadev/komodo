@@ -8,6 +8,7 @@ use std::{
   io::Write,
   os::unix::fs::PermissionsExt,
   path::Path,
+  sync::atomic::AtomicBool,
 };
 
 use anyhow::{Context, anyhow};
@@ -146,7 +147,25 @@ impl VykarRepository {
     source_label: &str,
     source_paths: &[String],
   ) -> anyhow::Result<BackupResult> {
-    let outcome = commands::backup::run(
+    self.backup_cancellable(
+      snapshot_name,
+      source_label,
+      source_paths,
+      None,
+    )
+  }
+
+  /// Run a backup that observes a caller-owned cancellation flag before its
+  /// commit point. This is used for Core-local work, where there is no remote
+  /// Periphery cancellation request to interrupt the Vykar worker.
+  pub fn backup_cancellable(
+    &self,
+    snapshot_name: &str,
+    source_label: &str,
+    source_paths: &[String],
+    shutdown: Option<&AtomicBool>,
+  ) -> anyhow::Result<BackupResult> {
+    let outcome = commands::backup::run_with_progress(
       &self.config,
       commands::backup::BackupRequest {
         snapshot_name,
@@ -162,6 +181,8 @@ impl VykarRepository {
         command_dumps: &[],
         verbose: false,
       },
+      None,
+      shutdown,
     )?;
     Ok(BackupResult {
       partial: outcome.is_partial || outcome.stats.errors > 0,
@@ -169,6 +190,35 @@ impl VykarRepository {
       original_size: outcome.stats.original_size,
       stored_size: outcome.stats.deduplicated_size,
     })
+  }
+
+  /// Delete one exact snapshot if it exists. Inventory must be complete before
+  /// any destructive operation is allowed.
+  pub fn delete_snapshot_if_present(
+    &self,
+    snapshot_name: &str,
+  ) -> anyhow::Result<bool> {
+    let inventory = self.list_snapshots()?;
+    if inventory.hidden > 0 {
+      return Err(anyhow!(
+        "Repository inventory is incomplete; snapshot cleanup is blocked"
+      ));
+    }
+    if !inventory
+      .snapshots
+      .iter()
+      .any(|snapshot| snapshot.name == snapshot_name)
+    {
+      return Ok(false);
+    }
+    commands::delete::run(
+      &self.config,
+      Some(&self.passphrase),
+      &[snapshot_name],
+      false,
+      None,
+    )?;
+    Ok(true)
   }
 
   /// List snapshots directly from the repository. Unknown labels remain

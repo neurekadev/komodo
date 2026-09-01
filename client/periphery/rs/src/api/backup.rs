@@ -84,6 +84,10 @@ pub struct VykarBackupTask {
   /// Retry only the primary for a snapshot already committed to the mirror.
   #[serde(default)]
   pub primary_only: bool,
+  /// A prior asymmetric attempt that this fresh, node-quiesced attempt
+  /// replaces once at least one repository commits the new snapshot.
+  #[serde(default)]
+  pub superseded_snapshot_names: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Resolve)]

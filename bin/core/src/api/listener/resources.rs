@@ -45,6 +45,8 @@ pub async fn handle_build_webhook<B: super::ExtractBranch>(
   if !build.config.webhook_enabled {
     return Ok(());
   }
+  let _mutation_guard =
+    crate::backup::mutation_barrier().clone().read_owned().await;
 
   // Use the correct target branch when using linked repo.
   let branch = if build.config.linked_repo.is_empty() {
@@ -260,6 +262,8 @@ async fn handle_repo_webhook_inner<
   if !repo.config.webhook_enabled {
     return Ok(());
   }
+  let _mutation_guard =
+    crate::backup::mutation_barrier().clone().read_owned().await;
 
   // Acquire and hold lock to make a task queue for
   // subsequent listener calls on same resource.
@@ -382,6 +386,8 @@ pub async fn handle_stack_webhook_inner<
   if !stack.config.webhook_enabled {
     return Ok(());
   }
+  let _mutation_guard =
+    crate::backup::mutation_barrier().clone().read_owned().await;
 
   // Acquire and hold lock to make a task queue for
   // subsequent listener calls on same resource.
@@ -497,6 +503,8 @@ async fn handle_sync_webhook_inner<
   if !sync.config.webhook_enabled {
     return Ok(());
   }
+  let _mutation_guard =
+    crate::backup::mutation_barrier().clone().read_owned().await;
 
   // Acquire and hold lock to make a task queue for
   // subsequent listener calls on same resource.
@@ -546,6 +554,8 @@ pub async fn handle_procedure_webhook<B: super::ExtractBranch>(
   if !procedure.config.webhook_enabled {
     return Ok(());
   }
+  let _mutation_guard =
+    crate::backup::mutation_barrier().clone().read_owned().await;
 
   // Acquire and hold lock to make a task queue for
   // subsequent listener calls on same resource.
@@ -602,6 +612,8 @@ pub async fn handle_action_webhook<B: super::ExtractBranch>(
   if !action.config.webhook_enabled {
     return Ok(());
   }
+  let _mutation_guard =
+    crate::backup::mutation_barrier().clone().read_owned().await;
 
   // Acquire and hold lock to make a task queue for
   // subsequent listener calls on same resource.

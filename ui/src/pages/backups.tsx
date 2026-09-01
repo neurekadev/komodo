@@ -294,7 +294,13 @@ function BackupSettingsForm({
   });
   const { mutate: verify, isPending: verifying } = useWrite(
     "VerifyBackupRepository",
-    { onSuccess: (result) => notifications.show({ color: "green", message: result.message }) },
+    {
+      onSuccess: (result) =>
+        notifications.show({
+          color: result.state === Types.BackupRunState.Failed ? "red" : "green",
+          message: result.message,
+        }),
+    },
   );
   const { mutate: promote, isPending: promoting } = useWrite(
     "PromoteBackupMirror",
