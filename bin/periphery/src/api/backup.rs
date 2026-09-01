@@ -438,6 +438,44 @@ fn paths_overlap(left: &Path, right: &Path) -> bool {
   left == right || left.starts_with(right) || right.starts_with(left)
 }
 
+fn resolve_existing_ancestor(path: &Path) -> anyhow::Result<PathBuf> {
+  let mut ancestor = path;
+  let mut missing = Vec::new();
+  loop {
+    match ancestor.canonicalize() {
+      Ok(mut resolved) => {
+        while let Some(component) = missing.pop() {
+          resolved.push(component);
+        }
+        return Ok(resolved);
+      }
+      Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        let name = ancestor.file_name().with_context(|| {
+          format!(
+            "Restore destination has no resolvable ancestor: {}",
+            path.display()
+          )
+        })?;
+        missing.push(name.to_os_string());
+        ancestor = ancestor.parent().with_context(|| {
+          format!(
+            "Restore destination has no resolvable ancestor: {}",
+            path.display()
+          )
+        })?;
+      }
+      Err(error) => {
+        return Err(error).with_context(|| {
+          format!(
+            "Failed to resolve restore destination ancestor: {}",
+            path.display()
+          )
+        });
+      }
+    }
+  }
+}
+
 fn insert_bind_backup_root(
   bind_paths: &mut BTreeSet<PathBuf>,
   run_directory: &Path,
@@ -666,10 +704,9 @@ async fn discover_running_containers(
       let paths = publish
         .iter()
         .map(|item| {
-          let path = PathBuf::from(&item.destination);
-          path.canonicalize().unwrap_or(path)
+          resolve_existing_ancestor(Path::new(&item.destination))
         })
-        .collect::<BTreeSet<_>>();
+        .collect::<anyhow::Result<BTreeSet<_>>>()?;
       let project_name = stack.project_name(false);
       affected_running_containers(
         docker,
@@ -1304,6 +1341,10 @@ struct RestoreJournalEntry {
   source: PathBuf,
   destination: PathBuf,
   rollback: PathBuf,
+  /// `None` denotes a legacy journal whose original-destination state is
+  /// ambiguous and must be recovered conservatively.
+  #[serde(default)]
+  original_existed: Option<bool>,
   published: bool,
 }
 
@@ -1508,6 +1549,7 @@ fn publish_restore_in(
     let destination_parent = destination
       .parent()
       .context("Restore destination has no parent")?;
+    let original_existed = path_lexists(&destination);
     let rollback = restore_rollback_path(&destination, journal_id)?;
     if !rollback_paths.insert(rollback.clone()) {
       return Err(anyhow!(
@@ -1561,6 +1603,7 @@ fn publish_restore_in(
       source,
       destination,
       rollback,
+      original_existed: Some(original_existed),
       published: false,
     });
   }
@@ -1738,17 +1781,43 @@ fn rollback_published(
     let published = entry.published;
     let rollback = entry.rollback.clone();
     let destination = entry.destination.clone();
-    // A crash can happen after destination -> rollback but before publication
-    // intent is persisted. A rollback path independently proves publication
-    // preparation began.
-    if (published || path_lexists(&rollback))
-      && path_lexists(&destination)
-    {
-      remove_path(&destination)?;
-    }
-    if path_lexists(&rollback) {
-      std::fs::rename(&rollback, &destination)?;
-      fsync_parent(&destination)?;
+    let rollback_exists = path_lexists(&rollback);
+    match entry.original_existed {
+      Some(true) => {
+        // If rollback still exists it is the authoritative original. If it no
+        // longer exists, destination is either the untouched original or the
+        // already-restored original from a crash after the durable rename.
+        if rollback_exists {
+          if path_lexists(&destination) {
+            remove_path(&destination)?;
+          }
+          std::fs::rename(&rollback, &destination)?;
+          fsync_parent(&destination)?;
+        }
+      }
+      Some(false) => {
+        if published && path_lexists(&destination) {
+          remove_path(&destination)?;
+          fsync_parent(&destination)?;
+        }
+      }
+      None => {
+        // A rollback path proves that a legacy entry had an original. Without
+        // it, `published = true` is ambiguous, so fail closed rather than risk
+        // deleting a restored original.
+        if rollback_exists {
+          if path_lexists(&destination) {
+            remove_path(&destination)?;
+          }
+          std::fs::rename(&rollback, &destination)?;
+          fsync_parent(&destination)?;
+        } else if published {
+          return Err(anyhow!(
+            "Legacy restore journal is ambiguous for destination {}",
+            destination.display()
+          ));
+        }
+      }
     }
     restore.entries[index].published = false;
     persist_journal(journal_path, restore)?;
@@ -1915,6 +1984,19 @@ mod tests {
   }
 
   #[test]
+  fn restore_destinations_resolve_symlinked_existing_ancestors() {
+    let root = tempfile::tempdir().unwrap();
+    let real = root.path().join("real");
+    let alias = root.path().join("alias");
+    std::fs::create_dir(&real).unwrap();
+    std::os::unix::fs::symlink(&real, &alias).unwrap();
+    assert_eq!(
+      resolve_existing_ancestor(&alias.join("new/child")).unwrap(),
+      real.canonicalize().unwrap().join("new/child")
+    );
+  }
+
+  #[test]
   fn selected_volume_destinations_use_the_inspected_mountpoint() {
     let mut publish = vec![RestorePublishPath {
       snapshot_path: "source/_data/config/app.toml".into(),
@@ -2050,6 +2132,30 @@ mod tests {
       b"original"
     );
     assert!(!first.join("new.txt").exists());
+  }
+
+  #[test]
+  fn repeated_recovery_preserves_an_already_restored_original() {
+    let root = tempfile::tempdir().unwrap();
+    let destination = root.path().join("destination");
+    std::fs::write(&destination, b"original").unwrap();
+    let journal_path = root.path().join("journal.json");
+    let mut journal = RestoreJournal {
+      staging: root.path().join("staging"),
+      entries: vec![RestoreJournalEntry {
+        source: root.path().join("source"),
+        destination: destination.clone(),
+        rollback: root.path().join("rollback"),
+        original_existed: Some(true),
+        // Simulate a crash after rollback -> destination was synced but before
+        // this flag was durably cleared.
+        published: true,
+      }],
+      committed: false,
+    };
+    rollback_published(&mut journal, &journal_path).unwrap();
+    assert_eq!(std::fs::read(destination).unwrap(), b"original");
+    assert!(!journal.entries[0].published);
   }
 
   #[test]

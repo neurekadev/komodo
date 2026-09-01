@@ -116,15 +116,24 @@ pub async fn init_db_client() {
           .context("Failed to read Core recovery activation record");
       }
     };
-    if let Some(name) = activation.or_else(|| {
-      read_persistent_file(
+    let active_database = match activation {
+      Some(name) => Some(name),
+      None => match read_persistent_file(
         ACTIVE_DATABASE_POINTER,
         LEGACY_ACTIVE_DATABASE_POINTER,
-      )
-      .ok()
-      .flatten()
-      .and_then(|bytes| String::from_utf8(bytes).ok())
-    }) {
+      ) {
+        Ok(Some(bytes)) => Some(String::from_utf8(bytes).context(
+          "Active database recovery pointer is not UTF-8",
+        )?),
+        Ok(None) => None,
+        Err(error) => {
+          return Err(error).context(
+            "Failed to read active database recovery pointer",
+          );
+        }
+      },
+    };
+    if let Some(name) = active_database {
       let name = name.trim();
       if !name.is_empty()
         && name.chars().all(|character| {

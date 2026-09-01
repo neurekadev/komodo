@@ -71,6 +71,11 @@ const PLANS_COLLECTION: &str = "BackupRestorePlan";
 const CORE_RECOVERY_COLLECTION: &str = "CoreRecoveryPlan";
 const HEALTH_COLLECTION: &str = "BackupRepositoryHealth";
 const CORE_STAGING_PATH: &str = "/data/backups/.komodo-core-staging";
+const CORE_CACHE_PATH: &str = "/data/backups/.komodo-vykar-cache";
+const CORE_RECOVERY_STAGING_PATH: &str =
+  "/data/backups/.komodo-core-recovery";
+const STACK_MANIFEST_STAGING_PATH: &str =
+  "/data/backups/.komodo-stack-manifest";
 const CORE_INSTANCE_ID_PATH: &str = "/data/keys/backup-instance-id";
 const LEGACY_CORE_INSTANCE_ID_PATH: &str =
   "/config/keys/backup-instance-id";
@@ -206,6 +211,13 @@ pub async fn save_settings(
 async fn save_settings_after_promotion(
   proposed: BackupSettings,
 ) -> anyhow::Result<BackupSettings> {
+  // Health is keyed by role, not repository identity. Invalidate both roles
+  // before the swap so any later failure leaves maintenance in the safe
+  // full-verification-required state rather than assigning stale health to the
+  // opposite repository.
+  health_collection()
+    .delete_many(doc! { "_id": { "$in": ["primary", "mirror"] } })
+    .await?;
   save_settings_inner(proposed, true).await
 }
 
@@ -354,6 +366,26 @@ fn validate_repository_definition(
           "Core-local repository path must be absolute"
         ));
       }
+      let normalized = normalize_core_local_path(path);
+      let resolved = normalized
+        .canonicalize()
+        .unwrap_or_else(|_| normalized.clone());
+      if [
+        CORE_STAGING_PATH,
+        CORE_CACHE_PATH,
+        CORE_RECOVERY_STAGING_PATH,
+        STACK_MANIFEST_STAGING_PATH,
+      ]
+      .iter()
+      .any(|reserved| {
+        let reserved = Path::new(*reserved);
+        normalized.starts_with(reserved)
+          || resolved.starts_with(reserved)
+      }) {
+        return Err(anyhow!(
+          "Core-local repository path is reserved for internal backup staging or cache data"
+        ));
+      }
     }
     BackupRepositoryBackend::S3 { url, region, .. } => {
       if url.trim().is_empty() || region.trim().is_empty() {
@@ -392,16 +424,7 @@ fn validate_repository_definition(
 fn repository_location(repository: &BackupRepository) -> String {
   match &repository.backend {
     BackupRepositoryBackend::CoreLocal { path } => {
-      let mut normalized = PathBuf::new();
-      for component in Path::new(path.trim()).components() {
-        match component {
-          std::path::Component::CurDir => {}
-          std::path::Component::ParentDir => {
-            normalized.pop();
-          }
-          component => normalized.push(component.as_os_str()),
-        }
-      }
+      let normalized = normalize_core_local_path(path);
       format!("core-local:{}", normalized.to_string_lossy())
     }
     BackupRepositoryBackend::S3 { url, .. } => {
@@ -414,6 +437,20 @@ fn repository_location(repository: &BackupRepository) -> String {
       format!("rest:{}", normalize_repository_url(url))
     }
   }
+}
+
+fn normalize_core_local_path(path: &str) -> PathBuf {
+  let mut normalized = PathBuf::new();
+  for component in Path::new(path.trim()).components() {
+    match component {
+      std::path::Component::CurDir => {}
+      std::path::Component::ParentDir => {
+        normalized.pop();
+      }
+      component => normalized.push(component.as_os_str()),
+    }
+  }
+  normalized
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -682,7 +719,7 @@ fn persist_core_recovery_activation(
 }
 
 fn core_cache_dir() -> anyhow::Result<PathBuf> {
-  let directory = PathBuf::from("/data/backups/.komodo-vykar-cache");
+  let directory = PathBuf::from(CORE_CACHE_PATH);
   std::fs::create_dir_all(&directory)?;
   Ok(directory)
 }
@@ -820,6 +857,8 @@ async fn finish_run(
 }
 
 pub async fn status() -> anyhow::Result<BackupStatus> {
+  let _repository_roles =
+    repository_role_barrier().clone().read_owned().await;
   let recent_runs = find_collect(
     &runs_collection(),
     None,
@@ -1250,10 +1289,10 @@ async fn run_maintenance(
         };
         retention.insert(snapshot.source_label, keep);
       }
-      let pruned = vykar.prune_complete_snapshots(&retention)?;
-      if pruned.snapshots_deleted == 0 {
-        return Ok(());
-      }
+      vykar.prune_complete_snapshots(&retention)?;
+      // Retry reconciliation can delete partial/superseded snapshots before
+      // retention runs. Always give threshold-based compaction a chance to
+      // reclaim those dead packs even when retention deleted nothing new.
       let max_repack = match repository.backend {
         BackupRepositoryBackend::S3 { .. }
         | BackupRepositoryBackend::Sftp { .. } => {
@@ -2420,7 +2459,7 @@ async fn snapshot_stack_source(
     .find(|path| is_backup_manifest_source(path))
     .context("Stack snapshot has no embedded recovery manifest")?
     .clone();
-  let staging = PathBuf::from("/data/backups/.komodo-stack-manifest")
+  let staging = PathBuf::from(STACK_MANIFEST_STAGING_PATH)
     .join(Uuid::new_v4().to_string());
   tokio::fs::create_dir_all(&staging).await?;
   let _staging_cleanup = RemoveDirectoryOnDrop::new(staging.clone());
@@ -3223,7 +3262,7 @@ pub async fn plan_core_recovery(
 
   let settings = get_settings().await?;
   let repository = settings.primary.clone();
-  let staging = PathBuf::from("/data/backups/.komodo-core-recovery")
+  let staging = PathBuf::from(CORE_RECOVERY_STAGING_PATH)
     .join(Uuid::new_v4().to_string());
   tokio::fs::create_dir_all(&staging).await?;
   let _staging_cleanup = RemoveDirectoryOnDrop::new(staging.clone());
@@ -3879,6 +3918,26 @@ mod tests {
       repository_location(&rest("https://backup.example/repo")),
       repository_location(&rest("https://backup.example/repo/"))
     );
+  }
+
+  #[test]
+  fn core_local_repositories_reject_internal_work_directories() {
+    for path in [
+      CORE_STAGING_PATH,
+      CORE_CACHE_PATH,
+      CORE_RECOVERY_STAGING_PATH,
+      STACK_MANIFEST_STAGING_PATH,
+      "/data/backups/.komodo-core-staging/repository",
+    ] {
+      let repository = BackupRepository {
+        name: "reserved".into(),
+        backend: BackupRepositoryBackend::CoreLocal {
+          path: path.into(),
+        },
+        ..Default::default()
+      };
+      assert!(validate_repository_definition(&repository).is_err());
+    }
   }
 
   #[test]

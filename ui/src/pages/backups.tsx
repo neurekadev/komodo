@@ -401,7 +401,7 @@ function BackupSettingsForm({
                     name: "mirror",
                     backend: {
                       type: "CoreLocal",
-                      params: { path: "/backups/vykar-mirror" },
+                      params: { path: "/data/backups/vykar-mirror" },
                     },
                     passphrase: {},
                   }
