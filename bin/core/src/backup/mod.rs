@@ -4,12 +4,12 @@ use std::{
   io::Write,
   os::unix::fs::OpenOptionsExt,
   path::{Path, PathBuf},
-  sync::{Arc, OnceLock, RwLock},
+  sync::{Arc, Mutex, OnceLock, RwLock},
 };
 
 use anyhow::{Context, anyhow};
 use database::{
-  bson::{doc, to_document},
+  bson::{doc, to_bson, to_document},
   mungos::{
     find::find_collect,
     mongodb::{
@@ -52,7 +52,7 @@ use crate::{
   helpers::periphery_client,
   permission::get_check_permissions,
   resource::{self, KomodoResource},
-  state::db_client,
+  state::{CORE_RECOVERY_ACTIVATION_PATH, db_client},
 };
 
 mod crypto;
@@ -202,6 +202,7 @@ pub async fn save_settings(
     .with_options(UpdateOptions::builder().upsert(true).build())
     .await
     .context("Failed to persist sealed backup settings")?;
+  notify_scheduler();
   let mut redacted = proposed;
   redacted.redact();
   Ok(redacted)
@@ -314,15 +315,58 @@ fn validate_repository_definition(
 fn repository_location(repository: &BackupRepository) -> String {
   match &repository.backend {
     BackupRepositoryBackend::CoreLocal { path } => {
-      format!("core-local:{path}")
+      let mut normalized = PathBuf::new();
+      for component in Path::new(path.trim()).components() {
+        match component {
+          std::path::Component::CurDir => {}
+          std::path::Component::ParentDir => {
+            normalized.pop();
+          }
+          component => normalized.push(component.as_os_str()),
+        }
+      }
+      format!("core-local:{}", normalized.to_string_lossy())
     }
-    BackupRepositoryBackend::S3 { url, .. } => format!("s3:{url}"),
+    BackupRepositoryBackend::S3 { url, .. } => {
+      format!("s3:{}", normalize_repository_url(url))
+    }
     BackupRepositoryBackend::Sftp { url, .. } => {
-      format!("sftp:{url}")
+      format!("sftp:{}", normalize_repository_url(url))
     }
     BackupRepositoryBackend::Rest { url, .. } => {
-      format!("rest:{url}")
+      format!("rest:{}", normalize_repository_url(url))
     }
+  }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CoreRecoveryActivation {
+  database: String,
+  core_instance_id: String,
+}
+
+fn is_backup_manifest_source(path: &str) -> bool {
+  Path::new(path)
+    .file_name()
+    .and_then(|name| name.to_str())
+    .and_then(|name| name.strip_prefix("komodo-backup-manifest-"))
+    .is_some_and(|suffix| {
+      suffix.len() == 6
+        && suffix
+          .chars()
+          .all(|character| character.is_ascii_alphanumeric())
+    })
+}
+
+fn normalize_repository_url(value: &str) -> String {
+  let value = value.trim();
+  if let Ok(mut url) = url::Url::parse(value) {
+    let normalized_path =
+      url.path().trim_end_matches('/').to_string();
+    url.set_path(&normalized_path);
+    url.to_string().trim_end_matches('/').to_string()
+  } else {
+    value.trim_end_matches('/').to_string()
   }
 }
 
@@ -422,6 +466,29 @@ fn core_instance_id() -> anyhow::Result<&'static str> {
 }
 
 fn load_or_create_core_instance_id() -> anyhow::Result<String> {
+  match std::fs::read(CORE_RECOVERY_ACTIVATION_PATH) {
+    Ok(bytes) => {
+      let activation: CoreRecoveryActivation =
+        serde_json::from_slice(&bytes)
+          .context("Invalid Core recovery activation record")?;
+      if activation.core_instance_id.len() != 32
+        || !activation
+          .core_instance_id
+          .chars()
+          .all(|character| character.is_ascii_hexdigit())
+      {
+        return Err(anyhow!(
+          "Invalid recovered Core backup identity"
+        ));
+      }
+      return Ok(activation.core_instance_id);
+    }
+    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+    Err(error) => {
+      return Err(error)
+        .context("Failed to read Core recovery activation record");
+    }
+  }
   let path = Path::new(CORE_INSTANCE_ID_PATH);
   if let Ok(id) = std::fs::read_to_string(path) {
     let id = id.trim();
@@ -466,19 +533,30 @@ fn load_or_create_core_instance_id() -> anyhow::Result<String> {
   }
 }
 
-fn persist_core_instance_id(id: &str) -> anyhow::Result<()> {
+fn persist_core_recovery_activation(
+  database: &str,
+  id: &str,
+) -> anyhow::Result<()> {
   if id.len() != 32
     || !id.chars().all(|character| character.is_ascii_hexdigit())
   {
     return Err(anyhow!("Recovered Core backup identity is invalid"));
   }
-  let destination = Path::new(CORE_INSTANCE_ID_PATH);
+  if database.is_empty()
+    || !database.chars().all(|character| {
+      character.is_ascii_alphanumeric()
+        || matches!(character, '_' | '-')
+    })
+  {
+    return Err(anyhow!("Unsafe active database name"));
+  }
+  let destination = Path::new(CORE_RECOVERY_ACTIVATION_PATH);
   let parent = destination
     .parent()
     .context("Core backup identity path has no parent")?;
   std::fs::create_dir_all(parent)?;
   let temporary = parent.join(format!(
-    ".backup-instance-id-{}.tmp",
+    ".backup-recovery-activation-{}.tmp",
     Uuid::new_v4().simple()
   ));
   let mut file = OpenOptions::new()
@@ -486,7 +564,10 @@ fn persist_core_instance_id(id: &str) -> anyhow::Result<()> {
     .write(true)
     .mode(0o600)
     .open(&temporary)?;
-  file.write_all(id.as_bytes())?;
+  file.write_all(&serde_json::to_vec(&CoreRecoveryActivation {
+    database: database.to_string(),
+    core_instance_id: id.to_string(),
+  })?)?;
   file.sync_all()?;
   std::fs::rename(temporary, destination)?;
   std::fs::File::open(parent)?.sync_all()?;
@@ -559,19 +640,32 @@ pub async fn initialize_repositories() -> anyhow::Result<BackupRun> {
     repository_role_barrier().clone().read_owned().await;
   let settings = get_settings().await?;
   let run = new_run(None, "Initializing repositories").await?;
-  for repository in
-    std::iter::once(&settings.primary).chain(settings.mirror.iter())
-  {
-    let repository = repository.clone();
-    let settings = settings.clone();
-    tokio::task::spawn_blocking(move || {
-      core_repository(&repository, &settings)?.init()
-    })
-    .await
-    .context("Vykar initialization worker failed")??;
+  let result = async {
+    for repository in
+      std::iter::once(&settings.primary).chain(settings.mirror.iter())
+    {
+      let repository = repository.clone();
+      let settings = settings.clone();
+      tokio::task::spawn_blocking(move || {
+        core_repository(&repository, &settings)?.init()
+      })
+      .await
+      .context("Vykar initialization worker failed")??;
+    }
+    anyhow::Ok(())
   }
-  finish_run(run, BackupRunState::Complete, "Repositories ready")
-    .await
+  .await;
+  match result {
+    Ok(()) => {
+      finish_run(run, BackupRunState::Complete, "Repositories ready")
+        .await
+    }
+    Err(error) => {
+      let message = format!("{error:#}");
+      let _ = finish_run(run, BackupRunState::Failed, message).await;
+      Err(error)
+    }
+  }
 }
 
 async fn new_run(
@@ -598,12 +692,23 @@ async fn finish_run(
   run.state = state;
   run.message = message.into();
   run.finished_at = komodo_timestamp();
-  runs_collection()
-    .update_one(
-      doc! { "id": &run.id },
-      doc! { "$set": to_document(&run)? },
-    )
+  let filter = if state == BackupRunState::Cancelled {
+    doc! { "id": &run.id }
+  } else {
+    doc! {
+      "id": &run.id,
+      "state": { "$ne": to_bson(&BackupRunState::Cancelled)? },
+    }
+  };
+  let updated = runs_collection()
+    .update_one(filter, doc! { "$set": to_document(&run)? })
     .await?;
+  if updated.matched_count == 0 {
+    return runs_collection()
+      .find_one(doc! { "id": &run.id })
+      .await?
+      .context("Backup run disappeared while finishing");
+  }
   Ok(run)
 }
 
@@ -1061,10 +1166,18 @@ async fn run_fleet(
     let run = run.clone();
     batches.push(async move {
       let _permit = semaphore.acquire_owned().await?;
-      let targets =
-        refresh_node_targets(&settings, &server_id, targets).await?;
-      let result =
-        run_node_batch(&settings, &run, &server_id, &targets).await;
+      let refreshed =
+        refresh_node_targets(&settings, &server_id, targets.clone())
+          .await;
+      let (targets, result) = match refreshed {
+        Ok(targets) => {
+          let result =
+            run_node_batch(&settings, &run, &server_id, &targets)
+              .await;
+          (targets, result)
+        }
+        Err(error) => (targets, Err(error)),
+      };
       anyhow::Ok((server_id, targets, result))
     });
   }
@@ -1167,12 +1280,22 @@ fn spawn_core_retry(settings: BackupSettings, run: BackupRun) {
     let mut retry = 0_u32;
     loop {
       if *fleet_generation().read().unwrap() != run.id {
+        let retry =
+          { core_mirror_retries().lock().unwrap().remove(&run.id) };
+        if let Some(retry) = retry {
+          let _ = tokio::fs::remove_dir_all(retry.staging).await;
+        }
         return;
       }
       let seconds = 2_u64.saturating_pow(retry.min(8)).min(300);
       tokio::time::sleep(std::time::Duration::from_secs(seconds))
         .await;
       if *fleet_generation().read().unwrap() != run.id {
+        let retry =
+          { core_mirror_retries().lock().unwrap().remove(&run.id) };
+        if let Some(retry) = retry {
+          let _ = tokio::fs::remove_dir_all(retry.staging).await;
+        }
         return;
       }
       retry = retry.saturating_add(1);
@@ -1356,10 +1479,58 @@ async fn run_target(
   }
 }
 
+#[derive(Clone)]
+struct CoreMirrorRetry {
+  snapshot_name: String,
+  source_label: String,
+  source_path: String,
+  staging: PathBuf,
+}
+
+fn core_mirror_retries()
+-> &'static Mutex<HashMap<String, CoreMirrorRetry>> {
+  static RETRIES: OnceLock<Mutex<HashMap<String, CoreMirrorRetry>>> =
+    OnceLock::new();
+  RETRIES.get_or_init(Default::default)
+}
+
+async fn retry_core_mirror(
+  settings: &BackupSettings,
+  run: &BackupRun,
+  retry: CoreMirrorRetry,
+) -> anyhow::Result<bool> {
+  let mirror = settings
+    .mirror
+    .clone()
+    .context("Mirror is no longer configured")?;
+  let settings_for_worker = settings.clone();
+  let retry_for_worker = retry.clone();
+  let result = tokio::task::spawn_blocking(move || {
+    core_repository(&mirror, &settings_for_worker)?.backup(
+      &retry_for_worker.snapshot_name,
+      &retry_for_worker.source_label,
+      std::slice::from_ref(&retry_for_worker.source_path),
+    )
+  })
+  .await
+  .context("Core mirror retry worker failed")??;
+  if result.partial {
+    return Ok(true);
+  }
+  core_mirror_retries().lock().unwrap().remove(&run.id);
+  let _ = tokio::fs::remove_dir_all(&retry.staging).await;
+  Ok(false)
+}
+
 async fn backup_core(
   settings: &BackupSettings,
   run: &BackupRun,
 ) -> anyhow::Result<bool> {
+  let mirror_retry =
+    core_mirror_retries().lock().unwrap().get(&run.id).cloned();
+  if let Some(retry) = mirror_retry {
+    return retry_core_mirror(settings, run, retry).await;
+  }
   let staging =
     PathBuf::from("/backups/.komodo-core-staging").join(&run.id);
   let _ = tokio::fs::remove_dir_all(&staging).await;
@@ -1396,26 +1567,116 @@ async fn backup_core(
   .await?;
   let primary = settings.primary.clone();
   let mirror = settings.mirror.clone();
-  let settings = settings.clone();
+  let settings_for_worker = settings.clone();
   let label = BackupTarget::Core.source_label(core_instance_id()?);
   let name = snapshot_name("core");
   let path = staging.to_string_lossy().into_owned();
-  let result =
-    tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
-      let primary_result = core_repository(&primary, &settings)?
-        .backup(&name, &label, std::slice::from_ref(&path))?;
-      let mut partial = primary_result.partial;
-      if let Some(mirror) = mirror {
-        partial |= core_repository(&mirror, &settings)?
-          .backup(&name, &label, std::slice::from_ref(&path))?
-          .partial;
+  let primary_name = name.clone();
+  let primary_label = label.clone();
+  let primary_path = path.clone();
+  let primary_result = tokio::task::spawn_blocking(move || {
+    core_repository(&primary, &settings_for_worker)?.backup(
+      &primary_name,
+      &primary_label,
+      std::slice::from_ref(&primary_path),
+    )
+  })
+  .await
+  .context("Core primary backup worker failed");
+  let primary_result = match primary_result {
+    Ok(Ok(result)) => result,
+    Ok(Err(error)) => {
+      let _ = tokio::fs::remove_dir_all(&staging).await;
+      return Err(error);
+    }
+    Err(error) => {
+      let _ = tokio::fs::remove_dir_all(&staging).await;
+      return Err(error);
+    }
+  };
+  let Some(mirror) = mirror else {
+    let _ = tokio::fs::remove_dir_all(&staging).await;
+    return Ok(primary_result.partial);
+  };
+  let retry = CoreMirrorRetry {
+    snapshot_name: name,
+    source_label: label,
+    source_path: path,
+    staging: staging.clone(),
+  };
+  let mirror_settings = settings.clone();
+  let mirror_retry = retry.clone();
+  let mirror_result = tokio::task::spawn_blocking(move || {
+    core_repository(&mirror, &mirror_settings)?.backup(
+      &mirror_retry.snapshot_name,
+      &mirror_retry.source_label,
+      std::slice::from_ref(&mirror_retry.source_path),
+    )
+  })
+  .await
+  .context("Core mirror backup worker failed");
+  match mirror_result {
+    Ok(Ok(result))
+      if result.partial
+        && !primary_result.partial
+        && *fleet_generation().read().unwrap() == run.id =>
+    {
+      core_mirror_retries()
+        .lock()
+        .unwrap()
+        .insert(run.id.clone(), retry);
+      warn!(
+        "Core primary snapshot committed but mirror was partial; retrying only the mirror"
+      );
+      Ok(true)
+    }
+    Ok(Ok(result)) => {
+      let _ = tokio::fs::remove_dir_all(&staging).await;
+      Ok(primary_result.partial || result.partial)
+    }
+    Ok(Err(error)) if !primary_result.partial => {
+      if *fleet_generation().read().unwrap() == run.id {
+        core_mirror_retries()
+          .lock()
+          .unwrap()
+          .insert(run.id.clone(), retry);
+        warn!(
+          "Core primary snapshot committed but mirror failed; retrying only the mirror: {error:#}"
+        );
+        Ok(true)
+      } else {
+        let _ = tokio::fs::remove_dir_all(&staging).await;
+        Err(error.context(
+          "Core primary snapshot committed but mirror backup failed",
+        ))
       }
-      Ok(partial)
-    })
-    .await
-    .context("Core backup worker failed")??;
-  let _ = tokio::fs::remove_dir_all(staging).await;
-  Ok(result)
+    }
+    Err(error) if !primary_result.partial => {
+      if *fleet_generation().read().unwrap() == run.id {
+        core_mirror_retries()
+          .lock()
+          .unwrap()
+          .insert(run.id.clone(), retry);
+        warn!(
+          "Core primary snapshot committed but mirror worker failed; retrying only the mirror: {error:#}"
+        );
+        Ok(true)
+      } else {
+        let _ = tokio::fs::remove_dir_all(&staging).await;
+        Err(error.context(
+          "Core primary snapshot committed but mirror worker failed",
+        ))
+      }
+    }
+    Ok(Err(error)) => {
+      let _ = tokio::fs::remove_dir_all(&staging).await;
+      Err(error)
+    }
+    Err(error) => {
+      let _ = tokio::fs::remove_dir_all(&staging).await;
+      Err(error)
+    }
+  }
 }
 
 async fn backup_stack(
@@ -1672,7 +1933,7 @@ pub async fn plan_restore(
       let source_paths = snapshot
         .source_paths
         .iter()
-        .filter(|path| !path.contains("komodo-backup-manifest-"))
+        .filter(|path| !is_backup_manifest_source(path))
         .cloned()
         .collect::<Vec<_>>();
       if source_paths.is_empty() {
@@ -1730,7 +1991,7 @@ pub async fn plan_restore(
       let source_path = snapshot
         .source_paths
         .iter()
-        .find(|path| !path.contains("komodo-backup-manifest-"))
+        .find(|path| !is_backup_manifest_source(path))
         .context("Snapshot does not contain a volume source path")?;
       publish.push(
         periphery_client::api::backup::RestorePublishPath {
@@ -2108,10 +2369,46 @@ pub async fn restore_plan(
     .context("Restore plan does not exist")
 }
 
+struct RemoveDirectoryOnDrop(PathBuf);
+
+impl Drop for RemoveDirectoryOnDrop {
+  fn drop(&mut self) {
+    let _ = std::fs::remove_dir_all(&self.0);
+  }
+}
+
+async fn cleanup_expired_core_recovery_plans() -> anyhow::Result<()> {
+  let expired = find_collect(
+    &core_recovery_collection(),
+    doc! { "plan.expires_at": { "$lt": komodo_timestamp() } },
+    None,
+  )
+  .await?;
+  for stored in expired {
+    db_client()
+      .db
+      .client()
+      .database(&stored.plan.validation_database)
+      .drop()
+      .await
+      .with_context(|| {
+        format!(
+          "Failed to drop expired Core recovery database '{}'",
+          stored.plan.validation_database
+        )
+      })?;
+    core_recovery_collection()
+      .delete_one(doc! { "_id": &stored.id })
+      .await?;
+  }
+  Ok(())
+}
+
 pub async fn plan_core_recovery(
   snapshot_name: &str,
   created_by: String,
 ) -> anyhow::Result<CoreRecoveryPlan> {
+  cleanup_expired_core_recovery_plans().await?;
   let _repository_roles =
     repository_role_barrier().clone().read_owned().await;
   let snapshot = list_snapshots()
@@ -2136,6 +2433,7 @@ pub async fn plan_core_recovery(
   let staging = PathBuf::from("/backups/.komodo-core-recovery")
     .join(Uuid::new_v4().to_string());
   tokio::fs::create_dir_all(&staging).await?;
+  let _staging_cleanup = RemoveDirectoryOnDrop(staging.clone());
   let worker_staging = staging.clone();
   let snapshot_for_worker = snapshot.name.clone();
   let settings_for_worker = settings.clone();
@@ -2202,62 +2500,67 @@ pub async fn plan_core_recovery(
   );
   let validation =
     db_client().db.client().database(&validation_database);
-  database::utils::restore(
-    &validation,
-    &backup_root,
-    Some(Path::new(&restore_folder)),
-  )
-  .await
-  .context("Failed to restore the Core validation database")?;
-  // Repository credentials are deliberately excluded from Core snapshots.
-  // Carry forward the freshly configured, locally sealed repository settings
-  // so recovery can still access its primary after the database switch.
-  if let Some(active_settings) = settings_collection()
-    .find_one(doc! { "_id": SETTINGS_ID })
-    .await?
-  {
-    validation
-      .collection::<SealedBackupSettings>(SETTINGS_COLLECTION)
-      .update_one(
-        doc! { "_id": SETTINGS_ID },
-        doc! { "$set": to_document(&active_settings)? },
-      )
-      .with_options(UpdateOptions::builder().upsert(true).build())
-      .await
-      .context(
-        "Failed to carry active repository settings into recovery database",
-      )?;
-  }
-  let enabled_admins = validation
-    .collection::<komodo_client::entities::user::User>("User")
-    .count_documents(doc! { "enabled": true, "admin": true })
-    .await?;
-  if enabled_admins == 0 {
-    validation.drop().await.ok();
-    return Err(anyhow!(
-      "Recovered Core database has no enabled administrator; activation blocked"
-    ));
-  }
+  let result = async {
+    database::utils::restore(
+      &validation,
+      &backup_root,
+      Some(Path::new(&restore_folder)),
+    )
+    .await
+    .context("Failed to restore the Core validation database")?;
+    // Repository credentials are deliberately excluded from Core snapshots.
+    // Carry forward the freshly configured, locally sealed repository settings
+    // so recovery can still access its primary after the database switch.
+    if let Some(active_settings) = settings_collection()
+      .find_one(doc! { "_id": SETTINGS_ID })
+      .await?
+    {
+      validation
+        .collection::<SealedBackupSettings>(SETTINGS_COLLECTION)
+        .update_one(
+          doc! { "_id": SETTINGS_ID },
+          doc! { "$set": to_document(&active_settings)? },
+        )
+        .with_options(UpdateOptions::builder().upsert(true).build())
+        .await
+        .context(
+          "Failed to carry active repository settings into recovery database",
+        )?;
+    }
+    let enabled_admins = validation
+      .collection::<komodo_client::entities::user::User>("User")
+      .count_documents(doc! { "enabled": true, "admin": true })
+      .await?;
+    if enabled_admins == 0 {
+      return Err(anyhow!(
+        "Recovered Core database has no enabled administrator; activation blocked"
+      ));
+    }
 
-  let plan = CoreRecoveryPlan {
-    id: Uuid::new_v4().to_string(),
-    snapshot: snapshot.name,
-    current_database,
-    validation_database,
-    backup_schema,
-    backup_version,
-    expires_at: komodo_timestamp() + 30 * 60 * 1000,
-  };
-  core_recovery_collection()
-    .insert_one(StoredCoreRecoveryPlan {
-      id: plan.id.clone(),
-      created_by,
-      recovered_core_instance_id,
-      plan: plan.clone(),
-    })
-    .await?;
-  let _ = tokio::fs::remove_dir_all(staging).await;
-  Ok(plan)
+    let plan = CoreRecoveryPlan {
+      id: Uuid::new_v4().to_string(),
+      snapshot: snapshot.name,
+      current_database,
+      validation_database,
+      backup_schema,
+      backup_version,
+      expires_at: komodo_timestamp() + 30 * 60 * 1000,
+    };
+    core_recovery_collection()
+      .insert_one(StoredCoreRecoveryPlan {
+        id: plan.id.clone(),
+        created_by,
+        recovered_core_instance_id,
+        plan: plan.clone(),
+      })
+      .await?;
+    Ok(plan)
+  }
+  .await;
+  if result.is_err() {
+    validation.drop().await.ok();
+  }
+  result
 }
 
 pub async fn execute_core_recovery(
@@ -2265,12 +2568,19 @@ pub async fn execute_core_recovery(
   user_id: &str,
 ) -> anyhow::Result<BackupRun> {
   let stored = core_recovery_collection()
-    .find_one_and_delete(
-      doc! { "_id": plan_id, "created_by": user_id },
-    )
+    .find_one(doc! { "_id": plan_id, "created_by": user_id })
     .await?
     .context("Core recovery plan does not exist")?;
   if stored.plan.expires_at < komodo_timestamp() {
+    db_client()
+      .db
+      .client()
+      .database(&stored.plan.validation_database)
+      .drop()
+      .await?;
+    core_recovery_collection()
+      .delete_one(doc! { "_id": &stored.id })
+      .await?;
     return Err(anyhow!("Core recovery plan has expired"));
   }
   let validation = db_client()
@@ -2286,14 +2596,20 @@ pub async fn execute_core_recovery(
       "Validation database no longer has an enabled administrator"
     ));
   }
-  persist_core_instance_id(&stored.recovered_core_instance_id)?;
-  persist_active_database_pointer(&stored.plan.validation_database)?;
+  persist_core_recovery_activation(
+    &stored.plan.validation_database,
+    &stored.recovered_core_instance_id,
+  )?;
+  let delete_result = core_recovery_collection()
+    .delete_one(doc! { "_id": &stored.id })
+    .await;
   // Once the durable pointer is published, restart even if recording the
   // final audit result encounters a transient database error.
   tokio::spawn(async {
     tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
     std::process::exit(75);
   });
+  delete_result?;
   let run =
     new_run(Some(BackupTarget::Core), "Core recovery activating")
       .await?;
@@ -2307,37 +2623,6 @@ pub async fn execute_core_recovery(
   )
   .await?;
   Ok(run)
-}
-
-fn persist_active_database_pointer(
-  database: &str,
-) -> anyhow::Result<()> {
-  if database.is_empty()
-    || !database.chars().all(|character| {
-      character.is_ascii_alphanumeric()
-        || matches!(character, '_' | '-')
-    })
-  {
-    return Err(anyhow!("Unsafe active database name"));
-  }
-  let destination = Path::new(crate::state::ACTIVE_DATABASE_POINTER);
-  let parent = destination
-    .parent()
-    .context("Database pointer has no parent")?;
-  std::fs::create_dir_all(parent)?;
-  let temporary = parent.join(format!(
-    ".backup-active-database-{}.tmp",
-    Uuid::new_v4().simple()
-  ));
-  let mut file = std::fs::OpenOptions::new()
-    .create_new(true)
-    .write(true)
-    .open(&temporary)?;
-  file.write_all(database.as_bytes())?;
-  file.sync_all()?;
-  std::fs::rename(&temporary, destination)?;
-  std::fs::File::open(parent)?.sync_all()?;
-  Ok(())
 }
 
 fn find_file_named(root: &Path, name: &str) -> Option<PathBuf> {
@@ -2402,6 +2687,14 @@ pub async fn verify(
   let _repository_roles =
     repository_role_barrier().clone().read_owned().await;
   let settings = get_settings().await?;
+  verify_repository(settings, mirror, full).await
+}
+
+async fn verify_repository(
+  settings: BackupSettings,
+  mirror: bool,
+  full: bool,
+) -> anyhow::Result<BackupRun> {
   let repository = if mirror {
     settings
       .mirror
@@ -2411,53 +2704,71 @@ pub async fn verify(
     settings.primary.clone()
   };
   let run = new_run(None, "Repository verification running").await?;
-  let settings_for_worker = settings.clone();
-  let result = tokio::task::spawn_blocking(move || {
-    core_repository(&repository, &settings_for_worker)?.verify(
-      full,
-      settings_for_worker.advanced.verify_sample_percent,
-    )
-  })
-  .await
-  .context("Vykar verification worker failed")??;
-  if result.errors.is_empty() {
-    if full {
-      let id = if mirror { "mirror" } else { "primary" };
-      let now = komodo_timestamp();
-      health_collection()
-        .update_one(
-          doc! { "_id": id },
-          doc! { "$set": {
-            "healthy": true,
-            "checked_at": now,
-            "last_full_verification_at": now,
-          } },
-        )
-        .with_options(UpdateOptions::builder().upsert(true).build())
-        .await?;
-    }
-    finish_run(run, BackupRunState::Complete, "Repository verified")
-      .await
-  } else {
-    finish_run(
-      run,
-      BackupRunState::Failed,
-      format!("Integrity errors: {}", result.errors.join("; ")),
-    )
+  let operation = async {
+    let settings_for_worker = settings.clone();
+    let result = tokio::task::spawn_blocking(move || {
+      core_repository(&repository, &settings_for_worker)?.verify(
+        full,
+        settings_for_worker.advanced.verify_sample_percent,
+      )
+    })
     .await
+    .context("Vykar verification worker failed")??;
+    if result.errors.is_empty() {
+      if full {
+        let id = if mirror { "mirror" } else { "primary" };
+        let now = komodo_timestamp();
+        health_collection()
+          .update_one(
+            doc! { "_id": id },
+            doc! { "$set": {
+              "healthy": true,
+              "checked_at": now,
+              "last_full_verification_at": now,
+            } },
+          )
+          .with_options(UpdateOptions::builder().upsert(true).build())
+          .await?;
+      }
+      finish_run(
+        run.clone(),
+        BackupRunState::Complete,
+        "Repository verified",
+      )
+      .await
+    } else {
+      finish_run(
+        run.clone(),
+        BackupRunState::Failed,
+        format!("Integrity errors: {}", result.errors.join("; ")),
+      )
+      .await
+    }
+  }
+  .await;
+  match operation {
+    Ok(run) => Ok(run),
+    Err(error) => {
+      let message = format!("{error:#}");
+      let _ = finish_run(run, BackupRunState::Failed, message).await;
+      Err(error)
+    }
   }
 }
 
 pub async fn promote_mirror() -> anyhow::Result<BackupSettings> {
-  let verification = verify(true, true).await?;
+  // Keep the exclusive role barrier from the start of mandatory verification
+  // through the settings swap. No unverified mirror write can land in between.
+  let _repository_roles =
+    repository_role_barrier().clone().write_owned().await;
+  let mut settings = get_settings().await?;
+  let verification =
+    verify_repository(settings.clone(), true, true).await?;
   if verification.state != BackupRunState::Complete {
     return Err(anyhow!(
       "Mirror verification failed; promotion blocked"
     ));
   }
-  let _repository_roles =
-    repository_role_barrier().clone().write_owned().await;
-  let mut settings = get_settings().await?;
   let primary = settings.primary.clone();
   let mirror_for_inventory = settings
     .mirror
@@ -2514,6 +2825,11 @@ pub async fn cancel_run(run_id: &str) -> anyhow::Result<BackupRun> {
   if *fleet_generation().read().unwrap() == run_id {
     fleet_generation().write().unwrap().clear();
   }
+  let mirror_retry =
+    { core_mirror_retries().lock().unwrap().remove(run_id) };
+  if let Some(retry) = mirror_retry {
+    let _ = tokio::fs::remove_dir_all(retry.staging).await;
+  }
   let servers = find_collect(&db_client().servers, None, None)
     .await
     .unwrap_or_default();
@@ -2569,6 +2885,18 @@ fn next_run_cache() -> &'static RwLock<i64> {
   NEXT.get_or_init(Default::default)
 }
 
+fn scheduler_revision() -> &'static tokio::sync::watch::Sender<u64> {
+  static REVISION: OnceLock<tokio::sync::watch::Sender<u64>> =
+    OnceLock::new();
+  REVISION.get_or_init(|| tokio::sync::watch::channel(0).0)
+}
+
+fn notify_scheduler() {
+  scheduler_revision().send_modify(|revision| {
+    *revision = revision.wrapping_add(1);
+  });
+}
+
 fn compute_next_run(
   settings: &BackupSettings,
 ) -> anyhow::Result<i64> {
@@ -2606,33 +2934,73 @@ pub fn spawn_scheduler() {
   let _ = maintenance_sender();
   tokio::spawn(async {
     loop {
+      if let Err(error) = cleanup_expired_core_recovery_plans().await
+      {
+        error!(
+          "Failed to clean expired Core recovery plans: {error:#}"
+        );
+      }
+      tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+    }
+  });
+  tokio::spawn(async {
+    let mut revision = scheduler_revision().subscribe();
+    loop {
       let settings = match get_settings().await {
         Ok(settings) => settings,
         Err(error) => {
           error!("Failed to load backup schedule: {error:#}");
-          tokio::time::sleep(std::time::Duration::from_secs(60))
-            .await;
+          tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {}
+            _ = revision.changed() => {}
+          }
           continue;
         }
       };
       if !settings.enabled {
         *next_run_cache().write().unwrap() = 0;
-        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        tokio::select! {
+          _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
+          _ = revision.changed() => {}
+        }
         continue;
       }
       let next = match compute_next_run(&settings) {
         Ok(next) => next,
         Err(error) => {
           error!("Invalid backup schedule: {error:#}");
-          tokio::time::sleep(std::time::Duration::from_secs(60))
-            .await;
+          tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {}
+            _ = revision.changed() => {}
+          }
           continue;
         }
       };
       *next_run_cache().write().unwrap() = next;
       let delay = (next - komodo_timestamp()).max(0) as u64;
-      tokio::time::sleep(std::time::Duration::from_millis(delay))
-        .await;
+      tokio::select! {
+        _ = tokio::time::sleep(std::time::Duration::from_millis(delay)) => {}
+        _ = revision.changed() => continue,
+      }
+      let current = match get_settings().await {
+        Ok(current)
+          if current.enabled
+            && current.updated_at == settings.updated_at =>
+        {
+          current
+        }
+        Ok(_) => continue,
+        Err(error) => {
+          error!(
+            "Failed to reload backup schedule before run: {error:#}"
+          );
+          continue;
+        }
+      };
+      // The reloaded settings check above prevents a stale timer from running
+      // after disable or reschedule. `current` is intentionally kept alive so
+      // this validation cannot be optimized into the earlier snapshot.
+      drop(current);
       if let Err(error) = run_backup(None).await {
         error!("Scheduled fleet backup failed: {error:#}");
       }
@@ -2653,6 +3021,33 @@ mod tests {
     };
     preserve_secret(&mut proposed, &existing);
     assert_eq!(proposed.value, "sealed-plaintext");
+  }
+
+  #[test]
+  fn repository_locations_normalize_equivalent_paths_and_urls() {
+    let local = |path: &str| BackupRepository {
+      backend: BackupRepositoryBackend::CoreLocal {
+        path: path.into(),
+      },
+      ..Default::default()
+    };
+    assert_eq!(
+      repository_location(&local("/backups/repo")),
+      repository_location(&local("/backups/./repo/"))
+    );
+
+    let rest = |url: &str| BackupRepository {
+      backend: BackupRepositoryBackend::Rest {
+        url: url.into(),
+        access_token: Default::default(),
+        allow_insecure_http: false,
+      },
+      ..Default::default()
+    };
+    assert_eq!(
+      repository_location(&rest("https://backup.example/repo")),
+      repository_location(&rest("https://backup.example/repo/"))
+    );
   }
 
   #[test]
@@ -2690,5 +3085,18 @@ mod tests {
   fn core_export_excludes_sealed_repository_settings() {
     assert!(!core_export_includes_collection(SETTINGS_COLLECTION));
     assert!(core_export_includes_collection("Stack"));
+  }
+
+  #[test]
+  fn manifest_source_matching_requires_the_exact_tempdir_pattern() {
+    assert!(is_backup_manifest_source(
+      "/tmp/komodo-backup-manifest-aB12z9"
+    ));
+    assert!(!is_backup_manifest_source(
+      "/var/lib/docker/volumes/data-komodo-backup-manifest-aB12z9/_data"
+    ));
+    assert!(!is_backup_manifest_source(
+      "/tmp/komodo-backup-manifest-not-a-tempdir"
+    ));
   }
 }

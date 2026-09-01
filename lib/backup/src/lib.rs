@@ -215,16 +215,40 @@ impl VykarRepository {
     page: u64,
     limit: u64,
   ) -> anyhow::Result<SnapshotDirectoryPage> {
-    let (items, _) =
+    let (items, source_paths) =
       commands::list::list_snapshot_items_with_source_paths(
         &self.config,
         Some(&self.passphrase),
         snapshot_name,
       )?;
+    let manifest_roots = source_paths
+      .into_iter()
+      .filter(|path| {
+        Path::new(path)
+          .file_name()
+          .and_then(|name| name.to_str())
+          .and_then(|name| {
+            name.strip_prefix("komodo-backup-manifest-")
+          })
+          .is_some_and(|suffix| {
+            suffix.len() == 6
+              && suffix
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric())
+          })
+      })
+      .map(|path| path.trim_matches('/').to_string())
+      .collect::<HashSet<_>>();
     Ok(build_directory_page(
       items
         .into_iter()
-        .filter(|item| !item.path.contains("komodo-backup-manifest-"))
+        .filter(|item| {
+          let item_path = item.path.trim_matches('/');
+          !manifest_roots.iter().any(|root| {
+            item_path == root
+              || item_path.starts_with(&format!("{root}/"))
+          })
+        })
         .map(|item| ItemView {
           path: item.path,
           directory: item.entry_type == ItemType::Directory,

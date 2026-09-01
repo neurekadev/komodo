@@ -168,13 +168,19 @@ function StatusSection({ status }: { status?: Types.BackupStatus }) {
         <StatusItem
           label="Mirror"
           value={
-            status?.mirror_healthy === undefined
+            status?.mirror_healthy == null
               ? "Not configured"
               : status.mirror_healthy
                 ? "Healthy"
                 : "Unavailable"
           }
-          color={status?.mirror_healthy === false ? "red" : "green"}
+          color={
+            status?.mirror_healthy == null
+              ? "gray"
+              : status.mirror_healthy
+                ? "green"
+                : "red"
+          }
         />
         <StatusItem
           label="Mirror lag"

@@ -19,7 +19,7 @@ use crate::{config::periphery_config, state::stats_client};
 
 pub mod terminal;
 
-mod backup;
+pub(crate) mod backup;
 mod build;
 mod compose;
 mod container;

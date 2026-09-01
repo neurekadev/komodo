@@ -4,7 +4,10 @@ use std::{
   io::{Read, Write},
   os::unix::fs::{MetadataExt, PermissionsExt},
   path::{Path, PathBuf},
-  sync::{Mutex, OnceLock},
+  sync::{
+    Arc, Mutex, OnceLock,
+    atomic::{AtomicBool, Ordering},
+  },
 };
 
 use anyhow::{Context, anyhow};
@@ -522,7 +525,9 @@ impl Resolve<Args> for TransactionalVykarRestore {
     }
     let running_containers =
       discover_running_containers(&self.target).await?;
-    if matches!(self.target, PeripheryBackupTarget::Volume { .. }) {
+    if self.selected_paths.is_empty()
+      && matches!(self.target, PeripheryBackupTarget::Volume { .. })
+    {
       let mountpoint = discover_source(&self.target)
         .await?
         .paths
@@ -571,8 +576,40 @@ impl Resolve<Args> for TransactionalVykarRestore {
       .unwrap()
       .remove(&self.journal_id);
     let rolled_back = match restore_result {
-      Ok(rolled_back) => rolled_back,
-      Err(error) => {
+      RestoreTransactionResult::Published { rolled_back } => {
+        rolled_back
+      }
+      RestoreTransactionResult::FailedBeforePublication(error) => {
+        warn!(
+          "Restore failed before publication; original data is unchanged: {error:#}"
+        );
+        let mut restarted = Vec::new();
+        let mut restart_errors = Vec::new();
+        for container in &stopped_containers {
+          match run_container_command("start", container).await {
+            Ok(()) => restarted.push(container.clone()),
+            Err(error) => {
+              restart_errors.push(format!("{container}: {error:#}"))
+            }
+          }
+        }
+        return Ok(TransactionalVykarRestoreResponse {
+          complete: false,
+          rolled_back: true,
+          containers_restarted: if restart_errors.is_empty() {
+            restarted
+          } else {
+            Vec::new()
+          },
+          critical_error: (!restart_errors.is_empty()).then(|| {
+            format!(
+              "Restore failed before publication ({error:#}) and affected containers could not all be restarted: {}",
+              restart_errors.join("; ")
+            )
+          }),
+        });
+      }
+      RestoreTransactionResult::Indeterminate(error) => {
         return Ok(TransactionalVykarRestoreResponse {
           complete: false,
           rolled_back: false,
@@ -628,7 +665,8 @@ impl Resolve<Args> for PreflightVykarRestore {
         .unwrap_or_default();
     let discovered = discover_source(&self.target).await.ok();
     let destination_exists = discovered.is_some();
-    if matches!(self.target, PeripheryBackupTarget::Volume { .. })
+    if self.selected_paths.is_empty()
+      && matches!(self.target, PeripheryBackupTarget::Volume { .. })
       && let Some(mountpoint) =
         discovered.as_ref().and_then(|source| source.paths.first())
     {
@@ -776,25 +814,37 @@ fn collect_unexpected_paths(
   Ok(())
 }
 
+enum RestoreTransactionResult {
+  Published { rolled_back: bool },
+  FailedBeforePublication(anyhow::Error),
+  Indeterminate(anyhow::Error),
+}
+
 async fn transactional_restore(
   request: &TransactionalVykarRestore,
-) -> anyhow::Result<bool> {
+) -> RestoreTransactionResult {
   if request.publish.is_empty() {
-    return Err(anyhow!("Restore publish plan is empty"));
+    return RestoreTransactionResult::FailedBeforePublication(
+      anyhow!("Restore publish plan is empty"),
+    );
   }
   if operation_cancelled(&request.journal_id) {
-    return Ok(true);
+    return RestoreTransactionResult::Published { rolled_back: true };
   }
   let first_destination =
     PathBuf::from(&request.publish[0].destination);
-  let parent = first_destination
-    .parent()
-    .context("Restore destination has no parent")?
-    .to_path_buf();
+  let Some(parent) = first_destination.parent() else {
+    return RestoreTransactionResult::FailedBeforePublication(
+      anyhow!("Restore destination has no parent"),
+    );
+  };
+  let parent = parent.to_path_buf();
   let staging =
     parent.join(format!(".komodo-restore-{}", request.journal_id));
   if path_lexists(&staging) {
-    return Err(anyhow!("Restore staging path already exists"));
+    return RestoreTransactionResult::FailedBeforePublication(
+      anyhow!("Restore staging path already exists"),
+    );
   }
 
   let repository = request.repository.clone();
@@ -803,7 +853,7 @@ async fn transactional_restore(
   let snapshot = request.snapshot_name.clone();
   let selected = request.selected_paths.clone();
   let restore_staging = staging.clone();
-  tokio::task::spawn_blocking(move || {
+  let restore_result = tokio::task::spawn_blocking(move || {
     let cache = vykar_cache_dir(&hostname)?;
     let repository = VykarRepository::new(
       &repository,
@@ -813,21 +863,60 @@ async fn transactional_restore(
     )?;
     repository.restore(&snapshot, &restore_staging, &selected)
   })
-  .await
-  .context("Vykar restore worker failed")??;
+  .await;
+  match restore_result {
+    Ok(Ok(())) => {}
+    Ok(Err(error)) => {
+      let _ = std::fs::remove_dir_all(&staging);
+      return RestoreTransactionResult::FailedBeforePublication(
+        error,
+      );
+    }
+    Err(error) => {
+      let _ = std::fs::remove_dir_all(&staging);
+      return RestoreTransactionResult::FailedBeforePublication(
+        anyhow::Error::new(error)
+          .context("Vykar restore worker failed"),
+      );
+    }
+  }
 
   if operation_cancelled(&request.journal_id) {
     let _ = std::fs::remove_dir_all(&staging);
-    return Ok(true);
+    return RestoreTransactionResult::Published { rolled_back: true };
   }
 
   let publish = request.publish.clone();
   let journal_id = request.journal_id.clone();
-  tokio::task::spawn_blocking(move || {
-    publish_restore(&staging, &publish, &journal_id)
+  let publication_started = Arc::new(AtomicBool::new(false));
+  let worker_started = publication_started.clone();
+  let result = tokio::task::spawn_blocking(move || {
+    publish_restore(&staging, &publish, &journal_id, &worker_started)
   })
-  .await
-  .context("Restore publish worker failed")?
+  .await;
+  match result {
+    Ok(Ok(rolled_back)) => {
+      RestoreTransactionResult::Published { rolled_back }
+    }
+    Ok(Err(error)) => {
+      if publication_started.load(Ordering::SeqCst) {
+        RestoreTransactionResult::Indeterminate(error)
+      } else {
+        let _ = std::fs::remove_dir_all(&staging);
+        RestoreTransactionResult::FailedBeforePublication(error)
+      }
+    }
+    Err(error) => {
+      let error = anyhow::Error::new(error)
+        .context("Restore publish worker failed");
+      if publication_started.load(Ordering::SeqCst) {
+        RestoreTransactionResult::Indeterminate(error)
+      } else {
+        let _ = std::fs::remove_dir_all(&staging);
+        RestoreTransactionResult::FailedBeforePublication(error)
+      }
+    }
+  }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -838,10 +927,82 @@ struct RestoreJournalEntry {
   published: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RestoreJournal {
+  staging: PathBuf,
+  entries: Vec<RestoreJournalEntry>,
+  #[serde(default)]
+  committed: bool,
+}
+
+fn restore_journal_dir() -> anyhow::Result<PathBuf> {
+  let directory = periphery_config()
+    .stack_dir()
+    .join(".komodo-vykar")
+    .join("restore-journals");
+  std::fs::create_dir_all(&directory)?;
+  Ok(directory)
+}
+
+/// Roll back any publication interrupted after its durable journal was
+/// written. This runs before Periphery accepts requests.
+pub(crate) fn recover_restore_journals() -> anyhow::Result<()> {
+  let directory = restore_journal_dir()?;
+  for entry in std::fs::read_dir(&directory)? {
+    let path = entry?.path();
+    if path.extension().and_then(|value| value.to_str())
+      != Some("json")
+    {
+      continue;
+    }
+    let bytes = std::fs::read(&path).with_context(|| {
+      format!("Failed to read restore journal {}", path.display())
+    })?;
+    let mut journal: RestoreJournal = serde_json::from_slice(&bytes)
+      .with_context(|| {
+        format!("Failed to decode restore journal {}", path.display())
+      })?;
+    if journal.committed {
+      for entry in &journal.entries {
+        remove_path(&entry.rollback)?;
+        fsync_parent(&entry.destination)?;
+      }
+    } else {
+      rollback_published(&mut journal, &path)?;
+    }
+    for entry in &journal.entries {
+      remove_path(&entry.source)?;
+    }
+    remove_path(&journal.staging)?;
+    remove_path(&path)?;
+    fsync_parent(&path)?;
+    warn!("Recovered interrupted restore journal {}", path.display());
+  }
+  Ok(())
+}
+
 fn publish_restore(
   staging: &Path,
   publish: &[RestorePublishPath],
   journal_id: &str,
+  publication_started: &AtomicBool,
+) -> anyhow::Result<bool> {
+  let journal_directory = restore_journal_dir()?;
+  publish_restore_in(
+    staging,
+    publish,
+    journal_id,
+    publication_started,
+    &journal_directory,
+  )
+}
+
+fn publish_restore_in(
+  staging: &Path,
+  publish: &[RestorePublishPath],
+  journal_id: &str,
+  publication_started: &AtomicBool,
+  journal_directory: &Path,
 ) -> anyhow::Result<bool> {
   let mut entries = Vec::new();
   for (index, item) in publish.iter().enumerate() {
@@ -911,40 +1072,51 @@ fn publish_restore(
     });
   }
 
-  let journal_path = entries[0]
-    .destination
-    .parent()
-    .context("Restore destination has no parent")?
-    .join(format!(".komodo-restore-{journal_id}.json"));
-  persist_journal(&journal_path, &entries)?;
+  std::fs::create_dir_all(journal_directory)?;
+  let journal_path =
+    journal_directory.join(format!("{journal_id}.json"));
+  let mut journal = RestoreJournal {
+    staging: staging.to_path_buf(),
+    entries,
+    committed: false,
+  };
+  persist_journal(&journal_path, &journal)?;
+  publication_started.store(true, Ordering::SeqCst);
 
-  for index in 0..entries.len() {
-    if path_lexists(&entries[index].destination) {
-      std::fs::rename(
-        &entries[index].destination,
-        &entries[index].rollback,
+  for index in 0..journal.entries.len() {
+    if path_lexists(&journal.entries[index].destination)
+      && let Err(error) = std::fs::rename(
+        &journal.entries[index].destination,
+        &journal.entries[index].rollback,
       )
-      .context("Failed to prepare rollback path")?;
-    }
-    if let Err(error) = std::fs::rename(
-      &entries[index].source,
-      &entries[index].destination,
-    ) {
-      rollback_published(&mut entries, &journal_path)?;
-      warn!("Restore publish failed and was rolled back: {error:#}");
-      remove_path(&journal_path)?;
-      for entry in &entries {
-        remove_path(&entry.source)?;
-      }
-      let _ = std::fs::remove_dir_all(staging);
+    {
+      rollback_published(&mut journal, &journal_path)?;
+      warn!(
+        "Restore rollback preparation failed and earlier publications were rolled back: {error:#}"
+      );
+      cleanup_rolled_back_restore(&journal, &journal_path)?;
       return Ok(true);
     }
-    entries[index].published = true;
-    persist_journal(&journal_path, &entries)?;
-    fsync_parent(&entries[index].destination)?;
+    // Persist publication intent before source -> destination. On recovery,
+    // this distinguishes a newly-created destination (which has no rollback
+    // path) from an entry that was never reached.
+    journal.entries[index].published = true;
+    persist_journal(&journal_path, &journal)?;
+    if let Err(error) = std::fs::rename(
+      &journal.entries[index].source,
+      &journal.entries[index].destination,
+    ) {
+      rollback_published(&mut journal, &journal_path)?;
+      warn!("Restore publish failed and was rolled back: {error:#}");
+      cleanup_rolled_back_restore(&journal, &journal_path)?;
+      return Ok(true);
+    }
+    fsync_parent(&journal.entries[index].destination)?;
   }
 
-  for entry in &entries {
+  journal.committed = true;
+  persist_journal(&journal_path, &journal)?;
+  for entry in &journal.entries {
     if path_lexists(&entry.rollback) {
       remove_path(&entry.rollback)?;
     }
@@ -954,6 +1126,18 @@ fn publish_restore(
   fsync_parent(&journal_path)?;
   let _ = std::fs::remove_dir_all(staging);
   Ok(false)
+}
+
+fn cleanup_rolled_back_restore(
+  journal: &RestoreJournal,
+  journal_path: &Path,
+) -> anyhow::Result<()> {
+  remove_path(journal_path)?;
+  for entry in &journal.entries {
+    remove_path(&entry.source)?;
+  }
+  remove_path(&journal.staging)?;
+  fsync_parent(journal_path)
 }
 
 fn path_lexists(path: &Path) -> bool {
@@ -1031,29 +1215,38 @@ fn tree_digest(root: &Path) -> anyhow::Result<Vec<u8>> {
 }
 
 fn rollback_published(
-  entries: &mut [RestoreJournalEntry],
-  journal: &Path,
+  restore: &mut RestoreJournal,
+  journal_path: &Path,
 ) -> anyhow::Result<()> {
-  for entry in entries.iter_mut().rev() {
-    if entry.published && path_lexists(&entry.destination) {
-      remove_path(&entry.destination)?;
+  for index in (0..restore.entries.len()).rev() {
+    let entry = &restore.entries[index];
+    let published = entry.published;
+    let rollback = entry.rollback.clone();
+    let destination = entry.destination.clone();
+    // A crash can happen after destination -> rollback but before publication
+    // intent is persisted. A rollback path independently proves publication
+    // preparation began.
+    if (published || path_lexists(&rollback))
+      && path_lexists(&destination)
+    {
+      remove_path(&destination)?;
     }
-    if path_lexists(&entry.rollback) {
-      std::fs::rename(&entry.rollback, &entry.destination)?;
-      fsync_parent(&entry.destination)?;
+    if path_lexists(&rollback) {
+      std::fs::rename(&rollback, &destination)?;
+      fsync_parent(&destination)?;
     }
-    entry.published = false;
+    restore.entries[index].published = false;
+    persist_journal(journal_path, restore)?;
   }
-  persist_journal(journal, entries)?;
   Ok(())
 }
 
 fn persist_journal(
   path: &Path,
-  entries: &[RestoreJournalEntry],
+  journal: &RestoreJournal,
 ) -> anyhow::Result<()> {
   let temporary = path.with_extension("tmp");
-  let bytes = serde_json::to_vec(entries)?;
+  let bytes = serde_json::to_vec(journal)?;
   let mut file = OpenOptions::new()
     .create(true)
     .truncate(true)
@@ -1263,7 +1456,14 @@ mod tests {
       },
     ];
     assert!(
-      publish_restore(&download, &publish, "rollback-test").unwrap()
+      publish_restore_in(
+        &download,
+        &publish,
+        "rollback-test",
+        &AtomicBool::new(false),
+        &root.path().join("journals"),
+      )
+      .unwrap()
     );
     assert_eq!(
       std::fs::read(first.join("original.txt")).unwrap(),

@@ -36,6 +36,10 @@ static DB_CLIENT: OnceLock<database::Client> = OnceLock::new();
 /// is initialized. The previous database is deliberately retained.
 pub const ACTIVE_DATABASE_POINTER: &str =
   "/config/backup-active-database";
+/// Atomic recovery activation containing both the database pointer and the
+/// restored Core backup identity.
+pub const CORE_RECOVERY_ACTIVATION_PATH: &str =
+  "/config/backup-recovery-activation.json";
 
 pub fn db_client() -> &'static database::Client {
   DB_CLIENT.get().unwrap_or_else(|| {
@@ -50,8 +54,45 @@ pub fn db_client() -> &'static database::Client {
 pub async fn init_db_client() {
   let init = async {
     let mut database = core_config().database.clone();
-    if let Ok(name) = std::fs::read_to_string(ACTIVE_DATABASE_POINTER)
-    {
+    let activation =
+      match std::fs::read(CORE_RECOVERY_ACTIVATION_PATH) {
+        Ok(bytes) => {
+          let value: serde_json::Value =
+            serde_json::from_slice(&bytes)
+              .context("Invalid Core recovery activation record")?;
+          let name = value
+            .get("database")
+            .and_then(serde_json::Value::as_str)
+            .context("Core recovery activation has no database")?;
+          let identity = value
+            .get("core_instance_id")
+            .and_then(serde_json::Value::as_str)
+            .context("Core recovery activation has no identity")?;
+          if identity.len() != 32
+            || !identity
+              .chars()
+              .all(|character| character.is_ascii_hexdigit())
+          {
+            return Err(anyhow!(
+              "Invalid Core recovery activation identity"
+            ));
+          }
+          Some(name.to_string())
+        }
+        Err(error)
+          if error.kind() == std::io::ErrorKind::NotFound =>
+        {
+          None
+        }
+        Err(error) => {
+          return Err(error).context(
+            "Failed to read Core recovery activation record",
+          );
+        }
+      };
+    if let Some(name) = activation.or_else(|| {
+      std::fs::read_to_string(ACTIVE_DATABASE_POINTER).ok()
+    }) {
       let name = name.trim();
       if !name.is_empty()
         && name.chars().all(|character| {
