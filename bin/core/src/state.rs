@@ -1,4 +1,7 @@
-use std::sync::{Arc, OnceLock};
+use std::{
+  path::Path,
+  sync::{Arc, OnceLock},
+};
 
 use anyhow::{Context, anyhow};
 use arc_swap::ArcSwap;
@@ -35,11 +38,38 @@ static DB_CLIENT: OnceLock<database::Client> = OnceLock::new();
 /// A recovery-selected database name, read before the global database client
 /// is initialized. The previous database is deliberately retained.
 pub const ACTIVE_DATABASE_POINTER: &str =
+  "/data/backup-active-database";
+const LEGACY_ACTIVE_DATABASE_POINTER: &str =
   "/config/backup-active-database";
 /// Atomic recovery activation containing both the database pointer and the
 /// restored Core backup identity.
 pub const CORE_RECOVERY_ACTIVATION_PATH: &str =
+  "/data/backup-recovery-activation.json";
+pub const LEGACY_CORE_RECOVERY_ACTIVATION_PATH: &str =
   "/config/backup-recovery-activation.json";
+
+fn read_persistent_file(
+  path: &str,
+  legacy_path: &str,
+) -> std::io::Result<Option<Vec<u8>>> {
+  match std::fs::read(path) {
+    Ok(bytes) => return Ok(Some(bytes)),
+    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+    Err(error) => return Err(error),
+  }
+  let bytes = match std::fs::read(legacy_path) {
+    Ok(bytes) => bytes,
+    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+      return Ok(None);
+    }
+    Err(error) => return Err(error),
+  };
+  if let Some(parent) = Path::new(path).parent() {
+    std::fs::create_dir_all(parent)?;
+  }
+  std::fs::write(path, &bytes)?;
+  Ok(Some(bytes))
+}
 
 pub fn db_client() -> &'static database::Client {
   DB_CLIENT.get().unwrap_or_else(|| {
@@ -54,44 +84,46 @@ pub fn db_client() -> &'static database::Client {
 pub async fn init_db_client() {
   let init = async {
     let mut database = core_config().database.clone();
-    let activation =
-      match std::fs::read(CORE_RECOVERY_ACTIVATION_PATH) {
-        Ok(bytes) => {
-          let value: serde_json::Value =
-            serde_json::from_slice(&bytes)
-              .context("Invalid Core recovery activation record")?;
-          let name = value
-            .get("database")
-            .and_then(serde_json::Value::as_str)
-            .context("Core recovery activation has no database")?;
-          let identity = value
-            .get("core_instance_id")
-            .and_then(serde_json::Value::as_str)
-            .context("Core recovery activation has no identity")?;
-          if identity.len() != 32
-            || !identity
-              .chars()
-              .all(|character| character.is_ascii_hexdigit())
-          {
-            return Err(anyhow!(
-              "Invalid Core recovery activation identity"
-            ));
-          }
-          Some(name.to_string())
-        }
-        Err(error)
-          if error.kind() == std::io::ErrorKind::NotFound =>
+    let activation = match read_persistent_file(
+      CORE_RECOVERY_ACTIVATION_PATH,
+      LEGACY_CORE_RECOVERY_ACTIVATION_PATH,
+    ) {
+      Ok(Some(bytes)) => {
+        let value: serde_json::Value = serde_json::from_slice(&bytes)
+          .context("Invalid Core recovery activation record")?;
+        let name = value
+          .get("database")
+          .and_then(serde_json::Value::as_str)
+          .context("Core recovery activation has no database")?;
+        let identity = value
+          .get("core_instance_id")
+          .and_then(serde_json::Value::as_str)
+          .context("Core recovery activation has no identity")?;
+        if identity.len() != 32
+          || !identity
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
         {
-          None
+          return Err(anyhow!(
+            "Invalid Core recovery activation identity"
+          ));
         }
-        Err(error) => {
-          return Err(error).context(
-            "Failed to read Core recovery activation record",
-          );
-        }
-      };
+        Some(name.to_string())
+      }
+      Ok(None) => None,
+      Err(error) => {
+        return Err(error)
+          .context("Failed to read Core recovery activation record");
+      }
+    };
     if let Some(name) = activation.or_else(|| {
-      std::fs::read_to_string(ACTIVE_DATABASE_POINTER).ok()
+      read_persistent_file(
+        ACTIVE_DATABASE_POINTER,
+        LEGACY_ACTIVE_DATABASE_POINTER,
+      )
+      .ok()
+      .flatten()
+      .and_then(|bytes| String::from_utf8(bytes).ok())
     }) {
       let name = name.trim();
       if !name.is_empty()

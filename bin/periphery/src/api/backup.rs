@@ -214,6 +214,7 @@ impl Resolve<Args> for RunVykarBackupBatch {
         komodo_version: self.komodo_version.clone(),
         stop_containers: false,
         mirror_only: task.mirror_only,
+        primary_only: task.primary_only,
       };
       match run_backup_repositories(&request, &paths).await {
         Ok((primary, mirror)) => {
@@ -248,6 +249,18 @@ async fn run_backup_repositories(
   VykarBackupRepositoryResult,
   Option<VykarBackupRepositoryResult>,
 )> {
+  if request.primary_only && request.mirror_only {
+    return Err(anyhow!(
+      "A backup retry cannot be both primary-only and mirror-only"
+    ));
+  }
+  if (request.primary_only || request.mirror_only)
+    && request.mirror.is_none()
+  {
+    return Err(anyhow!(
+      "Repository-specific retry requested without a configured mirror"
+    ));
+  }
   let manifest_dir = tempfile::Builder::new()
     .prefix("komodo-backup-manifest-")
     .tempdir()
@@ -275,7 +288,15 @@ async fn run_backup_repositories(
   if operation_cancelled(&request.run_id) {
     return Err(anyhow!("Backup cancelled before mirror write"));
   }
-  let mirror = if let Some(repository) = request.mirror.clone() {
+  let mirror = if request.primary_only {
+    request
+      .mirror
+      .as_ref()
+      .map(|_| VykarBackupRepositoryResult {
+        complete: true,
+        ..Default::default()
+      })
+  } else if let Some(repository) = request.mirror.clone() {
     Some(
       run_repository_backup(
         repository,
@@ -288,11 +309,6 @@ async fn run_backup_repositories(
       .await,
     )
   } else {
-    if request.mirror_only {
-      return Err(anyhow!(
-        "Mirror-only retry requested without a configured mirror"
-      ));
-    }
     None
   };
   Ok((primary, mirror))

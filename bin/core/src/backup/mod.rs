@@ -53,7 +53,10 @@ use crate::{
   helpers::{periphery_client, query::id_or_name_filter},
   permission::get_check_permissions,
   resource::{self, KomodoResource},
-  state::{CORE_RECOVERY_ACTIVATION_PATH, db_client},
+  state::{
+    CORE_RECOVERY_ACTIVATION_PATH,
+    LEGACY_CORE_RECOVERY_ACTIVATION_PATH, db_client,
+  },
 };
 
 mod crypto;
@@ -64,7 +67,9 @@ const RUNS_COLLECTION: &str = "BackupRun";
 const PLANS_COLLECTION: &str = "BackupRestorePlan";
 const CORE_RECOVERY_COLLECTION: &str = "CoreRecoveryPlan";
 const HEALTH_COLLECTION: &str = "BackupRepositoryHealth";
-const CORE_INSTANCE_ID_PATH: &str = "/config/keys/backup-instance-id";
+const CORE_INSTANCE_ID_PATH: &str = "/data/keys/backup-instance-id";
+const LEGACY_CORE_INSTANCE_ID_PATH: &str =
+  "/config/keys/backup-instance-id";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SealedBackupSettings {
@@ -486,44 +491,80 @@ fn core_instance_id() -> anyhow::Result<&'static str> {
 }
 
 fn load_or_create_core_instance_id() -> anyhow::Result<String> {
-  match std::fs::read(CORE_RECOVERY_ACTIVATION_PATH) {
-    Ok(bytes) => {
-      let activation: CoreRecoveryActivation =
-        serde_json::from_slice(&bytes)
-          .context("Invalid Core recovery activation record")?;
-      if activation.core_instance_id.len() != 32
-        || !activation
-          .core_instance_id
-          .chars()
-          .all(|character| character.is_ascii_hexdigit())
-      {
-        return Err(anyhow!(
-          "Invalid recovered Core backup identity"
-        ));
+  for (path, migrate) in [
+    (CORE_RECOVERY_ACTIVATION_PATH, false),
+    (LEGACY_CORE_RECOVERY_ACTIVATION_PATH, true),
+  ] {
+    match std::fs::read(path) {
+      Ok(bytes) => {
+        let activation: CoreRecoveryActivation =
+          serde_json::from_slice(&bytes)
+            .context("Invalid Core recovery activation record")?;
+        if activation.core_instance_id.len() != 32
+          || !activation
+            .core_instance_id
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+        {
+          return Err(anyhow!(
+            "Invalid recovered Core backup identity"
+          ));
+        }
+        if migrate {
+          persist_core_recovery_activation(
+            &activation.database,
+            &activation.core_instance_id,
+          )?;
+        }
+        return Ok(activation.core_instance_id);
       }
-      return Ok(activation.core_instance_id);
-    }
-    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-    Err(error) => {
-      return Err(error)
-        .context("Failed to read Core recovery activation record");
+      Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+      Err(error) => {
+        return Err(error)
+          .context("Failed to read Core recovery activation record");
+      }
     }
   }
   let path = Path::new(CORE_INSTANCE_ID_PATH);
-  if let Ok(id) = std::fs::read_to_string(path) {
-    let id = id.trim();
-    if id.len() == 32
-      && id.chars().all(|character| character.is_ascii_hexdigit())
-    {
-      return Ok(id.to_string());
-    }
-    return Err(anyhow!("Persisted Core backup identity is invalid"));
+  if let Some(id) = read_core_instance_id(path)? {
+    return Ok(id);
   }
+  if let Some(id) =
+    read_core_instance_id(Path::new(LEGACY_CORE_INSTANCE_ID_PATH))?
+  {
+    return persist_core_instance_id(path, &id);
+  }
+  persist_core_instance_id(path, &Uuid::new_v4().simple().to_string())
+}
+
+fn read_core_instance_id(
+  path: &Path,
+) -> anyhow::Result<Option<String>> {
+  let id = match std::fs::read_to_string(path) {
+    Ok(id) => id,
+    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+      return Ok(None);
+    }
+    Err(error) => return Err(error.into()),
+  };
+  let id = id.trim();
+  if id.len() == 32
+    && id.chars().all(|character| character.is_ascii_hexdigit())
+  {
+    Ok(Some(id.to_string()))
+  } else {
+    Err(anyhow!("Persisted Core backup identity is invalid"))
+  }
+}
+
+fn persist_core_instance_id(
+  path: &Path,
+  id: &str,
+) -> anyhow::Result<String> {
   let parent = path
     .parent()
     .context("Core backup identity path has no parent")?;
   std::fs::create_dir_all(parent)?;
-  let id = Uuid::new_v4().simple().to_string();
   match OpenOptions::new()
     .create_new(true)
     .write(true)
@@ -534,20 +575,14 @@ fn load_or_create_core_instance_id() -> anyhow::Result<String> {
       file.write_all(id.as_bytes())?;
       file.sync_all()?;
       std::fs::File::open(parent)?.sync_all()?;
-      Ok(id)
+      Ok(id.to_string())
     }
     Err(error)
       if error.kind() == std::io::ErrorKind::AlreadyExists =>
     {
-      let id = std::fs::read_to_string(path)?;
-      let id = id.trim();
-      if id.len() == 32
-        && id.chars().all(|character| character.is_ascii_hexdigit())
-      {
-        Ok(id.to_string())
-      } else {
-        Err(anyhow!("Persisted Core backup identity is invalid"))
-      }
+      read_core_instance_id(path)?.context(
+        "Core backup identity disappeared after concurrent creation",
+      )
     }
     Err(error) => Err(error.into()),
   }
@@ -595,7 +630,7 @@ fn persist_core_recovery_activation(
 }
 
 fn core_cache_dir() -> anyhow::Result<PathBuf> {
-  let directory = PathBuf::from("/backups/.komodo-vykar-cache");
+  let directory = PathBuf::from("/data/backups/.komodo-vykar-cache");
   std::fs::create_dir_all(&directory)?;
   Ok(directory)
 }
@@ -943,7 +978,10 @@ pub async fn run_backup(
         .await
     }
   }?;
-  if finished.state == BackupRunState::Complete {
+  if matches!(
+    finished.state,
+    BackupRunState::Complete | BackupRunState::Partial
+  ) {
     queue_maintenance();
   }
   Ok(finished)
@@ -987,6 +1025,7 @@ fn queue_maintenance() {
 async fn run_maintenance(
   settings: BackupSettings,
 ) -> anyhow::Result<()> {
+  let _operation = backup_operation_lock().lock().await;
   let _repository_roles =
     repository_role_barrier().clone().read_owned().await;
   let repositories =
@@ -1215,39 +1254,63 @@ async fn run_fleet(
       let refreshed =
         refresh_node_targets(&settings, &server_id, targets.clone())
           .await;
-      let (targets, tasks, result) = match refreshed {
+      let (targets, tasks, refresh_targets, result) = match refreshed {
         Ok(targets) => {
           match build_node_backup_tasks(&targets, &run.id).await {
-            Ok(tasks) => {
-              let result = run_node_batch(
-                &settings,
-                &run,
-                &server_id,
-                tasks.clone(),
-              )
-              .await;
-              (targets, tasks, result)
+            Ok(prepared) => {
+              for error in &prepared.errors {
+                warn!(
+                  "Backup could not prepare a target on node {server_id}: {error}"
+                );
+              }
+              let tasks = prepared.tasks;
+              let result = if tasks.is_empty() {
+                Ok(NodeBatchOutcome {
+                  partial: !prepared.failed_targets.is_empty(),
+                  retry_tasks: Vec::new(),
+                  retry_blocked: false,
+                })
+              } else {
+                run_node_batch(
+                  &settings,
+                  &run,
+                  &server_id,
+                  tasks.clone(),
+                )
+                .await
+              };
+              (prepared.failed_targets, tasks, false, result)
             }
-            Err(error) => (targets, Vec::new(), Err(error)),
+            Err(error) => (targets, Vec::new(), false, Err(error)),
           }
         }
-        Err(error) => (targets, Vec::new(), Err(error)),
+        Err(error) => (targets, Vec::new(), true, Err(error)),
       };
-      anyhow::Ok((server_id, targets, tasks, result))
+      anyhow::Ok((
+        server_id,
+        targets,
+        tasks,
+        refresh_targets,
+        result,
+      ))
     });
   }
   while let Some(result) = batches.next().await {
-    let (server_id, targets, tasks, result) = result?;
+    let (server_id, targets, tasks, refresh_targets, result) =
+      result?;
     match result {
       Ok(outcome) => {
-        partial |= outcome.partial;
-        if !outcome.retry_tasks.is_empty() {
+        partial |= outcome.partial || !targets.is_empty();
+        if !outcome.retry_blocked
+          && (!outcome.retry_tasks.is_empty() || !targets.is_empty())
+        {
           spawn_node_retry(
             settings.clone(),
             run.clone(),
             server_id,
             targets,
             outcome.retry_tasks,
+            false,
           );
         }
       }
@@ -1260,6 +1323,7 @@ async fn run_fleet(
           server_id,
           targets,
           tasks,
+          refresh_targets,
         );
       }
     }
@@ -1276,8 +1340,9 @@ fn spawn_node_retry(
   settings: BackupSettings,
   run: BackupRun,
   server_id: String,
-  targets: Vec<BackupTarget>,
+  mut targets: Vec<BackupTarget>,
   mut tasks: Vec<VykarBackupTask>,
+  mut refresh_targets: bool,
 ) {
   tokio::spawn(async move {
     let mut retry = 0_u64;
@@ -1304,25 +1369,34 @@ fn spawn_node_retry(
         return;
       }
       if tasks.is_empty() {
-        let refreshed = match refresh_node_targets(
-          &settings,
-          &server_id,
-          targets.clone(),
+        let refreshed = if refresh_targets {
+          match refresh_node_targets(
+            &settings,
+            &server_id,
+            targets.clone(),
+          )
+          .await
+          {
+            Ok(targets) => {
+              refresh_targets = false;
+              targets
+            }
+            Err(error) => {
+              warn!(
+                "Backup retry {retry} could not rediscover node {server_id}: {error:#}"
+              );
+              continue;
+            }
+          }
+        } else {
+          targets.clone()
+        };
+        let prepared = match build_node_backup_tasks(
+          &refreshed, &run.id,
         )
         .await
         {
-          Ok(targets) => targets,
-          Err(error) => {
-            warn!(
-              "Backup retry {retry} could not rediscover node {server_id}: {error:#}"
-            );
-            continue;
-          }
-        };
-        tasks = match build_node_backup_tasks(&refreshed, &run.id)
-          .await
-        {
-          Ok(tasks) => tasks,
+          Ok(prepared) => prepared,
           Err(error) => {
             warn!(
               "Backup retry {retry} could not prepare node {server_id}: {error:#}"
@@ -1330,9 +1404,19 @@ fn spawn_node_retry(
             continue;
           }
         };
+        for error in &prepared.errors {
+          warn!(
+            "Backup retry {retry} could not prepare a target on node {server_id}: {error}"
+          );
+        }
+        targets = prepared.failed_targets;
+        tasks = prepared.tasks;
         if tasks.is_empty() {
-          queue_maintenance();
-          return;
+          if targets.is_empty() {
+            queue_maintenance();
+            return;
+          }
+          continue;
         }
       }
       if *fleet_generation().read().unwrap() != run.id {
@@ -1346,7 +1430,10 @@ fn spawn_node_retry(
       match run_node_batch(&settings, &run, &server_id, tasks.clone())
         .await
       {
-        Ok(outcome) if outcome.retry_tasks.is_empty() => {
+        Ok(outcome) if outcome.retry_blocked => return,
+        Ok(outcome)
+          if outcome.retry_tasks.is_empty() && targets.is_empty() =>
+        {
           if !outcome.partial {
             queue_maintenance();
           }
@@ -1479,54 +1566,96 @@ async fn refresh_node_targets(
   Ok(targets.into_iter().collect())
 }
 
+struct NodeTaskPreparation {
+  tasks: Vec<VykarBackupTask>,
+  failed_targets: Vec<BackupTarget>,
+  errors: Vec<String>,
+}
+
 async fn build_node_backup_tasks(
   targets: &[BackupTarget],
   run_id: &str,
-) -> anyhow::Result<Vec<VykarBackupTask>> {
+) -> anyhow::Result<NodeTaskPreparation> {
+  let core_instance_id = core_instance_id()?;
   let mut tasks = Vec::new();
+  let mut failed_targets = Vec::new();
+  let mut errors = Vec::new();
   for target in targets {
-    let periphery_target = match target {
-      BackupTarget::Stack { stack_id } => {
-        let stack = resource::get::<Stack>(stack_id).await?;
-        let repo = if stack.config.linked_repo.is_empty() {
-          None
-        } else {
-          Some(
-            resource::get::<Repo>(&stack.config.linked_repo).await?,
-          )
-        };
-        PeripheryBackupTarget::Stack {
-          stack: Box::new(stack),
-          repo: repo.map(Box::new),
+    let source_label = target.source_label(core_instance_id);
+    let task = async {
+      let periphery_target = match target {
+        BackupTarget::Stack { stack_id } => {
+          let stack = resource::get::<Stack>(stack_id).await?;
+          let repo = if stack.config.linked_repo.is_empty() {
+            None
+          } else {
+            Some(
+              resource::get::<Repo>(&stack.config.linked_repo)
+                .await?,
+            )
+          };
+          PeripheryBackupTarget::Stack {
+            stack: Box::new(stack),
+            repo: repo.map(Box::new),
+          }
         }
-      }
-      BackupTarget::Volume { volume_name, .. } => {
-        PeripheryBackupTarget::Volume {
-          volume_name: volume_name.clone(),
+        BackupTarget::Volume { volume_name, .. } => {
+          PeripheryBackupTarget::Volume {
+            volume_name: volume_name.clone(),
+          }
         }
+        BackupTarget::Core | BackupTarget::Unbound { .. } => {
+          return Ok(None);
+        }
+      };
+      anyhow::Ok(Some(VykarBackupTask {
+        target: periphery_target,
+        source_label: source_label.clone(),
+        snapshot_name: snapshot_name(
+          match target {
+            BackupTarget::Stack { .. } => "stack",
+            BackupTarget::Volume { .. } => "volume",
+            _ => "backup",
+          },
+          run_id,
+        ),
+        mirror_only: false,
+        primary_only: false,
+      }))
+    }
+    .await;
+    match task {
+      Ok(Some(task)) => tasks.push(task),
+      Ok(None) => {}
+      Err(error) => {
+        failed_targets.push(target.clone());
+        errors.push(format!("{source_label}: {error:#}"));
       }
-      BackupTarget::Core | BackupTarget::Unbound { .. } => continue,
-    };
-    tasks.push(VykarBackupTask {
-      target: periphery_target,
-      source_label: target.source_label(core_instance_id()?),
-      snapshot_name: snapshot_name(
-        match target {
-          BackupTarget::Stack { .. } => "stack",
-          BackupTarget::Volume { .. } => "volume",
-          _ => "backup",
-        },
-        run_id,
-      ),
-      mirror_only: false,
-    });
+    }
   }
-  Ok(tasks)
+  Ok(NodeTaskPreparation {
+    tasks,
+    failed_targets,
+    errors,
+  })
 }
 
 struct NodeBatchOutcome {
   partial: bool,
   retry_tasks: Vec<VykarBackupTask>,
+  retry_blocked: bool,
+}
+
+fn repository_retry_state(
+  primary_complete: bool,
+  mirror_complete: bool,
+  has_mirror: bool,
+) -> (bool, bool, bool) {
+  (
+    primary_complete && !mirror_complete && has_mirror,
+    mirror_complete && !primary_complete && has_mirror,
+    !primary_complete && !mirror_complete,
+  )
 }
 
 async fn run_node_batch(
@@ -1575,14 +1704,21 @@ async fn run_node_batch(
     };
     let primary_complete = task.mirror_only
       || result.primary.complete && result.primary.error.is_none();
-    let mirror_complete = settings.mirror.is_none()
+    let mirror_complete = task.primary_only
+      || settings.mirror.is_none()
       || result.mirror.as_ref().is_some_and(|mirror| {
         mirror.complete && mirror.error.is_none()
       });
     if !primary_complete || !mirror_complete {
-      task.mirror_only =
-        primary_complete && settings.mirror.is_some();
-      if !primary_complete {
+      let (mirror_only, primary_only, replace_snapshot_name) =
+        repository_retry_state(
+          primary_complete,
+          mirror_complete,
+          settings.mirror.is_some(),
+        );
+      task.mirror_only = mirror_only;
+      task.primary_only = primary_only;
+      if replace_snapshot_name {
         task.snapshot_name = snapshot_name(
           match &task.target {
             PeripheryBackupTarget::Stack { .. } => "stack",
@@ -1606,6 +1742,7 @@ async fn run_node_batch(
   Ok(NodeBatchOutcome {
     partial,
     retry_tasks,
+    retry_blocked: !response.restart_errors.is_empty(),
   })
 }
 
@@ -1686,7 +1823,7 @@ async fn backup_core(
     return retry_core_mirror(settings, run, retry).await;
   }
   let staging =
-    PathBuf::from("/backups/.komodo-core-staging").join(&run.id);
+    PathBuf::from("/data/backups/.komodo-core-staging").join(&run.id);
   let _ = tokio::fs::remove_dir_all(&staging).await;
   tokio::fs::create_dir_all(&staging).await?;
   // A versioned logical dump is produced before upload. Mongo writes resume as
@@ -1875,6 +2012,7 @@ async fn backup_stack(
       komodo_version: env!("CARGO_PKG_VERSION").into(),
       stop_containers: settings.stop_containers,
       mirror_only: false,
+      primary_only: false,
     })
     .await?;
   if !response.restart_errors.is_empty() {
@@ -1926,6 +2064,7 @@ async fn backup_volume(
       komodo_version: env!("CARGO_PKG_VERSION").into(),
       stop_containers: settings.stop_containers,
       mirror_only: false,
+      primary_only: false,
     })
     .await?;
   if !response.restart_errors.is_empty() {
@@ -2028,7 +2167,7 @@ async fn snapshot_stack_source(
     .find(|path| is_backup_manifest_source(path))
     .context("Stack snapshot has no embedded recovery manifest")?
     .clone();
-  let staging = PathBuf::from("/backups/.komodo-stack-manifest")
+  let staging = PathBuf::from("/data/backups/.komodo-stack-manifest")
     .join(Uuid::new_v4().to_string());
   tokio::fs::create_dir_all(&staging).await?;
   let _staging_cleanup = RemoveDirectoryOnDrop(staging.clone());
@@ -2783,7 +2922,7 @@ pub async fn plan_core_recovery(
 
   let settings = get_settings().await?;
   let repository = settings.primary.clone();
-  let staging = PathBuf::from("/backups/.komodo-core-recovery")
+  let staging = PathBuf::from("/data/backups/.komodo-core-recovery")
     .join(Uuid::new_v4().to_string());
   tokio::fs::create_dir_all(&staging).await?;
   let _staging_cleanup = RemoveDirectoryOnDrop(staging.clone());
@@ -3110,6 +3249,17 @@ async fn verify_repository(
   }
 }
 
+fn mirror_copy_is_sufficient(
+  primary_partial: bool,
+  mirror_partial: Option<bool>,
+) -> bool {
+  match mirror_partial {
+    None => false,
+    Some(false) => true,
+    Some(true) => primary_partial,
+  }
+}
+
 pub async fn promote_mirror() -> anyhow::Result<BackupSettings> {
   // Keep the exclusive role barrier from the start of mandatory verification
   // through the settings swap. No unverified mirror write can land in between.
@@ -3142,16 +3292,21 @@ pub async fn promote_mirror() -> anyhow::Result<BackupSettings> {
         "Promotion blocked because a repository inventory is incomplete"
       ));
     }
-    let mirror_names = mirror
+    let mirror_snapshots = mirror
       .snapshots
       .into_iter()
-      .map(|snapshot| snapshot.name)
-      .collect::<HashSet<_>>();
+      .map(|snapshot| (snapshot.name, snapshot.partial))
+      .collect::<HashMap<_, _>>();
     Ok::<_, anyhow::Error>(
       primary
         .snapshots
         .into_iter()
-        .filter(|snapshot| !mirror_names.contains(&snapshot.name))
+        .filter(|snapshot| {
+          !mirror_copy_is_sufficient(
+            snapshot.partial,
+            mirror_snapshots.get(&snapshot.name).copied(),
+          )
+        })
         .map(|snapshot| snapshot.name)
         .collect::<Vec<_>>(),
     )
@@ -3160,7 +3315,7 @@ pub async fn promote_mirror() -> anyhow::Result<BackupSettings> {
   .context("Mirror comparison worker failed")??;
   if !missing.is_empty() {
     return Err(anyhow!(
-      "Mirror promotion blocked because it is missing {} primary snapshot(s)",
+      "Mirror promotion blocked because it is missing or has incomplete copies of {} primary snapshot(s)",
       missing.len()
     ));
   }
@@ -3467,5 +3622,29 @@ mod tests {
     assert!(!is_backup_manifest_source(
       "/tmp/komodo-backup-manifest-not-a-tempdir"
     ));
+  }
+
+  #[test]
+  fn complete_primary_requires_a_complete_mirror_copy() {
+    assert!(!mirror_copy_is_sufficient(false, None));
+    assert!(!mirror_copy_is_sufficient(false, Some(true)));
+    assert!(mirror_copy_is_sufficient(false, Some(false)));
+    assert!(mirror_copy_is_sufficient(true, Some(true)));
+  }
+
+  #[test]
+  fn repository_retry_preserves_the_successful_copy() {
+    assert_eq!(
+      repository_retry_state(false, true, true),
+      (false, true, false)
+    );
+    assert_eq!(
+      repository_retry_state(true, false, true),
+      (true, false, false)
+    );
+    assert_eq!(
+      repository_retry_state(false, false, true),
+      (false, false, true)
+    );
   }
 }

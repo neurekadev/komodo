@@ -49,6 +49,9 @@ pub struct RunVykarBackup {
   /// Retry only the mirror for a snapshot already committed to primary.
   #[serde(default)]
   pub mirror_only: bool,
+  /// Retry only the primary for a snapshot already committed to the mirror.
+  #[serde(default)]
+  pub primary_only: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -78,6 +81,9 @@ pub struct VykarBackupTask {
   /// Retry only the mirror for a snapshot already committed to primary.
   #[serde(default)]
   pub mirror_only: bool,
+  /// Retry only the primary for a snapshot already committed to the mirror.
+  #[serde(default)]
+  pub primary_only: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Resolve)]
