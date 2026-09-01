@@ -622,8 +622,6 @@ function TargetFileManager({ target, titleOther }: FileManagerProps) {
       plan: PendingCommit,
       conflictDecisions: Types.FileManagerConflictDecision[] = [],
     ) => {
-      setPendingCommit(undefined);
-      setDecisions({});
       operations.submitting(plan.notificationId, plan.label);
       try {
         const ticket = await commit({
@@ -632,6 +630,8 @@ function TargetFileManager({ target, titleOther }: FileManagerProps) {
           decisions: conflictDecisions,
           confirmed: true,
         });
+        setPendingCommit(undefined);
+        setDecisions({});
         const status = await operations.track(
           ticket.operation_id,
           target,
@@ -714,6 +714,7 @@ function TargetFileManager({ target, titleOther }: FileManagerProps) {
   );
 
   const cancelPendingCommit = useCallback(() => {
+    if (busy) return;
     if (pendingCommit) {
       operations.cancelPending(
         pendingCommit.notificationId,
@@ -722,7 +723,7 @@ function TargetFileManager({ target, titleOther }: FileManagerProps) {
     }
     setPendingCommit(undefined);
     setDecisions({});
-  }, [operations, pendingCommit]);
+  }, [busy, operations, pendingCommit]);
 
   const selectEntry = (
     entry: Types.FileManagerEntry,
@@ -2044,12 +2045,17 @@ function TargetFileManager({ target, titleOther }: FileManagerProps) {
             </Group>
           ))}
           <Group justify="end">
-            <Button variant="default" onClick={cancelPendingCommit}>
+            <Button
+              variant="default"
+              disabled={busy}
+              onClick={cancelPendingCommit}
+            >
               Cancel
             </Button>
             <Button
               color="red"
               disabled={
+                busy ||
                 !!pendingCommit?.preflight.conflicts.some(
                   (conflict) => !decisions[conflict.path],
                 )
