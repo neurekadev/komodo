@@ -1762,6 +1762,14 @@ function TargetFileManager({ target, titleOther }: FileManagerProps) {
                       {path && (
                         <Table.Tr
                           onClick={() => setPath(parentPath(path))}
+                          onDragOver={(event) => {
+                            event.preventDefault();
+                            event.stopPropagation();
+                            event.dataTransfer.dropEffect = "move";
+                          }}
+                          onDrop={(event) =>
+                            void onDrop(event, parentPath(path))
+                          }
                           style={{ cursor: "pointer" }}
                         >
                           <Table.Td />

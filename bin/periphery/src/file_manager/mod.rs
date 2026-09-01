@@ -489,6 +489,12 @@ enum JournalActionKind {
     path: String,
     quarantine_name: String,
   },
+  /// An empty source directory removed after its children were merged.
+  /// Undo recreates it before replaying child relocations in reverse.
+  RemovedEmptyDirectory {
+    path: String,
+    metadata: Option<JournalEntryMetadata>,
+  },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2142,6 +2148,11 @@ pub async fn commit(
               == FileManagerExecutionMode::Recoverable);
         let journal = finish_action_journal(journal, retain)?;
         return Ok((Some(journal), guard));
+      }
+      if move_trees_overlap(&plan.operation)? {
+        return Err(anyhow!(
+          "This ancestor directory merge cannot be completed safely on this filesystem"
+        ));
       }
       verify_plan_revisions(
         &root_dir,
@@ -4454,26 +4465,17 @@ fn supports_action_journal(
       let destination = relative_path(destination, true)?;
       for source in paths {
         let source = relative_path(source, false)?;
-        let (source_parent, source_name) =
-          open_parent_nofollow(root, &source)?;
-        let source_metadata =
-          source_parent.symlink_metadata(&source_name)?;
-        let target = destination.join(&source_name);
-        let (target_parent, target_name) =
-          open_parent_nofollow(root, &target)?;
-        if source_metadata.dev() != root_device
-          || target_parent.dir_metadata()?.dev() != root_device
-        {
-          return Ok(false);
-        }
-        if let Ok(target_metadata) =
-          target_parent.symlink_metadata(&target_name)
-          && (target_metadata.dev() != root_device
-            || (source_metadata.is_dir()
-              && !source_metadata.file_type().is_symlink()
-              && target_metadata.is_dir()
-              && !target_metadata.file_type().is_symlink()))
-        {
+        let source_name = source
+          .file_name()
+          .context("Source path has no filename")?;
+        let target = destination.join(source_name);
+        if !action_move_merge_is_local(
+          root,
+          &source,
+          &target,
+          root_device,
+          0,
+        )? {
           return Ok(false);
         }
       }
@@ -4493,6 +4495,87 @@ fn supports_action_journal(
     | FileManagerOperation::CreateArchive { .. }
     | FileManagerOperation::ExtractArchive { .. } => Ok(false),
   }
+}
+
+fn action_move_merge_is_local(
+  root: &Dir,
+  source: &Path,
+  target: &Path,
+  root_device: u64,
+  depth: usize,
+) -> anyhow::Result<bool> {
+  if depth > path::MAX_DEPTH {
+    return Err(anyhow!("Entry exceeds File Manager tree limits"));
+  }
+  let (source_parent, source_name) =
+    open_parent_nofollow(root, source)?;
+  let source_metadata =
+    source_parent.symlink_metadata(&source_name)?;
+  let (target_parent, target_name) =
+    open_parent_nofollow(root, target)?;
+  if source_metadata.dev() != root_device
+    || target_parent.dir_metadata()?.dev() != root_device
+  {
+    return Ok(false);
+  }
+  let target_metadata =
+    match target_parent.symlink_metadata(&target_name) {
+      Ok(metadata) => metadata,
+      Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        return Ok(true);
+      }
+      Err(error) => return Err(error.into()),
+    };
+  if target_metadata.dev() != root_device {
+    return Ok(false);
+  }
+  if source_metadata.is_dir()
+    && !source_metadata.file_type().is_symlink()
+    && target_metadata.is_dir()
+    && !target_metadata.file_type().is_symlink()
+  {
+    let source_directory =
+      source_parent.open_dir_nofollow(&source_name)?;
+    let mut children = source_directory
+      .entries()?
+      .map(|entry| entry.map(|entry| entry.file_name()))
+      .collect::<std::io::Result<Vec<_>>>()?;
+    children.sort();
+    for child in children {
+      if !action_move_merge_is_local(
+        root,
+        &source.join(&child),
+        &target.join(&child),
+        root_device,
+        depth + 1,
+      )? {
+        return Ok(false);
+      }
+    }
+  }
+  Ok(true)
+}
+
+fn move_trees_overlap(
+  operation: &FileManagerOperation,
+) -> anyhow::Result<bool> {
+  let FileManagerOperation::Move { paths, destination } = operation
+  else {
+    return Ok(false);
+  };
+  let destination = relative_path(destination, true)?;
+  for source in paths {
+    let source = relative_path(source, false)?;
+    let target = destination.join(
+      source.file_name().context("Source path has no filename")?,
+    );
+    if source != target
+      && (source.starts_with(&target) || target.starts_with(&source))
+    {
+      return Ok(true);
+    }
+  }
+  Ok(false)
 }
 
 fn action_operation_work(
@@ -4587,18 +4670,9 @@ fn apply_action_operation(
               .context("Source path has no filename")?,
           ),
         )?;
-        if visible_exists(root, &target)? {
-          match decision_for(&target, decisions) {
-            Some(FileManagerConflictAction::Skip) => continue,
-            Some(FileManagerConflictAction::Overwrite) => {
-              quarantine_visible(root, record, &target)?;
-            }
-            None => {
-              return Err(anyhow!("Destination already exists"));
-            }
-          }
-        }
-        relocate_visible(root, record, source, &target)?;
+        apply_action_move_entry(
+          root, record, source, &target, decisions, progress, 0,
+        )?;
         if let Some(progress) = progress {
           progress.add_entry();
         }
@@ -4666,6 +4740,91 @@ fn apply_action_operation(
     progress.add_entry();
   }
   Ok(())
+}
+
+fn apply_action_move_entry(
+  root: &Dir,
+  record: &mut JournalRecord,
+  source: &str,
+  target: &str,
+  decisions: &[FileManagerConflictDecision],
+  progress: Option<&OperationProgress>,
+  depth: usize,
+) -> anyhow::Result<()> {
+  if depth > path::MAX_DEPTH {
+    return Err(anyhow!("Entry exceeds File Manager tree limits"));
+  }
+  if let Some(progress) = progress {
+    progress.check_cancelled()?;
+  }
+  let source_path = relative_path(source, false)?;
+  let (source_parent, source_name) =
+    open_parent_nofollow(root, &source_path)?;
+  let source_metadata =
+    source_parent.symlink_metadata(&source_name)?;
+  let target_path = relative_path(target, false)?;
+  let (target_parent, target_name) =
+    open_parent_nofollow(root, &target_path)?;
+  let target_metadata =
+    match target_parent.symlink_metadata(&target_name) {
+      Ok(metadata) => Some(metadata),
+      Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        None
+      }
+      Err(error) => return Err(error.into()),
+    };
+
+  if let Some(target_metadata) = target_metadata {
+    if source_metadata.is_dir()
+      && !source_metadata.file_type().is_symlink()
+      && target_metadata.is_dir()
+      && !target_metadata.file_type().is_symlink()
+    {
+      let source_directory =
+        source_parent.open_dir_nofollow(&source_name)?;
+      let mut children = source_directory
+        .entries()?
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+      children.sort();
+      drop(source_directory);
+      for child in children {
+        let child = child
+          .to_str()
+          .context("Non-UTF-8 filenames are unsupported")?;
+        apply_action_move_entry(
+          root,
+          record,
+          &format!("{source}/{child}"),
+          &format!("{target}/{child}"),
+          decisions,
+          progress,
+          depth + 1,
+        )?;
+      }
+      let source_directory =
+        source_parent.open_dir_nofollow(&source_name)?;
+      let empty = source_directory.entries()?.next().is_none();
+      drop(source_directory);
+      if empty {
+        remove_empty_directory_visible(
+          root,
+          record,
+          source,
+          recorded_file_metadata(&source_metadata),
+        )?;
+      }
+      return Ok(());
+    }
+    match decision_for(target, decisions) {
+      Some(FileManagerConflictAction::Skip) => return Ok(()),
+      Some(FileManagerConflictAction::Overwrite) => {
+        quarantine_visible(root, record, target)?;
+      }
+      None => return Err(anyhow!("Destination already exists")),
+    }
+  }
+  relocate_visible(root, record, source, target)
 }
 
 fn merge_entry(
@@ -5516,6 +5675,59 @@ fn prepare_created_action(
   )
 }
 
+fn remove_empty_directory_visible(
+  root: &Dir,
+  record: &mut JournalRecord,
+  path: &str,
+  metadata: Option<JournalEntryMetadata>,
+) -> anyhow::Result<()> {
+  let index = append_action(
+    record,
+    JournalActionKind::RemovedEmptyDirectory {
+      path: path.to_string(),
+      metadata,
+    },
+  )?;
+  remove_visible_empty_directory(root, path)?;
+  mark_action_applied(record, index)
+}
+
+fn remove_visible_empty_directory(
+  root: &Dir,
+  path: &str,
+) -> anyhow::Result<()> {
+  let relative = relative_path(path, false)?;
+  let (parent, name) = open_parent_nofollow(root, &relative)?;
+  let directory = parent.open_dir_nofollow(&name)?;
+  if directory.entries()?.next().is_some() {
+    return Err(anyhow!(
+      "Directory changed during merge and is no longer empty"
+    ));
+  }
+  drop(directory);
+  parent.remove_dir(&name)?;
+  sync_capability_directory(&parent)
+}
+
+fn restore_visible_directory(
+  root: &Dir,
+  path: &str,
+  metadata: Option<&JournalEntryMetadata>,
+) -> anyhow::Result<()> {
+  ensure_visible_absent(root, path)?;
+  let relative = relative_path(path, false)?;
+  let (parent, name) = open_parent_nofollow(root, &relative)?;
+  parent.create_dir(&name)?;
+  let directory = parent.open_dir_nofollow(&name)?;
+  if let Some(metadata) = metadata {
+    let file = directory.open(".")?;
+    apply_recorded_file_metadata(&file, metadata, true)?;
+    file.sync_all()?;
+  }
+  sync_capability_directory(&directory)?;
+  sync_capability_directory(&parent)
+}
+
 fn create_action_journal(
   root: &ResolvedRoot,
   actor: &str,
@@ -5630,23 +5842,63 @@ fn action_was_applied(
   record: &JournalRecord,
   action: &JournalAction,
 ) -> anyhow::Result<bool> {
-  if action.state == JournalActionState::Applied {
-    return Ok(true);
-  }
   let quarantine = action_quarantine_directory(root, &record.id)?;
   match &action.kind {
     JournalActionKind::Quarantine {
       path,
       quarantine_name,
-    } => Ok(
-      !visible_exists(root, path)?
-        && quarantine.symlink_metadata(quarantine_name).is_ok(),
-    ),
+    } => match (
+      visible_exists(root, path)?,
+      quarantine.symlink_metadata(quarantine_name).is_ok(),
+    ) {
+      (false, true) => Ok(true),
+      (true, false) => Ok(false),
+      _ => Err(anyhow!(
+        "File Manager recovery state is ambiguous for {path}"
+      )),
+    },
     JournalActionKind::Relocate { from, to } => {
-      Ok(!visible_exists(root, from)? && visible_exists(root, to)?)
+      match (visible_exists(root, from)?, visible_exists(root, to)?) {
+        (false, true) => Ok(true),
+        (true, false) => Ok(false),
+        _ => Err(anyhow!(
+          "File Manager recovery state is ambiguous for {from} and {to}"
+        )),
+      }
     }
-    JournalActionKind::Created { path, .. } => {
-      visible_exists(root, path)
+    JournalActionKind::Created {
+      path,
+      quarantine_name,
+    } => match (
+      visible_exists(root, path)?,
+      quarantine.symlink_metadata(quarantine_name).is_ok(),
+    ) {
+      (true, false) => Ok(true),
+      (false, false) | (false, true) => Ok(false),
+      _ => Err(anyhow!(
+        "File Manager recovery state is ambiguous for {path}"
+      )),
+    },
+    JournalActionKind::RemovedEmptyDirectory { path, .. } => {
+      let relative = relative_path(path, false)?;
+      let (parent, name) = open_parent_nofollow(root, &relative)?;
+      match parent.symlink_metadata(name) {
+        Ok(metadata)
+          if metadata.is_dir()
+            && !metadata.file_type().is_symlink() =>
+        {
+          Ok(false)
+        }
+        Ok(_) => Err(anyhow!(
+          "File Manager recovery expected {path} to be a directory"
+        )),
+        Err(error)
+          if error.kind() == std::io::ErrorKind::NotFound =>
+        {
+          Ok(true)
+        }
+        Err(error) => Err(error.into()),
+      }
     }
   }
 }
@@ -5681,6 +5933,9 @@ fn rollback_action_journal(
           remove_entry(&parent, name)?;
         }
       }
+      JournalActionKind::RemovedEmptyDirectory { path, metadata } => {
+        restore_visible_directory(root, path, metadata.as_ref())?;
+      }
     }
   }
   Ok(())
@@ -5692,7 +5947,10 @@ fn action_paths(record: &JournalRecord) -> Vec<String> {
     .iter()
     .flat_map(|action| match &action.kind {
       JournalActionKind::Quarantine { path, .. }
-      | JournalActionKind::Created { path, .. } => vec![path.clone()],
+      | JournalActionKind::Created { path, .. }
+      | JournalActionKind::RemovedEmptyDirectory { path, .. } => {
+        vec![path.clone()]
+      }
       JournalActionKind::Relocate { from, to } => {
         vec![from.clone(), to.clone()]
       }
@@ -5720,6 +5978,15 @@ fn undo_action_journal(
   progress: Option<&OperationProgress>,
 ) -> anyhow::Result<()> {
   begin_journal_transition(record, JournalTransition::Undo)?;
+  undo_action_steps(root, record, progress)?;
+  complete_journal_transition(record, JournalHistorySide::Redo)
+}
+
+fn undo_action_steps(
+  root: &Dir,
+  record: &JournalRecord,
+  progress: Option<&OperationProgress>,
+) -> anyhow::Result<()> {
   let quarantine = action_quarantine_directory(root, &record.id)?;
   for action in record.actions.iter().rev() {
     if let Some(progress) = progress {
@@ -5751,12 +6018,15 @@ fn undo_action_journal(
         sync_capability_directory(&parent)?;
         sync_capability_directory(&quarantine)?;
       }
+      JournalActionKind::RemovedEmptyDirectory { path, metadata } => {
+        restore_visible_directory(root, path, metadata.as_ref())?;
+      }
     }
     if let Some(progress) = progress {
       progress.add_entry();
     }
   }
-  complete_journal_transition(record, JournalHistorySide::Redo)
+  Ok(())
 }
 
 fn redo_action_journal(
@@ -5765,6 +6035,15 @@ fn redo_action_journal(
   progress: Option<&OperationProgress>,
 ) -> anyhow::Result<()> {
   begin_journal_transition(record, JournalTransition::Redo)?;
+  redo_action_steps(root, record, progress)?;
+  complete_journal_transition(record, JournalHistorySide::Undo)
+}
+
+fn redo_action_steps(
+  root: &Dir,
+  record: &JournalRecord,
+  progress: Option<&OperationProgress>,
+) -> anyhow::Result<()> {
   let quarantine = action_quarantine_directory(root, &record.id)?;
   for action in &record.actions {
     if let Some(progress) = progress {
@@ -5796,12 +6075,15 @@ fn redo_action_journal(
         sync_capability_directory(&quarantine)?;
         sync_capability_directory(&parent)?;
       }
+      JournalActionKind::RemovedEmptyDirectory { path, .. } => {
+        remove_visible_empty_directory(root, path)?;
+      }
     }
     if let Some(progress) = progress {
       progress.add_entry();
     }
   }
-  complete_journal_transition(record, JournalHistorySide::Undo)
+  Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -8813,6 +9095,185 @@ mod tests {
       )
       .unwrap(),
       "new"
+    );
+    fs::remove_dir_all(directory).unwrap();
+  }
+
+  #[test]
+  fn ancestor_directory_merge_uses_the_action_journal() {
+    let directory =
+      std::env::temp_dir().join(Uuid::new_v4().to_string());
+    fs::create_dir_all(directory.join("sites/sites")).unwrap();
+    fs::write(directory.join("sites/sites/new.txt"), "new").unwrap();
+    fs::write(directory.join("sites/sites/conflict.txt"), "incoming")
+      .unwrap();
+    fs::write(directory.join("sites/conflict.txt"), "existing")
+      .unwrap();
+    let root =
+      Dir::open_ambient_dir(&directory, ambient_authority()).unwrap();
+    let operation = FileManagerOperation::Move {
+      paths: vec!["sites/sites".into()],
+      destination: String::new(),
+    };
+
+    assert!(supports_action_journal(&root, &operation, &[]).unwrap());
+    assert!(move_trees_overlap(&operation).unwrap());
+    let conflicts = find_conflicts(Some(&root), &operation).unwrap();
+    assert_eq!(conflicts.len(), 1);
+    assert_eq!(conflicts[0].path, "sites/conflict.txt");
+
+    fs::remove_dir_all(directory).unwrap();
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn ancestor_merge_actions_preserve_tree_through_undo_redo_and_rollback()
+   {
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+    let directory =
+      std::env::temp_dir().join(Uuid::new_v4().to_string());
+    let source = directory.join("sites/sites");
+    fs::create_dir_all(&source).unwrap();
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o751))
+      .unwrap();
+    fs::write(source.join("new.txt"), "new").unwrap();
+    fs::write(source.join("conflict.txt"), "incoming").unwrap();
+    symlink("new.txt", source.join("link")).unwrap();
+    fs::write(directory.join("sites/conflict.txt"), "existing")
+      .unwrap();
+
+    let id = Uuid::new_v4().to_string();
+    let private = directory.join(PRIVATE_STATE_DIRECTORY);
+    fs::create_dir(&private).unwrap();
+    fs::write(
+      private.join(PRIVATE_STATE_MARKER),
+      PRIVATE_STATE_MARKER_CONTENTS,
+    )
+    .unwrap();
+    let operation = private.join(&id);
+    fs::create_dir(&operation).unwrap();
+    fs::create_dir(operation.join("quarantine")).unwrap();
+    fs::create_dir(operation.join("staging")).unwrap();
+
+    let root =
+      Dir::open_ambient_dir(&directory, ambient_authority()).unwrap();
+    let source_metadata = recorded_file_metadata(
+      &root.symlink_metadata("sites/sites").unwrap(),
+    );
+    let mut record = test_journal_record(
+      &id,
+      komodo_timestamp(),
+      JournalHistorySide::Undo,
+    );
+    record.root_path = directory.clone();
+
+    fs::rename(
+      source.join("new.txt"),
+      directory.join("sites/new.txt"),
+    )
+    .unwrap();
+    record.actions.push(JournalAction {
+      state: JournalActionState::Applied,
+      kind: JournalActionKind::Relocate {
+        from: "sites/sites/new.txt".into(),
+        to: "sites/new.txt".into(),
+      },
+    });
+    fs::rename(source.join("link"), directory.join("sites/link"))
+      .unwrap();
+    record.actions.push(JournalAction {
+      state: JournalActionState::Applied,
+      kind: JournalActionKind::Relocate {
+        from: "sites/sites/link".into(),
+        to: "sites/link".into(),
+      },
+    });
+    fs::rename(
+      directory.join("sites/conflict.txt"),
+      operation.join("quarantine/existing"),
+    )
+    .unwrap();
+    record.actions.push(JournalAction {
+      state: JournalActionState::Applied,
+      kind: JournalActionKind::Quarantine {
+        path: "sites/conflict.txt".into(),
+        quarantine_name: "existing".into(),
+      },
+    });
+    fs::rename(
+      source.join("conflict.txt"),
+      directory.join("sites/conflict.txt"),
+    )
+    .unwrap();
+    record.actions.push(JournalAction {
+      state: JournalActionState::Applied,
+      kind: JournalActionKind::Relocate {
+        from: "sites/sites/conflict.txt".into(),
+        to: "sites/conflict.txt".into(),
+      },
+    });
+    fs::remove_dir(&source).unwrap();
+    record.actions.push(JournalAction {
+      state: JournalActionState::Applied,
+      kind: JournalActionKind::RemovedEmptyDirectory {
+        path: "sites/sites".into(),
+        metadata: source_metadata,
+      },
+    });
+
+    undo_action_steps(&root, &record, None).unwrap();
+    assert_eq!(
+      fs::read_to_string(source.join("new.txt")).unwrap(),
+      "new"
+    );
+    assert_eq!(
+      fs::read_to_string(source.join("conflict.txt")).unwrap(),
+      "incoming"
+    );
+    assert_eq!(
+      fs::read_to_string(directory.join("sites/conflict.txt"))
+        .unwrap(),
+      "existing"
+    );
+    assert_eq!(
+      fs::read_link(source.join("link")).unwrap(),
+      Path::new("new.txt")
+    );
+    assert_eq!(
+      fs::metadata(&source).unwrap().permissions().mode() & 0o7777,
+      0o751
+    );
+
+    redo_action_steps(&root, &record, None).unwrap();
+    assert!(!source.exists());
+    assert_eq!(
+      fs::read_to_string(directory.join("sites/conflict.txt"))
+        .unwrap(),
+      "incoming"
+    );
+    assert_eq!(
+      fs::read_link(directory.join("sites/link")).unwrap(),
+      Path::new("new.txt")
+    );
+
+    rollback_action_journal(&root, &record).unwrap();
+    assert_eq!(
+      fs::read_to_string(source.join("new.txt")).unwrap(),
+      "new"
+    );
+    assert_eq!(
+      fs::read_to_string(source.join("conflict.txt")).unwrap(),
+      "incoming"
+    );
+    assert_eq!(
+      fs::read_to_string(directory.join("sites/conflict.txt"))
+        .unwrap(),
+      "existing"
+    );
+    assert_eq!(
+      fs::metadata(&source).unwrap().permissions().mode() & 0o7777,
+      0o751
     );
     fs::remove_dir_all(directory).unwrap();
   }
