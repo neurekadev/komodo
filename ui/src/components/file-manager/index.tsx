@@ -622,8 +622,6 @@ function TargetFileManager({ target, titleOther }: FileManagerProps) {
       plan: PendingCommit,
       conflictDecisions: Types.FileManagerConflictDecision[] = [],
     ) => {
-      setPendingCommit(undefined);
-      setDecisions({});
       operations.submitting(plan.notificationId, plan.label);
       try {
         const ticket = await commit({
@@ -632,6 +630,8 @@ function TargetFileManager({ target, titleOther }: FileManagerProps) {
           decisions: conflictDecisions,
           confirmed: true,
         });
+        setPendingCommit(undefined);
+        setDecisions({});
         const status = await operations.track(
           ticket.operation_id,
           target,
