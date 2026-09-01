@@ -3140,7 +3140,8 @@ fn purge_abandoned_core_staging() -> anyhow::Result<()> {
     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
     Err(error) => {
       return Err(
-        error.context("Failed to purge abandoned Core staging"),
+        anyhow::Error::new(error)
+          .context("Failed to purge abandoned Core staging"),
       );
     }
   }
