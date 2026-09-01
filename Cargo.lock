@@ -2152,7 +2152,6 @@ dependencies = [
  "formatting",
  "komodo_client",
  "mogh_secret_file",
- "tokio",
 ]
 
 [[package]]
@@ -3630,7 +3629,6 @@ dependencies = [
  "dotenvy",
  "encoding",
  "english-to-cron",
- "environment",
  "envy",
  "formatting",
  "futures-util",

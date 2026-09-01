@@ -501,4 +501,30 @@ mod tests {
 
     fs::remove_dir_all(directory).await.unwrap();
   }
+
+  #[tokio::test]
+  async fn clearing_managed_environment_retires_stale_values() {
+    let directory = std::env::temp_dir().join(format!(
+      "komodo-managed-env-clear-{}",
+      uuid::Uuid::new_v4()
+    ));
+    fs::create_dir_all(&directory).await.unwrap();
+    let env_path = directory.join(".env");
+    fs::write(&env_path, "STALE=value\n").await.unwrap();
+
+    let mut stack = Stack::default();
+    stack.config.file_contents = "services: {}\n".into();
+    stack.config.environment.clear();
+
+    write_stack_ui_defined_at(
+      &stack,
+      directory.clone(),
+      TestWriteResponse::default(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(fs::read_to_string(&env_path).await.unwrap(), "");
+    fs::remove_dir_all(directory).await.unwrap();
+  }
 }

@@ -410,6 +410,23 @@ pub struct EnvironmentVar {
   pub value: String,
 }
 
+/// Render environment variables exactly as stack deployment writes them.
+pub fn render_environment_file(
+  environment: &[EnvironmentVar],
+) -> String {
+  let contents = environment
+    .iter()
+    .map(|env| format!("{}={}", env.variable, env.value))
+    .collect::<Vec<_>>()
+    .join("\n");
+
+  if contents.is_empty() || contents.ends_with('\n') {
+    contents
+  } else {
+    contents + "\n"
+  }
+}
+
 pub fn environment_vars_from_str(
   input: &str,
 ) -> anyhow::Result<Vec<EnvironmentVar>> {
@@ -419,6 +436,29 @@ pub fn environment_vars_from_str(
       .map(|(variable, value)| EnvironmentVar { variable, value })
       .collect()
   })
+}
+
+#[cfg(test)]
+mod environment_tests {
+  use super::*;
+
+  #[test]
+  fn renderer_handles_values_and_empty_sources() {
+    assert_eq!(render_environment_file(&[]), "");
+    assert_eq!(
+      render_environment_file(&[
+        EnvironmentVar {
+          variable: "FIRST".into(),
+          value: "one".into(),
+        },
+        EnvironmentVar {
+          variable: "QUOTED".into(),
+          value: "\"two words\"".into(),
+        },
+      ]),
+      "FIRST=one\nQUOTED=\"two words\"\n"
+    );
+  }
 }
 
 #[typeshare]

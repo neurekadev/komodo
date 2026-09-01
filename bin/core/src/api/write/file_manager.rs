@@ -1740,7 +1740,9 @@ async fn expand_managed_source(
   match kind {
     ManagedFileKind::Compose => Ok(stack.config.file_contents),
     ManagedFileKind::Environment => {
-      Ok(environment::render_env_file(&stack.config.env_vars()?))
+      Ok(komodo_client::entities::render_environment_file(
+        &stack.config.env_vars()?,
+      ))
     }
   }
 }

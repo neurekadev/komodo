@@ -101,7 +101,7 @@ jobs:
       - unit-tests
       - build
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
+    timeout-minutes: 45
     permissions:
       contents: read
       packages: write

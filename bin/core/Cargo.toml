@@ -18,7 +18,6 @@ komodo_client = { workspace = true, features = ["core"] }
 periphery_client.workspace = true
 mogh_validations.workspace = true
 interpolate.workspace = true
-environment.workspace = true
 mogh_secret_file.workspace = true
 formatting.workspace = true
 mogh_rate_limit.workspace = true
