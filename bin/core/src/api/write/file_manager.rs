@@ -99,9 +99,7 @@ const MANAGED_TRANSACTION_LEASE_RENEW_INTERVAL: Duration =
 
 fn managed_transaction_collection()
 -> Collection<ManagedFileManagerTransaction> {
-  db_client()
-    .db
-    .collection(MANAGED_TRANSACTION_COLLECTION)
+  db_client().db.collection(MANAGED_TRANSACTION_COLLECTION)
 }
 
 fn managed_transaction_owner() -> &'static str {
@@ -201,9 +199,8 @@ fn start_live_managed_transaction(
   let stack_id = transaction.stack_id.clone();
   let operation_id = transaction.operation_id.clone();
   tokio::spawn(async move {
-    let mut interval = tokio::time::interval(
-      MANAGED_TRANSACTION_LEASE_RENEW_INTERVAL,
-    );
+    let mut interval =
+      tokio::time::interval(MANAGED_TRANSACTION_LEASE_RENEW_INTERVAL);
     interval.tick().await;
     loop {
       tokio::select! {
@@ -314,9 +311,8 @@ async fn record_managed_transaction_error(
 
 pub fn spawn_managed_transaction_reconciliation_loop() {
   tokio::spawn(async {
-    let mut interval = tokio::time::interval(
-      MANAGED_TRANSACTION_RECONCILE_INTERVAL,
-    );
+    let mut interval =
+      tokio::time::interval(MANAGED_TRANSACTION_RECONCILE_INTERVAL);
     loop {
       interval.tick().await;
       let transactions = match find_collect(
@@ -1438,8 +1434,7 @@ async fn rollback_managed_host_operation(
         status.state
       ));
     }
-    delete_managed_transaction(stack_id, source_operation_id)
-      .await?;
+    delete_managed_transaction(stack_id, source_operation_id).await?;
     return Ok(ManagedRollbackOutcome::Complete);
   }
   let rollback_id = Uuid::new_v4().to_string();

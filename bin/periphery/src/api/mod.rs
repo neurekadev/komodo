@@ -66,9 +66,7 @@ pub enum PeripheryRequest {
   BeginManagedFileManagerTransaction(
     BeginManagedFileManagerTransaction,
   ),
-  GetManagedFileManagerTransaction(
-    GetManagedFileManagerTransaction,
-  ),
+  GetManagedFileManagerTransaction(GetManagedFileManagerTransaction),
   FinalizeManagedFileManagerTransaction(
     FinalizeManagedFileManagerTransaction,
   ),
