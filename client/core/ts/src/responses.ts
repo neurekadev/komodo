@@ -80,6 +80,15 @@ export type ReadResponses = {
   ListCommonStackExtraArgs: Types.ListCommonStackExtraArgsResponse;
   ListCommonStackBuildExtraArgs: Types.ListCommonStackBuildExtraArgsResponse;
 
+  // ==== FILE MANAGER ====
+  GetFileManagerCapabilities: Types.FileManagerCapabilities;
+  ListFileManagerDirectory: Types.FileManagerDirectory;
+  ReadFileManagerText: Types.FileManagerTextFile;
+  ReadManagedFileManagerRenderedText: Types.FileManagerTextFile;
+  GetFileManagerOperationStatus: Types.FileManagerOperationStatus;
+  ListActiveFileManagerOperations: Types.FileManagerActiveOperations;
+  GetFileManagerJournalStatus: Types.FileManagerJournalStatus;
+
   // ==== DEPLOYMENT ====
   GetDeploymentsSummary: Types.GetDeploymentsSummaryResponse;
   GetDeployment: Types.GetDeploymentResponse;
@@ -228,6 +237,17 @@ export type WriteResponses = {
   RefreshStackCache: Types.NoData;
   CheckStackForUpdate: Types.CheckStackForUpdateResponse;
   BatchCheckStackForUpdate: Types.BatchCheckStackForUpdateResponse;
+
+  // ==== FILE MANAGER ====
+  PreflightFileManagerOperation: Types.FileManagerPreflight;
+  CommitFileManagerOperation: Types.FileManagerOperationTicket;
+  ResolveFileManagerOperationConflict: Types.FileManagerOperationStatus;
+  CancelFileManagerOperation: Types.FileManagerOperationStatus;
+  PrepareFileManagerUpload: Types.FileManagerTransferTicket;
+  PrepareFileManagerDownload: Types.FileManagerTransferTicket;
+  PrepareManagedFileManagerRenderedDownload: Types.FileManagerTransferTicket;
+  UndoFileManagerOperation: Types.FileManagerOperationTicket;
+  RedoFileManagerOperation: Types.FileManagerOperationTicket;
 
   // ==== DEPLOYMENT ====
   CreateDeployment: Types.Deployment;

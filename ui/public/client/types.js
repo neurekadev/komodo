@@ -106,6 +106,7 @@ export var Operation;
     Operation["PruneDockerBuilders"] = "PruneDockerBuilders";
     Operation["PruneBuildx"] = "PruneBuildx";
     Operation["PruneSystem"] = "PruneSystem";
+    Operation["FileManager"] = "FileManager";
     Operation["CreateStack"] = "CreateStack";
     Operation["UpdateStack"] = "UpdateStack";
     Operation["RenameStack"] = "RenameStack";
@@ -797,6 +798,11 @@ export var StackState;
     /** Server not reachable for status */
     StackState["Unknown"] = "unknown";
 })(StackState || (StackState = {}));
+export var FileManagerConflictAction;
+(function (FileManagerConflictAction) {
+    FileManagerConflictAction["Skip"] = "skip";
+    FileManagerConflictAction["Overwrite"] = "overwrite";
+})(FileManagerConflictAction || (FileManagerConflictAction = {}));
 /**
  * Configures the behavior of [CreateTerminal] if the
  * specified terminal name already exists.
@@ -819,6 +825,33 @@ export var ContainerTerminalMode;
     ContainerTerminalMode["Exec"] = "exec";
     ContainerTerminalMode["Attach"] = "attach";
 })(ContainerTerminalMode || (ContainerTerminalMode = {}));
+export var FileManagerOperationState;
+(function (FileManagerOperationState) {
+    FileManagerOperationState["Pending"] = "pending";
+    FileManagerOperationState["Running"] = "running";
+    FileManagerOperationState["WaitingForInput"] = "waiting_for_input";
+    FileManagerOperationState["Complete"] = "complete";
+    FileManagerOperationState["Failed"] = "failed";
+    FileManagerOperationState["Cancelled"] = "cancelled";
+})(FileManagerOperationState || (FileManagerOperationState = {}));
+export var FileManagerOperationPhase;
+(function (FileManagerOperationPhase) {
+    FileManagerOperationPhase["Queued"] = "queued";
+    FileManagerOperationPhase["Preparing"] = "preparing";
+    FileManagerOperationPhase["Snapshotting"] = "snapshotting";
+    FileManagerOperationPhase["Applying"] = "applying";
+    FileManagerOperationPhase["Verifying"] = "verifying";
+    FileManagerOperationPhase["Transferring"] = "transferring";
+    FileManagerOperationPhase["Finalizing"] = "finalizing";
+    FileManagerOperationPhase["RollingBack"] = "rolling_back";
+})(FileManagerOperationPhase || (FileManagerOperationPhase = {}));
+export var FileManagerEntryKind;
+(function (FileManagerEntryKind) {
+    FileManagerEntryKind["File"] = "file";
+    FileManagerEntryKind["Directory"] = "directory";
+    FileManagerEntryKind["Symlink"] = "symlink";
+    FileManagerEntryKind["Special"] = "special";
+})(FileManagerEntryKind || (FileManagerEntryKind = {}));
 export var ActionSortBy;
 (function (ActionSortBy) {
     /** Sort by name. Default. */
@@ -1017,6 +1050,13 @@ export var DayOfWeek;
     DayOfWeek["Saturday"] = "Saturday";
     DayOfWeek["Sunday"] = "Sunday";
 })(DayOfWeek || (DayOfWeek = {}));
+export var FileManagerArchiveFormat;
+(function (FileManagerArchiveFormat) {
+    FileManagerArchiveFormat["Zip"] = "zip";
+    FileManagerArchiveFormat["Tar"] = "tar";
+    FileManagerArchiveFormat["TarGz"] = "tar_gz";
+    FileManagerArchiveFormat["SevenZip"] = "seven_zip";
+})(FileManagerArchiveFormat || (FileManagerArchiveFormat = {}));
 /**
  * One representative IANA zone for each distinct base UTC offset in the tz database.
  * https://en.wikipedia.org/wiki/List_of_tz_database_time_zones.
@@ -1112,6 +1152,11 @@ export var RepoWebhookAction;
 /** The specific types of permission that a User or UserGroup can have on a resource. */
 export var SpecificPermission;
 (function (SpecificPermission) {
+    /**
+     * On **Server / Stack**
+     * - Access File Manager APIs for the resource
+     */
+    SpecificPermission["FileManager"] = "FileManager";
     /**
      * On **Server**
      * - Access the terminal apis

@@ -20,7 +20,8 @@ use komodo_client::entities::{
 use mogh_cache::CloneCache;
 use mogh_error::serror_into_anyhow_error;
 use periphery_client::transport::{
-  EncodedTransportMessage, ResponseMessage, TransportMessage,
+  EncodedTransportMessage, FileTransferMessage, ResponseMessage,
+  TransportMessage,
 };
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
@@ -260,6 +261,86 @@ pub type ResponseChannels =
 pub type TerminalChannels =
   CloneCache<Uuid, Sender<anyhow::Result<Vec<u8>>>>;
 
+#[derive(Debug, Clone)]
+pub enum FileTransferRoute {
+  Legacy(Sender<anyhow::Result<Vec<u8>>>),
+  FlowControlled(Sender<anyhow::Result<Vec<u8>>>),
+}
+
+impl FileTransferRoute {
+  async fn send(
+    &self,
+    data: anyhow::Result<Vec<u8>>,
+  ) -> anyhow::Result<()> {
+    match self {
+      FileTransferRoute::Legacy(sender) => sender.send(data).await,
+      FileTransferRoute::FlowControlled(sender) => {
+        sender.try_send(data)
+      }
+    }
+  }
+
+  fn is_flow_controlled(&self) -> bool {
+    matches!(self, FileTransferRoute::FlowControlled(_))
+  }
+}
+
+pub type FileTransferChannels = CloneCache<Uuid, FileTransferRoute>;
+
+const FILE_TRANSFER_CANCEL_SEND_TIMEOUT: Duration =
+  Duration::from_secs(1);
+
+async fn send_file_transfer_cancel_with_timeout(
+  outgoing: &Sender<EncodedTransportMessage>,
+  channel: Uuid,
+  timeout: Duration,
+) {
+  let _ = tokio::time::timeout(
+    timeout,
+    outgoing.send_file_transfer(
+      channel,
+      Ok(FileTransferMessage::Cancel.into_raw()),
+    ),
+  )
+  .await;
+}
+
+pub(crate) async fn send_file_transfer_cancel_bounded(
+  outgoing: &Sender<EncodedTransportMessage>,
+  channel: Uuid,
+) {
+  send_file_transfer_cancel_with_timeout(
+    outgoing,
+    channel,
+    FILE_TRANSFER_CANCEL_SEND_TIMEOUT,
+  )
+  .await;
+}
+
+async fn forward_file_transfer(
+  routes: &FileTransferChannels,
+  outgoing: &Sender<EncodedTransportMessage>,
+  channel: Uuid,
+  data: anyhow::Result<Vec<u8>>,
+) {
+  let Some(route) = routes.get(&channel).await else {
+    warn!(
+      "Failed to forward file transfer | No channel found at {channel}"
+    );
+    return;
+  };
+  if let Err(error) = route.send(data).await {
+    warn!("Failed to forward file transfer at {channel} | {error:#}");
+    if route.is_flow_controlled() {
+      routes.remove(&channel).await;
+      let outgoing = outgoing.clone();
+      tokio::spawn(async move {
+        send_file_transfer_cancel_bounded(&outgoing, channel).await;
+      });
+    }
+  }
+}
+
 #[derive(Debug)]
 pub struct PeripheryConnection {
   /// The connection args
@@ -278,6 +359,8 @@ pub struct PeripheryConnection {
   pub responses: Arc<ResponseChannels>,
   /// Forward bytes from Periphery to terminal channel handlers.
   pub terminals: Arc<TerminalChannels>,
+  /// Forward binary file-transfer frames to active HTTP streams.
+  pub file_transfers: Arc<FileTransferChannels>,
 }
 
 impl PeripheryConnection {
@@ -297,6 +380,7 @@ impl PeripheryConnection {
         error: Default::default(),
         responses: Default::default(),
         terminals: Default::default(),
+        file_transfers: Default::default(),
       }
       .into(),
       receiever,
@@ -322,6 +406,7 @@ impl PeripheryConnection {
         error: self.error.clone(),
         responses: self.responses.clone(),
         terminals: self.terminals.clone(),
+        file_transfers: self.file_transfers.clone(),
       }
       .into(),
       receiever,
@@ -467,6 +552,20 @@ impl PeripheryConnection {
           warn!("Failed to read Terminal message | {e:#}");
         }
       },
+      TransportMessage::FileTransfer(data) => match data.decode() {
+        Ok(WithChannel { channel, data }) => {
+          forward_file_transfer(
+            &self.file_transfers,
+            &self.sender,
+            channel,
+            data,
+          )
+          .await;
+        }
+        Err(error) => {
+          warn!("Failed to decode file-transfer message | {error:#}");
+        }
+      },
       //
       other => {
         warn!("Received unexpected transport message | {other:?}");
@@ -544,4 +643,91 @@ fn spawn_update_attempted_public_key(
       );
     };
   });
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use transport::channel::{channel, channel_with_capacity};
+
+  #[tokio::test]
+  async fn flow_controlled_overflow_removes_only_that_route() {
+    let routes = FileTransferChannels::default();
+    let overflowed_id = Uuid::new_v4();
+    let retained_id = Uuid::new_v4();
+    let (overflowed_sender, _overflowed_receiver) =
+      channel_with_capacity::<anyhow::Result<Vec<u8>>>(1);
+    overflowed_sender.try_send(Ok(vec![1])).unwrap();
+    routes
+      .insert(
+        overflowed_id,
+        FileTransferRoute::FlowControlled(overflowed_sender),
+      )
+      .await;
+    let (retained_sender, _retained_receiver) =
+      channel_with_capacity::<anyhow::Result<Vec<u8>>>(1);
+    routes
+      .insert(
+        retained_id,
+        FileTransferRoute::FlowControlled(retained_sender),
+      )
+      .await;
+    let (outgoing, mut outgoing_receiver) =
+      channel::<EncodedTransportMessage>();
+
+    forward_file_transfer(
+      &routes,
+      &outgoing,
+      overflowed_id,
+      Ok(vec![2]),
+    )
+    .await;
+
+    assert!(routes.get(&overflowed_id).await.is_none());
+    assert!(routes.get(&retained_id).await.is_some());
+    let message = tokio::time::timeout(
+      Duration::from_secs(1),
+      outgoing_receiver.recv(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let TransportMessage::FileTransfer(message) =
+      message.decode().unwrap()
+    else {
+      panic!("Expected file-transfer cancellation");
+    };
+    let WithChannel { channel, data } = message.decode().unwrap();
+    assert_eq!(channel, overflowed_id);
+    assert_eq!(
+      FileTransferMessage::from_raw(data.unwrap()).unwrap(),
+      FileTransferMessage::Cancel
+    );
+  }
+
+  #[tokio::test]
+  async fn file_transfer_cancel_send_is_bounded_when_outgoing_stalls()
+  {
+    let channel_id = Uuid::new_v4();
+    let (outgoing, _outgoing_receiver) =
+      channel_with_capacity::<EncodedTransportMessage>(1);
+    outgoing
+      .send_file_transfer(
+        Uuid::new_v4(),
+        Ok(FileTransferMessage::Cancel.into_raw()),
+      )
+      .await
+      .unwrap();
+
+    tokio::time::timeout(
+      Duration::from_millis(100),
+      send_file_transfer_cancel_with_timeout(
+        &outgoing,
+        channel_id,
+        Duration::from_millis(10),
+      ),
+    )
+    .await
+    .unwrap();
+  }
 }

@@ -11,6 +11,7 @@ pub mod build;
 pub mod compose;
 pub mod container;
 pub mod docker;
+pub mod file_manager;
 pub mod git;
 pub mod keys;
 pub mod poll;

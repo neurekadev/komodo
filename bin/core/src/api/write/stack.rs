@@ -217,7 +217,10 @@ impl Resolve<WriteArgs> for WriteStackFileContents {
     let mut update =
       make_update(&stack, Operation::WriteStackContents, user);
 
-    update.push_simple_log("File contents to write", &contents);
+    update.push_simple_log(
+      "Write file contents",
+      format!("Writing stack file {file_path:?}"),
+    );
 
     let id = stack.id.clone();
 

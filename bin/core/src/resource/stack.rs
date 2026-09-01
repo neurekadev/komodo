@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use anyhow::Context;
 use database::mungos::mongodb::Collection;
 use formatting::format_serror;
@@ -14,6 +16,7 @@ use komodo_client::{
       PartialStackConfig, Stack, StackConfig, StackConfigDiff,
       StackInfo, StackListItem, StackListItemInfo,
       StackQuerySpecifics, StackServiceWithUpdate, StackState,
+      validate_stack_file_paths,
     },
     swarm::Swarm,
     to_docker_compatible_name,
@@ -68,6 +71,7 @@ impl super::KomodoResource for Stack {
 
   fn creator_specific_permissions() -> IndexSet<SpecificPermission> {
     [
+      SpecificPermission::FileManager,
       SpecificPermission::Inspect,
       SpecificPermission::Logs,
       SpecificPermission::Terminal,
@@ -274,7 +278,8 @@ impl super::KomodoResource for Stack {
     config: &mut Self::PartialConfig,
     user: &User,
   ) -> anyhow::Result<()> {
-    validate_config(config, user).await
+    validate_config(config, user).await?;
+    validate_create_file_paths(config)
   }
 
   async fn post_create(
@@ -331,11 +336,13 @@ impl super::KomodoResource for Stack {
   }
 
   async fn validate_update_config(
-    _id: &str,
+    id: &str,
     config: &mut Self::PartialConfig,
     user: &User,
   ) -> anyhow::Result<()> {
-    validate_config(config, user).await
+    validate_config(config, user).await?;
+    let current = super::get::<Stack>(id).await?;
+    validate_effective_file_paths(&current.config, config)
   }
 
   async fn post_update(
@@ -515,4 +522,72 @@ async fn validate_config(
     config.linked_repo = Some(repo.id);
   }
   Ok(())
+}
+
+fn validate_create_file_paths(
+  config: &PartialStackConfig,
+) -> anyhow::Result<()> {
+  let effective: StackConfig = config.clone().into();
+  validate_stack_file_paths(
+    &effective.file_paths,
+    &effective.env_file_path,
+    Path::new(""),
+  )
+}
+
+fn validate_effective_file_paths(
+  current: &StackConfig,
+  update: &PartialStackConfig,
+) -> anyhow::Result<()> {
+  validate_stack_file_paths(
+    update.file_paths.as_ref().unwrap_or(&current.file_paths),
+    update
+      .env_file_path
+      .as_deref()
+      .unwrap_or(&current.env_file_path),
+    Path::new(""),
+  )
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn validates_create_and_partial_update_file_paths() {
+    let create = PartialStackConfig {
+      file_paths: Some(vec!["./.env".into()]),
+      env_file_path: Some(".env".into()),
+      ..Default::default()
+    };
+    assert!(validate_create_file_paths(&create).is_err());
+
+    let current = StackConfig {
+      file_paths: vec!["compose.yaml".into()],
+      env_file_path: ".env".into(),
+      ..Default::default()
+    };
+    let env_update = PartialStackConfig {
+      env_file_path: Some("nested/../compose.yaml".into()),
+      ..Default::default()
+    };
+    assert!(
+      validate_effective_file_paths(&current, &env_update).is_err()
+    );
+    let compose_update = PartialStackConfig {
+      file_paths: Some(vec!["nested/../.env".into()]),
+      ..Default::default()
+    };
+    assert!(
+      validate_effective_file_paths(&current, &compose_update)
+        .is_err()
+    );
+    assert!(
+      validate_effective_file_paths(
+        &current,
+        &PartialStackConfig::default()
+      )
+      .is_ok()
+    );
+  }
 }

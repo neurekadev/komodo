@@ -13,6 +13,8 @@ pub mod execute;
 pub mod read;
 pub mod write;
 
+mod file_manager;
+
 mod listener;
 mod openapi;
 mod terminal;
@@ -34,6 +36,7 @@ pub fn app() -> Router {
     .nest("/write", write::router())
     .nest("/execute", execute::router())
     .nest("/terminal", terminal::router())
+    .nest("/file-manager", file_manager::router())
     .nest("/listener", listener::router())
     .nest("/ws", ws::router())
     .nest("/client", ts_client::router())

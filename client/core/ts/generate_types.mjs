@@ -42,6 +42,11 @@ function fix_types() {
       ", PermissionLevelAndSpecifics",
       ", PermissionLevelAndSpecifics | PermissionLevel"
     )
-    .replaceAll("IndexMap", "Record");
+    .replaceAll("IndexMap", "Record")
+    .split("\n")
+    .map((line) => line.trimEnd())
+    .join("\n")
+    .trimEnd()
+    .concat("\n");
   writeFileSync(types_path, fixed);
 }

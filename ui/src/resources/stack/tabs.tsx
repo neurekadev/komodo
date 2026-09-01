@@ -2,7 +2,7 @@ import { useLocalStorage } from "@mantine/hooks";
 import { useStack } from ".";
 import { usePermissions, useRead } from "@/lib/hooks";
 import { Types } from "komodo_client";
-import { useMemo } from "react";
+import { useEffect, useMemo } from "react";
 import { MobileFriendlyTabsSelector, TabNoContent } from "mogh_ui";
 import { Tabs } from "@mantine/core";
 import { ICONS } from "@/lib/icons";
@@ -13,8 +13,15 @@ import StackInfo from "./info";
 import StackServices from "./services";
 import StackLog from "./log";
 import TerminalSection from "@/components/terminal/section";
+import FileManager from "@/components/file-manager";
 
-type StackTabsView = "Config" | "Info" | "Services" | "Log" | "Terminals";
+type StackTabsView =
+  | "Config"
+  | "Info"
+  | "Services"
+  | "Files"
+  | "Log"
+  | "Terminals";
 
 export default function StackTabs({ id }: { id: string }) {
   const [_view, setView] = useLocalStorage<StackTabsView>({
@@ -22,10 +29,12 @@ export default function StackTabs({ id }: { id: string }) {
     defaultValue: "Config",
   });
   const info = useStack(id)?.info;
-  const { specificLogs, specificTerminal } = usePermissions({
-    type: "Stack",
-    id,
-  });
+  const {
+    specificLogs,
+    specificTerminal,
+    specificFileManager,
+    permissionsLoaded,
+  } = usePermissions({ type: "Stack", id });
 
   const services = useRead("ListStackServices", { stack: id }).data;
 
@@ -39,6 +48,7 @@ export default function StackTabs({ id }: { id: string }) {
     state === Types.StackState.Unknown ||
     state === Types.StackState.Down ||
     !specificLogs;
+  const hideFiles = !specificFileManager;
   const terminalDisabled =
     !specificTerminal ||
     containerTerminalsDisabled ||
@@ -54,6 +64,7 @@ export default function StackTabs({ id }: { id: string }) {
   const view =
     (_view === "Info" && hideInfo) ||
     (_view === "Terminals" && terminalDisabled) ||
+    (_view === "Files" && hideFiles) ||
     (_view === "Log" && hideLogs)
       ? "Config"
       : _view;
@@ -74,6 +85,11 @@ export default function StackTabs({ id }: { id: string }) {
         icon: ICONS.Service,
       },
       {
+        value: "Files",
+        hidden: hideFiles,
+        icon: ICONS.FileManager,
+      },
+      {
         value: "Log",
         disabled: hideLogs,
         icon: ICONS.Log,
@@ -87,12 +103,19 @@ export default function StackTabs({ id }: { id: string }) {
     ],
     [
       hideInfo,
+      hideFiles,
       specificLogs,
       hideLogs,
       specificTerminal,
       terminalDisabled,
     ],
   );
+
+  useEffect(() => {
+    if (permissionsLoaded && _view === "Files" && hideFiles) {
+      setView("Config");
+    }
+  }, [_view, hideFiles, permissionsLoaded, setView]);
 
   const Selector = (
     <MobileFriendlyTabsSelector
@@ -122,6 +145,14 @@ export default function StackTabs({ id }: { id: string }) {
       break;
     case "Services":
       View = <StackServices id={id} titleOther={Selector} />;
+      break;
+    case "Files":
+      View = (
+        <FileManager
+          target={{ type: "Stack", params: { stack: id } }}
+          titleOther={Selector}
+        />
+      );
       break;
     case "Log":
       View = <StackLog id={id} titleOther={Selector} />;

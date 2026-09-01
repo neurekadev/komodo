@@ -73,6 +73,12 @@ services:
     depends_on:
       - core
     env_file: ./.env
+    environment:
+      ## Keep Docker-managed workspaces in the host daemon's path namespace.
+      ## These paths are aliases of the same data volume mounted at /data.
+      PERIPHERY_REPO_DIR: ${PERIPHERY_REPO_DIR:-${PERIPHERY_DOCKER_VOLUME_ROOT:-/var/lib/docker/volumes}/${COMPOSE_PROJECT_NAME:-komodo}_data/_data/repos}
+      PERIPHERY_STACK_DIR: ${PERIPHERY_STACK_DIR:-${PERIPHERY_DOCKER_VOLUME_ROOT:-/var/lib/docker/volumes}/${COMPOSE_PROJECT_NAME:-komodo}_data/_data/stacks}
+      PERIPHERY_BUILD_DIR: ${PERIPHERY_BUILD_DIR:-${PERIPHERY_DOCKER_VOLUME_ROOT:-/var/lib/docker/volumes}/${COMPOSE_PROJECT_NAME:-komodo}_data/_data/builds}
     volumes:
       ## Share keys and Periphery-managed state with Core.
       - data:/data
@@ -80,6 +86,10 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       ## Allow the File Manager to access local Docker named volumes.
       ## Keep Docker's absolute host volume root identical inside the container.
+      ## Set this to Docker's absolute volume root when using a nonstandard data root.
+      ## Security: This intentionally grants Periphery read/write access to every
+      ## local named volume. Restrict Server FileManager permission accordingly;
+      ## the File Manager rejects Periphery's own protected data volume.
       - ${PERIPHERY_DOCKER_VOLUME_ROOT:-/var/lib/docker/volumes}:${PERIPHERY_DOCKER_VOLUME_ROOT:-/var/lib/docker/volumes}
       ## Allow Periphery to see processes outside of container
       - /proc:/proc

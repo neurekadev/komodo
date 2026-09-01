@@ -14,6 +14,7 @@ mod auth;
 mod cloud;
 mod config;
 mod connection;
+mod file_manager;
 mod helpers;
 mod monitor;
 mod network;
@@ -73,6 +74,7 @@ async fn app() -> anyhow::Result<()> {
     schedule::spawn_schedule_executor();
     helpers::prune::spawn_prune_loop();
     report::spawn_reporting_loop();
+    api::write::spawn_managed_transaction_reconciliation_loop();
   }
   .instrument(startup_span)
   .await;

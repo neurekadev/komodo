@@ -104,7 +104,15 @@ docker compose config
 docker compose up -d
 ```
 
-Periphery stores its keys, repositories, stacks, builds, SSL material, and File Manager journal beneath `/data` in the `komodo_data` named volume. Docker's host volume root remains mounted separately at the same absolute path so the File Manager can access named volumes.
+Periphery stores its keys, repositories, stacks, builds, SSL material, and File Manager journal in the `komodo_data` named volume mounted at `/data`. The template exposes the repository, stack, and build directories through aliases beneath Docker's host volume root so relative Compose bind mounts resolve in the host daemon's path namespace. `PERIPHERY_DOCKER_VOLUME_ROOT` is mounted at that same absolute path inside Periphery, which also enables File Manager access to named volumes.
+
+With the default project name and Docker volume root, `docker compose config` resolves `PERIPHERY_STACK_DIR` to `/var/lib/docker/volumes/komodo_data/_data/stacks`. Rootless or customized Docker installations use the corresponding path beneath their configured `PERIPHERY_DOCKER_VOLUME_ROOT`.
+
+:::warning Docker host trust boundary
+The volume-root bind mount is intentionally read/write. Periphery needs it for writable Docker-volume File Manager operations and for the host-visible repository, Stack, and build paths used by the official template. Making it read-only or mounting only `komodo_data` breaks that functionality.
+
+The mount gives the Periphery process access to every local named volume. The File Manager API rejects roots that overlap its private journal, including filesystem aliases; the shared `komodo_data` volume remains listed but its Files tab is unavailable because it contains that journal and Periphery credentials. A Server-level `FileManager` permission deliberately exposes every other eligible named volume on that Server. Periphery also controls the host through the Docker socket. Treat the container as Docker-host trusted, protect its connection to Core, and grant [`FileManager`](/docs/configuration/permissioning#specific-permissions) only to users trusted with all other named-volume data on the host.
+:::
 
 ```mdx-code-block
 <ComposeAndEnv file_name="periphery.compose.yaml" />

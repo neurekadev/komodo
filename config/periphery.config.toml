@@ -63,6 +63,14 @@ root_directory = "/etc/komodo"
 ## Default: bash
 default_terminal_command = "bash"
 
+## Maximum number of entries a File Manager operation may traverse,
+## create, or extract. Larger values allow larger archives and directory
+## trees but can increase CPU, memory, and temporary-storage use.
+## Must be greater than zero.
+## Env: PERIPHERY_FILE_MANAGER_MAX_ENTRIES
+## Default: 1000000
+file_manager_max_entries = 1000000
+
 ## Disable the terminal APIs and disallow remote shell access through Periphery.
 ## Env: PERIPHERY_DISABLE_TERMINALS
 ## Default: false

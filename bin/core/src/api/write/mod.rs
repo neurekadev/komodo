@@ -24,6 +24,7 @@ mod alerter;
 mod build;
 mod builder;
 mod deployment;
+mod file_manager;
 mod onboarding;
 mod permissions;
 mod procedure;
@@ -43,6 +44,7 @@ mod variable;
 
 pub use {
   deployment::check_deployment_for_update_inner,
+  file_manager::spawn_managed_transaction_reconciliation_loop,
   stack::check_stack_for_update_inner,
 };
 
@@ -96,6 +98,21 @@ pub enum WriteRequest {
   RefreshStackCache(RefreshStackCache),
   CheckStackForUpdate(CheckStackForUpdate),
   BatchCheckStackForUpdate(BatchCheckStackForUpdate),
+
+  // ==== FILE MANAGER ====
+  PreflightFileManagerOperation(PreflightFileManagerOperation),
+  CommitFileManagerOperation(CommitFileManagerOperation),
+  ResolveFileManagerOperationConflict(
+    ResolveFileManagerOperationConflict,
+  ),
+  CancelFileManagerOperation(CancelFileManagerOperation),
+  PrepareFileManagerUpload(PrepareFileManagerUpload),
+  PrepareFileManagerDownload(PrepareFileManagerDownload),
+  PrepareManagedFileManagerRenderedDownload(
+    PrepareManagedFileManagerRenderedDownload,
+  ),
+  UndoFileManagerOperation(UndoFileManagerOperation),
+  RedoFileManagerOperation(RedoFileManagerOperation),
 
   // ==== DEPLOYMENT ====
   CreateDeployment(CreateDeployment),

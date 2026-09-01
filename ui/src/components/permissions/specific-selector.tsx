@@ -13,6 +13,7 @@ const ALL_PERMISSIONS_BY_TYPE: {
     Types.SpecificPermission.Logs,
   ],
   Server: [
+    Types.SpecificPermission.FileManager,
     Types.SpecificPermission.Attach,
     Types.SpecificPermission.Inspect,
     Types.SpecificPermission.Logs,
@@ -20,6 +21,7 @@ const ALL_PERMISSIONS_BY_TYPE: {
     Types.SpecificPermission.Processes,
   ],
   Stack: [
+    Types.SpecificPermission.FileManager,
     Types.SpecificPermission.Inspect,
     Types.SpecificPermission.Logs,
     Types.SpecificPermission.Terminal,

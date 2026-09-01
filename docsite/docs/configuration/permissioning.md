@@ -28,6 +28,12 @@ There are 4 permission levels a user / group can be given on a Resource:
 Permission levels alone are not quite enough to provide granular access control.
 Some features are additionally gated behind a specific permission for that feature.
 
+- **`FileManager`**: User can access the [File Manager](/docs/file-manager) on the associated resource.
+  - Valid on `Server` and `Stack`.
+  - The base level still controls the allowed operation: Read or Execute permits browsing and downloads, while Write permits changes when the target is writable.
+  - On a `Stack`, access is confined to that Stack's resolved file root. Stacks inherit specific permissions from their attached Server, but still require a base permission level on the Stack.
+  - On a `Server`, this permits File Manager access to **every eligible Docker named volume on that Server**; there is no per-volume permission target. Volume roots that overlap Periphery's private File Manager journal are excluded by filesystem identity. This makes the official template's `komodo_data` volume unavailable in File Manager. Treat the grant as a sensitive, host-wide data permission for every other named volume.
+  - `KOMODO_TRANSPARENT_MODE=true` grants a base Read level, not this specific permission.
 - **`Logs`**: User can retrieve docker / docker compose logs on the associated resource.
   - Valid on `Server`, `Stack`, `Deployment`.
   - For admins wanting this permission by default for all users with read permissions, see below on default user groups.
@@ -55,7 +61,7 @@ In TOML form, this looks like:
 name = "groupo"
 users = ["mbecker20", "karamvirsingh98"]
 all.Build = "Execute" # <- Group members can run all builds (but not update config),
-all.Stack = { level = "Read", specific = ["Logs"] }    # <- And see all Stacks / logs (no deploy / update, inspect, or terminal access).
+all.Stack = { level = "Read", specific = ["Logs"] }    # <- And see all Stacks / logs (no deploy / update, file manager, inspect, or terminal access).
 ```
 
 A user / group can still be given a greater permission level on select resources:

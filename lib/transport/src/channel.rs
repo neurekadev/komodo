@@ -4,8 +4,8 @@ use encoding::{
 };
 use futures_util::FutureExt;
 use periphery_client::transport::{
-  EncodedTransportMessage, RequestMessage, ResponseMessage,
-  TerminalMessage,
+  EncodedTransportMessage, FileTransferTransportMessage,
+  RequestMessage, ResponseMessage, TerminalMessage,
 };
 use serde::Serialize;
 use tokio::sync::{Mutex, MutexGuard, mpsc};
@@ -45,7 +45,14 @@ impl<T> BufferedChannel<T> {
 
 /// Create a channel
 pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
-  let (sender, receiver) = mpsc::channel(RESPONSE_BUFFER_MAX_LEN);
+  channel_with_capacity(RESPONSE_BUFFER_MAX_LEN)
+}
+
+/// Create a channel with an explicit item capacity.
+pub fn channel_with_capacity<T>(
+  capacity: usize,
+) -> (Sender<T>, Receiver<T>) {
+  let (sender, receiver) = mpsc::channel(capacity);
   (
     Sender(sender),
     Receiver {
@@ -74,6 +81,17 @@ impl<T> Clone for Sender<T> {
 impl<T> Sender<T> {
   pub async fn send(&self, data: T) -> anyhow::Result<()> {
     self.0.send(data).await.map_err(|e| anyhow!("{e:?}"))
+  }
+
+  pub fn try_send(&self, data: T) -> anyhow::Result<()> {
+    self.0.try_send(data).map_err(|error| match error {
+      mpsc::error::TrySendError::Full(_) => {
+        anyhow!("Channel is full")
+      }
+      mpsc::error::TrySendError::Closed(_) => {
+        anyhow!("Channel is permanently closed")
+      }
+    })
   }
 }
 
@@ -136,6 +154,16 @@ impl Sender<EncodedTransportMessage> {
         channel,
         Err(anyhow!("pty exited")),
       ))
+      .await
+  }
+
+  pub async fn send_file_transfer(
+    &self,
+    channel: Uuid,
+    data: anyhow::Result<Vec<u8>>,
+  ) -> anyhow::Result<()> {
+    self
+      .send_message(FileTransferTransportMessage::new(channel, data))
       .await
   }
 }
@@ -228,5 +256,24 @@ impl<T: Send + Clone> BufferedReceiver<T> {
   /// Should be called after transmission confirmed.
   pub fn clear_buffer(&mut self) {
     self.buffer = None;
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[tokio::test]
+  async fn explicit_capacity_bounds_nonblocking_sends() {
+    let (sender, mut receiver) = channel_with_capacity(1);
+
+    sender.try_send(1).unwrap();
+    assert_eq!(
+      sender.try_send(2).unwrap_err().to_string(),
+      "Channel is full"
+    );
+    assert_eq!(receiver.recv().await.unwrap(), 1);
+    sender.try_send(2).unwrap();
+    assert_eq!(receiver.recv().await.unwrap(), 2);
   }
 }

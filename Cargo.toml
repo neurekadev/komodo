@@ -129,6 +129,12 @@ croner = "3.0.1"
 
 # MISC
 async-compression = { version = "0.4.43", features = ["tokio", "gzip"] }
+cap-std = "4.0.3"
+cap-fs-ext = "4.0.3"
+flate2 = "1.1.9"
+tar = "0.4.46"
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+sevenz-rust2 = "0.22.2"
 schemars = { version = "1.2.2", features = ["indexmap2"] }
 derive_builder = "0.20.2"
 comfy-table = "8.0.0"

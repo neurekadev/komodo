@@ -434,6 +434,7 @@ export declare enum Operation {
     PruneDockerBuilders = "PruneDockerBuilders",
     PruneBuildx = "PruneBuildx",
     PruneSystem = "PruneSystem",
+    FileManager = "FileManager",
     CreateStack = "CreateStack",
     UpdateStack = "UpdateStack",
     RenameStack = "RenameStack",
@@ -6332,6 +6333,28 @@ export interface CancelBuild {
     /** Can be id or name */
     build: string;
 }
+/**
+ * A filesystem root exposed by the File Manager.
+ *
+ * Core resolves this logical target to a trusted host root. Host paths are
+ * never accepted from, or returned to, API clients.
+ */
+export type FileManagerTarget = {
+    type: "Stack";
+    params: {
+        stack: string;
+    };
+} | {
+    type: "Volume";
+    params: {
+        server: string;
+        volume: string;
+    };
+};
+export interface CancelFileManagerOperation {
+    target: FileManagerTarget;
+    operation_id: string;
+}
 /** Cancels the target procedure run. Response: [Update] */
 export interface CancelProcedure {
     /** Id or name */
@@ -6420,6 +6443,20 @@ export interface CloneRepo {
 export interface CloseAlert {
     /** The id of the Alert to close. */
     id: string;
+}
+export declare enum FileManagerConflictAction {
+    Skip = "skip",
+    Overwrite = "overwrite"
+}
+export interface FileManagerConflictDecision {
+    path: string;
+    action: FileManagerConflictAction;
+}
+export interface CommitFileManagerOperation {
+    target: FileManagerTarget;
+    plan_id: string;
+    decisions?: FileManagerConflictDecision[];
+    confirmed?: boolean;
 }
 /**
  * Exports matching resources, and writes to the target sync's resource file. Response: [Update]
@@ -7585,6 +7622,134 @@ export interface ExportResourcesToToml {
      */
     existing?: ResourcesToml;
 }
+export declare enum FileManagerOperationState {
+    Pending = "pending",
+    Running = "running",
+    WaitingForInput = "waiting_for_input",
+    Complete = "complete",
+    Failed = "failed",
+    Cancelled = "cancelled"
+}
+export declare enum FileManagerOperationPhase {
+    Queued = "queued",
+    Preparing = "preparing",
+    Snapshotting = "snapshotting",
+    Applying = "applying",
+    Verifying = "verifying",
+    Transferring = "transferring",
+    Finalizing = "finalizing",
+    RollingBack = "rolling_back"
+}
+export declare enum FileManagerEntryKind {
+    File = "file",
+    Directory = "directory",
+    Symlink = "symlink",
+    Special = "special"
+}
+export interface FileManagerConflict {
+    path: string;
+    existing_kind: FileManagerEntryKind;
+    incoming_kind: FileManagerEntryKind;
+}
+export interface FileManagerPendingConflict {
+    /** Opaque, single-use identifier for the currently pending decision. */
+    decision_id: string;
+    conflict: FileManagerConflict;
+}
+export interface FileManagerOperationStatus {
+    operation_id: string;
+    state: FileManagerOperationState;
+    phase?: FileManagerOperationPhase;
+    description?: string;
+    /** Server timestamp in milliseconds when the operation was accepted. */
+    started_at?: I64;
+    /** Server timestamp in milliseconds when this status last changed. */
+    updated_at?: I64;
+    /** Server timestamp in milliseconds when the current phase began. */
+    phase_started_at?: I64;
+    /** Whether the server can still accept a cancellation request. */
+    cancellable?: boolean;
+    /** Bytes currently retained in staging or internal rollback storage. */
+    temporary_storage_bytes?: U64;
+    /** A conflict awaiting an explicit overwrite or skip decision. */
+    pending_conflict?: FileManagerPendingConflict;
+    /** Counters are scoped to `phase` and reset on each phase transition. */
+    completed_entries: U64;
+    total_entries: U64;
+    completed_bytes: U64;
+    total_bytes: U64;
+    error?: string;
+}
+export interface FileManagerActiveOperations {
+    operations: FileManagerOperationStatus[];
+}
+export interface FileManagerLimits {
+    max_text_bytes: U64;
+    max_entries: U64;
+    max_depth: U64;
+    max_archive_expanded_bytes: U64;
+    max_archive_expansion_ratio: U64;
+    minimum_free_bytes: U64;
+}
+export interface FileManagerCapabilities {
+    available: boolean;
+    read_only: boolean;
+    reason?: string;
+    managed_file?: string;
+    limits: FileManagerLimits;
+}
+/** An opaque optimistic-concurrency revision. */
+export interface FileManagerRevision {
+    id: string;
+}
+export interface FileManagerEntry {
+    /** Normalized root-relative path using `/` separators. */
+    path: string;
+    name: string;
+    kind: FileManagerEntryKind;
+    size: U64;
+    /** Unix timestamp in milliseconds. */
+    modified_at: I64;
+    revision: FileManagerRevision;
+    /** The entry is the database-managed compose source. */
+    managed?: boolean;
+}
+export interface FileManagerDirectory {
+    path: string;
+    entries: FileManagerEntry[];
+}
+export interface FileManagerJournalStatus {
+    can_undo: boolean;
+    can_redo: boolean;
+    undo_description?: string;
+    redo_description?: string;
+    expires_at?: I64;
+    /** Bytes retained for the current undo/redo history. */
+    retained_storage_bytes?: U64;
+    /** Server-safe explanation of where File Manager data is stored. */
+    storage_description?: string;
+}
+export interface FileManagerOperationTicket {
+    operation_id: string;
+}
+export interface FileManagerPreflight {
+	plan_id: string;
+	expires_at: I64;
+	conflicts: FileManagerConflict[];
+	confirmation_required: boolean;
+	supports_durable_managed_transactions?: boolean;
+}
+export interface FileManagerTextFile {
+    path: string;
+    contents: string;
+    revision: FileManagerRevision;
+}
+export interface FileManagerTransferTicket {
+    operation_id: string;
+    token: string;
+    url: string;
+    expires_at: I64;
+}
 /**
  * **Admin only.**
  * Find a user.
@@ -7902,6 +8067,16 @@ export interface GetDeploymentsSummaryResponse {
     unhealthy: I64;
     /** The number of Deployments with Unknown state */
     unknown: I64;
+}
+export interface GetFileManagerCapabilities {
+    target: FileManagerTarget;
+}
+export interface GetFileManagerJournalStatus {
+    target: FileManagerTarget;
+}
+export interface GetFileManagerOperationStatus {
+    target: FileManagerTarget;
+    operation_id: string;
 }
 /**
  * Get a specific git provider account.
@@ -8546,6 +8721,9 @@ export interface ListActions {
     /** Reverse the sort direction. */
     sort_desc?: boolean;
 }
+export interface ListActiveFileManagerOperations {
+    target: FileManagerTarget;
+}
 export declare enum AlerterSortBy {
     /** Sort by name. Default. */
     Name = "Name",
@@ -8918,6 +9096,10 @@ export interface ListDeployments {
     sort_by?: DeploymentSortBy;
     /** Reverse the sort direction. */
     sort_desc?: boolean;
+}
+export interface ListFileManagerDirectory {
+    target: FileManagerTarget;
+    path?: string;
 }
 /** List actions matching optional query. Response: [ListFullActionsResponse]. */
 export interface ListFullActions {
@@ -9841,6 +10023,80 @@ export interface PauseStack {
      */
     services?: string[];
 }
+export type FileManagerOperation = {
+    type: "CreateFile";
+    params: {
+        path: string;
+    };
+} | {
+    type: "CreateDirectory";
+    params: {
+        path: string;
+    };
+} | {
+    type: "Rename";
+    params: {
+        path: string;
+        new_name: string;
+    };
+} | {
+    type: "Move";
+    params: {
+        paths: string[];
+        destination: string;
+    };
+} | {
+    type: "Copy";
+    params: {
+        paths: string[];
+        destination: string;
+    };
+} | {
+    type: "Delete";
+    params: {
+        paths: string[];
+    };
+} | {
+    type: "WriteText";
+    params: {
+        path: string;
+        contents: string;
+        expected_revision: FileManagerRevision;
+    };
+} | {
+    type: "CreateArchive";
+    params: {
+        paths: string[];
+        destination: string;
+        format: FileManagerArchiveFormat;
+    };
+} | {
+    type: "ExtractArchive";
+    params: {
+        path: string;
+        destination: string;
+    };
+};
+export interface PreflightFileManagerOperation {
+    target: FileManagerTarget;
+    operation: FileManagerOperation;
+}
+export interface PrepareFileManagerDownload {
+    target: FileManagerTarget;
+    paths: string[];
+}
+export interface PrepareManagedFileManagerRenderedDownload {
+    target: FileManagerTarget;
+}
+export interface PrepareFileManagerUpload {
+    target: FileManagerTarget;
+    destination: string;
+    file_names: string[];
+    total_bytes?: U64;
+    overwrite?: boolean;
+    confirmed?: boolean;
+    expected_revision?: FileManagerRevision;
+}
 /**
  * Prunes the docker buildx cache on the target server. Response: [Update].
  *
@@ -9943,6 +10199,17 @@ export interface PushRecentlyViewed {
 export interface PushoverAlerterEndpoint {
     /** The pushover URL including application and user tokens in parameters. */
     url: string;
+}
+export interface ReadFileManagerText {
+    target: FileManagerTarget;
+    path: string;
+}
+export interface ReadManagedFileManagerRenderedText {
+    target: FileManagerTarget;
+}
+export interface RedoFileManagerOperation {
+    target: FileManagerTarget;
+    confirmed?: boolean;
 }
 /** Trigger a refresh of the cached latest hash and message. */
 export interface RefreshBuildCache {
@@ -10207,6 +10474,13 @@ export interface RepoExecutionResponse {
     commit_hash?: string;
     /** Latest commit message, if it could be retrieved */
     commit_message?: string;
+}
+export interface ResolveFileManagerOperationConflict {
+    target: FileManagerTarget;
+    operation_id: string;
+    decision_id: string;
+    action: FileManagerConflictAction;
+    apply_to_all?: boolean;
 }
 /** Restarts all containers on the target server. Response: [Update] */
 export interface RestartAllContainers {
@@ -10717,6 +10991,10 @@ export interface TotalDiskUsage {
     used_gb: number;
     /** Total size in GB */
     total_gb: number;
+}
+export interface UndoFileManagerOperation {
+    target: FileManagerTarget;
+    confirmed?: boolean;
 }
 /** Unpauses all containers on the target server. Response: [Update] */
 export interface UnpauseAllContainers {
@@ -11438,6 +11716,12 @@ export type ExecuteRequest = {
     type: "RotateCoreKeys";
     params: RotateCoreKeys;
 };
+export declare enum FileManagerArchiveFormat {
+    Zip = "zip",
+    Tar = "tar",
+    TarGz = "tar_gz",
+    SevenZip = "seven_zip"
+}
 /**
  * One representative IANA zone for each distinct base UTC offset in the tz database.
  * https://en.wikipedia.org/wiki/List_of_tz_database_time_zones.
@@ -11722,6 +12006,27 @@ export type ReadRequest = {
     type: "ListCommonStackBuildExtraArgs";
     params: ListCommonStackBuildExtraArgs;
 } | {
+    type: "GetFileManagerCapabilities";
+    params: GetFileManagerCapabilities;
+} | {
+    type: "ListFileManagerDirectory";
+    params: ListFileManagerDirectory;
+} | {
+    type: "ReadFileManagerText";
+    params: ReadFileManagerText;
+} | {
+    type: "ReadManagedFileManagerRenderedText";
+    params: ReadManagedFileManagerRenderedText;
+} | {
+    type: "GetFileManagerOperationStatus";
+    params: GetFileManagerOperationStatus;
+} | {
+    type: "ListActiveFileManagerOperations";
+    params: ListActiveFileManagerOperations;
+} | {
+    type: "GetFileManagerJournalStatus";
+    params: GetFileManagerJournalStatus;
+} | {
     type: "GetDeploymentsSummary";
     params: GetDeploymentsSummary;
 } | {
@@ -11952,6 +12257,11 @@ export declare enum RepoWebhookAction {
 /** The specific types of permission that a User or UserGroup can have on a resource. */
 export declare enum SpecificPermission {
     /**
+     * On **Server / Stack**
+     * - Access File Manager APIs for the resource
+     */
+    FileManager = "FileManager",
+    /**
      * On **Server**
      * - Access the terminal apis
      * On **Stack / Deployment**
@@ -12076,6 +12386,33 @@ export type WriteRequest = {
 } | {
     type: "BatchCheckStackForUpdate";
     params: BatchCheckStackForUpdate;
+} | {
+    type: "PreflightFileManagerOperation";
+    params: PreflightFileManagerOperation;
+} | {
+    type: "CommitFileManagerOperation";
+    params: CommitFileManagerOperation;
+} | {
+    type: "ResolveFileManagerOperationConflict";
+    params: ResolveFileManagerOperationConflict;
+} | {
+    type: "CancelFileManagerOperation";
+    params: CancelFileManagerOperation;
+} | {
+    type: "PrepareFileManagerUpload";
+    params: PrepareFileManagerUpload;
+} | {
+    type: "PrepareFileManagerDownload";
+    params: PrepareFileManagerDownload;
+} | {
+    type: "PrepareManagedFileManagerRenderedDownload";
+    params: PrepareManagedFileManagerRenderedDownload;
+} | {
+    type: "UndoFileManagerOperation";
+    params: UndoFileManagerOperation;
+} | {
+    type: "RedoFileManagerOperation";
+    params: RedoFileManagerOperation;
 } | {
     type: "CreateDeployment";
     params: CreateDeployment;

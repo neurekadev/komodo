@@ -45,6 +45,7 @@ mod build;
 mod builder;
 mod deployment;
 mod docker;
+mod file_manager;
 mod onboarding_key;
 mod permission;
 mod procedure;
@@ -173,6 +174,17 @@ enum ReadRequest {
   ListAllStackServices(ListAllStackServices),
   ListCommonStackExtraArgs(ListCommonStackExtraArgs),
   ListCommonStackBuildExtraArgs(ListCommonStackBuildExtraArgs),
+
+  // ==== FILE MANAGER ====
+  GetFileManagerCapabilities(GetFileManagerCapabilities),
+  ListFileManagerDirectory(ListFileManagerDirectory),
+  ReadFileManagerText(ReadFileManagerText),
+  ReadManagedFileManagerRenderedText(
+    ReadManagedFileManagerRenderedText,
+  ),
+  GetFileManagerOperationStatus(GetFileManagerOperationStatus),
+  ListActiveFileManagerOperations(ListActiveFileManagerOperations),
+  GetFileManagerJournalStatus(GetFileManagerJournalStatus),
 
   // ==== DEPLOYMENT ====
   GetDeploymentsSummary(GetDeploymentsSummary),

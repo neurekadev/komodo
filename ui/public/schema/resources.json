@@ -1027,6 +1027,13 @@
             "null"
           ]
         },
+        "custom_name": {
+          "description": "Specify a custom container / service name,\nif different from Deployment name.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "image": {
           "description": "The image which the deployment deploys.\nCan either be a user inputted image, or a Komodo Build.",
           "anyOf": [
@@ -3312,6 +3319,14 @@
         "pattern": {
           "description": "Id or name or wildcard pattern or regex.\nSupports multiline and comma delineated combinations of the above.\n\nExample:\n```text\n# match all foo-* stacks\nfoo-*\n# add some more\nextra-stack-1, extra-stack-2\n```",
           "type": "string"
+        },
+        "tags": {
+          "description": "Filter matches by tag.\nIf empty, skips tag filtering.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
         }
       },
       "required": [
@@ -3346,6 +3361,14 @@
         "pattern": {
           "description": "Id or name or wildcard pattern or regex.\nSupports multiline and comma delineated combinations of the above.\n\nExample:\n```text\n# match all foo-* stacks\nfoo-*\n# add some more\nextra-stack-1, extra-stack-2\n```",
           "type": "string"
+        },
+        "tags": {
+          "description": "Filter matches by tag.\nIf empty, skips tag filtering.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
         }
       },
       "required": [
@@ -3380,6 +3403,14 @@
         "pattern": {
           "description": "Id or name or wildcard pattern or regex.\nSupports multiline and comma delineated combinations of the above.\n\nExample:\n```text\n# match all foo-* stacks\nfoo-*\n# add some more\nextra-stack-1, extra-stack-2\n```",
           "type": "string"
+        },
+        "tags": {
+          "description": "Filter matches by tag.\nIf empty, skips tag filtering.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
         }
       },
       "required": [
@@ -3540,6 +3571,14 @@
         "pattern": {
           "description": "Id or name or wildcard pattern or regex.\nSupports multiline and comma delineated combinations of the above.\n\nExample:\n```text\n# match all foo-* stacks\nfoo-*\n# add some more\nextra-stack-1, extra-stack-2\n```",
           "type": "string"
+        },
+        "tags": {
+          "description": "Filter matches by tag.\nIf empty, skips tag filtering.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
         }
       },
       "required": [
@@ -3679,6 +3718,14 @@
         "pattern": {
           "description": "Id or name or wildcard pattern or regex.\nSupports multiline and comma delineated combinations of the above.\n\nExample:\n```text\n# match all foo-* deployments\nfoo-*\n# add some more\nextra-deployment-1, extra-deployment-2\n```",
           "type": "string"
+        },
+        "tags": {
+          "description": "Filter matches by tag.\nIf empty, skips tag filtering.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
         }
       },
       "required": [
@@ -3821,6 +3868,14 @@
         "pattern": {
           "description": "Id or name or wildcard pattern or regex.\nSupports multiline and comma delineated combinations of the above.\n\nExample:\n```text\n# match all foo-* deployments\nfoo-*\n# add some more\nextra-deployment-1, extra-deployment-2\n```",
           "type": "string"
+        },
+        "tags": {
+          "description": "Filter matches by tag.\nIf empty, skips tag filtering.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
         }
       },
       "required": [
@@ -3847,6 +3902,14 @@
         "pattern": {
           "description": "Id or name or wildcard pattern or regex.\nSupports multiline and comma delineated combinations of the above.\n\nExample:\n```text\n# match all foo-* builds\nfoo-*\n# add some more\nextra-build-1, extra-build-2\n```",
           "type": "string"
+        },
+        "tags": {
+          "description": "Filter matches by tag.\nIf empty, skips tag filtering.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
         }
       },
       "required": [
@@ -3886,6 +3949,14 @@
         "pattern": {
           "description": "Id or name or wildcard pattern or regex.\nSupports multiline and comma delineated combinations of the above.\n\nExample:\n```text\n# match all foo-* repos\nfoo-*\n# add some more\nextra-repo-1, extra-repo-2\n```",
           "type": "string"
+        },
+        "tags": {
+          "description": "Filter matches by tag.\nIf empty, skips tag filtering.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
         }
       },
       "required": [
@@ -3912,6 +3983,14 @@
         "pattern": {
           "description": "Id or name or wildcard pattern or regex.\nSupports multiline and comma delineated combinations of the above.\n\nExample:\n```text\n# match all foo-* repos\nfoo-*\n# add some more\nextra-repo-1, extra-repo-2\n```",
           "type": "string"
+        },
+        "tags": {
+          "description": "Filter matches by tag.\nIf empty, skips tag filtering.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
         }
       },
       "required": [
@@ -3938,6 +4017,14 @@
         "pattern": {
           "description": "Id or name or wildcard pattern or regex.\nSupports multiline and comma delineated combinations of the above.\n\nExample:\n```text\n# match all foo-* repos\nfoo-*\n# add some more\nextra-repo-1, extra-repo-2\n```",
           "type": "string"
+        },
+        "tags": {
+          "description": "Filter matches by tag.\nIf empty, skips tag filtering.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
         }
       },
       "required": [
@@ -3977,6 +4064,14 @@
         "pattern": {
           "description": "Id or name or wildcard pattern or regex.\nSupports multiline and comma delineated combinations of the above.\n\nExample:\n```text\n# match all foo-* procedures\nfoo-*\n# add some more\nextra-procedure-1, extra-procedure-2\n```",
           "type": "string"
+        },
+        "tags": {
+          "description": "Filter matches by tag.\nIf empty, skips tag filtering.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
         }
       },
       "required": [
@@ -4031,6 +4126,14 @@
         "pattern": {
           "description": "Id or name or wildcard pattern or regex.\nSupports multiline and comma delineated combinations of the above.\n\nExample:\n```text\n# match all foo-* actions\nfoo-*\n# add some more\nextra-action-1, extra-action-2\n```",
           "type": "string"
+        },
+        "tags": {
+          "description": "Filter matches by tag.\nIf empty, skips tag filtering.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
         }
       },
       "required": [
@@ -6318,6 +6421,11 @@
     "SpecificPermission": {
       "description": "The specific types of permission that a User or UserGroup can have on a resource.",
       "oneOf": [
+        {
+          "description": "On **Server / Stack**\n  - Access File Manager APIs for the resource",
+          "type": "string",
+          "const": "FileManager"
+        },
         {
           "description": "On **Server**\n  - Access the terminal apis\nOn **Stack / Deployment**\n  - Access the container exec Apis",
           "type": "string",

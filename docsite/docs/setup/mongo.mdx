@@ -23,6 +23,10 @@ docker compose up -d
 
 Docker Compose discovers `compose.yaml` and `.env` automatically. The `.env` file sets `COMPOSE_PROJECT_NAME=komodo`, preserving the established `komodo_*` volume names.
 
+:::warning Periphery host access
+The template intentionally mounts Docker's named-volume root read/write into Periphery for host-visible workspaces and Docker-volume File Manager access. This makes Periphery Docker-host trusted. File Manager refuses to open `komodo_data` because it contains Periphery's private journal and credentials, but Server-level `FileManager` permission covers every other eligible named volume. Review the [File Manager trust boundary and permission scope](/docs/file-manager#containerized-periphery) before deploying.
+:::
+
 ```mdx-code-block
 import ComposeAndEnv from "@site/src/components/ComposeAndEnv";
 

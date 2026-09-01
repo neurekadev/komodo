@@ -15,7 +15,10 @@
 use clap::Parser;
 use ipnetwork::IpNetwork;
 use serde::Deserialize;
-use std::{collections::HashMap, path::PathBuf, sync::OnceLock};
+use std::{
+  collections::HashMap, num::NonZeroU64, path::PathBuf,
+  sync::OnceLock,
+};
 
 use crate::{
   deserializers::{
@@ -176,6 +179,8 @@ pub struct Env {
   pub periphery_build_dir: Option<PathBuf>,
   /// Override `default_terminal_command`
   pub periphery_default_terminal_command: Option<String>,
+  /// Override `file_manager_max_entries`
+  pub periphery_file_manager_max_entries: Option<NonZeroU64>,
   /// Override `disable_terminals`
   pub periphery_disable_terminals: Option<bool>,
   /// Override `disable_container_terminals`
@@ -367,6 +372,12 @@ pub struct PeripheryConfig {
   #[serde(default = "default_default_terminal_command")]
   pub default_terminal_command: String,
 
+  /// Maximum number of entries File Manager operations may traverse,
+  /// create, or extract. Must be greater than zero.
+  /// Default: `1000000`
+  #[serde(default = "default_file_manager_max_entries")]
+  pub file_manager_max_entries: NonZeroU64,
+
   /// Whether to disable the create terminal
   /// and disallow direct remote shell access.
   /// Default: false
@@ -452,6 +463,10 @@ fn default_default_terminal_command() -> String {
   String::from("bash")
 }
 
+fn default_file_manager_max_entries() -> NonZeroU64 {
+  NonZeroU64::new(1_000_000).unwrap()
+}
+
 fn default_stats_polling_rate() -> Timelength {
   Timelength::FiveSeconds
 }
@@ -482,6 +497,7 @@ impl Default for PeripheryConfig {
       stack_dir: None,
       build_dir: None,
       default_terminal_command: default_default_terminal_command(),
+      file_manager_max_entries: default_file_manager_max_entries(),
       disable_terminals: Default::default(),
       disable_container_terminals: Default::default(),
       stats_polling_rate: default_stats_polling_rate(),
@@ -533,6 +549,7 @@ impl PeripheryConfig {
       stack_dir: self.stack_dir.clone(),
       build_dir: self.build_dir.clone(),
       default_terminal_command: self.default_terminal_command.clone(),
+      file_manager_max_entries: self.file_manager_max_entries,
       disable_terminals: self.disable_terminals,
       disable_container_terminals: self.disable_container_terminals,
       stats_polling_rate: self.stats_polling_rate,
@@ -682,5 +699,34 @@ impl mogh_server::ServerConfig for &PeripheryConfig {
         .into_string()
         .expect("Invalid ssl cert file path.")
     })
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn file_manager_entry_limit_defaults_to_one_million() {
+    let config: PeripheryConfig = serde_json::from_str("{}").unwrap();
+    assert_eq!(config.file_manager_max_entries.get(), 1_000_000);
+  }
+
+  #[test]
+  fn file_manager_entry_limit_accepts_positive_values() {
+    let config: PeripheryConfig =
+      serde_json::from_str(r#"{ "file_manager_max_entries": 42 }"#)
+        .unwrap();
+    assert_eq!(config.file_manager_max_entries.get(), 42);
+  }
+
+  #[test]
+  fn file_manager_entry_limit_rejects_zero() {
+    assert!(
+      serde_json::from_str::<PeripheryConfig>(
+        r#"{ "file_manager_max_entries": 0 }"#
+      )
+      .is_err()
+    );
   }
 }
