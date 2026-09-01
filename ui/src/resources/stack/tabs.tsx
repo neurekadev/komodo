@@ -53,6 +53,7 @@ export default function StackTabs({ id }: { id: string }) {
     state === Types.StackState.Down ||
     !specificLogs;
   const hideFiles = !specificFileManager;
+  const hideBackups = !specificBackups || !!info?.swarm_id;
   const terminalDisabled =
     !specificTerminal ||
     containerTerminalsDisabled ||
@@ -69,7 +70,7 @@ export default function StackTabs({ id }: { id: string }) {
     (_view === "Info" && hideInfo) ||
     (_view === "Terminals" && terminalDisabled) ||
     (_view === "Files" && hideFiles) ||
-    (_view === "Backups" && !specificBackups) ||
+    (_view === "Backups" && hideBackups) ||
     (_view === "Log" && hideLogs)
       ? "Config"
       : _view;
@@ -96,7 +97,7 @@ export default function StackTabs({ id }: { id: string }) {
       },
       {
         value: "Backups",
-        hidden: !specificBackups,
+        hidden: hideBackups,
         icon: ICONS.Backup,
       },
       {
@@ -114,7 +115,7 @@ export default function StackTabs({ id }: { id: string }) {
     [
       hideInfo,
       hideFiles,
-      specificBackups,
+      hideBackups,
       specificLogs,
       hideLogs,
       specificTerminal,
@@ -126,10 +127,10 @@ export default function StackTabs({ id }: { id: string }) {
     if (permissionsLoaded && _view === "Files" && hideFiles) {
       setView("Config");
     }
-    if (permissionsLoaded && _view === "Backups" && !specificBackups) {
+    if (permissionsLoaded && _view === "Backups" && hideBackups) {
       setView("Config");
     }
-  }, [_view, hideFiles, permissionsLoaded, setView, specificBackups]);
+  }, [_view, hideBackups, hideFiles, permissionsLoaded, setView]);
 
   const Selector = (
     <MobileFriendlyTabsSelector
@@ -173,7 +174,7 @@ export default function StackTabs({ id }: { id: string }) {
         <ResourceBackups
           target={{ type: "Stack", params: { stack_id: id } }}
           sourceServerId={info?.server_id ?? ""}
-          canExecute={canExecute && specificBackups}
+          canExecute={canExecute && !hideBackups}
           titleOther={Selector}
         />
       );

@@ -57,7 +57,7 @@ const backendDefaults = (
         params: { url: "", access_token: {}, allow_insecure_http: false },
       };
     default:
-      return { type: "CoreLocal", params: { path: "/backups/vykar" } };
+      return { type: "CoreLocal", params: { path: "/data/backups/vykar" } };
   }
 };
 
@@ -432,11 +432,13 @@ function BackupSettingsForm({
                 onChange={(value) => patch({ advanced: { ...settings.advanced, node_concurrency: Number(value) } })}
               />
               <NumberInput
-                label="Upload bytes per second, per node"
+                label="Upload MiB/s, per node"
                 description="Zero is unlimited."
                 min={0}
-                value={settings.advanced.upload_bytes_per_second}
-                onChange={(value) => patch({ advanced: { ...settings.advanced, upload_bytes_per_second: Number(value) } })}
+                step={1}
+                allowDecimal={false}
+                value={settings.advanced.upload_bytes_per_second / (1024 * 1024)}
+                onChange={(value) => patch({ advanced: { ...settings.advanced, upload_bytes_per_second: Number(value) * 1024 * 1024 } })}
               />
               <NumberInput
                 label="Client repack cap (bytes)"

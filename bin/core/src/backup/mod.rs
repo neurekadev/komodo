@@ -306,6 +306,15 @@ fn validate_settings(
   if !(1..=64).contains(&settings.advanced.node_concurrency) {
     return Err(anyhow!("Node concurrency must be between 1 and 64"));
   }
+  if !settings
+    .advanced
+    .upload_bytes_per_second
+    .is_multiple_of(1024 * 1024)
+  {
+    return Err(anyhow!(
+      "Upload limit must be configured in whole MiB/s increments"
+    ));
+  }
   if settings.advanced.client_repack_limit_bytes == 0 {
     return Err(anyhow!(
       "Client-side repack limit must be greater than zero"
@@ -3058,6 +3067,7 @@ pub async fn execute_restore(
       config.run_directory = recovered_run_directory;
       config.repo = Some(String::new());
       config.linked_repo = Some(String::new());
+      let _mutation = mutation_barrier().read().await;
       if let Err(error) =
         resource::create::<Stack>(&name, config, None, user).await
       {

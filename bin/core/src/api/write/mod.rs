@@ -289,12 +289,23 @@ async fn task(
   request: WriteRequest,
   user: User,
 ) -> mogh_error::Result<axum::response::Response> {
-  let _mutation_guard =
-    if matches!(&request, WriteRequest::RunBackup(_)) {
-      None
-    } else {
-      Some(crate::backup::mutation_barrier().read().await)
-    };
+  let _mutation_guard = if matches!(
+    &request,
+    WriteRequest::UpdateBackupSettings(_)
+      | WriteRequest::InitializeBackupRepositories(_)
+      | WriteRequest::RunBackup(_)
+      | WriteRequest::PlanBackupRestore(_)
+      | WriteRequest::ExecuteBackupRestore(_)
+      | WriteRequest::VerifyBackupRepository(_)
+      | WriteRequest::PromoteBackupMirror(_)
+      | WriteRequest::CancelBackupRun(_)
+      | WriteRequest::PlanCoreRecovery(_)
+      | WriteRequest::ExecuteCoreRecovery(_)
+  ) {
+    None
+  } else {
+    Some(crate::backup::mutation_barrier().read().await)
+  };
   let task_id = Uuid::new_v4();
   let method: WriteRequestMethod = (&request).into();
 

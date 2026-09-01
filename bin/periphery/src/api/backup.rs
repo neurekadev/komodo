@@ -87,6 +87,14 @@ impl Resolve<Args> for RunVykarBackup {
   ) -> anyhow::Result<RunVykarBackupResponse> {
     let _operation = backup_operation_lock().lock().await;
     let discovered = discover_source(&self.target).await?;
+    let container_journal = if self.stop_containers {
+      persist_container_quiesce_journal(
+        &self.run_id,
+        &discovered.running_containers,
+      )?
+    } else {
+      None
+    };
     let mut stopped: Vec<String> = Vec::new();
     if self.stop_containers {
       for container in &discovered.running_containers {
@@ -95,6 +103,11 @@ impl Resolve<Args> for RunVykarBackup {
         {
           let (restarted, restart_errors) =
             restart_containers(&stopped).await;
+          if restart_errors.is_empty() {
+            remove_container_quiesce_journal(
+              container_journal.as_deref(),
+            )?;
+          }
           if !restart_errors.is_empty() {
             return Ok(RunVykarBackupResponse {
               primary: VykarBackupRepositoryResult {
@@ -125,6 +138,9 @@ impl Resolve<Args> for RunVykarBackup {
 
     let (restarted, restart_errors) =
       restart_containers(&stopped).await;
+    if restart_errors.is_empty() {
+      remove_container_quiesce_journal(container_journal.as_deref())?;
+    }
 
     cancelled_operations().lock().unwrap().remove(&self.run_id);
     let (primary, mirror) = match result {
@@ -172,6 +188,12 @@ impl Resolve<Args> for RunVykarBackupBatch {
           .push(format!("{}: {error:#}", task.source_label)),
       }
     }
+    let running = running.into_iter().collect::<Vec<_>>();
+    let container_journal = if self.stop_containers {
+      persist_container_quiesce_journal(&self.run_id, &running)?
+    } else {
+      None
+    };
     let mut stopped: Vec<String> = Vec::new();
     if self.stop_containers {
       for container in running {
@@ -180,6 +202,11 @@ impl Resolve<Args> for RunVykarBackupBatch {
         {
           let (_, restart_errors) =
             restart_containers(&stopped).await;
+          if restart_errors.is_empty() {
+            remove_container_quiesce_journal(
+              container_journal.as_deref(),
+            )?;
+          }
           if !restart_errors.is_empty() {
             return Ok(RunVykarBackupBatchResponse {
               discovery_errors: vec![format!(
@@ -233,6 +260,9 @@ impl Resolve<Args> for RunVykarBackupBatch {
     }
 
     let (_, restart_errors) = restart_containers(&stopped).await;
+    if restart_errors.is_empty() {
+      remove_container_quiesce_journal(container_journal.as_deref())?;
+    }
     cancelled_operations().lock().unwrap().remove(&self.run_id);
     Ok(RunVykarBackupBatchResponse {
       results,
@@ -865,7 +895,7 @@ impl Resolve<Args> for TransactionalVykarRestore {
     // Persist the complete pre-restore running set before the first stop. If
     // Periphery exits mid-restore, startup recovery can restart every affected
     // container after repairing the filesystem journal.
-    let container_journal = persist_restore_container_journal(
+    let container_journal = persist_container_quiesce_journal(
       &self.journal_id,
       &running_containers,
     )?;
@@ -883,7 +913,7 @@ impl Resolve<Args> for TransactionalVykarRestore {
           }
         }
         if restart_errors.is_empty() {
-          remove_restore_container_journal(
+          remove_container_quiesce_journal(
             container_journal.as_deref(),
           )?;
         }
@@ -930,7 +960,7 @@ impl Resolve<Args> for TransactionalVykarRestore {
           }
         }
         if restart_errors.is_empty() {
-          remove_restore_container_journal(
+          remove_container_quiesce_journal(
             container_journal.as_deref(),
           )?;
         }
@@ -972,7 +1002,7 @@ impl Resolve<Args> for TransactionalVykarRestore {
       }
     }
     if restart_errors.is_empty() {
-      remove_restore_container_journal(container_journal.as_deref())?;
+      remove_container_quiesce_journal(container_journal.as_deref())?;
       Ok(TransactionalVykarRestoreResponse {
         complete: !rolled_back,
         rolled_back,
@@ -1286,7 +1316,7 @@ struct RestoreJournal {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct RestoreContainerJournal {
+struct ContainerQuiesceJournal {
   containers: Vec<String>,
 }
 
@@ -1310,34 +1340,34 @@ fn restore_journal_dir() -> anyhow::Result<PathBuf> {
   Ok(directory)
 }
 
-fn restore_container_journal_dir() -> anyhow::Result<PathBuf> {
+fn container_quiesce_journal_dir() -> anyhow::Result<PathBuf> {
   let directory = periphery_config()
     .stack_dir()
     .join(".komodo-vykar")
-    .join("restore-container-journals");
+    .join("container-quiesce-journals");
   std::fs::create_dir_all(&directory)?;
   Ok(directory)
 }
 
-fn persist_restore_container_journal(
+fn persist_container_quiesce_journal(
   journal_id: &str,
   containers: &[String],
 ) -> anyhow::Result<Option<PathBuf>> {
   if containers.is_empty() {
     return Ok(None);
   }
-  let path = restore_container_journal_dir()?
+  let path = container_quiesce_journal_dir()?
     .join(format!("{journal_id}.json"));
   persist_journal(
     &path,
-    &RestoreContainerJournal {
+    &ContainerQuiesceJournal {
       containers: containers.to_vec(),
     },
   )?;
   Ok(Some(path))
 }
 
-fn remove_restore_container_journal(
+fn remove_container_quiesce_journal(
   path: Option<&Path>,
 ) -> anyhow::Result<()> {
   let Some(path) = path else {
@@ -1348,8 +1378,8 @@ fn remove_restore_container_journal(
 }
 
 /// Roll back any publication interrupted after its durable journal was
-/// written, then restart containers quiesced by an interrupted restore. This
-/// runs before Periphery accepts requests.
+/// written, then restart containers quiesced by an interrupted backup or
+/// restore. This runs before Periphery accepts requests.
 pub(crate) async fn recover_restore_journals() -> anyhow::Result<()> {
   let directory = restore_journal_dir()?;
   for entry in std::fs::read_dir(&directory)? {
@@ -1382,7 +1412,7 @@ pub(crate) async fn recover_restore_journals() -> anyhow::Result<()> {
     fsync_parent(&path)?;
     warn!("Recovered interrupted restore journal {}", path.display());
   }
-  let directory = restore_container_journal_dir()?;
+  let directory = container_quiesce_journal_dir()?;
   for entry in std::fs::read_dir(&directory)? {
     let path = entry?.path();
     if path.extension().and_then(|value| value.to_str())
@@ -1392,21 +1422,21 @@ pub(crate) async fn recover_restore_journals() -> anyhow::Result<()> {
     }
     let bytes = std::fs::read(&path).with_context(|| {
       format!(
-        "Failed to read restore container journal {}",
+        "Failed to read container quiesce journal {}",
         path.display()
       )
     })?;
-    let journal: RestoreContainerJournal =
+    let journal: ContainerQuiesceJournal =
       serde_json::from_slice(&bytes).with_context(|| {
         format!(
-          "Failed to decode restore container journal {}",
+          "Failed to decode container quiesce journal {}",
           path.display()
         )
       })?;
     let (_, errors) = restart_containers(&journal.containers).await;
     if !errors.is_empty() {
       return Err(anyhow!(
-        "Failed to recover containers from interrupted restore {}: {}",
+        "Failed to recover containers from interrupted backup/restore {}: {}",
         path.display(),
         errors.join("; ")
       ));
@@ -1414,7 +1444,7 @@ pub(crate) async fn recover_restore_journals() -> anyhow::Result<()> {
     remove_path(&path)?;
     fsync_parent(&path)?;
     warn!(
-      "Restarted containers from interrupted restore journal {}",
+      "Restarted containers from interrupted backup/restore journal {}",
       path.display()
     );
   }

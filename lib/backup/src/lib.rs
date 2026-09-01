@@ -58,12 +58,14 @@ impl VykarRepository {
       Some(format!("{}d", advanced.full_verify_every_days.max(1)));
     config.limits.connections =
       advanced.node_concurrency.clamp(1, 16) as usize;
+    const MIB: u64 = 1024 * 1024;
+    if !advanced.upload_bytes_per_second.is_multiple_of(MIB) {
+      return Err(anyhow!(
+        "Upload limit must be configured in whole MiB/s increments"
+      ));
+    }
     config.limits.upload_mib_per_sec =
-      if advanced.upload_bytes_per_second == 0 {
-        0
-      } else {
-        advanced.upload_bytes_per_second.div_ceil(1024 * 1024)
-      };
+      advanced.upload_bytes_per_second / MIB;
 
     let mut sftp_key = None;
     match &repository.backend {
@@ -840,6 +842,35 @@ mod tests {
         configured: false,
       },
     }
+  }
+
+  #[test]
+  fn upload_limit_never_rounds_above_configured_bytes() {
+    let repository = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let repository = local_repository(repository.path());
+    let mut advanced = BackupAdvancedSettings {
+      upload_bytes_per_second: 1,
+      ..Default::default()
+    };
+    assert!(
+      VykarRepository::new(
+        &repository,
+        "komodo-test-host",
+        cache.path(),
+        &advanced,
+      )
+      .is_err()
+    );
+    advanced.upload_bytes_per_second = 3 * 1024 * 1024;
+    let vykar = VykarRepository::new(
+      &repository,
+      "komodo-test-host",
+      cache.path(),
+      &advanced,
+    )
+    .unwrap();
+    assert_eq!(vykar.config.limits.upload_mib_per_sec, 3);
   }
 
   fn exercise_repository(repository: BackupRepository) {
