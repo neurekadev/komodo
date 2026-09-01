@@ -5,7 +5,7 @@ use typeshare::typeshare;
 
 use crate::entities::{I64, docker::HealthConfig};
 
-use super::GraphDriverData;
+use super::{GraphDriverData, ImageDiskUsage};
 
 #[typeshare]
 #[derive(
@@ -35,6 +35,9 @@ pub struct ImageListItem {
   pub size: I64,
   /// Whether the image is in use by any container
   pub in_use: bool,
+  /// Disk usage from the most recent successful background measurement.
+  #[serde(default)]
+  pub disk_usage: ImageDiskUsage,
 }
 
 /// Information about an image in the local image cache.
@@ -107,6 +110,10 @@ pub struct Image {
 
   #[serde(rename = "Metadata")]
   pub metadata: Option<ImageInspectMetadata>,
+
+  /// Disk usage from the most recent successful background measurement.
+  #[serde(default, rename = "DiskUsage")]
+  pub disk_usage: ImageDiskUsage,
 }
 
 /// A descriptor struct containing digest, media type, and size, as defined in the [OCI Content Descriptors Specification](https://github.com/opencontainers/image-spec/blob/v1.0.1/descriptor.md).

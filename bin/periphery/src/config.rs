@@ -126,6 +126,9 @@ pub fn periphery_config() -> &'static PeripheryConfig {
       container_stats_polling_rate: env
         .periphery_container_stats_polling_rate
         .unwrap_or(config.container_stats_polling_rate),
+      docker_disk_usage_polling_rate: env
+        .periphery_docker_disk_usage_polling_rate
+        .unwrap_or(config.docker_disk_usage_polling_rate),
       legacy_compose_cli: env
         .periphery_legacy_compose_cli
         .unwrap_or(config.legacy_compose_cli),

@@ -6,6 +6,7 @@ use komodo_client::entities::docker::{
 };
 
 use super::DockerClient;
+use super::network_usage::network_usage;
 
 impl DockerClient {
   pub async fn list_networks(
@@ -39,6 +40,11 @@ impl DockerClient {
           None => false,
         };
         NetworkListItem {
+          traffic: network
+            .name
+            .as_deref()
+            .map(network_usage)
+            .unwrap_or_default(),
           name: network.name,
           id: network.id,
           created: network.created,
@@ -78,6 +84,8 @@ impl DockerClient {
         .into(),
       )
       .await?;
+    let traffic =
+      network_usage(network.name.as_deref().unwrap_or(network_name));
     Ok(Network {
       name: network.name,
       id: network.id,
@@ -120,6 +128,7 @@ impl DockerClient {
         .collect(),
       options: network.options.unwrap_or_default(),
       labels: network.labels.unwrap_or_default(),
+      traffic,
     })
   }
 }

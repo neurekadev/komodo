@@ -21,6 +21,7 @@ use crate::{
 };
 
 pub fn spawn_polling_thread() {
+  super::network_usage::spawn_polling_thread();
   tokio::spawn(async move {
     let polling_rate = periphery_config()
       .container_stats_polling_rate

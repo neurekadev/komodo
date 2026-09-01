@@ -29,6 +29,87 @@ pub mod swarm;
 pub mod task;
 pub mod volume;
 
+/// Whether a background Docker measurement can be reported safely.
+#[typeshare]
+#[derive(
+  Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize,
+)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum DockerMetricStatus {
+  /// The first background measurement has not completed yet.
+  #[default]
+  Pending,
+  /// The measurement is complete and safe to display.
+  Available,
+  /// Docker cannot provide a complete measurement.
+  Unavailable,
+}
+
+/// Disk usage measured by Docker for an image.
+#[typeshare]
+#[derive(
+  Debug, Clone, Default, PartialEq, Serialize, Deserialize,
+)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+pub struct ImageDiskUsage {
+  pub status: DockerMetricStatus,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub total_bytes: Option<I64>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub shared_bytes: Option<I64>,
+  /// Total size minus shared size. This is approximately reclaimable.
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub unique_bytes: Option<I64>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub measured_at: Option<I64>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub unavailable_reason: Option<String>,
+}
+
+/// Disk usage measured by Docker for a volume.
+#[typeshare]
+#[derive(
+  Debug, Clone, Default, PartialEq, Serialize, Deserialize,
+)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+pub struct VolumeDiskUsage {
+  pub status: DockerMetricStatus,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub used_bytes: Option<I64>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub measured_at: Option<I64>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub unavailable_reason: Option<String>,
+}
+
+/// Complete, conservatively attributed traffic for one Docker network.
+#[typeshare]
+#[derive(
+  Debug, Clone, Default, PartialEq, Serialize, Deserialize,
+)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+pub struct DockerNetworkUsage {
+  /// Availability of the cumulative byte counters.
+  pub status: DockerMetricStatus,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub ingress_bytes: Option<U64>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub egress_bytes: Option<U64>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub measured_at: Option<I64>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub unavailable_reason: Option<String>,
+  /// Availability of the current rates. A second stable sample is required.
+  pub rate_status: DockerMetricStatus,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub ingress_bytes_per_second: Option<f64>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub egress_bytes_per_second: Option<f64>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub rate_unavailable_reason: Option<String>,
+}
+
 /// Swarm lists available from a manager node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SwarmLists {

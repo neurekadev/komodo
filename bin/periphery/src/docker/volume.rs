@@ -4,6 +4,7 @@ use komodo_client::entities::docker::{
 };
 
 use crate::docker::DockerClient;
+use crate::docker::usage::volume_disk_usage;
 
 impl DockerClient {
   pub async fn list_volumes(
@@ -36,6 +37,7 @@ impl DockerClient {
           container.volumes.iter().any(|name| &volume.name == name)
         });
         VolumeListItem {
+          disk_usage: volume_disk_usage(&volume.name, &volume.driver),
           name: volume.name,
           driver: volume.driver,
           mountpoint: volume.mountpoint,
@@ -59,6 +61,7 @@ impl DockerClient {
     volume_name: &str,
   ) -> anyhow::Result<Volume> {
     let volume = self.docker.inspect_volume(volume_name).await?;
+    let disk_usage = volume_disk_usage(&volume.name, &volume.driver);
     Ok(Volume {
       name: volume.name,
       driver: volume.driver,
@@ -153,6 +156,7 @@ impl DockerClient {
         size: data.size,
         ref_count: data.ref_count,
       }),
+      disk_usage,
     })
   }
 }

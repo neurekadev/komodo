@@ -190,6 +190,8 @@ pub struct Env {
   pub periphery_stats_polling_rate: Option<Timelength>,
   /// Override `container_stats_polling_rate`
   pub periphery_container_stats_polling_rate: Option<Timelength>,
+  /// Override `docker_disk_usage_polling_rate`
+  pub periphery_docker_disk_usage_polling_rate: Option<Timelength>,
   /// Override `legacy_compose_cli`
   pub periphery_legacy_compose_cli: Option<bool>,
 
@@ -402,6 +404,12 @@ pub struct PeripheryConfig {
   #[serde(default = "default_container_stats_polling_rate")]
   pub container_stats_polling_rate: Timelength,
 
+  /// The rate at which Docker image and volume disk usage is measured.
+  /// Options: https://docs.rs/komodo_client/latest/komodo_client/entities/enum.Timelength.html
+  /// Default: `5-min`
+  #[serde(default = "default_docker_disk_usage_polling_rate")]
+  pub docker_disk_usage_polling_rate: Timelength,
+
   /// Whether stack actions should use `docker-compose ...`
   /// instead of `docker compose ...`.
   /// Default: false
@@ -475,6 +483,10 @@ fn default_container_stats_polling_rate() -> Timelength {
   Timelength::ThirtySeconds
 }
 
+fn default_docker_disk_usage_polling_rate() -> Timelength {
+  Timelength::FiveMinutes
+}
+
 fn default_ssl_enabled() -> bool {
   true
 }
@@ -503,6 +515,8 @@ impl Default for PeripheryConfig {
       stats_polling_rate: default_stats_polling_rate(),
       container_stats_polling_rate:
         default_container_stats_polling_rate(),
+      docker_disk_usage_polling_rate:
+        default_docker_disk_usage_polling_rate(),
       legacy_compose_cli: Default::default(),
       logging: Default::default(),
       pretty_startup_config: Default::default(),
@@ -554,6 +568,8 @@ impl PeripheryConfig {
       disable_container_terminals: self.disable_container_terminals,
       stats_polling_rate: self.stats_polling_rate,
       container_stats_polling_rate: self.container_stats_polling_rate,
+      docker_disk_usage_polling_rate: self
+        .docker_disk_usage_polling_rate,
       legacy_compose_cli: self.legacy_compose_cli,
       logging: self.logging.clone(),
       pretty_startup_config: self.pretty_startup_config,

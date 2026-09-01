@@ -13,6 +13,7 @@ import { Center, Group, Loader, Text } from "@mantine/core";
 import { Types } from "komodo_client";
 import { Waypoints } from "lucide-react";
 import { useNavigate, useParams } from "react-router-dom";
+import { DockerNetworkMetric } from "@/components/docker/metrics";
 
 export default function Network() {
   const { type, id, network } = useParams() as {
@@ -50,10 +51,14 @@ function NetworkInner({
     data: network,
     isPending,
     isError,
-  } = useRead("InspectNetwork", {
-    server: serverId,
-    network: networkName,
-  });
+  } = useRead(
+    "InspectNetwork",
+    {
+      server: serverId,
+      network: networkName,
+    },
+    { refetchInterval: 10_000 },
+  );
 
   const { mutate: deleteNetwork, isPending: deletePending } = useExecute(
     "DeleteNetwork",
@@ -213,6 +218,26 @@ function NetworkInner({
             {
               accessorKey: "Internal",
               header: "Internal",
+            },
+            {
+              accessorKey: "Traffic.ingress_bytes",
+              header: "Ingress",
+              cell: ({ row }) => (
+                <DockerNetworkMetric
+                  traffic={row.original.Traffic}
+                  direction="ingress"
+                />
+              ),
+            },
+            {
+              accessorKey: "Traffic.egress_bytes",
+              header: "Egress",
+              cell: ({ row }) => (
+                <DockerNetworkMetric
+                  traffic={row.original.Traffic}
+                  direction="egress"
+                />
+              ),
             },
           ]}
         />

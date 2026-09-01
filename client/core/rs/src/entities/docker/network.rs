@@ -3,6 +3,8 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use typeshare::typeshare;
 
+use super::DockerNetworkUsage;
+
 #[typeshare]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
@@ -21,6 +23,9 @@ pub struct NetworkListItem {
   pub ingress: Option<bool>,
   /// Whether the network is attached to one or more containers
   pub in_use: bool,
+  /// Complete traffic attributed by the most recent container-stats poll.
+  #[serde(default)]
+  pub traffic: DockerNetworkUsage,
 }
 
 #[typeshare]
@@ -68,6 +73,10 @@ pub struct Network {
 
   #[serde(default, rename = "Labels")]
   pub labels: HashMap<String, String>,
+
+  /// Complete traffic attributed by the most recent container-stats poll.
+  #[serde(default, rename = "Traffic")]
+  pub traffic: DockerNetworkUsage,
 }
 
 #[typeshare]

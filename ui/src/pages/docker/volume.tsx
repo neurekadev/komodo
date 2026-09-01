@@ -19,6 +19,7 @@ import { useLocalStorage } from "@mantine/hooks";
 import { Types } from "komodo_client";
 import { useNavigate, useParams } from "react-router-dom";
 import { useEffect } from "react";
+import { DockerDiskMetric } from "@/components/docker/metrics";
 
 type VolumeView = "Info" | "Files";
 
@@ -67,10 +68,14 @@ function VolumeInner({
     data: volume,
     isPending,
     isError,
-  } = useRead("InspectVolume", {
-    server: serverId,
-    volume: volumeName,
-  });
+  } = useRead(
+    "InspectVolume",
+    {
+      server: serverId,
+      volume: volumeName,
+    },
+    { refetchInterval: 10_000 },
+  );
 
   const { mutate: deleteVolume, isPending: deletePending } = useExecute(
     "DeleteVolume",
@@ -203,8 +208,18 @@ function VolumeInner({
                     header: "Created At",
                   },
                   {
-                    accessorKey: "UsageData.Size",
+                    accessorKey: "DiskUsage.used_bytes",
                     header: "Used Size",
+                    cell: ({ row }) => (
+                      <DockerDiskMetric
+                        status={row.original.DiskUsage?.status}
+                        bytes={row.original.DiskUsage?.used_bytes}
+                        measuredAt={row.original.DiskUsage?.measured_at}
+                        unavailableReason={
+                          row.original.DiskUsage?.unavailable_reason
+                        }
+                      />
+                    ),
                   },
                 ]}
               />

@@ -9,6 +9,7 @@ import { Badge, Group } from "@mantine/core";
 import { DataTable, SortableHeader } from "mogh_ui";
 import DockerResourceLink from "@/components/docker/link";
 import { SearchInput } from "mogh_ui";
+import { DockerDiskMetric } from "@/components/docker/metrics";
 
 export default function ServerVolumes({
   id,
@@ -73,6 +74,20 @@ export default function ServerVolumes({
             accessorKey: "scope",
             header: ({ column }) => (
               <SortableHeader column={column} title="Scope" />
+            ),
+          },
+          {
+            accessorKey: "disk_usage.used_bytes",
+            header: ({ column }) => (
+              <SortableHeader column={column} title="Used" />
+            ),
+            cell: ({ row }) => (
+              <DockerDiskMetric
+                status={row.original.disk_usage?.status}
+                bytes={row.original.disk_usage?.used_bytes}
+                measuredAt={row.original.disk_usage?.measured_at}
+                unavailableReason={row.original.disk_usage?.unavailable_reason}
+              />
             ),
           },
         ]}

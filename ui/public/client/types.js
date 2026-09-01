@@ -601,6 +601,16 @@ export var ImageManifestSummaryKindEnum;
     ImageManifestSummaryKindEnum["Attestation"] = "attestation";
     ImageManifestSummaryKindEnum["Unknown"] = "unknown";
 })(ImageManifestSummaryKindEnum || (ImageManifestSummaryKindEnum = {}));
+/** Whether a background Docker measurement can be reported safely. */
+export var DockerMetricStatus;
+(function (DockerMetricStatus) {
+    /** The first background measurement has not completed yet. */
+    DockerMetricStatus["Pending"] = "pending";
+    /** The measurement is complete and safe to display. */
+    DockerMetricStatus["Available"] = "available";
+    /** Docker cannot provide a complete measurement. */
+    DockerMetricStatus["Unavailable"] = "unavailable";
+})(DockerMetricStatus || (DockerMetricStatus = {}));
 export var TaskState;
 (function (TaskState) {
     TaskState["NEW"] = "new";

@@ -51,6 +51,7 @@ async fn app() -> anyhow::Result<()> {
 
     stats::spawn_polling_thread();
     docker::stats::spawn_polling_thread();
+    docker::usage::spawn_polling_thread();
     let handles = FuturesUnordered::new();
 
     // Spawn client side connections

@@ -4296,6 +4296,27 @@ export interface ImageInspectMetadata {
 	LastTagTime?: string;
 }
 
+/** Whether a background Docker measurement can be reported safely. */
+export enum DockerMetricStatus {
+	/** The first background measurement has not completed yet. */
+	Pending = "pending",
+	/** The measurement is complete and safe to display. */
+	Available = "available",
+	/** Docker cannot provide a complete measurement. */
+	Unavailable = "unavailable",
+}
+
+/** Disk usage measured by Docker for an image. */
+export interface ImageDiskUsage {
+	status: DockerMetricStatus;
+	total_bytes?: I64;
+	shared_bytes?: I64;
+	/** Total size minus shared size. This is approximately reclaimable. */
+	unique_bytes?: I64;
+	measured_at?: I64;
+	unavailable_reason?: string;
+}
+
 /** Information about an image in the local image cache. */
 export interface Image {
 	/** ID is the content-addressable ID of an image.  This identifier is a content-addressable digest calculated from the image's configuration (which includes the digests of layers used by the image).  Note that this digest differs from the `RepoDigests` below, which holds digests of image manifests that reference the image. */
@@ -4328,6 +4349,8 @@ export interface Image {
 	GraphDriver?: GraphDriverData;
 	RootFS?: ImageInspectRootFs;
 	Metadata?: ImageInspectMetadata;
+	/** Disk usage from the most recent successful background measurement. */
+	DiskUsage?: ImageDiskUsage;
 }
 
 export type InspectImageResponse = Image;
@@ -4358,6 +4381,21 @@ export interface NetworkContainer {
 	IPv6Address?: string;
 }
 
+/** Complete, conservatively attributed traffic for one Docker network. */
+export interface DockerNetworkUsage {
+	/** Availability of the cumulative byte counters. */
+	status: DockerMetricStatus;
+	ingress_bytes?: U64;
+	egress_bytes?: U64;
+	measured_at?: I64;
+	unavailable_reason?: string;
+	/** Availability of the current rates. A second stable sample is required. */
+	rate_status: DockerMetricStatus;
+	ingress_bytes_per_second?: number;
+	egress_bytes_per_second?: number;
+	rate_unavailable_reason?: string;
+}
+
 export interface Network {
 	Name?: string;
 	Id?: string;
@@ -4373,6 +4411,8 @@ export interface Network {
 	Containers: NetworkContainer[];
 	Options?: Record<string, string>;
 	Labels?: Record<string, string>;
+	/** Complete traffic attributed by the most recent container-stats poll. */
+	Traffic?: DockerNetworkUsage;
 }
 
 export type InspectNetworkResponse = Network;
@@ -4977,6 +5017,14 @@ export interface VolumeUsageData {
 	RefCount: I64;
 }
 
+/** Disk usage measured by Docker for a volume. */
+export interface VolumeDiskUsage {
+	status: DockerMetricStatus;
+	used_bytes?: I64;
+	measured_at?: I64;
+	unavailable_reason?: string;
+}
+
 export interface Volume {
 	/** Name of the volume. */
 	Name: string;
@@ -4996,6 +5044,8 @@ export interface Volume {
 	/** The driver specific options used when creating the volume. */
 	Options?: Record<string, string>;
 	UsageData?: VolumeUsageData;
+	/** Disk usage from the most recent successful background measurement. */
+	DiskUsage?: VolumeDiskUsage;
 }
 
 export type InspectVolumeResponse = Volume;
@@ -5270,6 +5320,8 @@ export interface ImageListItem {
 	size: I64;
 	/** Whether the image is in use by any container */
 	in_use: boolean;
+	/** Disk usage from the most recent successful background measurement. */
+	disk_usage?: ImageDiskUsage;
 }
 
 export type ListImagesResponse = ImageListItem[];
@@ -5289,6 +5341,8 @@ export interface NetworkListItem {
 	ingress?: boolean;
 	/** Whether the network is attached to one or more containers */
 	in_use: boolean;
+	/** Complete traffic attributed by the most recent container-stats poll. */
+	traffic?: DockerNetworkUsage;
 }
 
 export type ListNetworksResponse = NetworkListItem[];
@@ -5905,6 +5959,8 @@ export interface VolumeListItem {
 	size?: I64;
 	/** Whether the volume is currently attached to any container */
 	in_use: boolean;
+	/** Disk usage from the most recent successful background measurement. */
+	disk_usage?: VolumeDiskUsage;
 }
 
 export type ListVolumesResponse = VolumeListItem[];

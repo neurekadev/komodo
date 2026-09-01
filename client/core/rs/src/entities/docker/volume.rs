@@ -3,7 +3,10 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use typeshare::typeshare;
 
-use crate::entities::{I64, docker::Topology};
+use crate::entities::{
+  I64,
+  docker::{Topology, VolumeDiskUsage},
+};
 
 use super::ObjectVersion;
 
@@ -23,6 +26,9 @@ pub struct VolumeListItem {
   pub size: Option<I64>,
   /// Whether the volume is currently attached to any container
   pub in_use: bool,
+  /// Disk usage from the most recent successful background measurement.
+  #[serde(default)]
+  pub disk_usage: VolumeDiskUsage,
 }
 
 #[typeshare]
@@ -68,6 +74,10 @@ pub struct Volume {
 
   #[serde(rename = "UsageData")]
   pub usage_data: Option<VolumeUsageData>,
+
+  /// Disk usage from the most recent successful background measurement.
+  #[serde(default, rename = "DiskUsage")]
+  pub disk_usage: VolumeDiskUsage,
 }
 
 #[typeshare]

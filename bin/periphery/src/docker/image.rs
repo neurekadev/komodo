@@ -10,6 +10,7 @@ use komodo_client::entities::docker::{
 use serde::Deserialize;
 
 use super::DockerClient;
+use super::usage::image_disk_usage;
 
 impl DockerClient {
   pub async fn list_images(
@@ -35,6 +36,7 @@ impl DockerClient {
           .cloned()
           .unwrap_or_else(|| image.id.clone());
         ImageListItem {
+          disk_usage: image_disk_usage(&image.id),
           id: image.id,
           parent_id: image.parent_id,
           name,
@@ -59,6 +61,8 @@ impl DockerClient {
     image_name: &str,
   ) -> anyhow::Result<Image> {
     let image = self.docker.inspect_image(image_name).await?;
+    let disk_usage =
+      image_disk_usage(image.id.as_deref().unwrap_or_default());
     Ok(Image {
       id: image.id,
       descriptor: image.descriptor.map(convert_oci_descriptor),
@@ -113,6 +117,7 @@ impl DockerClient {
       metadata: image.metadata.map(|metadata| ImageInspectMetadata {
         last_tag_time: metadata.last_tag_time,
       }),
+      disk_usage,
       config: image.config.map(|config| ImageConfig {
         user: config.user,
         exposed_ports: config.exposed_ports,

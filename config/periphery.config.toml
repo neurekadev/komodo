@@ -95,6 +95,13 @@ stats_polling_rate = "5-sec"
 ## Default: 30-sec
 container_stats_polling_rate = "30-sec"
 
+## How often Periphery measures Docker image and volume disk usage.
+## A transient Docker error keeps the last successful measurement.
+## Env: PERIPHERY_DOCKER_DISK_USAGE_POLLING_RATE
+## Options: https://docs.rs/komodo_client/latest/komodo_client/entities/enum.Timelength.html
+## Default: 5-min
+docker_disk_usage_polling_rate = "5-min"
+
 ## Whether stack actions should use `docker-compose ...`
 ## instead of `docker compose ...`.
 ## Env: PERIPHERY_LEGACY_COMPOSE_CLI

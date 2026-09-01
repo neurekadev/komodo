@@ -9,6 +9,7 @@ import { Badge, Group } from "@mantine/core";
 import { DataTable, SortableHeader } from "mogh_ui";
 import DockerResourceLink from "@/components/docker/link";
 import { SearchInput } from "mogh_ui";
+import { DockerNetworkMetric } from "@/components/docker/metrics";
 
 export default function ServerNetworks({
   id,
@@ -108,6 +109,30 @@ export default function ServerNetworks({
             accessorKey: "ipam_driver",
             header: ({ column }) => (
               <SortableHeader column={column} title="IPAM Driver" />
+            ),
+          },
+          {
+            accessorKey: "traffic.ingress_bytes",
+            header: ({ column }) => (
+              <SortableHeader column={column} title="Ingress" />
+            ),
+            cell: ({ row }) => (
+              <DockerNetworkMetric
+                traffic={row.original.traffic}
+                direction="ingress"
+              />
+            ),
+          },
+          {
+            accessorKey: "traffic.egress_bytes",
+            header: ({ column }) => (
+              <SortableHeader column={column} title="Egress" />
+            ),
+            cell: ({ row }) => (
+              <DockerNetworkMetric
+                traffic={row.original.traffic}
+                direction="egress"
+              />
             ),
           },
         ]}

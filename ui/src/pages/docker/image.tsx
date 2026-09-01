@@ -5,7 +5,7 @@ import { useExecute, usePermissions, useRead, useSetTitle } from "@/lib/hooks";
 import { useServer } from "@/resources/server";
 import ResourceSubPage from "@/resources/sub-page";
 import { ICONS } from "@/lib/icons";
-import { ConfirmButton, fmtDateWithMinutes, fmtSizeBytes } from "mogh_ui";
+import { ConfirmButton, fmtDateWithMinutes } from "mogh_ui";
 import { DataTable } from "mogh_ui";
 import { PageGuard } from "mogh_ui";
 import { Section } from "mogh_ui";
@@ -14,6 +14,7 @@ import { Box, Center, Group, Text } from "@mantine/core";
 import { Types } from "komodo_client";
 import { useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
+import { DockerDiskMetric } from "@/components/docker/metrics";
 
 export default function Image() {
   const { type, id, image } = useParams() as {
@@ -52,10 +53,14 @@ function ImageInner({
     data: image,
     isPending,
     isError,
-  } = useRead("InspectImage", {
-    server: serverId,
-    image: imageName,
-  });
+  } = useRead(
+    "InspectImage",
+    {
+      server: serverId,
+      image: imageName,
+    },
+    { refetchInterval: 10_000 },
+  );
 
   const containers = useRead(
     "ListContainers",
@@ -147,12 +152,47 @@ function ImageInner({
                   header: "Os",
                 },
                 {
-                  accessorKey: "Size",
-                  header: "Size",
-                  cell: ({ row }) =>
-                    row.original.Size
-                      ? fmtSizeBytes(row.original.Size)
-                      : "Unknown",
+                  accessorKey: "DiskUsage.total_bytes",
+                  header: "Total",
+                  cell: ({ row }) => (
+                    <DockerDiskMetric
+                      status={row.original.DiskUsage?.status}
+                      bytes={row.original.DiskUsage?.total_bytes}
+                      measuredAt={row.original.DiskUsage?.measured_at}
+                      unavailableReason={
+                        row.original.DiskUsage?.unavailable_reason
+                      }
+                    />
+                  ),
+                },
+                {
+                  accessorKey: "DiskUsage.shared_bytes",
+                  header: "Shared",
+                  cell: ({ row }) => (
+                    <DockerDiskMetric
+                      status={row.original.DiskUsage?.status}
+                      bytes={row.original.DiskUsage?.shared_bytes}
+                      measuredAt={row.original.DiskUsage?.measured_at}
+                      unavailableReason={
+                        row.original.DiskUsage?.unavailable_reason
+                      }
+                    />
+                  ),
+                },
+                {
+                  accessorKey: "DiskUsage.unique_bytes",
+                  header: "Unique (approximately reclaimable)",
+                  cell: ({ row }) => (
+                    <DockerDiskMetric
+                      status={row.original.DiskUsage?.status}
+                      bytes={row.original.DiskUsage?.unique_bytes}
+                      measuredAt={row.original.DiskUsage?.measured_at}
+                      unavailableReason={
+                        row.original.DiskUsage?.unavailable_reason
+                      }
+                      approximate
+                    />
+                  ),
                 },
               ]}
             />

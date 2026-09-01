@@ -3,12 +3,13 @@ import { useServerDockerSearch } from ".";
 import { useDockerSelectionState, useRead } from "@/lib/hooks";
 import DockerBatchExecutions from "@/components/docker/batch-executions";
 import { filterBySplit } from "mogh_ui";
-import { fmtSizeBytes, Section } from "mogh_ui";
+import { Section } from "mogh_ui";
 import { Badge, Group } from "@mantine/core";
 import { Prune } from "../executions";
 import { DataTable, SortableHeader } from "mogh_ui";
 import DockerResourceLink from "@/components/docker/link";
 import { SearchInput } from "mogh_ui";
+import { DockerDiskMetric } from "@/components/docker/metrics";
 
 export default function ServerImages({
   id,
@@ -71,12 +72,47 @@ export default function ServerImages({
             ),
           },
           {
-            accessorKey: "size",
+            accessorKey: "disk_usage.total_bytes",
             header: ({ column }) => (
-              <SortableHeader column={column} title="Size" />
+              <SortableHeader column={column} title="Total" />
             ),
-            cell: ({ row }) =>
-              row.original.size ? fmtSizeBytes(row.original.size) : "Unknown",
+            cell: ({ row }) => (
+              <DockerDiskMetric
+                status={row.original.disk_usage?.status}
+                bytes={row.original.disk_usage?.total_bytes}
+                measuredAt={row.original.disk_usage?.measured_at}
+                unavailableReason={row.original.disk_usage?.unavailable_reason}
+              />
+            ),
+          },
+          {
+            accessorKey: "disk_usage.shared_bytes",
+            header: ({ column }) => (
+              <SortableHeader column={column} title="Shared" />
+            ),
+            cell: ({ row }) => (
+              <DockerDiskMetric
+                status={row.original.disk_usage?.status}
+                bytes={row.original.disk_usage?.shared_bytes}
+                measuredAt={row.original.disk_usage?.measured_at}
+                unavailableReason={row.original.disk_usage?.unavailable_reason}
+              />
+            ),
+          },
+          {
+            accessorKey: "disk_usage.unique_bytes",
+            header: ({ column }) => (
+              <SortableHeader column={column} title="Unique (approx.)" />
+            ),
+            cell: ({ row }) => (
+              <DockerDiskMetric
+                status={row.original.disk_usage?.status}
+                bytes={row.original.disk_usage?.unique_bytes}
+                measuredAt={row.original.disk_usage?.measured_at}
+                unavailableReason={row.original.disk_usage?.unavailable_reason}
+                approximate
+              />
+            ),
           },
         ]}
       />
