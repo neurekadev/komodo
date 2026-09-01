@@ -88,12 +88,10 @@ impl Resolve<WriteArgs> for PlanBackupRestore {
         } => Some(server_id.clone()),
         komodo_client::entities::backup::BackupTarget::Stack {
           stack_id,
-        } => Some(
-          crate::resource::get::<Stack>(stack_id)
-            .await?
-            .config
-            .server_id,
-        ),
+        } => crate::resource::get::<Stack>(stack_id)
+          .await
+          .ok()
+          .map(|stack| stack.config.server_id),
         _ => None,
       };
       if source_server.as_deref() != Some(destination.as_str()) {

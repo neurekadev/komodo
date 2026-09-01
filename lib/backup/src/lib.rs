@@ -654,15 +654,15 @@ pub fn parse_source_label(label: &str) -> BackupTarget {
 
 fn run_id_from_snapshot_name(name: &str) -> String {
   name
-    .rsplit_once('-')
-    .map(|(_, suffix)| suffix.to_string())
+    .rsplit_once("-run-")
+    .map(|(_, run_id)| run_id.to_string())
     .unwrap_or_default()
 }
 
 /// Unique, sortable snapshot name. Vykar requires names to be unique.
-pub fn snapshot_name(prefix: &str) -> String {
+pub fn snapshot_name(prefix: &str, run_id: &str) -> String {
   format!(
-    "{prefix}-{}-{}",
+    "{prefix}-{}-{}-run-{run_id}",
     chrono::Utc::now().format("%Y%m%dT%H%M%SZ"),
     uuid::Uuid::new_v4().simple()
   )
@@ -705,6 +705,14 @@ mod tests {
     let keep = HashMap::from([("komodo/v1/stack/s1".into(), 1)]);
     let delete = retention_deletions(&snapshots, &keep);
     assert_eq!(delete, vec!["complete-old", "partial-old"]);
+  }
+
+  #[test]
+  fn snapshot_names_preserve_the_actual_backup_run_id() {
+    let run_id = "01991f83-e064-7b50-8878-4ee722ffa6e4";
+    let name = snapshot_name("stack", run_id);
+    assert_eq!(run_id_from_snapshot_name(&name), run_id);
+    assert_eq!(run_id_from_snapshot_name("legacy-snapshot"), "");
   }
 
   #[test]

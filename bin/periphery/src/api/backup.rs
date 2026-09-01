@@ -28,6 +28,7 @@ use crate::{config::periphery_config, state::docker_client};
 use super::Args;
 
 const COMPOSE_PROJECT_LABEL: &str = "com.docker.compose.project";
+const RESTORE_PLAN_VOLUME_LABEL: &str = "komodo.restore-plan";
 
 #[derive(Deserialize)]
 struct BackupComposeConfig {
@@ -409,6 +410,12 @@ fn insert_bind_backup_root(
       run_directory.display()
     ));
   }
+  if bind_paths.iter().any(|existing| bind.starts_with(existing)) {
+    // An ancestor already captures this tree. Keeping both roots would make
+    // the resulting full snapshot impossible to publish atomically.
+    return Ok(());
+  }
+  bind_paths.retain(|existing| !existing.starts_with(&bind));
   bind_paths.insert(bind);
   Ok(())
 }
@@ -689,6 +696,28 @@ async fn run_container_command(
   }
 }
 
+async fn create_restore_volume(
+  volume_name: &str,
+  journal_id: &str,
+) -> anyhow::Result<()> {
+  let label = format!("{RESTORE_PLAN_VOLUME_LABEL}={journal_id}");
+  let log = run_komodo_standard_command(
+    &format!("Backup create restore volume {volume_name}"),
+    &format!(
+      "docker volume create --label {} -- {}",
+      escape(label.into()),
+      escape(volume_name.into())
+    ),
+    CommandOptions::default(),
+  )
+  .await;
+  if log.success {
+    Ok(())
+  } else {
+    Err(anyhow!("{}", log.stderr))
+  }
+}
+
 async fn restart_containers(
   containers: &[String],
 ) -> (Vec<String>, Vec<String>) {
@@ -750,12 +779,53 @@ impl Resolve<Args> for TransactionalVykarRestore {
     _: &Args,
   ) -> anyhow::Result<TransactionalVykarRestoreResponse> {
     let _operation = backup_operation_lock().lock().await;
-    if self.create_volume_if_missing
-      && let PeripheryBackupTarget::Volume { volume_name } =
-        &self.target
-      && discover_source(&self.target).await.is_err()
+    if let PeripheryBackupTarget::Volume { volume_name } =
+      &self.target
     {
-      run_container_command("volume create", volume_name).await?;
+      let volume_restore_plan_id =
+        if self.volume_restore_plan_id.is_empty() {
+          &self.journal_id
+        } else {
+          &self.volume_restore_plan_id
+        };
+      let docker_guard = docker_client().load();
+      let docker = docker_guard
+        .as_ref()
+        .as_ref()
+        .context("Docker is unavailable")?;
+      let containers = docker.list_containers().await?;
+      let exists = docker
+        .list_volumes(&containers)
+        .await?
+        .into_iter()
+        .any(|volume| volume.name == *volume_name);
+      if self.create_volume_if_missing {
+        if exists {
+          let volume = docker.inspect_volume(volume_name).await?;
+          if volume.labels.get(RESTORE_PLAN_VOLUME_LABEL)
+            != Some(volume_restore_plan_id)
+          {
+            return Err(anyhow!(
+              "Destination volume '{volume_name}' now exists; create a new restore preflight and explicitly confirm overwrite"
+            ));
+          }
+        } else {
+          create_restore_volume(volume_name, volume_restore_plan_id)
+            .await?;
+          let volume = docker.inspect_volume(volume_name).await?;
+          if volume.labels.get(RESTORE_PLAN_VOLUME_LABEL)
+            != Some(volume_restore_plan_id)
+          {
+            return Err(anyhow!(
+              "Destination volume '{volume_name}' was created concurrently by another process; restore aborted"
+            ));
+          }
+        }
+      } else if !exists {
+        return Err(anyhow!(
+          "Destination volume '{volume_name}' no longer exists; create a new restore preflight"
+        ));
+      }
     }
     let running_containers =
       discover_running_containers(&self.target, &self.publish)
@@ -1181,6 +1251,17 @@ struct RestoreJournal {
   committed: bool,
 }
 
+#[derive(Default)]
+struct RemovePathsOnDrop(Vec<PathBuf>);
+
+impl Drop for RemovePathsOnDrop {
+  fn drop(&mut self) {
+    for path in self.0.iter().rev() {
+      let _ = remove_path(path);
+    }
+  }
+}
+
 fn restore_journal_dir() -> anyhow::Result<PathBuf> {
   let directory = periphery_config()
     .stack_dir()
@@ -1243,6 +1324,21 @@ fn publish_restore(
   )
 }
 
+fn restore_rollback_path(
+  destination: &Path,
+  journal_id: &str,
+) -> anyhow::Result<PathBuf> {
+  let parent = destination
+    .parent()
+    .context("Restore destination has no parent")?;
+  let mut name = destination
+    .file_name()
+    .context("Restore destination has no file name")?
+    .to_os_string();
+  name.push(format!(".komodo-rollback-{journal_id}"));
+  Ok(parent.join(name))
+}
+
 fn publish_restore_in(
   staging: &Path,
   publish: &[RestorePublishPath],
@@ -1251,6 +1347,8 @@ fn publish_restore_in(
   journal_directory: &Path,
 ) -> anyhow::Result<bool> {
   let mut entries = Vec::new();
+  let mut rollback_paths = HashSet::new();
+  let mut preparation_cleanup = RemovePathsOnDrop::default();
   for (index, item) in publish.iter().enumerate() {
     let relative = Path::new(&item.snapshot_path);
     if relative.is_absolute()
@@ -1264,8 +1362,16 @@ fn publish_restore_in(
     if !destination.is_absolute() {
       return Err(anyhow!("Restore destination must be absolute"));
     }
-    let rollback = destination
-      .with_extension(format!("komodo-rollback-{journal_id}"));
+    let destination_parent = destination
+      .parent()
+      .context("Restore destination has no parent")?;
+    let rollback = restore_rollback_path(&destination, journal_id)?;
+    if !rollback_paths.insert(rollback.clone()) {
+      return Err(anyhow!(
+        "Restore destinations produce the same rollback path: {}",
+        rollback.display()
+      ));
+    }
     if path_lexists(&rollback) {
       return Err(anyhow!(
         "Rollback path already exists: {}",
@@ -1279,9 +1385,6 @@ fn publish_restore_in(
         item.snapshot_path
       ));
     }
-    let destination_parent = destination
-      .parent()
-      .context("Restore destination has no parent")?;
     std::fs::create_dir_all(destination_parent)?;
     let source = destination_parent
       .join(format!(".komodo-restore-{journal_id}-{index}"));
@@ -1291,6 +1394,7 @@ fn publish_restore_in(
         source.display()
       ));
     }
+    preparation_cleanup.0.push(source.clone());
     let copy = std::process::Command::new("cp")
       .arg("-a")
       .arg("--")
@@ -1305,11 +1409,11 @@ fn publish_restore_in(
       ));
     }
     if tree_digest(&restored_source)? != tree_digest(&source)? {
-      remove_path(&source)?;
       return Err(anyhow!(
         "Same-filesystem restore staging verification failed"
       ));
     }
+    sync_tree(&source)?;
     entries.push(RestoreJournalEntry {
       source,
       destination,
@@ -1327,6 +1431,8 @@ fn publish_restore_in(
     committed: false,
   };
   persist_journal(&journal_path, &journal)?;
+  // The durable journal owns cleanup from this point onward.
+  preparation_cleanup.0.clear();
   publication_started.store(true, Ordering::SeqCst);
 
   for index in 0..journal.entries.len() {
@@ -1458,6 +1564,22 @@ fn tree_digest(root: &Path) -> anyhow::Result<Vec<u8>> {
   let mut digest = Sha256::new();
   update(root, Path::new(""), &mut digest)?;
   Ok(digest.finalize().to_vec())
+}
+
+fn sync_tree(root: &Path) -> anyhow::Result<()> {
+  let metadata = std::fs::symlink_metadata(root)?;
+  if metadata.file_type().is_symlink() {
+    return Ok(());
+  }
+  if metadata.is_dir() {
+    for entry in std::fs::read_dir(root)? {
+      sync_tree(&entry?.path())?;
+    }
+    std::fs::File::open(root)?.sync_all()?;
+  } else if metadata.is_file() {
+    std::fs::File::open(root)?.sync_all()?;
+  }
+  Ok(())
 }
 
 fn rollback_published(
@@ -1687,6 +1809,30 @@ mod tests {
   }
 
   #[test]
+  fn nested_stack_bind_roots_collapse_to_the_ancestor() {
+    let run_directory = tempfile::tempdir().unwrap();
+    let binds = tempfile::tempdir().unwrap();
+    let child = binds.path().join("cache");
+    std::fs::create_dir(&child).unwrap();
+    let mut paths = BTreeSet::new();
+    insert_bind_backup_root(&mut paths, run_directory.path(), &child)
+      .unwrap();
+    insert_bind_backup_root(
+      &mut paths,
+      run_directory.path(),
+      binds.path(),
+    )
+    .unwrap();
+    assert_eq!(
+      paths,
+      [binds.path().canonicalize().unwrap()].into_iter().collect()
+    );
+    insert_bind_backup_root(&mut paths, run_directory.path(), &child)
+      .unwrap();
+    assert_eq!(paths.len(), 1);
+  }
+
+  #[test]
   fn exact_restore_preflight_reports_create_overwrite_and_delete() {
     let destination = tempfile::tempdir().unwrap();
     std::fs::write(destination.path().join("old.txt"), b"old")
@@ -1757,5 +1903,86 @@ mod tests {
       b"original"
     );
     assert!(!first.join("new.txt").exists());
+  }
+
+  #[test]
+  fn rollback_names_preserve_complete_destination_filenames() {
+    let root = tempfile::tempdir().unwrap();
+    let download = root.path().join("download");
+    std::fs::create_dir_all(&download).unwrap();
+    std::fs::write(download.join("new-json"), b"new-json").unwrap();
+    std::fs::write(download.join("new-yaml"), b"new-yaml").unwrap();
+    let json = root.path().join("app.json");
+    let yaml = root.path().join("app.yaml");
+    assert_ne!(
+      restore_rollback_path(&json, "unique-rollback-test").unwrap(),
+      restore_rollback_path(&yaml, "unique-rollback-test").unwrap()
+    );
+    std::fs::write(&json, b"old-json").unwrap();
+    std::fs::write(&yaml, b"old-yaml").unwrap();
+    let publish = vec![
+      RestorePublishPath {
+        snapshot_path: "new-json".into(),
+        destination: json.to_string_lossy().into_owned(),
+      },
+      RestorePublishPath {
+        snapshot_path: "new-yaml".into(),
+        destination: yaml.to_string_lossy().into_owned(),
+      },
+    ];
+    assert!(
+      !publish_restore_in(
+        &download,
+        &publish,
+        "unique-rollback-test",
+        &AtomicBool::new(false),
+        &root.path().join("journals"),
+      )
+      .unwrap()
+    );
+    assert_eq!(std::fs::read(json).unwrap(), b"new-json");
+    assert_eq!(std::fs::read(yaml).unwrap(), b"new-yaml");
+  }
+
+  #[test]
+  fn preparation_errors_remove_same_filesystem_staging() {
+    let root = tempfile::tempdir().unwrap();
+    let download = root.path().join("download");
+    std::fs::create_dir_all(&download).unwrap();
+    std::fs::write(download.join("present"), b"present").unwrap();
+    let publish = vec![
+      RestorePublishPath {
+        snapshot_path: "present".into(),
+        destination: root
+          .path()
+          .join("first")
+          .to_string_lossy()
+          .into_owned(),
+      },
+      RestorePublishPath {
+        snapshot_path: "missing".into(),
+        destination: root
+          .path()
+          .join("second")
+          .to_string_lossy()
+          .into_owned(),
+      },
+    ];
+    assert!(
+      publish_restore_in(
+        &download,
+        &publish,
+        "prepare-cleanup-test",
+        &AtomicBool::new(false),
+        &root.path().join("journals"),
+      )
+      .is_err()
+    );
+    assert!(
+      !root
+        .path()
+        .join(".komodo-restore-prepare-cleanup-test-0")
+        .exists()
+    );
   }
 }

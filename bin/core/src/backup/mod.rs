@@ -45,11 +45,12 @@ use periphery_client::api::backup::{
   VykarBackupTask,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
   config::core_config,
-  helpers::periphery_client,
+  helpers::{periphery_client, query::id_or_name_filter},
   permission::get_check_permissions,
   resource::{self, KomodoResource},
   state::{CORE_RECOVERY_ACTIVATION_PATH, db_client},
@@ -90,6 +91,12 @@ struct StoredRestorePlan {
   destination_volume_name: Option<String>,
   #[serde(default)]
   create_volume_if_missing: bool,
+  /// Immutable source metadata used when this plan creates a recovered Stack.
+  #[serde(default)]
+  recovered_stack_source: Option<Stack>,
+  /// Missing source resources are recoverable only by administrators.
+  #[serde(default)]
+  source_stack_missing: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,6 +107,18 @@ struct StoredCoreRecoveryPlan {
   created_by: String,
   recovered_core_instance_id: String,
   plan: CoreRecoveryPlan,
+}
+
+#[derive(Debug, Deserialize)]
+struct SnapshotBackupManifest {
+  schema: String,
+  version: u32,
+  run_id: String,
+  source_label: String,
+  paths: Vec<String>,
+  target: PeripheryBackupTarget,
+  configuration_sha256: String,
+  paths_sha256: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -854,6 +873,11 @@ fn backup_operation_lock() -> &'static tokio::sync::Mutex<()> {
   LOCK.get_or_init(Default::default)
 }
 
+fn core_recovery_operation_lock() -> &'static tokio::sync::Mutex<()> {
+  static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+  LOCK.get_or_init(Default::default)
+}
+
 pub async fn list_snapshots()
 -> anyhow::Result<(Vec<BackupSnapshot>, u64)> {
   let settings = get_settings().await?;
@@ -1193,7 +1217,7 @@ async fn run_fleet(
           .await;
       let (targets, tasks, result) = match refreshed {
         Ok(targets) => {
-          match build_node_backup_tasks(&targets).await {
+          match build_node_backup_tasks(&targets, &run.id).await {
             Ok(tasks) => {
               let result = run_node_batch(
                 &settings,
@@ -1295,7 +1319,9 @@ fn spawn_node_retry(
             continue;
           }
         };
-        tasks = match build_node_backup_tasks(&refreshed).await {
+        tasks = match build_node_backup_tasks(&refreshed, &run.id)
+          .await
+        {
           Ok(tasks) => tasks,
           Err(error) => {
             warn!(
@@ -1455,6 +1481,7 @@ async fn refresh_node_targets(
 
 async fn build_node_backup_tasks(
   targets: &[BackupTarget],
+  run_id: &str,
 ) -> anyhow::Result<Vec<VykarBackupTask>> {
   let mut tasks = Vec::new();
   for target in targets {
@@ -1483,11 +1510,14 @@ async fn build_node_backup_tasks(
     tasks.push(VykarBackupTask {
       target: periphery_target,
       source_label: target.source_label(core_instance_id()?),
-      snapshot_name: snapshot_name(match target {
-        BackupTarget::Stack { .. } => "stack",
-        BackupTarget::Volume { .. } => "volume",
-        _ => "backup",
-      }),
+      snapshot_name: snapshot_name(
+        match target {
+          BackupTarget::Stack { .. } => "stack",
+          BackupTarget::Volume { .. } => "volume",
+          _ => "backup",
+        },
+        run_id,
+      ),
       mirror_only: false,
     });
   }
@@ -1553,10 +1583,13 @@ async fn run_node_batch(
       task.mirror_only =
         primary_complete && settings.mirror.is_some();
       if !primary_complete {
-        task.snapshot_name = snapshot_name(match &task.target {
-          PeripheryBackupTarget::Stack { .. } => "stack",
-          PeripheryBackupTarget::Volume { .. } => "volume",
-        });
+        task.snapshot_name = snapshot_name(
+          match &task.target {
+            PeripheryBackupTarget::Stack { .. } => "stack",
+            PeripheryBackupTarget::Volume { .. } => "volume",
+          },
+          &run.id,
+        );
       }
       retry_tasks.push(task);
     }
@@ -1690,7 +1723,7 @@ async fn backup_core(
   let mirror = settings.mirror.clone();
   let settings_for_worker = settings.clone();
   let label = BackupTarget::Core.source_label(core_instance_id()?);
-  let name = snapshot_name("core");
+  let name = snapshot_name("core", &run.id);
   let path = staging.to_string_lossy().into_owned();
   let primary_name = name.clone();
   let primary_label = label.clone();
@@ -1837,7 +1870,7 @@ async fn backup_stack(
         stack_id: stack_id.into(),
       }
       .source_label(core_instance_id()?),
-      snapshot_name: snapshot_name("stack"),
+      snapshot_name: snapshot_name("stack", &run.id),
       run_id: run.id.clone(),
       komodo_version: env!("CARGO_PKG_VERSION").into(),
       stop_containers: settings.stop_containers,
@@ -1888,7 +1921,7 @@ async fn backup_volume(
         volume_name: volume_name.into(),
       }
       .source_label(core_instance_id()?),
-      snapshot_name: snapshot_name("volume"),
+      snapshot_name: snapshot_name("volume", &run.id),
       run_id: run.id.clone(),
       komodo_version: env!("CARGO_PKG_VERSION").into(),
       stop_containers: settings.stop_containers,
@@ -1960,8 +1993,100 @@ pub async fn authorize_snapshot(
     .into_iter()
     .find(|snapshot| snapshot.name == snapshot_name)
     .context("Snapshot does not exist in the primary repository")?;
-  authorize_target(&snapshot.target, user, level).await?;
+  if let BackupTarget::Stack { stack_id } = &snapshot.target
+    && Stack::coll()
+      .find_one(id_or_name_filter(stack_id))
+      .await?
+      .is_none()
+  {
+    if !user.admin {
+      return Err(anyhow!(
+        "Only administrators can recover a snapshot whose Stack resource was deleted"
+      ));
+    }
+  } else {
+    authorize_target(&snapshot.target, user, level).await?;
+  }
   Ok(snapshot)
+}
+
+async fn snapshot_stack_source(
+  snapshot: &BackupSnapshot,
+) -> anyhow::Result<(Stack, bool)> {
+  let BackupTarget::Stack { stack_id } = &snapshot.target else {
+    return Err(anyhow!("Snapshot is not a Stack backup"));
+  };
+  if let Some(stack) =
+    Stack::coll().find_one(id_or_name_filter(stack_id)).await?
+  {
+    return Ok((stack, false));
+  }
+
+  let manifest_source = snapshot
+    .source_paths
+    .iter()
+    .find(|path| is_backup_manifest_source(path))
+    .context("Stack snapshot has no embedded recovery manifest")?
+    .clone();
+  let staging = PathBuf::from("/backups/.komodo-stack-manifest")
+    .join(Uuid::new_v4().to_string());
+  tokio::fs::create_dir_all(&staging).await?;
+  let _staging_cleanup = RemoveDirectoryOnDrop(staging.clone());
+  let destination = staging.clone();
+  let settings = get_settings().await?;
+  let repository = settings.primary.clone();
+  let advanced = settings.advanced.clone();
+  let hostname = snapshot.hostname.clone();
+  let snapshot_name = snapshot.name.clone();
+  tokio::task::spawn_blocking(move || {
+    VykarRepository::new(
+      &repository,
+      &hostname,
+      &core_cache_dir()?,
+      &advanced,
+    )?
+    .restore(&snapshot_name, &destination, &[manifest_source])
+  })
+  .await
+  .context("Stack manifest restore worker failed")??;
+  let manifest_path =
+    find_file_named(&staging, "komodo-backup-manifest.json")
+      .context("Stack snapshot recovery manifest is missing")?;
+  let manifest: SnapshotBackupManifest =
+    serde_json::from_slice(&std::fs::read(manifest_path)?)?;
+  if manifest.schema != "komodo.backup-manifest/v1"
+    || manifest.version != 1
+    || manifest.run_id.is_empty()
+    || manifest.source_label != snapshot.source_label
+  {
+    return Err(anyhow!(
+      "Stack snapshot recovery manifest identity is invalid"
+    ));
+  }
+  let configuration_sha256 = hex::encode(Sha256::digest(
+    serde_json::to_vec(&manifest.target)?,
+  ));
+  let paths_sha256 =
+    hex::encode(Sha256::digest(serde_json::to_vec(&manifest.paths)?));
+  if configuration_sha256 != manifest.configuration_sha256
+    || paths_sha256 != manifest.paths_sha256
+  {
+    return Err(anyhow!(
+      "Stack snapshot recovery manifest checksum is invalid"
+    ));
+  }
+  let PeripheryBackupTarget::Stack { stack, .. } = manifest.target
+  else {
+    return Err(anyhow!(
+      "Stack snapshot recovery manifest has the wrong target type"
+    ));
+  };
+  if stack.id != *stack_id {
+    return Err(anyhow!(
+      "Stack snapshot recovery manifest does not match its source label"
+    ));
+  }
+  Ok((*stack, true))
 }
 
 pub async fn plan_restore(
@@ -1974,7 +2099,7 @@ pub async fn plan_restore(
   let PlanBackupRestore {
     destination_server_id,
     selected_paths,
-    recovered_stack_name,
+    mut recovered_stack_name,
     bind_path_mappings,
     destination_volume_name,
     confirm_existing_volume,
@@ -1986,20 +2111,29 @@ pub async fn plan_restore(
     ));
   }
   let selected_paths = normalize_selected_paths(&selected_paths)?;
+  let (snapshot_stack, source_stack_missing) =
+    if matches!(&snapshot.target, BackupTarget::Stack { .. }) {
+      let (stack, missing) = snapshot_stack_source(&snapshot).await?;
+      (Some(stack), missing)
+    } else {
+      (None, false)
+    };
   let destination_server_id = match destination_server_id {
     Some(destination) => Some(destination),
     None => match &snapshot.target {
       BackupTarget::Volume { server_id, .. } => {
         Some(server_id.clone())
       }
-      BackupTarget::Stack { stack_id } => {
-        Some(resource::get::<Stack>(stack_id).await?.config.server_id)
-      }
+      BackupTarget::Stack { .. } => snapshot_stack
+        .as_ref()
+        .map(|stack| stack.config.server_id.clone()),
       BackupTarget::Core => None,
       BackupTarget::Unbound { .. } => None,
     },
   };
   let mut publish = Vec::new();
+  let mut recovered_stack_source = None;
+  let mut recovered_stack_run_directory = None;
   match &snapshot.target {
     BackupTarget::Core => {
       return Err(anyhow!(
@@ -2011,22 +2145,21 @@ pub async fn plan_restore(
         "Unbound snapshot recovery requires the administrator recovery flow"
       ));
     }
-    BackupTarget::Stack { stack_id } => {
-      let stack = resource::get::<Stack>(stack_id).await?;
+    BackupTarget::Stack { .. } => {
+      let stack = snapshot_stack
+        .as_ref()
+        .context("Stack snapshot metadata is missing")?;
       let destination = destination_server_id
         .clone()
         .unwrap_or_else(|| stack.config.server_id.clone());
-      if destination != stack.config.server_id
-        && recovered_stack_name
-          .as_deref()
-          .unwrap_or_default()
-          .is_empty()
-      {
-        return Err(anyhow!(
-          "Cross-node stack restore requires a new unique stack name"
-        ));
-      }
-      if destination != stack.config.server_id {
+      let recovering_stack =
+        source_stack_missing || destination != stack.config.server_id;
+      if recovering_stack {
+        if !Stack::user_can_create(user) {
+          return Err(anyhow!(
+            "Recovered Stack creation requires Stack-create permission"
+          ));
+        }
         let recovered_name = recovered_stack_name
           .as_deref()
           .context("Recovered Stack name is missing")?;
@@ -2045,6 +2178,8 @@ pub async fn plan_restore(
             "A Stack named '{recovered_name}' already exists"
           ));
         }
+        recovered_stack_name = Some(recovered_name);
+        recovered_stack_source = Some(stack.clone());
       }
       if destination != stack.config.server_id
         && bind_path_mappings.is_empty()
@@ -2053,11 +2188,9 @@ pub async fn plan_restore(
           "Cross-node stack restore requires explicit bind path mappings"
         ));
       }
-      if destination != stack.config.server_id
-        && !selected_paths.is_empty()
-      {
+      if recovering_stack && !selected_paths.is_empty() {
         return Err(anyhow!(
-          "Cross-node Stack recovery requires the complete snapshot"
+          "Recovered Stack creation requires the complete snapshot"
         ));
       }
       let source_paths = snapshot
@@ -2098,6 +2231,24 @@ pub async fn plan_restore(
           },
         );
       }
+      if recovering_stack {
+        recovered_stack_run_directory =
+          publish.first().map(|path| path.destination.clone());
+        let name = recovered_stack_name
+          .as_deref()
+          .context("Recovered Stack name is missing")?;
+        let mut config:
+          komodo_client::entities::stack::PartialStackConfig =
+          stack.clone().config.into();
+        config.server_id = Some(destination);
+        config.swarm_id = Some(String::new());
+        config.project_name = Some(name.to_string());
+        config.files_on_host = Some(true);
+        config.run_directory = recovered_stack_run_directory.clone();
+        config.repo = Some(String::new());
+        config.linked_repo = Some(String::new());
+        Stack::validate_create_config(&mut config, user).await?;
+      }
     }
     BackupTarget::Volume {
       server_id,
@@ -2133,37 +2284,6 @@ pub async fn plan_restore(
       );
     }
   }
-  let recovered_stack_run_directory =
-    if let BackupTarget::Stack { stack_id } = &snapshot.target {
-      let source_server =
-        resource::get::<Stack>(stack_id).await?.config.server_id;
-      (Some(source_server.as_str())
-        != destination_server_id.as_deref())
-      .then(|| publish.first().map(|path| path.destination.clone()))
-      .flatten()
-    } else {
-      None
-    };
-  if let BackupTarget::Stack { stack_id } = &snapshot.target {
-    let stack = resource::get::<Stack>(stack_id).await?;
-    if Some(stack.config.server_id.as_str())
-      != destination_server_id.as_deref()
-    {
-      let name = recovered_stack_name
-        .as_deref()
-        .context("Recovered Stack name is missing")?;
-      let mut config: komodo_client::entities::stack::PartialStackConfig =
-        stack.config.into();
-      config.server_id = destination_server_id.clone();
-      config.swarm_id = Some(String::new());
-      config.project_name = Some(name.to_string());
-      config.files_on_host = Some(true);
-      config.run_directory = recovered_stack_run_directory.clone();
-      config.repo = Some(String::new());
-      config.linked_repo = Some(String::new());
-      Stack::validate_create_config(&mut config, user).await?;
-    }
-  }
   if !selected_paths.is_empty() {
     publish = selected_publish_paths(&selected_paths, &publish)?;
     if publish.is_empty() {
@@ -2173,7 +2293,7 @@ pub async fn plan_restore(
     }
   }
   validate_non_overlapping_destinations(&publish)?;
-  let create_volume_if_missing = matches!(
+  let volume_destination_changed = matches!(
     &snapshot.target,
     BackupTarget::Volume {
       server_id,
@@ -2188,6 +2308,7 @@ pub async fn plan_restore(
   let target = restore_periphery_target(
     &snapshot.target,
     &destination_server,
+    recovered_stack_source.as_ref(),
     recovered_stack_name.as_deref(),
     destination_volume_name.as_deref(),
     publish.first().map(|path| path.destination.as_str()),
@@ -2206,16 +2327,17 @@ pub async fn plan_restore(
       publish: publish.clone(),
     })
     .await?;
-  if matches!(
-    &snapshot.target,
-    BackupTarget::Volume { server_id, .. } if server_id != &destination_server
-  ) && !confirm_existing_volume
+  if volume_destination_changed
+    && !confirm_existing_volume
     && preflight.destination_exists
   {
     return Err(anyhow!(
       "Cross-node restore into an existing volume requires explicit confirmation"
     ));
   }
+  let create_volume_if_missing =
+    matches!(&snapshot.target, BackupTarget::Volume { .. })
+      && !preflight.destination_exists;
   let plan = BackupRestorePlan {
     id: Uuid::new_v4().to_string(),
     snapshot: snapshot.name,
@@ -2238,6 +2360,8 @@ pub async fn plan_restore(
       recovered_stack_run_directory,
       destination_volume_name: destination_volume_name.clone(),
       create_volume_if_missing,
+      recovered_stack_source,
+      source_stack_missing,
     })
     .await?;
   Ok(plan)
@@ -2322,15 +2446,20 @@ fn validate_non_overlapping_destinations(
 async fn restore_periphery_target(
   source: &BackupTarget,
   destination_server: &str,
+  recovered_stack_source: Option<&Stack>,
   recovered_stack_name: Option<&str>,
   destination_volume_name: Option<&str>,
   recovered_run_directory: Option<&str>,
 ) -> anyhow::Result<PeripheryBackupTarget> {
   match source {
     BackupTarget::Stack { stack_id } => {
-      let mut stack = resource::get::<Stack>(stack_id).await?;
-      let cross_node = stack.config.server_id != destination_server;
-      if cross_node {
+      let (mut stack, recovering_stack) =
+        if let Some(stack) = recovered_stack_source {
+          (stack.clone(), true)
+        } else {
+          (resource::get::<Stack>(stack_id).await?, false)
+        };
+      if recovering_stack {
         let name = recovered_stack_name
           .filter(|name| !name.trim().is_empty())
           .context("Recovered Stack name is missing")?;
@@ -2393,12 +2522,20 @@ pub async fn execute_restore(
       .await?;
     return Err(anyhow!("Restore plan has expired"));
   }
-  authorize_target(
-    &stored.plan.source,
-    user,
-    komodo_client::entities::permission::PermissionLevel::Execute,
-  )
-  .await?;
+  if stored.source_stack_missing {
+    if !user.admin {
+      return Err(anyhow!(
+        "Only administrators can recover a snapshot whose Stack resource was deleted"
+      ));
+    }
+  } else {
+    authorize_target(
+      &stored.plan.source,
+      user,
+      komodo_client::entities::permission::PermissionLevel::Execute,
+    )
+    .await?;
+  }
   let server_id = stored
     .plan
     .destination_server_id
@@ -2412,9 +2549,13 @@ pub async fn execute_restore(
     .context("Restore destination server is missing")?;
   let server = resource::get::<Server>(&server_id).await?;
   let source_server_id = match &stored.plan.source {
-    BackupTarget::Stack { stack_id } => {
-      Some(resource::get::<Stack>(stack_id).await?.config.server_id)
-    }
+    BackupTarget::Stack { stack_id } => Some(
+      if let Some(stack) = stored.recovered_stack_source.as_ref() {
+        stack.config.server_id.clone()
+      } else {
+        resource::get::<Stack>(stack_id).await?.config.server_id
+      },
+    ),
     BackupTarget::Volume { server_id, .. } => Some(server_id.clone()),
     BackupTarget::Core | BackupTarget::Unbound { .. } => None,
   };
@@ -2428,29 +2569,25 @@ pub async fn execute_restore(
       komodo_client::entities::permission::PermissionLevel::Execute,
     )
     .await?;
-    if matches!(stored.plan.source, BackupTarget::Stack { .. })
-      && !Stack::user_can_create(user)
-    {
+  }
+  let recovered_stack = stored.recovered_stack_source.clone();
+  if recovered_stack.is_some() {
+    if !Stack::user_can_create(user) {
       return Err(anyhow!(
-        "Cross-node stack restore requires Stack-create permission"
+        "Recovered Stack creation requires Stack-create permission"
       ));
     }
-  }
-  let cross_node_stack = match &stored.plan.source {
-    BackupTarget::Stack { stack_id } => {
-      let stack = resource::get::<Stack>(stack_id).await?;
-      (stack.config.server_id != server_id).then_some(stack)
-    }
-    _ => None,
-  };
-  if cross_node_stack.is_some() {
     let recovered_name = stored
       .recovered_stack_name
       .as_deref()
       .context("Recovered Stack name is missing")?;
-    let recovered_name = Stack::validated_name(recovered_name);
+    if Stack::validated_name(recovered_name) != recovered_name {
+      return Err(anyhow!(
+        "Recovered Stack name is not normalized; create a new preflight"
+      ));
+    }
     if Stack::coll()
-      .find_one(doc! { "name": &recovered_name })
+      .find_one(doc! { "name": recovered_name })
       .await?
       .is_some()
     {
@@ -2462,6 +2599,7 @@ pub async fn execute_restore(
   let target = restore_periphery_target(
     &stored.plan.source,
     &server_id,
+    recovered_stack.as_ref(),
     stored.recovered_stack_name.as_deref(),
     stored.destination_volume_name.as_deref(),
     stored.recovered_stack_run_directory.as_deref().or_else(|| {
@@ -2492,6 +2630,7 @@ pub async fn execute_restore(
         selected_paths: stored.plan.selected_paths,
         publish: stored.publish,
         journal_id: run.id.clone(),
+        volume_restore_plan_id: stored.id.clone(),
         create_volume_if_missing: stored.create_volume_if_missing,
       })
       .await?;
@@ -2516,7 +2655,7 @@ pub async fn execute_restore(
       )
       .await;
     }
-    if let Some(stack) = cross_node_stack {
+    if let Some(stack) = recovered_stack {
       let name = stored
         .recovered_stack_name
         .context("Recovered stack name is missing")?;
@@ -2591,6 +2730,7 @@ impl Drop for RemoveDirectoryOnDrop {
 }
 
 async fn cleanup_expired_core_recovery_plans() -> anyhow::Result<()> {
+  let _operation = core_recovery_operation_lock().lock().await;
   let expired = find_collect(
     &core_recovery_collection(),
     doc! { "plan.expires_at": { "$lt": komodo_timestamp() } },
@@ -2780,6 +2920,7 @@ pub async fn execute_core_recovery(
   plan_id: &str,
   user_id: &str,
 ) -> anyhow::Result<BackupRun> {
+  let _operation = core_recovery_operation_lock().lock().await;
   let stored = core_recovery_collection()
     .find_one(doc! { "_id": plan_id, "created_by": user_id })
     .await?

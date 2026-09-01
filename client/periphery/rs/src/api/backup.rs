@@ -122,6 +122,10 @@ pub struct TransactionalVykarRestore {
   /// Snapshot-relative path to absolute destination path.
   pub publish: Vec<RestorePublishPath>,
   pub journal_id: String,
+  /// Stable restore-plan identity used to recognize a Volume created by an
+  /// earlier execution attempt of the same plan.
+  #[serde(default)]
+  pub volume_restore_plan_id: String,
   /// Create a local destination volume when it does not exist.
   #[serde(default)]
   pub create_volume_if_missing: bool,
