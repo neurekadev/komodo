@@ -11,7 +11,8 @@ use anyhow::{Context, anyhow};
 use command::{CommandOptions, run_komodo_standard_command};
 use komodo_backup::VykarRepository;
 use komodo_client::entities::docker::{
-  container::ContainerStateStatusEnum, volume::VolumeScopeEnum,
+  container::{ContainerListItem, ContainerStateStatusEnum},
+  volume::VolumeScopeEnum,
 };
 use mogh_resolver::Resolve;
 use periphery_client::api::backup::*;
@@ -345,9 +346,10 @@ async fn discover_source(
       )?;
       let mut bind_paths = BTreeSet::new();
       let mut running = Vec::new();
+      let project_name = stack.project_name(false);
       for container in containers.iter().filter(|container| {
         container.labels.get(COMPOSE_PROJECT_LABEL)
-          == Some(&stack.config.project_name)
+          == Some(&project_name)
       }) {
         if container.state == ContainerStateStatusEnum::Running {
           running.push(container.name.clone());
@@ -435,25 +437,35 @@ async fn discover_running_containers(
     .as_ref()
     .context("Docker is unavailable")?;
   let containers = docker.list_containers().await?;
-  Ok(match target {
-    PeripheryBackupTarget::Stack { stack, .. } => containers
-      .into_iter()
-      .filter(|container| {
-        container.state == ContainerStateStatusEnum::Running
-          && container.labels.get(COMPOSE_PROJECT_LABEL)
-            == Some(&stack.config.project_name)
-      })
-      .map(|container| container.name)
-      .collect(),
+  Ok(running_containers_for_target(&containers, target))
+}
+
+fn running_containers_for_target(
+  containers: &[ContainerListItem],
+  target: &PeripheryBackupTarget,
+) -> Vec<String> {
+  match target {
+    PeripheryBackupTarget::Stack { stack, .. } => {
+      let project_name = stack.project_name(false);
+      containers
+        .iter()
+        .filter(|container| {
+          container.state == ContainerStateStatusEnum::Running
+            && container.labels.get(COMPOSE_PROJECT_LABEL)
+              == Some(&project_name)
+        })
+        .map(|container| container.name.clone())
+        .collect()
+    }
     PeripheryBackupTarget::Volume { volume_name } => containers
-      .into_iter()
+      .iter()
       .filter(|container| {
         container.state == ContainerStateStatusEnum::Running
           && container.volumes.contains(volume_name)
       })
-      .map(|container| container.name)
+      .map(|container| container.name.clone())
       .collect(),
-  })
+  }
 }
 
 fn validate_source_path(path: &Path) -> anyhow::Result<PathBuf> {
@@ -1075,6 +1087,117 @@ impl Resolve<Args> for CancelVykarOperation {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  fn container(
+    name: &str,
+    state: ContainerStateStatusEnum,
+    project: Option<&str>,
+    volumes: &[&str],
+  ) -> ContainerListItem {
+    let mut labels = std::collections::HashMap::new();
+    if let Some(project) = project {
+      labels.insert(COMPOSE_PROJECT_LABEL.into(), project.into());
+    }
+    ContainerListItem {
+      name: name.into(),
+      state,
+      volumes: volumes
+        .iter()
+        .map(|volume| (*volume).into())
+        .collect(),
+      labels,
+      ..Default::default()
+    }
+  }
+
+  #[test]
+  fn stack_restore_stops_the_whole_running_deployed_project() {
+    let stack = komodo_client::entities::stack::Stack {
+      name: "configured-stack-name".into(),
+      config: komodo_client::entities::stack::StackConfig {
+        project_name: "new-project-name".into(),
+        ..Default::default()
+      },
+      info: komodo_client::entities::stack::StackInfo {
+        deployed_project_name: Some("deployed-project-name".into()),
+        ..Default::default()
+      },
+      ..Default::default()
+    };
+    let target = PeripheryBackupTarget::Stack {
+      stack: Box::new(stack),
+      repo: None,
+    };
+    let containers = vec![
+      container(
+        "web",
+        ContainerStateStatusEnum::Running,
+        Some("deployed-project-name"),
+        &[],
+      ),
+      container(
+        "worker",
+        ContainerStateStatusEnum::Running,
+        Some("deployed-project-name"),
+        &[],
+      ),
+      container(
+        "already-stopped",
+        ContainerStateStatusEnum::Exited,
+        Some("deployed-project-name"),
+        &[],
+      ),
+      container(
+        "unrelated",
+        ContainerStateStatusEnum::Running,
+        Some("other-project"),
+        &[],
+      ),
+    ];
+
+    assert_eq!(
+      running_containers_for_target(&containers, &target),
+      ["web", "worker"]
+    );
+  }
+
+  #[test]
+  fn volume_restore_stops_every_running_container_with_access() {
+    let target = PeripheryBackupTarget::Volume {
+      volume_name: "shared-data".into(),
+    };
+    let containers = vec![
+      container(
+        "stack-a-web",
+        ContainerStateStatusEnum::Running,
+        Some("stack-a"),
+        &["shared-data"],
+      ),
+      container(
+        "stack-b-worker",
+        ContainerStateStatusEnum::Running,
+        Some("stack-b"),
+        &["shared-data", "other-data"],
+      ),
+      container(
+        "already-stopped",
+        ContainerStateStatusEnum::Exited,
+        Some("stack-c"),
+        &["shared-data"],
+      ),
+      container(
+        "unrelated",
+        ContainerStateStatusEnum::Running,
+        None,
+        &["other-data"],
+      ),
+    ];
+
+    assert_eq!(
+      running_containers_for_target(&containers, &target),
+      ["stack-a-web", "stack-b-worker"]
+    );
+  }
 
   #[test]
   fn source_validation_rejects_relative_paths() {

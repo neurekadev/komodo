@@ -54,7 +54,7 @@ Each Periphery also has a stable Vykar hostname so snapshots remain attributable
 
 Open the resource's **Backups** tab, choose a complete snapshot, and select **Restore**. Leave the picker empty for a full restore, or expand folders and select multiple files and directories. The tree starts fully collapsed and loads from the primary repository as you expand it.
 
-Before confirmation, Komodo lists paths that will be created, overwritten, and deleted, plus containers that will stop. Restore data is written to staging on the destination filesystem, verified with its metadata, and then published using a persisted rollback journal and directory synchronization. Containers restart only after successful publication or a proven rollback. If state becomes indeterminate, they remain stopped and Komodo raises a critical recovery alert.
+Before confirmation, Komodo lists paths that will be created, overwritten, and deleted, plus containers that will stop. A Volume restore stops every running container that mounts the destination volume, even when those containers belong to different Stacks. A Stack restore stops every running container in the deployed Compose project. Containers that were already stopped remain stopped. Restore data is written to staging on the destination filesystem, verified with its metadata, and then published using a persisted rollback journal and directory synchronization. Komodo restarts exactly the previously running containers after successful publication or a proven rollback. If state becomes indeterminate, they remain stopped and Komodo raises a critical recovery alert.
 
 ### Restore to another Periphery
 
