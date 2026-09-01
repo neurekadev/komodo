@@ -1,7 +1,7 @@
 ## All in one, multi stage compile + runtime Docker build for your architecture.
 
 # Build Core dependencies independently from application source.
-FROM lukemathwalker/cargo-chef:0.1.78-rust-1.97.1-trixie@sha256:6dce65df3d7430c797e94348b4cf36d8d5876b63ca54f35dbfd37a97c42d0add AS chef
+FROM lukemathwalker/cargo-chef:0.1.78-rust-1.98.0-trixie@sha256:d21902576546863995017609e991178939e6f151f6b35fb00f3c0fa97a616ef5 AS chef
 ENV CARGO_HTTP_TIMEOUT=600 \
   CARGO_NET_RETRY=10
 WORKDIR /builder

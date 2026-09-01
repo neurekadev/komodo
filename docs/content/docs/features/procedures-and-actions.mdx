@@ -59,11 +59,15 @@ executions = [
 
 Many executions have a `Batch` variant (e.g. [**BatchDeployStackIfChanged**](https://docs.rs/komodo_client/latest/komodo_client/api/execute/struct.BatchDeployStackIfChanged.html)) that matches multiple resources by name using [wildcard](https://docs.rs/wildcard/latest/wildcard) and [regex](https://docs.rs/regex/latest/regex) syntax.
 
+Batch executions can also filter by resource tags. When both a name pattern and
+tags are configured, Komodo expands the batch only to resources that satisfy
+both filters. Leave the tag list empty to retain pattern-only matching.
+
 ```toml
 [[procedure.config.stage]]
 name = "Deploy matching stacks"
 executions = [
-  { execution.type = "BatchDeployStackIfChanged", execution.params.pattern = "foo-* , \\^bar-.*$\\" },
+  { execution.type = "BatchDeployStackIfChanged", execution.params.pattern = "foo-* , \\^bar-.*$\\", execution.params.tags = ["production"] },
 ]
 ```
 

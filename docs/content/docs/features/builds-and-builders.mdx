@@ -80,6 +80,12 @@ image_registry = [
 | `webhook_secret` | Alternate webhook secret (uses default from config if empty). | `""` |
 | `links` | Quick links displayed in the resource header. | `[]` |
 
+Komodo automatically supplies `IMAGE_NAME` and `VERSION` to the Docker build
+when those arguments are not already present in `build_args`. It also supplies
+`IMAGE_TAG` when the Build has a non-empty image tag. An explicit value in
+`build_args` takes precedence, which lets a Dockerfile use a different internal
+value without changing the image tags Komodo publishes.
+
 ## Image Versioning and Tagging
 
 Komodo uses a `major.minor.patch` versioning scheme. By default, each build auto-increments the patch number. You can control exactly which tags are pushed using the following options:

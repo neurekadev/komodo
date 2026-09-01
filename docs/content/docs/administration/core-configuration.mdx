@@ -16,6 +16,20 @@ Additional configuration options for Komodo Core and Periphery, including custom
 
 The expected result is a healthy Core and connected Periphery agents using the new value. If the service fails, restore the previous file, re-run `docker compose config`, and restart it before continuing.
 
+## First Server and Container Routing
+
+`KOMODO_FIRST_SERVER_ADDRESS` is optional. Core now applies legacy database
+repairs before creating startup resources, so an old deployment can safely
+leave this variable defined while upgrading. After startup, confirm the first
+Server appears once and reports **OK**.
+
+Set `KOMODO_INTERNET_INTERFACE` only when containerized Core must route outbound
+traffic through a specific interface. Core accepts operational interfaces that
+report either `UP` or `UNKNOWN`, derives the gateway from the interface CIDR,
+and replaces the default route atomically. The container needs the `NET_ADMIN`
+capability for this setting. Leave the value empty to keep the container's
+existing default route.
+
 ## Custom Certificate Authorities
 
 In order to communicate with companion services on private networks,

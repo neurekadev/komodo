@@ -22,6 +22,12 @@ Komodo can deploy Docker Compose projects through the `Stack` resource.
 
 The expected result is a **Running** Stack whose service state matches the Compose definition. If deployment fails, start with the first failed command in the update, run `docker compose config` against the same files on the host, and confirm repository and registry credentials.
 
+Resource pages include breadcrumbs back to their resource list and parent
+resource. Stack discovery and log commands allow additional time for Docker to
+respond, reducing intermittent **Project Missing** results on busy or remote
+hosts. If a project still appears missing, run `docker compose ls --all` on the
+target host and confirm the configured project name.
+
 ## Advanced Configuration
 
 ```toml

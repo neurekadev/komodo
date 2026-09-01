@@ -1,4 +1,4 @@
-FROM rust:1.97.1-trixie AS builder
+FROM rust:1.98.0-trixie AS builder
 ENV CARGO_HTTP_TIMEOUT=600 \
   CARGO_NET_RETRY=10
 RUN cargo install cargo-strip
