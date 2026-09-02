@@ -25,7 +25,7 @@ Defaults are daily at 01:00 in the Core timezone, 14 complete backups per catego
 
 ### Core
 
-A Core backup is a consistent, versioned export of Komodo's restorable database collections. It is a control-plane backup, not an operating-system image. Secrets used to access repositories, including encryption passphrases, are sealed with a persistent Core key and are never returned by the API or included in Core exports.
+A Core backup is a consistent, versioned export of Komodo's restorable database collections. It is a control-plane backup, not an operating-system image. Secrets used to access repositories, including encryption passphrases, are sealed with a persistent Core key and are never returned by the API or included in Core exports. Back up `/data/keys/backup.key` separately with the deployment configuration; Core snapshots intentionally do not contain that key.
 
 ### Stacks
 
@@ -33,7 +33,7 @@ A Stack backup contains its Compose run directory and normalized local bind-moun
 
 ### Volumes
 
-Every eligible local Docker named volume is included by default, including volumes not managed by a Komodo Stack. Komodo checks the driver and mountpoint at backup time. Remote/plugin volume drivers and non-local volume scope are rejected in this version.
+Every eligible local Docker named volume is included by default, including volumes not managed by a Komodo Stack. Komodo checks the driver and mountpoint at backup time. Docker mounts that expose a configured Core-local repository are excluded so a repository cannot recursively back up itself. Remote/plugin volume drivers and non-local volume scope are rejected in this version.
 
 Use **All**, **Include**, or **Exclude** selection for Stacks and Volumes. Volumes are identified directly by Server and Docker volume name, so unmanaged volumes can be selected without inventing a Stack association. Core has no include/exclude filter.
 
@@ -67,19 +67,30 @@ The source Periphery does not need to be online. Choose any connected destinatio
 
 - A cross-node Stack restore requires a unique new Stack name and explicit absolute bind-path mappings. Komodo creates a recovered Stack; the original is not retargeted.
 - A cross-node Volume restore creates a new local volume, unless you explicitly confirm restoring into an existing local destination volume.
-- Same-node restore defaults to the original location.
+- A resource-tab same-node restore defaults to the original location. The administrator inventory asks for a destination volume name even on the original Server, so it can recover a deleted Volume under a new name.
 
 After recovery, review application-specific ownership, external databases, DNS, secrets, and hardware dependencies before starting unrelated workloads.
 
 ## Recover Core on a fresh install
 
-During initial setup, connect the existing primary repository and select a Core snapshot. Komodo restores it into a validation database, checks the backup schema/version and confirms that an administrator account remains available. It then switches the persisted active-database pointer and restarts. The fresh pre-restore database is retained for rollback.
+The original `/data/keys/backup.key` is required before Komodo can identify or decrypt a Core snapshot. It authenticates snapshot identities and opens the repository credentials stored in the restored database.
+
+1. Stop the fresh Core before connecting the old repository.
+2. Replace the fresh installation's generated `/data/keys/backup.key` in the persistent Core data volume with the separately retained key from the original installation. Keep the file readable only by the Core service account.
+3. Start Core again. Core loads this key only at process startup, so copying it into a running container is not sufficient.
+4. Connect the existing primary repository in **Administration > Backups**, then select a Core snapshot under **Core recovery**.
+
+Komodo restores the snapshot into a validation database, checks the backup schema/version and confirms that an administrator account remains available. It then switches the persisted active-database pointer and restarts. The fresh pre-restore database is retained for rollback.
 
 Do not point two active Core instances at the same database. After recovery, reconnect Periphery nodes and verify the repository before allowing scheduled pruning.
 
 ## Primary and mirror behavior
 
 The primary repository is authoritative. Snapshot lists, manifests, file trees, and restores always come from the active primary backend. The mirror receives the same logical sources while data is quiesced, but it is not an automatic read fallback. Promotion is administrator-only and requires a successful full verification, making an incomplete mirror unable to silently become authoritative.
+
+<Callout title="Periphery backup-read trust" type="warn">
+Vykar encrypts and deduplicates on the client, so every Periphery that writes to a shared repository receives its encryption passphrase and the worker-scoped storage access needed to read repository metadata and packs. The passphrase protects backups from the storage provider; it does not isolate one participating Periphery from another or from Core snapshots in the same repository. Treat every participating Server as backup-read trusted. If hosts must not share that trust, manage them with separate Komodo deployments and separate repositories.
+</Callout>
 
 For an off-site mirror, use a different provider or failure domain. Core-local storage is exposed to Periphery through separate authenticated embedded [`vykar-server`](https://vykar.borgbase.com/server-setup) endpoints for primary and mirror storage, which also enables server-side encrypted repacking. Restart Core after adding a Core-local mirror, changing a Core-local path, or promoting a Core-local mirror; Komodo blocks Periphery access until the endpoint matches the saved role.
 

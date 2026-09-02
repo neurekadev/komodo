@@ -45,6 +45,10 @@ pub struct RunVykarBackup {
   pub snapshot_name: String,
   pub run_id: String,
   pub komodo_version: String,
+  /// Core-local repository paths as mounted inside Core. Periphery resolves
+  /// their Docker mount sources and refuses to capture those sources.
+  #[serde(default)]
+  pub protected_repository_paths: Vec<String>,
   #[serde(default)]
   pub stop_containers: bool,
   /// Retry only the mirror for a snapshot already committed to primary.
@@ -116,6 +120,10 @@ pub struct RunVykarBackupBatch {
   pub hostname: String,
   pub run_id: String,
   pub komodo_version: String,
+  /// Core-local repository paths as mounted inside Core. Periphery resolves
+  /// their Docker mount sources and refuses to capture those sources.
+  #[serde(default)]
+  pub protected_repository_paths: Vec<String>,
   #[serde(default)]
   pub stop_containers: bool,
 }

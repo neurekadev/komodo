@@ -35,6 +35,7 @@ type RestoreSnapshotButtonProps = {
   sourceServerId: string;
   snapshot?: Types.BackupSnapshot;
   forceStackRecovery?: boolean;
+  forceVolumeRecovery?: boolean;
   compact?: boolean;
   children?: ReactNode;
 };
@@ -161,6 +162,7 @@ export function RestoreSnapshotButton({
   sourceServerId,
   snapshot,
   forceStackRecovery = false,
+  forceVolumeRecovery = false,
   compact = false,
   children = "Restore",
 }: RestoreSnapshotButtonProps) {
@@ -191,6 +193,8 @@ export function RestoreSnapshotButton({
   );
   const requiredStackMappings = snapshot?.restorable_source_paths ?? [];
   const crossNode = destinationServerId !== sourceServerId;
+  const chooseDestinationVolume =
+    target.type === "Volume" && (crossNode || forceVolumeRecovery);
   const snapshotSourceServerId = snapshot?.hostname.startsWith(
     PERIPHERY_HOSTNAME_PREFIX,
   )
@@ -287,7 +291,7 @@ export function RestoreSnapshotButton({
               </Stack>
             </>
           )}
-          {crossNode && target.type === "Volume" && (
+          {chooseDestinationVolume && (
             <>
               <TextInput
                 label="Destination volume name"
@@ -331,7 +335,7 @@ export function RestoreSnapshotButton({
                 (stackRecovery && !recoveredName) ||
                 (stackRecovery &&
                   requiredStackMappings.some((path) => !bindings[path])) ||
-                (crossNode && target.type === "Volume" && !destinationVolume)
+                (chooseDestinationVolume && !destinationVolume)
               }
               onClick={() =>
                 snapshot &&
@@ -343,9 +347,7 @@ export function RestoreSnapshotButton({
                     stackRecovery ? recoveredName : undefined,
                   bind_path_mappings: bindings,
                   destination_volume_name:
-                    crossNode && target.type === "Volume"
-                      ? destinationVolume
-                      : undefined,
+                    chooseDestinationVolume ? destinationVolume : undefined,
                   confirm_existing_volume: confirmExistingVolume,
                 })
               }

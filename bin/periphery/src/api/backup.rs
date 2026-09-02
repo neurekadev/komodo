@@ -162,7 +162,7 @@ impl Resolve<Args> for DiscoverBackupSource {
     self,
     _: &Args,
   ) -> anyhow::Result<DiscoverBackupSourceResponse> {
-    discover_source(&self.target).await
+    discover_source(&self.target, &[]).await
   }
 }
 
@@ -174,7 +174,9 @@ impl Resolve<Args> for RunVykarBackup {
     let _operation = backup_operation_lock().lock().await;
     let (_cancellation, _cancellation_registration) =
       register_operation_cancellation(&self.run_id);
-    let discovered = discover_source(&self.target).await?;
+    let discovered =
+      discover_source(&self.target, &self.protected_repository_paths)
+        .await?;
     let container_journal = if self.stop_containers {
       persist_container_quiesce_journal(
         &self.run_id,
@@ -268,7 +270,12 @@ impl Resolve<Args> for RunVykarBackupBatch {
     let mut discovery_errors = Vec::new();
     let mut running = BTreeSet::new();
     for task in self.tasks {
-      match discover_source(&task.target).await {
+      match discover_source(
+        &task.target,
+        &self.protected_repository_paths,
+      )
+      .await
+      {
         Ok(source) => {
           running.extend(source.running_containers.iter().cloned());
           discovered.push((task, source.paths));
@@ -328,6 +335,9 @@ impl Resolve<Args> for RunVykarBackupBatch {
         snapshot_name: task.snapshot_name,
         run_id: self.run_id.clone(),
         komodo_version: self.komodo_version.clone(),
+        protected_repository_paths: self
+          .protected_repository_paths
+          .clone(),
         stop_containers: false,
         mirror_only: task.mirror_only,
         primary_only: task.primary_only,
@@ -917,6 +927,7 @@ async fn affected_running_containers(
 
 async fn discover_source(
   target: &PeripheryBackupTarget,
+  protected_repository_paths: &[String],
 ) -> anyhow::Result<DiscoverBackupSourceResponse> {
   let docker_guard = docker_client().load();
   let docker = docker_guard
@@ -924,6 +935,13 @@ async fn discover_source(
     .as_ref()
     .context("Docker is unavailable")?;
   let containers = docker.list_containers().await?;
+  let protected_repository_sources =
+    resolve_protected_repository_sources(
+      docker,
+      &containers,
+      protected_repository_paths,
+    )
+    .await?;
   match target {
     PeripheryBackupTarget::Stack { stack, repo } => {
       if !stack.config.swarm_id.is_empty() {
@@ -967,11 +985,19 @@ async fn discover_source(
         &internal_storage,
         "Backup source",
       )?;
+      validate_path_outside_protected_repositories(
+        &run_directory,
+        &protected_repository_sources,
+      )?;
       for bind_path in &bind_paths {
         validate_path_outside_internal_storage(
           bind_path,
           &internal_storage,
           "Backup source",
+        )?;
+        validate_path_outside_protected_repositories(
+          bind_path,
+          &protected_repository_sources,
         )?;
       }
       let mut affected_paths = bind_paths.clone();
@@ -1025,12 +1051,75 @@ async fn discover_source(
         &periphery_config().stack_dir().join(".komodo-vykar"),
         "Backup source",
       )?;
+      validate_path_outside_protected_repositories(
+        &mountpoint,
+        &protected_repository_sources,
+      )?;
       Ok(DiscoverBackupSourceResponse {
         paths: vec![mountpoint.to_string_lossy().into_owned()],
         running_containers,
       })
     }
   }
+}
+
+async fn resolve_protected_repository_sources(
+  docker: &crate::docker::DockerClient,
+  containers: &[ContainerListItem],
+  protected_repository_paths: &[String],
+) -> anyhow::Result<Vec<PathBuf>> {
+  if protected_repository_paths.is_empty() {
+    return Ok(Vec::new());
+  }
+  let protected = protected_repository_paths
+    .iter()
+    .map(PathBuf::from)
+    .collect::<Vec<_>>();
+  let mut sources = protected
+    .iter()
+    .cloned()
+    .map(|path| path.canonicalize().unwrap_or(path))
+    .collect::<BTreeSet<_>>();
+  for container in containers {
+    let inspected = docker.inspect_container(&container.name).await?;
+    for mount in inspected.mounts {
+      let Some(destination) = mount.destination.map(PathBuf::from)
+      else {
+        continue;
+      };
+      if !protected
+        .iter()
+        .any(|path| paths_overlap(&destination, path))
+      {
+        continue;
+      }
+      let Some(source) = mount.source.map(PathBuf::from) else {
+        continue;
+      };
+      sources.insert(source.canonicalize().unwrap_or(source));
+    }
+  }
+  Ok(sources.into_iter().collect())
+}
+
+fn validate_path_outside_protected_repositories(
+  path: &Path,
+  protected_repository_sources: &[PathBuf],
+) -> anyhow::Result<()> {
+  for repository in protected_repository_sources {
+    let resolved_path = resolve_existing_ancestor(path)?;
+    let resolved_repository = resolve_existing_ancestor(repository)?;
+    if paths_overlap(path, repository)
+      || paths_overlap(&resolved_path, &resolved_repository)
+    {
+      return Err(anyhow!(
+        "Backup source '{}' overlaps a Core-local repository mount '{}'",
+        path.display(),
+        repository.display()
+      ));
+    }
+  }
+  Ok(())
 }
 
 async fn discover_running_containers(
@@ -1322,7 +1411,7 @@ impl Resolve<Args> for TransactionalVykarRestore {
       if let PeripheryBackupTarget::Volume { volume_name } =
         &self.target
       {
-        let mountpoint = discover_source(&self.target)
+        let mountpoint = discover_source(&self.target, &[])
           .await?
           .paths
           .into_iter()
@@ -1565,7 +1654,7 @@ impl Resolve<Args> for PreflightVykarRestore {
       PeripheryBackupTarget::Stack { .. } => {
         // A missing Stack destination can legitimately be planned as a
         // recovered Stack; execution recreates its mapped filesystem roots.
-        discover_source(&self.target).await.ok()
+        discover_source(&self.target, &[]).await.ok()
       }
       PeripheryBackupTarget::Volume { volume_name } => {
         let docker_guard = docker_client().load();
@@ -1583,7 +1672,7 @@ impl Resolve<Args> for PreflightVykarRestore {
           // Once Docker confirms the Volume exists, an unsupported driver or
           // inspect failure is a real preflight error, not evidence that the
           // destination is absent.
-          Some(discover_source(&self.target).await?)
+          Some(discover_source(&self.target, &[]).await?)
         } else {
           None
         }
@@ -2957,6 +3046,35 @@ mod tests {
       &stack,
       &internal,
       "Backup source",
+    )
+    .unwrap();
+  }
+
+  #[test]
+  fn backup_sources_cannot_capture_core_repository_mounts() {
+    let root = tempfile::tempdir().unwrap();
+    let repository = root.path().join("core-repository");
+    let application = root.path().join("application");
+    std::fs::create_dir_all(&repository).unwrap();
+    std::fs::create_dir_all(&application).unwrap();
+
+    assert!(
+      validate_path_outside_protected_repositories(
+        root.path(),
+        std::slice::from_ref(&repository),
+      )
+      .is_err()
+    );
+    assert!(
+      validate_path_outside_protected_repositories(
+        &repository.join("packs"),
+        std::slice::from_ref(&repository),
+      )
+      .is_err()
+    );
+    validate_path_outside_protected_repositories(
+      &application,
+      &[repository],
     )
     .unwrap();
   }

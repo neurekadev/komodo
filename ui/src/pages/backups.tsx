@@ -105,7 +105,11 @@ export default function Backups() {
         ) : !settings ? (
           <Loader />
         ) : (
-          <BackupSettingsForm settings={settings} onChange={setSettings} />
+          <BackupSettingsForm
+            settings={settings}
+            persistedSettings={settingsQuery.data}
+            onChange={setSettings}
+          />
         )}
       </Stack>
     </Page>
@@ -151,6 +155,7 @@ function SnapshotInventory() {
                     sourceServerId={snapshotSourceServerId(snapshot)}
                     snapshot={snapshot}
                     forceStackRecovery={snapshot.target.type === "Stack"}
+                    forceVolumeRecovery={snapshot.target.type === "Volume"}
                     compact
                   >
                     Recover
@@ -308,14 +313,18 @@ function StatusItem({
 
 function BackupSettingsForm({
   settings,
+  persistedSettings,
   onChange,
 }: {
   settings: Types.BackupSettings;
+  persistedSettings?: Types.BackupSettings;
   onChange: (settings: Types.BackupSettings) => void;
 }) {
   const invalidate = useInvalidate();
   const patch = (value: Partial<Types.BackupSettings>) =>
     onChange({ ...settings, ...value });
+  const settingsDirty =
+    JSON.stringify(settings) !== JSON.stringify(persistedSettings);
   const { mutate: save, isPending: saving } = useWrite(
     "UpdateBackupSettings",
     {
@@ -432,6 +441,12 @@ function BackupSettingsForm({
           The primary is the only snapshot source of truth. A mirror is not
           readable until full verification and explicit promotion.
         </Alert>
+        <Alert color="orange" mb="md">
+          Every Periphery that writes to a shared Vykar repository receives
+          its encryption passphrase and can read that repository. Use separate
+          Komodo deployments and repositories for hosts that must not share
+          backup-read trust.
+        </Alert>
         <RepositoryEditor
           label="Primary"
           repository={settings.primary}
@@ -545,7 +560,17 @@ function BackupSettingsForm({
             </Button>
           </>
         )}
-        <Button variant="default" loading={initializing} onClick={() => initialize({})}>
+        <Button
+          variant="default"
+          loading={initializing}
+          disabled={settingsDirty}
+          title={
+            settingsDirty
+              ? "Save the displayed settings before initializing repositories."
+              : undefined
+          }
+          onClick={() => initialize({})}
+        >
           Initialize repositories
         </Button>
         <Button variant="light" loading={running} onClick={() => run({})}>

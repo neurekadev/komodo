@@ -128,8 +128,8 @@ struct StoredRestorePlan {
   #[serde(default)]
   recovered_stack_source: Option<Stack>,
   /// Missing source resources are recoverable only by administrators.
-  #[serde(default)]
-  source_stack_missing: bool,
+  #[serde(default, alias = "source_stack_missing")]
+  source_resource_missing: bool,
   /// Authenticated roots from the snapshot manifest. An in-place Stack
   /// restore is valid only while the live Stack still resolves to these
   /// exact roots.
@@ -1057,8 +1057,11 @@ fn core_repository(
 
 /// Convert Core-local storage to the embedded authenticated REST endpoint, or
 /// substitute distinct maintenance-denied credentials for an external
-/// backend. Authoritative credentials never cross the Core/Periphery trust
-/// boundary.
+/// backend. Authoritative maintenance credentials never cross the
+/// Core/Periphery boundary. Vykar writers do receive the repository
+/// passphrase because its client-side encryption and deduplication require
+/// read access; participating Periphery agents are therefore repository-read
+/// trusted as documented in the administrator guide.
 fn repository_for_periphery(
   repository: &BackupRepository,
   mirror: bool,
@@ -1128,6 +1131,20 @@ fn repository_for_periphery(
     },
     passphrase: repository.passphrase.clone(),
   })
+}
+
+fn core_local_repository_paths(
+  settings: &BackupSettings,
+) -> Vec<String> {
+  std::iter::once(&settings.primary)
+    .chain(settings.mirror.iter())
+    .filter_map(|repository| match &repository.backend {
+      BackupRepositoryBackend::CoreLocal { path } => {
+        Some(path.clone())
+      }
+      _ => None,
+    })
+    .collect()
 }
 
 pub async fn initialize_repositories() -> anyhow::Result<BackupRun> {
@@ -2867,6 +2884,9 @@ async fn run_node_batch(
       hostname: format!("komodo-periphery-{}", server.id),
       run_id: run.id.clone(),
       komodo_version: env!("CARGO_PKG_VERSION").into(),
+      protected_repository_paths: core_local_repository_paths(
+        settings,
+      ),
       stop_containers: settings.stop_containers,
     })
     .await;
@@ -3288,6 +3308,9 @@ async fn backup_stack(
       snapshot_name,
       run_id: run.id.clone(),
       komodo_version: env!("CARGO_PKG_VERSION").into(),
+      protected_repository_paths: core_local_repository_paths(
+        settings,
+      ),
       stop_containers: settings.stop_containers,
       mirror_only: false,
       primary_only: false,
@@ -3346,6 +3369,9 @@ async fn backup_volume(
       snapshot_name,
       run_id: run.id.clone(),
       komodo_version: env!("CARGO_PKG_VERSION").into(),
+      protected_repository_paths: core_local_repository_paths(
+        settings,
+      ),
       stop_containers: settings.stop_containers,
       mirror_only: false,
       primary_only: false,
@@ -3416,15 +3442,21 @@ pub async fn authorize_snapshot(
     .into_iter()
     .find(|snapshot| snapshot.name == snapshot_name)
     .context("Snapshot does not exist in the primary repository")?;
-  if let BackupTarget::Stack { stack_id } = &snapshot.target
-    && Stack::coll()
+  let source_resource_missing = match &snapshot.target {
+    BackupTarget::Stack { stack_id } => Stack::coll()
       .find_one(id_or_name_filter(stack_id))
       .await?
-      .is_none()
-  {
+      .is_none(),
+    BackupTarget::Volume { server_id, .. } => Server::coll()
+      .find_one(id_or_name_filter(server_id))
+      .await?
+      .is_none(),
+    BackupTarget::Core | BackupTarget::Unbound { .. } => false,
+  };
+  if source_resource_missing {
     if !user.admin {
       return Err(anyhow!(
-        "Only administrators can recover a snapshot whose Stack resource was deleted"
+        "Only administrators can recover a snapshot whose source resource was deleted"
       ));
     }
   } else {
@@ -3589,8 +3621,14 @@ pub async fn plan_restore(
     };
   let authenticated_snapshot_stack_paths =
     snapshot_stack_paths.clone();
-  let source_stack_missing = current_stack.is_none()
-    && matches!(&snapshot.target, BackupTarget::Stack { .. });
+  let source_resource_missing = match &snapshot.target {
+    BackupTarget::Stack { .. } => current_stack.is_none(),
+    BackupTarget::Volume { server_id, .. } => Server::coll()
+      .find_one(id_or_name_filter(server_id))
+      .await?
+      .is_none(),
+    BackupTarget::Core | BackupTarget::Unbound { .. } => false,
+  };
   let destination_server_id = match destination_server_id {
     Some(destination) => Some(destination),
     None => match &snapshot.target {
@@ -3833,7 +3871,7 @@ pub async fn plan_restore(
     && preflight.destination_exists
   {
     return Err(anyhow!(
-      "Cross-node restore into an existing volume requires explicit confirmation"
+      "Restore into a different existing volume requires explicit confirmation"
     ));
   }
   let create_volume_if_missing =
@@ -3865,7 +3903,7 @@ pub async fn plan_restore(
       create_volume_if_missing,
       destination_exists: preflight.destination_exists,
       recovered_stack_source,
-      source_stack_missing,
+      source_resource_missing,
       snapshot_stack_source_paths: authenticated_snapshot_stack_paths,
       bind_path_mappings: confirmed_bind_path_mappings,
     })
@@ -4150,10 +4188,10 @@ pub async fn execute_restore(
       .await?;
     return Err(anyhow!("Restore plan has expired"));
   }
-  if stored.source_stack_missing {
+  if stored.source_resource_missing {
     if !user.admin {
       return Err(anyhow!(
-        "Only administrators can recover a snapshot whose Stack resource was deleted"
+        "Only administrators can recover a snapshot whose source resource was deleted"
       ));
     }
   } else {
@@ -5813,7 +5851,7 @@ mod tests {
       create_volume_if_missing: false,
       destination_exists: true,
       recovered_stack_source: None,
-      source_stack_missing: false,
+      source_resource_missing: false,
       snapshot_stack_source_paths: Vec::new(),
       bind_path_mappings: HashMap::new(),
     };
