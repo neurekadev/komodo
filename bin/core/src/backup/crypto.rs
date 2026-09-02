@@ -13,8 +13,9 @@ use hmac::{Hmac, KeyInit as HmacKeyInit, Mac};
 use rand::RngExt as _;
 use sha2::Sha256;
 
-const BACKUP_KEY_PATH: &str = "/data/keys/backup.key";
-const LEGACY_BACKUP_KEY_PATH: &str = "/config/keys/backup.key";
+const BACKUP_KEY_PATH: &str = "/core-secrets/backup.key";
+const LEGACY_SHARED_BACKUP_KEY_PATH: &str = "/data/keys/backup.key";
+const LEGACY_CONFIG_BACKUP_KEY_PATH: &str = "/config/keys/backup.key";
 const AAD: &[u8] = b"komodo-backup-settings/v1";
 const SOURCE_AUTH_PREFIX: &str = "komodo-auth/v1";
 const SOURCE_AUTH_CONTEXT: &[u8] = b"komodo-backup-source/v1";
@@ -28,7 +29,10 @@ fn backup_key() -> anyhow::Result<&'static [u8; 32]> {
   }
   let key = load_or_create_key(
     Path::new(BACKUP_KEY_PATH),
-    Path::new(LEGACY_BACKUP_KEY_PATH),
+    &[
+      (Path::new(LEGACY_SHARED_BACKUP_KEY_PATH), true),
+      (Path::new(LEGACY_CONFIG_BACKUP_KEY_PATH), false),
+    ],
   )?;
   let _ = KEY.set(key);
   KEY.get().context("Failed to initialize backup sealing key")
@@ -36,17 +40,44 @@ fn backup_key() -> anyhow::Result<&'static [u8; 32]> {
 
 fn load_or_create_key(
   path: &Path,
-  legacy_path: &Path,
+  legacy_paths: &[(&Path, bool)],
 ) -> anyhow::Result<[u8; 32]> {
   if let Some(key) = read_key(path)? {
     return Ok(key);
   }
-  if let Some(key) = read_key(legacy_path)? {
-    return persist_key(path, key);
+  for (legacy_path, remove_after_migration) in legacy_paths {
+    if let Some(key) = read_key(legacy_path)? {
+      let key = persist_key(path, key)?;
+      if *remove_after_migration {
+        remove_legacy_key(legacy_path)?;
+      }
+      return Ok(key);
+    }
   }
   let mut key = [0_u8; 32];
   rand::rng().fill(&mut key);
   persist_key(path, key)
+}
+
+fn remove_legacy_key(path: &Path) -> anyhow::Result<()> {
+  match std::fs::remove_file(path) {
+    Ok(()) => {}
+    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+      return Ok(());
+    }
+    Err(error) => {
+      return Err(error).with_context(|| {
+        format!(
+          "Failed to remove legacy backup key at {}",
+          path.display()
+        )
+      });
+    }
+  }
+  if let Some(parent) = path.parent() {
+    std::fs::File::open(parent)?.sync_all()?;
+  }
+  Ok(())
 }
 
 fn read_key(path: &Path) -> anyhow::Result<Option<[u8; 32]>> {
@@ -299,10 +330,12 @@ mod tests {
     let expected = [19_u8; 32];
     std::fs::write(&legacy_path, hex::encode(expected)).unwrap();
 
-    let actual = load_or_create_key(&path, &legacy_path).unwrap();
+    let actual =
+      load_or_create_key(&path, &[(&legacy_path, true)]).unwrap();
 
     assert_eq!(actual, expected);
     assert_eq!(read_key(&path).unwrap(), Some(expected));
+    assert!(!legacy_path.exists());
   }
 
   #[test]

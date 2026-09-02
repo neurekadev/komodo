@@ -9,7 +9,7 @@ use mungos::{
   bulk_update::{BulkUpdate, bulk_update_retry_too_big},
   mongodb::{
     Database,
-    bson::{Document, doc},
+    bson::{Bson, Document, doc},
   },
 };
 use tokio::io::BufReader;
@@ -74,7 +74,7 @@ pub async fn restore(
                 if line.is_empty() {
                   continue;
                 }
-                let document =
+                let mut document =
                   match serde_json::from_str::<Document>(&line)
                     .context("Failed to deserialize line")
                   {
@@ -84,15 +84,14 @@ pub async fn restore(
                       continue;
                     }
                   };
-                let Some(id) = document
-                  .get("_id")
-                  .and_then(|id| id.as_object_id())
-                else {
-                  continue;
-                };
+                let id = document.remove("_id").with_context(|| {
+                  format!(
+                    "Restore document in collection '{collection}' has no _id"
+                  )
+                })?;
                 count += 1;
                 buffer.push(BulkUpdate {
-                  query: doc! { "_id": id },
+                  query: restore_id_query(id),
                   update: doc! { "$set": document },
                 });
                 if buffer.len() >= max_buffer {
@@ -161,6 +160,10 @@ pub async fn restore(
   info!("Finished restoring database ✅");
 
   Ok(())
+}
+
+fn restore_id_query(id: Bson) -> Document {
+  doc! { "_id": id }
 }
 
 async fn latest_restore_folder(
@@ -277,5 +280,15 @@ mod tests {
         .iter()
         .any(|(collection, _)| collection == "Stats")
     );
+  }
+
+  #[test]
+  fn restore_preserves_string_and_object_id_types() {
+    let string = restore_id_query(Bson::String("stack-id".into()));
+    assert_eq!(string.get_str("_id").unwrap(), "stack-id");
+
+    let object_id = mungos::mongodb::bson::oid::ObjectId::new();
+    let object = restore_id_query(Bson::ObjectId(object_id));
+    assert_eq!(object.get_object_id("_id").unwrap(), object_id);
   }
 }

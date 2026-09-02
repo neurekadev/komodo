@@ -225,7 +225,16 @@ pub fn inner_handler(
 > {
   Box::pin(async move {
     let mutation_guard =
-      crate::backup::mutation_barrier().clone().read_owned().await;
+      if super::write::mutation_guard_held_by_write_request() {
+        None
+      } else {
+        Some(
+          crate::backup::mutation_barrier()
+            .clone()
+            .read_owned()
+            .await,
+        )
+      };
     let task_id = Uuid::new_v4();
 
     // Need to validate no cancel is active before any update is created.

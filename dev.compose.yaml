@@ -16,6 +16,7 @@ services:
       KOMODO_JWT_SECRET: a_random_secret
     volumes:
       - repo-cache:/repo-cache
+      - core-secrets:/core-secrets
 
   periphery:
     build:
@@ -53,5 +54,6 @@ networks:
 volumes:
   data:
   repo-cache:
+  core-secrets:
   repos:
   stacks:

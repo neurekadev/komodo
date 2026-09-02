@@ -53,6 +53,17 @@ pub struct WriteArgs {
   pub user: User,
 }
 
+tokio::task_local! {
+  /// Set while the write router owns the backup mutation barrier's read side.
+  /// Synchronous nested executions reuse that ownership instead of attempting
+  /// a recursive Tokio RwLock read after a writer has queued.
+  static WRITE_MUTATION_GUARD_HELD: ();
+}
+
+pub(super) fn mutation_guard_held_by_write_request() -> bool {
+  WRITE_MUTATION_GUARD_HELD.try_with(|_| ()).is_ok()
+}
+
 #[typeshare]
 #[derive(
   Serialize, Deserialize, Debug, Clone, Resolve, EnumDiscriminants,
@@ -289,7 +300,7 @@ async fn task(
   request: WriteRequest,
   user: User,
 ) -> mogh_error::Result<axum::response::Response> {
-  let _mutation_guard = if matches!(
+  let mutation_guard = if matches!(
     &request,
     WriteRequest::UpdateBackupSettings(_)
       | WriteRequest::InitializeBackupRepositories(_)
@@ -327,7 +338,13 @@ async fn task(
     );
   }
 
-  let res = request.resolve(&WriteArgs { user }).await;
+  let args = WriteArgs { user };
+  let resolve = request.resolve(&args);
+  let res = if let Some(_mutation_guard) = mutation_guard {
+    WRITE_MUTATION_GUARD_HELD.scope((), resolve).await
+  } else {
+    resolve.await
+  };
 
   if let Err(e) = &res {
     warn!(
@@ -341,4 +358,27 @@ async fn task(
   }
 
   res.map(|res| res.0)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[tokio::test]
+  async fn synchronous_nested_work_reuses_only_the_current_task_guard()
+   {
+    assert!(!mutation_guard_held_by_write_request());
+    WRITE_MUTATION_GUARD_HELD
+      .scope((), async {
+        assert!(mutation_guard_held_by_write_request());
+        assert!(
+          !tokio::spawn(async {
+            mutation_guard_held_by_write_request()
+          })
+          .await
+          .unwrap()
+        );
+      })
+      .await;
+  }
 }

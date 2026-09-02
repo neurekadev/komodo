@@ -1,5 +1,5 @@
 use std::{
-  collections::{BTreeSet, HashMap, HashSet},
+  collections::{BTreeMap, BTreeSet, HashMap, HashSet},
   fs::OpenOptions,
   io::{Read, Write},
   os::unix::fs::{MetadataExt, PermissionsExt},
@@ -202,12 +202,11 @@ impl Resolve<Args> for RunVykarBackup {
           run_container_command("stop", container).await
         {
           let (restarted, restart_errors) =
-            restart_containers(&stopped).await;
-          if restart_errors.is_empty() {
-            remove_container_quiesce_journal(
+            restart_quiesced_containers(
               container_journal.as_deref(),
-            )?;
-          }
+              &stopped,
+            )
+            .await?;
           if !restart_errors.is_empty() {
             return Ok(RunVykarBackupResponse {
               primary: VykarBackupRepositoryResult {
@@ -236,11 +235,11 @@ impl Resolve<Args> for RunVykarBackup {
       run_backup_repositories(&self, &discovered.paths).await
     };
 
-    let (restarted, restart_errors) =
-      restart_containers(&stopped).await;
-    if restart_errors.is_empty() {
-      remove_container_quiesce_journal(container_journal.as_deref())?;
-    }
+    let (restarted, restart_errors) = restart_quiesced_containers(
+      container_journal.as_deref(),
+      &stopped,
+    )
+    .await?;
 
     let (primary, mirror) = match result {
       Ok(result) => result,
@@ -307,13 +306,11 @@ impl Resolve<Args> for RunVykarBackupBatch {
         if let Err(error) =
           run_container_command("stop", &container).await
         {
-          let (_, restart_errors) =
-            restart_containers(&stopped).await;
-          if restart_errors.is_empty() {
-            remove_container_quiesce_journal(
-              container_journal.as_deref(),
-            )?;
-          }
+          let (_, restart_errors) = restart_quiesced_containers(
+            container_journal.as_deref(),
+            &stopped,
+          )
+          .await?;
           if !restart_errors.is_empty() {
             return Ok(RunVykarBackupBatchResponse {
               discovery_errors: vec![format!(
@@ -370,10 +367,11 @@ impl Resolve<Args> for RunVykarBackupBatch {
       }
     }
 
-    let (_, restart_errors) = restart_containers(&stopped).await;
-    if restart_errors.is_empty() {
-      remove_container_quiesce_journal(container_journal.as_deref())?;
-    }
+    let (_, restart_errors) = restart_quiesced_containers(
+      container_journal.as_deref(),
+      &stopped,
+    )
+    .await?;
     Ok(RunVykarBackupBatchResponse {
       results,
       discovery_errors,
@@ -537,9 +535,11 @@ struct KomodoBackupManifest<'a> {
   hostname: &'a str,
   komodo_version: &'a str,
   paths: &'a [String],
+  path_aliases: &'a BTreeMap<String, String>,
   target: &'a PeripheryBackupTarget,
   configuration_sha256: String,
   paths_sha256: String,
+  path_aliases_sha256: String,
 }
 
 fn write_manifest(
@@ -549,6 +549,7 @@ fn write_manifest(
 ) -> anyhow::Result<()> {
   let target = serde_json::to_vec(&request.target)
     .context("Failed to serialize backup source identity")?;
+  let path_aliases = backup_manifest_path_aliases(request, paths)?;
   let manifest = KomodoBackupManifest {
     schema: "komodo.backup-manifest/v1",
     version: 1,
@@ -557,11 +558,16 @@ fn write_manifest(
     hostname: &request.hostname,
     komodo_version: &request.komodo_version,
     paths,
+    path_aliases: &path_aliases,
     target: &request.target,
     configuration_sha256: hex::encode(Sha256::digest(target)),
     paths_sha256: hex::encode(Sha256::digest(
       serde_json::to_vec(paths)
         .context("Failed to serialize backup source paths")?,
+    )),
+    path_aliases_sha256: hex::encode(Sha256::digest(
+      serde_json::to_vec(&path_aliases)
+        .context("Failed to serialize backup source path aliases")?,
     )),
   };
   let bytes = serde_json::to_vec_pretty(&manifest)
@@ -577,6 +583,20 @@ fn write_manifest(
   file.write_all(&bytes)?;
   file.sync_all()?;
   Ok(())
+}
+
+fn backup_manifest_path_aliases(
+  request: &RunVykarBackup,
+  paths: &[String],
+) -> anyhow::Result<BTreeMap<String, String>> {
+  let PeripheryBackupTarget::Stack { stack, .. } = &request.target
+  else {
+    return Ok(BTreeMap::new());
+  };
+  let run_directory = paths
+    .first()
+    .context("Stack backup has no run-directory source")?;
+  compose_bind_path_aliases(stack, Path::new(run_directory))
 }
 
 fn paths_overlap(left: &Path, right: &Path) -> bool {
@@ -754,19 +774,7 @@ fn compose_bind_paths(
     .into_values()
     .flat_map(|service| service.volumes)
   {
-    let source = match mount {
-      BackupComposeMount::Long { mount_type, source } => source
-        .filter(|source| {
-          mount_type.as_deref() == Some("bind")
-            || mount_type.is_none() && Path::new(source).is_absolute()
-        }),
-      BackupComposeMount::Short(value) => {
-        value.split_once(':').and_then(|(source, _)| {
-          (Path::new(source).is_absolute() || source.starts_with('.'))
-            .then(|| source.to_string())
-        })
-      }
-    };
+    let source = compose_bind_source(mount);
     let Some(source) = source else {
       continue;
     };
@@ -781,11 +789,68 @@ fn compose_bind_paths(
   Ok(paths)
 }
 
+fn compose_bind_source(mount: BackupComposeMount) -> Option<String> {
+  match mount {
+    BackupComposeMount::Long { mount_type, source } => {
+      source.filter(|source| {
+        mount_type.as_deref() == Some("bind")
+          || mount_type.is_none() && Path::new(source).is_absolute()
+      })
+    }
+    BackupComposeMount::Short(value) => {
+      value.split_once(':').and_then(|(source, _)| {
+        (Path::new(source).is_absolute() || source.starts_with('.'))
+          .then(|| source.to_string())
+      })
+    }
+  }
+}
+
+fn compose_bind_path_aliases(
+  stack: &komodo_client::entities::stack::Stack,
+  _run_directory: &Path,
+) -> anyhow::Result<BTreeMap<String, String>> {
+  let Some(config) = stack.info.deployed_config.as_deref() else {
+    return Ok(BTreeMap::new());
+  };
+  let config: BackupComposeConfig =
+    serde_yaml_ng::from_str(config)
+      .context("Failed to parse deployed Compose configuration")?;
+  let mut aliases = BTreeMap::new();
+  for mount in config
+    .services
+    .into_values()
+    .flat_map(|service| service.volumes)
+  {
+    let Some(source) = compose_bind_source(mount) else {
+      continue;
+    };
+    let source_path = Path::new(&source);
+    if !source_path.is_absolute() {
+      // Relative bind paths move with the recovered run directory and do not
+      // need an absolute source rewrite.
+      continue;
+    }
+    let canonical = validate_source_path(source_path)?;
+    if canonical != source_path {
+      aliases
+        .insert(source, canonical.to_string_lossy().into_owned());
+    }
+  }
+  Ok(aliases)
+}
+
 fn remap_absolute_bind_source(
   source: &str,
   mappings: &HashMap<String, String>,
+  path_aliases: &HashMap<String, String>,
 ) -> Option<String> {
-  let source = Path::new(source);
+  let source = Path::new(
+    path_aliases
+      .get(source)
+      .map(String::as_str)
+      .unwrap_or(source),
+  );
   if !source.is_absolute() {
     return None;
   }
@@ -807,6 +872,7 @@ fn remap_absolute_bind_source(
 fn rewrite_compose_bind_mappings(
   document: &mut serde_yaml_ng::Value,
   mappings: &HashMap<String, String>,
+  path_aliases: &HashMap<String, String>,
 ) -> usize {
   use serde_yaml_ng::Value;
 
@@ -834,7 +900,7 @@ fn rewrite_compose_bind_mappings(
             continue;
           };
           if let Some(mapped) =
-            remap_absolute_bind_source(source, mappings)
+            remap_absolute_bind_source(source, mappings, path_aliases)
           {
             *short = format!("{mapped}:{suffix}");
             rewritten += 1;
@@ -856,9 +922,11 @@ fn rewrite_compose_bind_mappings(
           {
             continue;
           }
-          if let Some(mapped) =
-            remap_absolute_bind_source(&source, mappings)
-          {
+          if let Some(mapped) = remap_absolute_bind_source(
+            &source,
+            mappings,
+            path_aliases,
+          ) {
             long.insert(key("source"), Value::String(mapped));
             rewritten += 1;
           }
@@ -918,6 +986,7 @@ fn rewrite_recovered_stack_compose_files(
     if rewrite_compose_bind_mappings(
       &mut document,
       &request.bind_path_mappings,
+      &request.bind_path_aliases,
     ) == 0
     {
       continue;
@@ -936,6 +1005,7 @@ async fn affected_running_containers(
   containers: &[ContainerListItem],
   project_name: Option<&str>,
   paths: &BTreeSet<PathBuf>,
+  include_named_volume_mounts: bool,
 ) -> anyhow::Result<Vec<String>> {
   let mut affected = BTreeSet::new();
   for container in containers.iter().filter(|container| {
@@ -956,7 +1026,12 @@ async fn affected_running_containers(
     if inspected
       .mounts
       .into_iter()
-      .filter(|mount| mount.typ.as_deref() == Some("bind"))
+      .filter(|mount| {
+        mount_type_affects_paths(
+          mount.typ.as_deref(),
+          include_named_volume_mounts,
+        )
+      })
       .filter_map(|mount| mount.source)
       .map(|source| {
         let source = PathBuf::from(source);
@@ -970,6 +1045,14 @@ async fn affected_running_containers(
     }
   }
   Ok(affected.into_iter().collect())
+}
+
+fn mount_type_affects_paths(
+  mount_type: Option<&str>,
+  include_named_volume_mounts: bool,
+) -> bool {
+  mount_type == Some("bind")
+    || include_named_volume_mounts && mount_type == Some("volume")
 }
 
 async fn discover_source(
@@ -1062,6 +1145,7 @@ async fn discover_source(
         &containers,
         Some(&project_name),
         &affected_paths,
+        false,
       )
       .await?;
       let mut paths =
@@ -1283,6 +1367,7 @@ async fn discover_running_containers(
         &containers,
         Some(&project_name),
         &paths,
+        true,
       )
       .await
     }
@@ -1602,25 +1687,18 @@ impl Resolve<Args> for TransactionalVykarRestore {
       if let Err(stop_error) =
         run_container_command("stop", container).await
       {
-        let mut restart_errors = Vec::new();
-        for stopped in &stopped_containers {
-          if let Err(error) =
-            run_container_command("start", stopped).await
-          {
-            restart_errors.push(format!("{stopped}: {error:#}"));
-          }
-        }
+        let (restarted, restart_errors) =
+          restart_quiesced_containers(
+            container_journal.as_deref(),
+            &stopped_containers,
+          )
+          .await?;
         let volume_cleanup_error =
           if let Some(journal) = owned_volume_journal.as_deref() {
             cleanup_owned_restore_volume_journal(journal).await.err()
           } else {
             None
           };
-        if restart_errors.is_empty() {
-          remove_container_quiesce_journal(
-            container_journal.as_deref(),
-          )?;
-        }
         return Ok(TransactionalVykarRestoreResponse {
           complete: false,
           rolled_back: volume_cleanup_error.is_none(),
@@ -1628,7 +1706,7 @@ impl Resolve<Args> for TransactionalVykarRestore {
           containers_restarted: if restart_errors.is_empty()
             && volume_cleanup_error.is_none()
           {
-            stopped_containers
+            restarted
           } else {
             Vec::new()
           },
@@ -1696,21 +1774,12 @@ impl Resolve<Args> for TransactionalVykarRestore {
           } else {
             None
           };
-        let mut restarted = Vec::new();
-        let mut restart_errors = Vec::new();
-        for container in &stopped_containers {
-          match run_container_command("start", container).await {
-            Ok(()) => restarted.push(container.clone()),
-            Err(error) => {
-              restart_errors.push(format!("{container}: {error:#}"))
-            }
-          }
-        }
-        if restart_errors.is_empty() {
-          remove_container_quiesce_journal(
+        let (restarted, restart_errors) =
+          restart_quiesced_containers(
             container_journal.as_deref(),
-          )?;
-        }
+            &stopped_containers,
+          )
+          .await?;
         return Ok(TransactionalVykarRestoreResponse {
           complete: false,
           rolled_back: cleanup_error.is_none(),
@@ -1753,18 +1822,12 @@ impl Resolve<Args> for TransactionalVykarRestore {
         });
       }
     };
-    let mut restarted = Vec::new();
-    let mut restart_errors = Vec::new();
-    for container in &stopped_containers {
-      match run_container_command("start", container).await {
-        Ok(()) => restarted.push(container.clone()),
-        Err(error) => {
-          restart_errors.push(format!("{container}: {error:#}"))
-        }
-      }
-    }
+    let (restarted, restart_errors) = restart_quiesced_containers(
+      container_journal.as_deref(),
+      &stopped_containers,
+    )
+    .await?;
     if restart_errors.is_empty() {
-      remove_container_quiesce_journal(container_journal.as_deref())?;
       Ok(TransactionalVykarRestoreResponse {
         complete: !rolled_back,
         rolled_back,
@@ -2110,6 +2173,7 @@ async fn transactional_restore(
   let worker_started = publication_started.clone();
   let publish_staging = staging.clone();
   let publication_staging_journal = staging_journal.clone();
+  let defer_finalize = request.defer_finalize;
   let result = tokio::task::spawn_blocking(move || {
     publish_restore(
       &publish_staging,
@@ -2117,7 +2181,7 @@ async fn transactional_restore(
       &journal_id,
       &worker_started,
       Some(&publication_staging_journal),
-      request.defer_finalize,
+      defer_finalize,
     )
   })
   .await;
@@ -2365,18 +2429,50 @@ fn persist_container_quiesce_journal(
   journal_id: &str,
   containers: &[String],
 ) -> anyhow::Result<Option<PathBuf>> {
+  let path = container_quiesce_journal_dir()?
+    .join(format!("{journal_id}.json"));
+  let existing = if path_lexists(&path) {
+    read_container_quiesce_journal(&path)?.containers
+  } else {
+    Vec::new()
+  };
+  let containers =
+    merge_container_quiesce_sets(&existing, containers);
   if containers.is_empty() {
     return Ok(None);
   }
-  let path = container_quiesce_journal_dir()?
-    .join(format!("{journal_id}.json"));
-  persist_journal(
-    &path,
-    &ContainerQuiesceJournal {
-      containers: containers.to_vec(),
-    },
-  )?;
+  persist_journal(&path, &ContainerQuiesceJournal { containers })?;
   Ok(Some(path))
+}
+
+fn merge_container_quiesce_sets(
+  existing: &[String],
+  current: &[String],
+) -> Vec<String> {
+  existing
+    .iter()
+    .chain(current)
+    .cloned()
+    .collect::<BTreeSet<_>>()
+    .into_iter()
+    .collect()
+}
+
+fn read_container_quiesce_journal(
+  path: &Path,
+) -> anyhow::Result<ContainerQuiesceJournal> {
+  serde_json::from_slice(&std::fs::read(path).with_context(|| {
+    format!(
+      "Failed to read container quiesce journal {}",
+      path.display()
+    )
+  })?)
+  .with_context(|| {
+    format!(
+      "Failed to decode container quiesce journal {}",
+      path.display()
+    )
+  })
 }
 
 fn remove_container_quiesce_journal(
@@ -2395,25 +2491,23 @@ async fn restart_container_quiesce_journal(
   if !path_lexists(path) {
     return Ok(Default::default());
   }
-  let journal: ContainerQuiesceJournal = serde_json::from_slice(
-    &std::fs::read(path).with_context(|| {
-      format!(
-        "Failed to read container quiesce journal {}",
-        path.display()
-      )
-    })?,
-  )
-  .with_context(|| {
-    format!(
-      "Failed to decode container quiesce journal {}",
-      path.display()
-    )
-  })?;
+  let journal = read_container_quiesce_journal(path)?;
   let result = restart_containers(&journal.containers).await;
   if result.1.is_empty() {
     remove_container_quiesce_journal(Some(path))?;
   }
   Ok(result)
+}
+
+async fn restart_quiesced_containers(
+  journal: Option<&Path>,
+  stopped_this_attempt: &[String],
+) -> anyhow::Result<(Vec<String>, Vec<String>)> {
+  if let Some(journal) = journal {
+    restart_container_quiesce_journal(journal).await
+  } else {
+    Ok(restart_containers(stopped_this_attempt).await)
+  }
 }
 
 /// Recover publications with a durable decision, then restart containers
@@ -3545,7 +3639,11 @@ mod tests {
       "/srv/recovered".to_string(),
     )]);
     assert_eq!(
-      rewrite_compose_bind_mappings(&mut document, &mappings),
+      rewrite_compose_bind_mappings(
+        &mut document,
+        &mappings,
+        &HashMap::new(),
+      ),
       2
     );
     let rewritten = serde_yaml_ng::to_string(&document).unwrap();
@@ -3553,6 +3651,33 @@ mod tests {
     assert!(rewritten.contains("/srv/recovered/cache:/cache:ro"));
     assert!(rewritten.contains("named-data:/named"));
     assert!(!rewritten.contains("/srv/old"));
+  }
+
+  #[test]
+  fn recovered_compose_rewrites_a_recorded_symlink_alias() {
+    let mut document: serde_yaml_ng::Value = serde_yaml_ng::from_str(
+      "services:\n  app:\n    volumes:\n      - /srv/link/cache:/cache:ro\n",
+    )
+    .unwrap();
+    let mappings = HashMap::from([(
+      "/srv/real".to_string(),
+      "/srv/recovered".to_string(),
+    )]);
+    let aliases = HashMap::from([(
+      "/srv/link/cache".to_string(),
+      "/srv/real/cache".to_string(),
+    )]);
+    assert_eq!(
+      rewrite_compose_bind_mappings(
+        &mut document,
+        &mappings,
+        &aliases,
+      ),
+      1
+    );
+    let rewritten = serde_yaml_ng::to_string(&document).unwrap();
+    assert!(rewritten.contains("/srv/recovered/cache:/cache:ro"));
+    assert!(!rewritten.contains("/srv/link"));
   }
 
   #[test]
@@ -3874,5 +3999,28 @@ mod tests {
     assert!(!staging.exists());
     assert!(!destination_copy.exists());
     assert!(!journal_path.exists());
+  }
+
+  #[test]
+  fn repeated_quiesce_attempts_preserve_every_pending_container() {
+    assert_eq!(
+      merge_container_quiesce_sets(
+        &["original".into(), "shared".into()],
+        &["retry".into(), "shared".into()],
+      ),
+      vec![
+        "original".to_string(),
+        "retry".to_string(),
+        "shared".to_string(),
+      ]
+    );
+  }
+
+  #[test]
+  fn restore_quiescing_includes_named_volume_mounts() {
+    assert!(mount_type_affects_paths(Some("bind"), false));
+    assert!(!mount_type_affects_paths(Some("volume"), false));
+    assert!(mount_type_affects_paths(Some("volume"), true));
+    assert!(!mount_type_affects_paths(Some("tmpfs"), true));
   }
 }

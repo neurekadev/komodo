@@ -1,5 +1,5 @@
 use std::{
-  collections::{HashMap, HashSet},
+  collections::{BTreeMap, HashMap, HashSet},
   fs::OpenOptions,
   io::Write,
   os::unix::fs::OpenOptionsExt,
@@ -136,6 +136,9 @@ struct StoredRestorePlan {
   /// exact roots.
   #[serde(default)]
   snapshot_stack_source_paths: Vec<String>,
+  /// Original absolute Compose bind source to its canonical snapshot path.
+  #[serde(default)]
+  snapshot_stack_path_aliases: HashMap<String, String>,
   /// Source absolute bind path to destination absolute bind path. Retained
   /// with the confirmed plan so execution cannot substitute new mappings.
   #[serde(default)]
@@ -160,9 +163,13 @@ struct SnapshotBackupManifest {
   source_label: String,
   hostname: String,
   paths: Vec<String>,
+  #[serde(default)]
+  path_aliases: BTreeMap<String, String>,
   target: PeripheryBackupTarget,
   configuration_sha256: String,
   paths_sha256: String,
+  #[serde(default)]
+  path_aliases_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1866,7 +1873,9 @@ fn spawn_fleet_retry_finalizer(
       all_complete,
     );
     match finish_run(current, state, message).await {
-      Ok(finished) if finished.state == BackupRunState::Complete => {
+      Ok(finished)
+        if fleet_retry_requires_maintenance(&finished.state) =>
+      {
         queue_maintenance()
       }
       Ok(_) => {}
@@ -1894,6 +1903,10 @@ fn fleet_retry_completion(
       "Backup retries stopped before every target completed",
     )
   }
+}
+
+fn fleet_retry_requires_maintenance(state: &BackupRunState) -> bool {
+  matches!(state, BackupRunState::Complete | BackupRunState::Partial)
 }
 
 fn maintenance_sender() -> &'static tokio::sync::mpsc::Sender<()> {
@@ -3575,7 +3588,12 @@ pub fn snapshot_server_id(snapshot: &BackupSnapshot) -> Option<&str> {
 
 async fn snapshot_stack_source(
   snapshot: &BackupSnapshot,
-) -> anyhow::Result<(Stack, Option<Stack>, Vec<String>)> {
+) -> anyhow::Result<(
+  Stack,
+  Option<Stack>,
+  Vec<String>,
+  BTreeMap<String, String>,
+)> {
   let BackupTarget::Stack { stack_id } = &snapshot.target else {
     return Err(anyhow!("Snapshot is not a Stack backup"));
   };
@@ -3628,8 +3646,17 @@ async fn snapshot_stack_source(
   ));
   let paths_sha256 =
     hex::encode(Sha256::digest(serde_json::to_vec(&manifest.paths)?));
+  let path_aliases_sha256 = hex::encode(Sha256::digest(
+    serde_json::to_vec(&manifest.path_aliases)?,
+  ));
   if configuration_sha256 != manifest.configuration_sha256
     || paths_sha256 != manifest.paths_sha256
+    || manifest
+      .path_aliases_sha256
+      .as_deref()
+      .is_some_and(|expected| expected != path_aliases_sha256)
+    || !manifest.path_aliases.is_empty()
+      && manifest.path_aliases_sha256.is_none()
   {
     return Err(anyhow!(
       "Stack snapshot recovery manifest checksum is invalid"
@@ -3646,7 +3673,7 @@ async fn snapshot_stack_source(
       "Stack snapshot recovery manifest does not match its source label"
     ));
   }
-  Ok((*stack, current, manifest.paths))
+  Ok((*stack, current, manifest.paths, manifest.path_aliases))
 }
 
 pub async fn current_stack_backup_source(
@@ -3720,14 +3747,23 @@ pub async fn plan_restore(
     ));
   }
   let selected_paths = normalize_selected_paths(&selected_paths)?;
-  let (snapshot_stack, current_stack, snapshot_stack_paths) =
-    if matches!(&snapshot.target, BackupTarget::Stack { .. }) {
-      let (snapshot_stack, current_stack, source_paths) =
-        snapshot_stack_source(&snapshot).await?;
-      (Some(snapshot_stack), current_stack, source_paths)
-    } else {
-      (None, None, Vec::new())
-    };
+  let (
+    snapshot_stack,
+    current_stack,
+    snapshot_stack_paths,
+    snapshot_stack_path_aliases,
+  ) = if matches!(&snapshot.target, BackupTarget::Stack { .. }) {
+    let (snapshot_stack, current_stack, source_paths, path_aliases) =
+      snapshot_stack_source(&snapshot).await?;
+    (
+      Some(snapshot_stack),
+      current_stack,
+      source_paths,
+      path_aliases,
+    )
+  } else {
+    (None, None, Vec::new(), BTreeMap::new())
+  };
   let authenticated_snapshot_stack_paths =
     snapshot_stack_paths.clone();
   let source_resource_missing = match &snapshot.target {
@@ -4017,6 +4053,9 @@ pub async fn plan_restore(
       recovered_stack_source,
       source_resource_missing,
       snapshot_stack_source_paths: authenticated_snapshot_stack_paths,
+      snapshot_stack_path_aliases: snapshot_stack_path_aliases
+        .into_iter()
+        .collect(),
       bind_path_mappings: confirmed_bind_path_mappings,
     })
     .await?;
@@ -4546,6 +4585,9 @@ pub async fn execute_restore(
           volume_restore_plan_id: stored.id.clone(),
           create_volume_if_missing: stored.create_volume_if_missing,
           bind_path_mappings: stored.bind_path_mappings.clone(),
+          bind_path_aliases: stored
+            .snapshot_stack_path_aliases
+            .clone(),
           defer_finalize: recovered_creation.is_some(),
         })
         .await?;
@@ -5990,6 +6032,7 @@ mod tests {
       recovered_stack_source: None,
       source_resource_missing: false,
       snapshot_stack_source_paths: Vec::new(),
+      snapshot_stack_path_aliases: HashMap::new(),
       bind_path_mappings: HashMap::new(),
     };
     let mut current = PreflightVykarRestoreResponse {
@@ -6147,6 +6190,15 @@ mod tests {
       fleet_retry_completion(true, true).0,
       BackupRunState::Cancelled
     );
+    assert!(fleet_retry_requires_maintenance(
+      &BackupRunState::Complete
+    ));
+    assert!(fleet_retry_requires_maintenance(
+      &BackupRunState::Partial
+    ));
+    assert!(!fleet_retry_requires_maintenance(
+      &BackupRunState::Cancelled
+    ));
   }
 
   #[test]

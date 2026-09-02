@@ -197,6 +197,10 @@ pub struct TransactionalVykarRestore {
   /// Stack Compose files are rewritten in staging before publication.
   #[serde(default)]
   pub bind_path_mappings: HashMap<String, String>,
+  /// Original absolute Compose bind source to its canonical snapshot path.
+  /// This preserves symlink aliases when recovery happens on another node.
+  #[serde(default)]
+  pub bind_path_aliases: HashMap<String, String>,
   /// Keep the durable filesystem rollback journal until Core confirms the
   /// recovered Stack resource was inserted successfully.
   #[serde(default)]

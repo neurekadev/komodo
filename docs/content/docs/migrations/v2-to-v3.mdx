@@ -27,11 +27,11 @@ The encrypted backup feature likewise requires the new `Backups` specific permis
 
 ## Migrate to Komodo v3
 
-The v3 templates share the Compose volume `komodo_data` between Core and Periphery at `/data`. Existing MongoDB or FerretDB database volumes keep their v2 names.
+The v3 templates share the Compose volume `komodo_data` between Core and Periphery at `/data`, and attach a separate `komodo_core-secrets` volume only to Core for backup authentication and sealing material. Existing MongoDB or FerretDB database volumes keep their v2 names.
 
 <Callout title="Back up your deployment" type="error">
 
-Back up the database, `/etc/komodo`, the `komodo_keys` volume, and any custom configuration or certificates before continuing. The migration below moves files out of their v2 locations and assumes `komodo_data` does not already contain another deployment.
+Back up the database, `/etc/komodo`, the `komodo_keys` volume, any existing `komodo_core-secrets` volume, and any custom configuration or certificates before continuing. The migration below moves files out of their v2 locations and assumes `komodo_data` does not already contain another deployment.
 
 </Callout>
 
@@ -112,6 +112,8 @@ COMPOSE_KOMODO_IMAGE_TAG="3"
 ## Persist Core identity and reporting keys in the shared data volume.
 KOMODO_PRIVATE_KEY=file:/data/keys/core.key
 KOMODO_REPORTING_PRIVATE_KEY=file:/data/keys/reporting.key
+## The backup key is generated under /core-secrets by Core and is not shared
+## with Periphery. The Compose template persists that directory separately.
 ## Allow Periphery to connect via its generated public key.
 KOMODO_PERIPHERY_PUBLIC_KEY=file:/data/keys/periphery.pub
 

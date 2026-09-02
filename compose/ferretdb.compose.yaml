@@ -55,8 +55,10 @@ services:
     environment:
       KOMODO_DATABASE_ADDRESS: ferretdb:27017
     volumes:
-      ## Share keys, backups, syncs, and repository and Vykar caches with Periphery.
+      ## Share backups, syncs, and repository and Vykar caches with Periphery.
       - data:/data
+      ## Keep backup sealing and source-authentication material Core-only.
+      - core-secrets:/core-secrets
       ## Optionally mount a custom core.config.toml
       # - /path/to/core.config.toml:/config/config.toml
       ## Optionally mount custom root CA certificate to trust
@@ -105,3 +107,5 @@ volumes:
   ferretdb-state:
   # Core / Periphery
   data:
+  # Core-only backup authentication and sealing key
+  core-secrets:
