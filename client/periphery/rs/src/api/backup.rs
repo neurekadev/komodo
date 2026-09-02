@@ -214,6 +214,10 @@ pub struct FinalizeVykarRestore {
   /// Commit the publication when true; restore the original filesystem when
   /// false.
   pub commit: bool,
+  /// Remove the durable finalization receipt after Core has persisted the
+  /// matching cross-system outcome. Repeating an acknowledgement is safe.
+  #[serde(default)]
+  pub acknowledge: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]

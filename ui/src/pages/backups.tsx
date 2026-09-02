@@ -86,7 +86,7 @@ export default function Backups() {
         <Group justify="end">
           <Button
             component="a"
-            href="https://komodo.docs.neureka.dev/docs/backups"
+            href="https://komodo.docs.neureka.dev/administration/backups"
             target="_blank"
             variant="subtle"
           >
@@ -128,7 +128,7 @@ function SnapshotInventory() {
           <Group key={snapshot.name} justify="space-between" wrap="nowrap">
             <Stack gap={0} className="overflow-hidden">
               <Text size="sm" fw={500} truncate>
-                {snapshot.source_label}
+                {snapshotTargetLabel(snapshot.target)}
               </Text>
               <Text size="xs" c="dimmed" truncate>
                 {snapshot.name} · {snapshot.hostname}
@@ -150,6 +150,19 @@ function SnapshotInventory() {
       </Stack>
     </Section>
   );
+}
+
+function snapshotTargetLabel(target: Types.BackupTarget) {
+  switch (target.type) {
+    case "Core":
+      return "Core";
+    case "Stack":
+      return `Stack · ${target.params.stack_id}`;
+    case "Volume":
+      return `Volume · ${target.params.server_id}/${target.params.volume_name}`;
+    case "Unbound":
+      return `Unbound · ${target.params.source_label}`;
+  }
 }
 
 function StatusSection({ status }: { status?: Types.BackupStatus }) {

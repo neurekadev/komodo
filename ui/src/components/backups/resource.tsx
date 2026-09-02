@@ -212,7 +212,7 @@ export default function ResourceBackups({
             Restore always stops affected running containers. They restart only
             after a verified publish or a proven rollback. See the{" "}
             <a
-              href="https://komodo.docs.neureka.dev/docs/backups#restore-a-stack-or-volume"
+              href="https://komodo.docs.neureka.dev/administration/backups#restore-a-stack-or-volume"
               target="_blank"
               rel="noreferrer"
             >

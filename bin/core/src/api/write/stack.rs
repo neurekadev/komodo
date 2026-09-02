@@ -745,6 +745,7 @@ impl Resolve<WriteArgs> for RefreshStackCache {
     };
 
     let info = StackInfo {
+      recovery_plan_id: stack.info.recovery_plan_id.clone(),
       missing_files,
       deployed_services: stack.info.deployed_services.clone(),
       deployed_project_name: stack.info.deployed_project_name.clone(),

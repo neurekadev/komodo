@@ -1899,6 +1899,14 @@ struct RestoreJournal {
   /// idempotent across transient Docker failures.
   #[serde(default)]
   finalized: bool,
+  /// Core must decide deferred recovered-Stack publications. Periphery never
+  /// rolls an undecided deferred journal back during startup.
+  #[serde(default)]
+  deferred: bool,
+  /// Filesystem finalization and container recovery both completed. Deferred
+  /// journals retain this receipt until Core acknowledges its durable state.
+  #[serde(default)]
+  completed: bool,
   /// A Volume created specifically for this restore. The same durable
   /// journal owns both filesystem rollback and removal of the side effect
   /// until publication is committed.
@@ -1964,6 +1972,8 @@ fn persist_restore_volume_journal(
       entries: Vec::new(),
       committed: false,
       finalized: false,
+      deferred: false,
+      completed: false,
       owned_volume: Some(RestoreOwnedVolume {
         volume_name: volume_name.to_string(),
         restore_plan_id: restore_plan_id.to_string(),
@@ -2108,11 +2118,40 @@ fn remove_container_quiesce_journal(
   fsync_parent(path)
 }
 
-/// Roll back any publication interrupted after its durable journal was
-/// written, then restart containers quiesced by an interrupted backup or
-/// restore. This runs before Periphery accepts requests.
+async fn restart_container_quiesce_journal(
+  path: &Path,
+) -> anyhow::Result<(Vec<String>, Vec<String>)> {
+  if !path_lexists(path) {
+    return Ok(Default::default());
+  }
+  let journal: ContainerQuiesceJournal = serde_json::from_slice(
+    &std::fs::read(path).with_context(|| {
+      format!(
+        "Failed to read container quiesce journal {}",
+        path.display()
+      )
+    })?,
+  )
+  .with_context(|| {
+    format!(
+      "Failed to decode container quiesce journal {}",
+      path.display()
+    )
+  })?;
+  let result = restart_containers(&journal.containers).await;
+  if result.1.is_empty() {
+    remove_container_quiesce_journal(Some(path))?;
+  }
+  Ok(result)
+}
+
+/// Recover publications with a durable decision, then restart containers
+/// quiesced by an interrupted backup or restore. Undecided deferred
+/// recovered-Stack publications remain intact for Core reconciliation. This
+/// runs before Periphery accepts requests.
 pub(crate) async fn recover_restore_journals() -> anyhow::Result<()> {
   let directory = restore_journal_dir()?;
+  let mut deferred_journal_ids = HashSet::new();
   for entry in std::fs::read_dir(&directory)? {
     let path = entry?.path();
     if path.extension().and_then(|value| value.to_str())
@@ -2127,6 +2166,51 @@ pub(crate) async fn recover_restore_journals() -> anyhow::Result<()> {
       .with_context(|| {
         format!("Failed to decode restore journal {}", path.display())
       })?;
+    let journal_id = path
+      .file_stem()
+      .and_then(|value| value.to_str())
+      .context("Restore journal has an invalid file name")?;
+    if journal.deferred {
+      deferred_journal_ids.insert(journal_id.to_string());
+      // An uncommitted, unfinalized deferred journal belongs to a recovered
+      // Stack saga. Only Core can prove whether its resource insert happened,
+      // so startup must leave both publication and containers untouched.
+      if !journal.committed && !journal.finalized {
+        continue;
+      }
+      if !journal.finalized {
+        for entry in &journal.entries {
+          remove_path(&entry.rollback)?;
+          fsync_parent(&entry.destination)?;
+          remove_path(&entry.source)?;
+          fsync_parent(&entry.source)?;
+        }
+        if !journal.staging.as_os_str().is_empty() {
+          remove_path(&journal.staging)?;
+          fsync_parent(&journal.staging)?;
+        }
+        journal.finalized = true;
+        persist_journal(&path, &journal)?;
+      }
+      if !journal.completed {
+        let container_path = container_quiesce_journal_dir()?
+          .join(format!("{journal_id}.json"));
+        let (_, errors) =
+          restart_container_quiesce_journal(&container_path).await?;
+        if !errors.is_empty() {
+          return Err(anyhow!(
+            "Failed to recover containers from finalized deferred restore {}: {}",
+            path.display(),
+            errors.join("; ")
+          ));
+        }
+        journal.completed = true;
+        persist_journal(&path, &journal)?;
+      }
+      // Keep the completed receipt until Core durably records and
+      // acknowledges the matching recovered Stack outcome.
+      continue;
+    }
     if journal.committed {
       for entry in &journal.entries {
         remove_path(&entry.rollback)?;
@@ -2174,20 +2258,15 @@ pub(crate) async fn recover_restore_journals() -> anyhow::Result<()> {
     {
       continue;
     }
-    let bytes = std::fs::read(&path).with_context(|| {
-      format!(
-        "Failed to read container quiesce journal {}",
-        path.display()
-      )
-    })?;
-    let journal: ContainerQuiesceJournal =
-      serde_json::from_slice(&bytes).with_context(|| {
-        format!(
-          "Failed to decode container quiesce journal {}",
-          path.display()
-        )
-      })?;
-    let (_, errors) = restart_containers(&journal.containers).await;
+    if path
+      .file_stem()
+      .and_then(|value| value.to_str())
+      .is_some_and(|id| deferred_journal_ids.contains(id))
+    {
+      continue;
+    }
+    let (_, errors) =
+      restart_container_quiesce_journal(&path).await?;
     if !errors.is_empty() {
       return Err(anyhow!(
         "Failed to recover containers from interrupted backup/restore {}: {}",
@@ -2195,8 +2274,6 @@ pub(crate) async fn recover_restore_journals() -> anyhow::Result<()> {
         errors.join("; ")
       ));
     }
-    remove_path(&path)?;
-    fsync_parent(&path)?;
     warn!(
       "Restarted containers from interrupted backup/restore journal {}",
       path.display()
@@ -2373,6 +2450,8 @@ fn publish_restore_in(
     entries,
     committed: false,
     finalized: false,
+    deferred: defer_finalize,
+    completed: false,
     owned_volume,
   };
   persist_journal(&journal_path, &journal)?;
@@ -2475,6 +2554,8 @@ fn cleanup_rolled_back_restore(
         entries: Vec::new(),
         committed: false,
         finalized: false,
+        deferred: journal.deferred,
+        completed: false,
         owned_volume: journal.owned_volume.clone(),
       },
     )
@@ -2653,15 +2734,31 @@ fn fsync_parent(path: &Path) -> anyhow::Result<()> {
 async fn finalize_restore_publication(
   journal_id: &str,
   commit: bool,
+  acknowledge: bool,
 ) -> anyhow::Result<FinalizeVykarRestoreResponse> {
   let journal_path =
     restore_journal_dir()?.join(format!("{journal_id}.json"));
-  let bytes = std::fs::read(&journal_path).with_context(|| {
-    format!(
-      "Pending restore publication does not exist: {}",
-      journal_path.display()
-    )
-  })?;
+  let bytes = match std::fs::read(&journal_path) {
+    Ok(bytes) => bytes,
+    Err(error)
+      if acknowledge
+        && error.kind() == std::io::ErrorKind::NotFound =>
+    {
+      return Ok(FinalizeVykarRestoreResponse {
+        complete: true,
+        rolled_back: !commit,
+        ..Default::default()
+      });
+    }
+    Err(error) => {
+      return Err(error).with_context(|| {
+        format!(
+          "Pending restore publication does not exist: {}",
+          journal_path.display()
+        )
+      });
+    }
+  };
   let mut journal: RestoreJournal = serde_json::from_slice(&bytes)
     .with_context(|| {
       format!(
@@ -2714,18 +2811,23 @@ async fn finalize_restore_publication(
     persist_journal(&journal_path, &journal)?;
   }
 
+  if journal.completed {
+    if acknowledge || !journal.deferred {
+      remove_path(&journal_path)?;
+      fsync_parent(&journal_path)?;
+    }
+    return Ok(FinalizeVykarRestoreResponse {
+      complete: true,
+      rolled_back: !commit,
+      ..Default::default()
+    });
+  }
+
   let container_journal_path = container_quiesce_journal_dir()?
     .join(format!("{journal_id}.json"));
-  let containers = if path_lexists(&container_journal_path) {
-    let journal: ContainerQuiesceJournal = serde_json::from_slice(
-      &std::fs::read(&container_journal_path)?,
-    )?;
-    journal.containers
-  } else {
-    Vec::new()
-  };
   let (restarted, restart_errors) =
-    restart_containers(&containers).await;
+    restart_container_quiesce_journal(&container_journal_path)
+      .await?;
   if !restart_errors.is_empty() {
     return Ok(FinalizeVykarRestoreResponse {
       complete: false,
@@ -2737,14 +2839,15 @@ async fn finalize_restore_publication(
       )),
     });
   }
-  remove_container_quiesce_journal(
-    path_lexists(&container_journal_path)
-      .then_some(container_journal_path.as_path()),
-  )?;
-  // Retain the finalized publication journal until restart succeeds. A
-  // retry can now load the decision and retry only container recovery.
-  remove_path(&journal_path)?;
-  fsync_parent(&journal_path)?;
+  journal.completed = true;
+  persist_journal(&journal_path, &journal)?;
+  // Deferred recovered-Stack publications retain a durable receipt until
+  // Core records the outcome. Other callers preserve the prior cleanup
+  // behavior, and acknowledgement makes receipt removal idempotent.
+  if acknowledge || !journal.deferred {
+    remove_path(&journal_path)?;
+    fsync_parent(&journal_path)?;
+  }
   Ok(FinalizeVykarRestoreResponse {
     complete: true,
     rolled_back: !commit,
@@ -2759,7 +2862,12 @@ impl Resolve<Args> for FinalizeVykarRestore {
     _: &Args,
   ) -> anyhow::Result<FinalizeVykarRestoreResponse> {
     let _operation = backup_operation_lock().lock().await;
-    finalize_restore_publication(&self.journal_id, self.commit).await
+    finalize_restore_publication(
+      &self.journal_id,
+      self.commit,
+      self.acknowledge,
+    )
+    .await
   }
 }
 
@@ -3197,6 +3305,8 @@ mod tests {
       serde_json::from_slice(&std::fs::read(&journal_path).unwrap())
         .unwrap();
     assert!(!journal.committed);
+    assert!(journal.deferred);
+    assert!(!journal.completed);
     assert!(journal.entries[0].rollback.exists());
     rollback_published(&mut journal, &journal_path).unwrap();
     assert_eq!(std::fs::read(&destination).unwrap(), b"original");
@@ -3221,6 +3331,8 @@ mod tests {
       }],
       committed: false,
       finalized: false,
+      deferred: false,
+      completed: false,
       owned_volume: None,
     };
     rollback_published(&mut journal, &journal_path).unwrap();
@@ -3237,6 +3349,8 @@ mod tests {
       entries: Vec::new(),
       committed: false,
       finalized: false,
+      deferred: false,
+      completed: false,
       owned_volume: Some(RestoreOwnedVolume {
         volume_name: "recovered-data".into(),
         restore_plan_id: "plan-id".into(),

@@ -2776,6 +2776,11 @@ export interface StackRemoteFileContents {
 
 export interface StackInfo {
 	/**
+	 * Internal marker linking a newly recovered Stack to the durable restore
+	 * plan until Core and Periphery acknowledge the same finalization outcome.
+	 */
+	recovery_plan_id?: string;
+	/**
 	 * If any of the expected compose / additional files are missing in the repo,
 	 * they will be stored here.
 	 */

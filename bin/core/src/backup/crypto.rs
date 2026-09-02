@@ -9,7 +9,7 @@ use chacha20poly1305::{
   aead::{Aead, KeyInit},
 };
 use data_encoding::BASE64URL_NOPAD;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit as HmacKeyInit, Mac};
 use rand::RngExt as _;
 use sha2::Sha256;
 
@@ -262,9 +262,10 @@ fn source_label_mac(
   snapshot_name: &str,
   key: &[u8; 32],
 ) -> anyhow::Result<HmacSha256> {
-  let mut mac = HmacSha256::new_from_slice(key).map_err(|_| {
-    anyhow!("Failed to initialize source authorization")
-  })?;
+  let mut mac = <HmacSha256 as HmacKeyInit>::new_from_slice(key)
+    .map_err(|_| {
+      anyhow!("Failed to initialize source authorization")
+    })?;
   mac.update(SOURCE_AUTH_CONTEXT);
   for value in [encoded_source_label, hostname, snapshot_name] {
     mac.update(&(value.len() as u64).to_be_bytes());

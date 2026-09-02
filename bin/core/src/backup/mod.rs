@@ -12,7 +12,7 @@ use std::{
 
 use anyhow::{Context, anyhow};
 use database::{
-  bson::{doc, to_bson, to_document},
+  bson::{Bson, doc, to_bson, to_document},
   mungos::{
     find::find_collect,
     mongodb::{
@@ -40,7 +40,7 @@ use komodo_client::{
     komodo_timestamp,
     repo::Repo,
     server::Server,
-    stack::Stack,
+    stack::{Stack, StackConfig},
     user::User,
   },
 };
@@ -110,6 +110,12 @@ struct StoredRestorePlan {
   publish: Vec<periphery_client::api::backup::RestorePublishPath>,
   #[serde(default)]
   recovered_stack_name: Option<String>,
+  /// Stack identity written after the atomically marked resource insert.
+  #[serde(default)]
+  recovered_stack_id: Option<String>,
+  /// Core durably recorded Periphery's completed commit receipt.
+  #[serde(default)]
+  recovered_stack_finalized: bool,
   #[serde(default)]
   recovered_stack_run_directory: Option<String>,
   #[serde(default)]
@@ -520,6 +526,11 @@ fn validate_repository_definition(
         ));
       }
       let normalized = normalize_core_local_path(path);
+      if normalized.to_string_lossy() != path.as_str() {
+        return Err(anyhow!(
+          "Core-local repository path must be normalized exactly (no surrounding whitespace, '.', '..', duplicate separators, or trailing separator)"
+        ));
+      }
       let resolved = resolve_existing_path_ancestor(&normalized)?;
       for reserved in [
         CORE_STAGING_PATH,
@@ -2046,6 +2057,7 @@ async fn run_fleet(
     }
   }
   if settings.volumes_enabled {
+    let mut matched_included_volumes = HashSet::new();
     // Volume inventory comes from every configured Periphery at run time, so
     // unmanaged local named volumes participate automatically.
     for server in servers {
@@ -2110,11 +2122,31 @@ async fn run_fleet(
           &settings.volume_selection.volumes,
           &identity,
         ) {
+          if settings.volume_selection.mode
+            == BackupSelectionMode::Include
+          {
+            matched_included_volumes.insert(identity.clone());
+          }
           targets.push(BackupTarget::Volume {
             server_id: identity.server_id,
             volume_name: identity.volume_name,
           });
         }
+      }
+    }
+    if settings.volume_selection.mode == BackupSelectionMode::Include
+    {
+      for selected in &settings.volume_selection.volumes {
+        if matched_included_volumes.contains(selected)
+          || discovery_retry_servers.contains(&selected.server_id)
+        {
+          continue;
+        }
+        warn!(
+          "Explicitly selected Volume '{}/{}' is missing, unsupported, or belongs to a missing or disabled Server",
+          selected.server_id, selected.volume_name
+        );
+        partial = true;
       }
     }
   }
@@ -3826,6 +3858,8 @@ pub async fn plan_restore(
       plan: plan.clone(),
       publish,
       recovered_stack_name,
+      recovered_stack_id: None,
+      recovered_stack_finalized: false,
       recovered_stack_run_directory,
       destination_volume_name: destination_volume_name.clone(),
       create_volume_if_missing,
@@ -4008,6 +4042,94 @@ async fn restore_periphery_target(
   }
 }
 
+fn recovered_stack_belongs_to_plan(
+  stored: &StoredRestorePlan,
+  stack: &Stack,
+) -> bool {
+  stack.info.recovery_plan_id.as_deref() == Some(stored.id.as_str())
+    || (stored.recovered_stack_finalized
+      && stored.recovered_stack_id.as_deref()
+        == Some(stack.id.as_str()))
+}
+
+async fn finalize_recovered_stack_saga(
+  stored: &mut StoredRestorePlan,
+  server: &Server,
+  stack: &Stack,
+) -> anyhow::Result<()> {
+  let periphery = periphery_client(server).await?;
+  if !stored.recovered_stack_finalized {
+    let finalized = periphery
+      .request(FinalizeVykarRestore {
+        journal_id: stored.id.clone(),
+        commit: true,
+        acknowledge: false,
+      })
+      .await?;
+    if !finalized.complete
+      || finalized.rolled_back
+      || finalized.critical_error.is_some()
+    {
+      return Err(anyhow!(
+        "Periphery did not confirm recovered Stack restore commit: {}",
+        finalized
+          .critical_error
+          .unwrap_or_else(|| "incomplete finalization".into())
+      ));
+    }
+    plans_collection()
+      .update_one(
+        doc! { "_id": &stored.id },
+        doc! { "$set": {
+          "recovered_stack_id": &stack.id,
+          "recovered_stack_finalized": true,
+        } },
+      )
+      .await
+      .context(
+        "Failed to persist recovered Stack finalization outcome",
+      )?;
+    stored.recovered_stack_id = Some(stack.id.clone());
+    stored.recovered_stack_finalized = true;
+  }
+
+  let acknowledged = periphery
+    .request(FinalizeVykarRestore {
+      journal_id: stored.id.clone(),
+      commit: true,
+      acknowledge: true,
+    })
+    .await?;
+  if !acknowledged.complete
+    || acknowledged.rolled_back
+    || acknowledged.critical_error.is_some()
+  {
+    return Err(anyhow!(
+      "Periphery did not acknowledge recovered Stack restore commit: {}",
+      acknowledged
+        .critical_error
+        .unwrap_or_else(|| "incomplete acknowledgement".into())
+    ));
+  }
+  Stack::coll()
+    .update_one(
+      doc! {
+        "_id": database::bson::oid::ObjectId::parse_str(&stack.id)?,
+        "info.recovery_plan_id": &stored.id,
+      },
+      doc! { "$unset": { "info.recovery_plan_id": "" } },
+    )
+    .await
+    .context(
+      "Failed to clear recovered Stack reconciliation marker",
+    )?;
+  plans_collection()
+    .delete_one(doc! { "_id": &stored.id })
+    .await
+    .context("Failed to delete completed restore plan")?;
+  Ok(())
+}
+
 pub async fn execute_restore(
   plan_id: &str,
   user: &User,
@@ -4016,11 +4138,13 @@ pub async fn execute_restore(
   let _repository_roles =
     repository_role_barrier().clone().read_owned().await;
   let mutation_guard = mutation_barrier().write().await;
-  let stored = plans_collection()
+  let mut stored = plans_collection()
     .find_one(doc! { "_id": plan_id, "created_by": &user.id })
     .await?
     .context("Restore plan does not exist")?;
-  if stored.plan.expires_at < komodo_timestamp() {
+  if stored.plan.expires_at < komodo_timestamp()
+    && stored.recovered_stack_name.is_none()
+  {
     plans_collection()
       .delete_one(doc! { "_id": &stored.id })
       .await?;
@@ -4090,10 +4214,10 @@ pub async fn execute_restore(
         "Recovered Stack name is not normalized; create a new preflight"
       ));
     }
-    if Stack::coll()
+    if let Some(existing) = Stack::coll()
       .find_one(doc! { "name": recovered_name })
       .await?
-      .is_some()
+      && !recovered_stack_belongs_to_plan(&stored, &existing)
     {
       return Err(anyhow!(
         "A Stack named '{recovered_name}' now exists; create a new preflight"
@@ -4180,147 +4304,221 @@ pub async fn execute_restore(
         config.repo = Some(String::new());
         config.linked_repo = Some(String::new());
         Stack::validate_create_config(&mut config, user).await?;
-        if Stack::coll()
+        let existing = Stack::coll()
           .find_one(doc! { "name": &name })
-          .await?
-          .is_some()
+          .await?;
+        if stored.plan.expires_at < komodo_timestamp()
+          && existing.is_none()
         {
           return Err(anyhow!(
-            "A Stack named '{name}' now exists; create a new preflight"
+            "Restore plan expired before recovered Stack creation; reconciliation will discard any interrupted publication"
           ));
         }
-        Some((name, config))
+        if let Some(existing) = &existing {
+          if !recovered_stack_belongs_to_plan(&stored, existing) {
+            return Err(anyhow!(
+              "A Stack named '{name}' now exists and is not linked to this restore plan; create a new preflight"
+            ));
+          }
+          let expected: StackConfig = config.clone().into();
+          if to_document(&existing.config)? != to_document(&expected)? {
+            return Err(anyhow!(
+              "Recovered Stack '{name}' changed before restore finalization"
+            ));
+          }
+        } else if stored.recovered_stack_id.is_some()
+          || stored.recovered_stack_finalized
+        {
+          return Err(anyhow!(
+            "Recovered Stack recorded by this restore plan no longer exists"
+          ));
+        }
+        Some((name, config, existing))
       } else {
         None
       };
     let periphery = periphery_client(&server).await?;
-    let response = periphery
-      .request(TransactionalVykarRestore {
-        target,
-        repository: repository_for_periphery(
-          &settings.primary,
-          false,
-        )?,
-        advanced: settings.advanced,
-        hostname: format!("komodo-periphery-{}", server.id),
-        snapshot_name: stored.plan.snapshot.clone(),
-        selected_paths: stored.plan.selected_paths.clone(),
-        publish: stored.publish.clone(),
-        journal_id: run.id.clone(),
-        volume_restore_plan_id: stored.id.clone(),
-        create_volume_if_missing: stored.create_volume_if_missing,
-        bind_path_mappings: stored.bind_path_mappings.clone(),
-        defer_finalize: recovered_creation.is_some(),
-      })
-      .await?;
-    if let Some(error) = response.critical_error {
-      *critical_alert().write().unwrap() = Some(error.clone());
-      return finish_run(
-        run.clone(),
-        BackupRunState::Failed,
-        error,
-      )
-      .await;
+    let existing_recovered_stack = recovered_creation
+      .as_ref()
+      .and_then(|(_, _, existing)| existing.as_ref());
+    let journal_id = if recovered_creation.is_some() {
+      stored.id.clone()
+    } else {
+      run.id.clone()
+    };
+    if recovered_creation.is_some()
+      && existing_recovered_stack.is_none()
+    {
+      // A prior attempt can crash after publication but before the marked
+      // Stack insert. Reset only that stable plan journal before replaying.
+      let reset = periphery
+        .request(FinalizeVykarRestore {
+          journal_id: journal_id.clone(),
+          commit: false,
+          acknowledge: true,
+        })
+        .await?;
+      if !reset.complete
+        || !reset.rolled_back
+        || reset.critical_error.is_some()
+      {
+        return Err(anyhow!(
+          "Previous recovered Stack publication could not be reset: {}",
+          reset
+            .critical_error
+            .unwrap_or_else(|| "incomplete rollback".into())
+        ));
+      }
     }
-    if !response.complete {
-      return finish_run(
-        run.clone(),
-        BackupRunState::Failed,
-        if response.rolled_back {
-          "Restore failed and was rolled back"
-        } else {
-          "Restore did not complete"
-        },
-      )
-      .await;
+    if existing_recovered_stack.is_none() {
+      let response = periphery
+        .request(TransactionalVykarRestore {
+          target,
+          repository: repository_for_periphery(
+            &settings.primary,
+            false,
+          )?,
+          advanced: settings.advanced,
+          hostname: format!("komodo-periphery-{}", server.id),
+          snapshot_name: stored.plan.snapshot.clone(),
+          selected_paths: stored.plan.selected_paths.clone(),
+          publish: stored.publish.clone(),
+          journal_id,
+          volume_restore_plan_id: stored.id.clone(),
+          create_volume_if_missing: stored.create_volume_if_missing,
+          bind_path_mappings: stored.bind_path_mappings.clone(),
+          defer_finalize: recovered_creation.is_some(),
+        })
+        .await?;
+      if let Some(error) = response.critical_error {
+        *critical_alert().write().unwrap() = Some(error.clone());
+        return finish_run(
+          run.clone(),
+          BackupRunState::Failed,
+          error,
+        )
+        .await;
+      }
+      if !response.complete {
+        return finish_run(
+          run.clone(),
+          BackupRunState::Failed,
+          if response.rolled_back {
+            "Restore failed and was rolled back"
+          } else {
+            "Restore did not complete"
+          },
+        )
+        .await;
+      }
+      if recovered_creation.is_some() != response.finalization_pending {
+        return Err(anyhow!(
+          "Periphery returned an inconsistent restore finalization state"
+        ));
+      }
     }
-    if recovered_creation.is_some() != response.finalization_pending {
-      return Err(anyhow!(
-        "Periphery returned an inconsistent restore finalization state"
-      ));
-    }
-    if let Some((name, config)) = recovered_creation {
-      let create_error =
-        match resource::create::<Stack>(&name, config, None, user).await
+    if let Some((name, config, existing)) = recovered_creation {
+      let creation = if let Some(existing) = existing {
+        Ok(existing)
+      } else {
+        let mut info = Stack::default_info().await?;
+        info.recovery_plan_id = Some(stored.id.clone());
+        match resource::create::<Stack>(
+          &name,
+          config,
+          Some(info),
+          user,
+        )
+        .await
         {
-          Ok(_) => None,
+          Ok(stack) => Ok(stack),
           Err(error) => {
             match Stack::coll().find_one(doc! { "name": &name }).await
             {
-              Ok(Some(_)) => {
+              Ok(Some(stack))
+                if stack.info.recovery_plan_id.as_deref()
+                  == Some(stored.id.as_str()) =>
+              {
                 warn!(
                   "Recovered Stack '{name}' was inserted but post-create bookkeeping failed: {:#}",
                   error.error
                 );
-                None
+                Ok(stack)
               }
-              Ok(None) => Some(error.error),
-              Err(check_error) => Some(check_error.context(format!(
-                "Recovered Stack creation failed and insertion could not be confirmed: {:#}",
-                error.error
-              ))),
+              Ok(_) => Err(error.error),
+              Err(check_error) => Err(
+                anyhow::Error::new(check_error).context(format!(
+                  "Recovered Stack creation failed and insertion could not be confirmed: {:#}",
+                  error.error
+                )),
+              ),
             }
           }
-        };
-      if let Some(create_error) = create_error {
-        let rollback = periphery
-          .request(FinalizeVykarRestore {
-            journal_id: run.id.clone(),
-            commit: false,
-          })
-          .await;
-        match rollback {
-          Ok(response)
-            if response.complete
-              && response.rolled_back
-              && response.critical_error.is_none() => {}
-          Ok(response) => {
-            let message = response.critical_error.unwrap_or_else(|| {
-              "Periphery did not confirm restore rollback".into()
-            });
-            *critical_alert().write().unwrap() = Some(message.clone());
-            return Err(create_error.context(message));
-          }
-          Err(rollback_error) => {
-            let message = format!(
-              "Recovered Stack creation failed and restore rollback could not be confirmed: {rollback_error:#}"
-            );
-            *critical_alert().write().unwrap() = Some(message.clone());
-            return Err(create_error.context(message));
-          }
-        }
-        return Err(create_error);
-      }
-      let finalized = match periphery
-        .request(FinalizeVykarRestore {
-          journal_id: run.id.clone(),
-          commit: true,
-        })
-        .await
-      {
-        Ok(finalized) => finalized,
-        Err(error) => {
-          let message = format!(
-            "Recovered Stack was inserted but restore commit could not be confirmed: {error:#}"
-          );
-          *critical_alert().write().unwrap() = Some(message.clone());
-          return Err(anyhow!(message));
         }
       };
-      if !finalized.complete
-        || finalized.rolled_back
-        || finalized.critical_error.is_some()
+      let recovered_stack = match creation {
+        Ok(stack) => stack,
+        Err(create_error) => {
+          let rollback = periphery
+            .request(FinalizeVykarRestore {
+              journal_id: stored.id.clone(),
+              commit: false,
+              acknowledge: true,
+            })
+            .await;
+          match rollback {
+            Ok(response)
+              if response.complete
+                && response.rolled_back
+                && response.critical_error.is_none() => {}
+            Ok(response) => {
+              let message = response.critical_error.unwrap_or_else(|| {
+                "Periphery did not confirm restore rollback".into()
+              });
+              *critical_alert().write().unwrap() =
+                Some(message.clone());
+              return Err(create_error.context(message));
+            }
+            Err(rollback_error) => {
+              let message = format!(
+                "Recovered Stack creation failed and restore rollback could not be confirmed: {rollback_error:#}"
+              );
+              *critical_alert().write().unwrap() =
+                Some(message.clone());
+              return Err(create_error.context(message));
+            }
+          }
+          return Err(create_error);
+        }
+      };
+      if stored.recovered_stack_id.as_deref()
+        != Some(recovered_stack.id.as_str())
       {
-        let message = finalized.critical_error.unwrap_or_else(|| {
-          "Periphery did not confirm recovered Stack restore commit".into()
-        });
+        plans_collection()
+          .update_one(
+            doc! { "_id": &stored.id },
+            doc! { "$set": { "recovered_stack_id": &recovered_stack.id } },
+          )
+          .await
+          .context("Failed to persist recovered Stack identity")?;
+        stored.recovered_stack_id = Some(recovered_stack.id.clone());
+      }
+      if let Err(error) = finalize_recovered_stack_saga(
+        &mut stored,
+        &server,
+        &recovered_stack,
+      )
+      .await
+      {
+        let message = format!(
+          "Recovered Stack finalization requires reconciliation: {error:#}"
+        );
         *critical_alert().write().unwrap() = Some(message.clone());
         return Err(anyhow!(message));
       }
     }
-    // Keep the exclusive mutation barrier through recovered Stack creation so
-    // a competing create cannot be mistaken for our insert after a
-    // post-insert bookkeeping failure.
+    // Keep the exclusive mutation barrier through recovered Stack creation
+    // and finalization so a competing mutation cannot obscure saga state.
     drop(mutation_guard);
     if let Err(error) = plans_collection()
       .delete_one(doc! { "_id": &stored.id })
@@ -4392,12 +4590,10 @@ fn purge_abandoned_core_staging() -> anyhow::Result<()> {
       Ok(()) => {}
       Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
       Err(error) => {
-        return Err(anyhow::Error::new(error).with_context(|| {
-          format!(
-            "Failed to purge abandoned Core staging at {}",
-            path.display()
-          )
-        }));
+        return Err(anyhow::Error::new(error).context(format!(
+          "Failed to purge abandoned Core staging at {}",
+          path.display()
+        )));
       }
     }
     std::fs::create_dir_all(path).with_context(|| {
@@ -4409,11 +4605,100 @@ fn purge_abandoned_core_staging() -> anyhow::Result<()> {
 
 async fn cleanup_expired_restore_plans() -> anyhow::Result<()> {
   plans_collection()
-    .delete_many(
-      doc! { "plan.expires_at": { "$lt": komodo_timestamp() } },
-    )
+    .delete_many(doc! {
+      "plan.expires_at": { "$lt": komodo_timestamp() },
+      "$or": [
+        { "recovered_stack_name": Bson::Null },
+        { "recovered_stack_name": { "$exists": false } },
+      ],
+    })
     .await?;
   Ok(())
+}
+
+async fn reconcile_recovered_stack_restores() -> anyhow::Result<()> {
+  let _operation = backup_operation_lock().lock().await;
+  let _mutation = mutation_barrier().write().await;
+  let collection = plans_collection();
+  let plans = find_collect(&collection, None, None).await?;
+  let mut errors = Vec::new();
+  for mut stored in plans {
+    let Some(name) = stored.recovered_stack_name.clone() else {
+      continue;
+    };
+    let outcome = async {
+      let server_id = stored
+        .plan
+        .destination_server_id
+        .as_deref()
+        .context("Recovered Stack plan has no destination Server")?;
+      let server = resource::get::<Server>(server_id).await?;
+      let existing = Stack::coll()
+        .find_one(doc! { "name": &name })
+        .await?;
+      if let Some(stack) = existing
+        && recovered_stack_belongs_to_plan(&stored, &stack)
+      {
+        finalize_recovered_stack_saga(
+          &mut stored,
+          &server,
+          &stack,
+        )
+        .await?;
+        return anyhow::Ok(());
+      }
+      if stored.recovered_stack_finalized
+        || stored.recovered_stack_id.is_some()
+      {
+        return Err(anyhow!(
+          "Recovered Stack recorded by plan '{}' is missing or no longer linked",
+          stored.id
+        ));
+      }
+      // No marked insert exists, so an interrupted publication must be
+      // rolled back. A missing journal is an idempotent acknowledgement that
+      // this plan never reached publication or was already reset.
+      let rollback = periphery_client(&server)
+        .await?
+        .request(FinalizeVykarRestore {
+          journal_id: stored.id.clone(),
+          commit: false,
+          acknowledge: true,
+        })
+        .await?;
+      if !rollback.complete
+        || !rollback.rolled_back
+        || rollback.critical_error.is_some()
+      {
+        return Err(anyhow!(
+          "Interrupted recovered Stack publication could not be rolled back: {}",
+          rollback
+            .critical_error
+            .unwrap_or_else(|| "incomplete rollback".into())
+        ));
+      }
+      if stored.plan.expires_at < komodo_timestamp() {
+        plans_collection()
+          .delete_one(doc! { "_id": &stored.id })
+          .await?;
+      }
+      anyhow::Ok(())
+    }
+    .await;
+    if let Err(error) = outcome {
+      errors.push(format!("{}: {error:#}", stored.id));
+    }
+  }
+  if errors.is_empty() {
+    Ok(())
+  } else {
+    let message = format!(
+      "Recovered Stack restore reconciliation failed: {}",
+      errors.join("; ")
+    );
+    *critical_alert().write().unwrap() = Some(message.clone());
+    Err(anyhow!(message))
+  }
 }
 
 fn parse_core_recovery_database(database: &str) -> Option<&str> {
@@ -5180,6 +5465,11 @@ pub fn spawn_scheduler() {
   }
   tokio::spawn(async {
     loop {
+      if let Err(error) = reconcile_recovered_stack_restores().await {
+        error!(
+          "Failed to reconcile recovered Stack restores: {error:#}"
+        );
+      }
       if let Err(error) = cleanup_expired_restore_plans().await {
         error!("Failed to clean expired restore plans: {error:#}");
       }
@@ -5449,6 +5739,30 @@ mod tests {
   }
 
   #[test]
+  fn core_local_repository_paths_must_be_canonical() {
+    for path in [
+      " /backups/repository",
+      "/backups/repository ",
+      "/backups/./repository",
+      "/backups/other/../repository",
+      "/backups//repository",
+      "/backups/repository/",
+    ] {
+      let repository = BackupRepository {
+        name: "Primary".into(),
+        backend: BackupRepositoryBackend::CoreLocal {
+          path: path.into(),
+        },
+        ..Default::default()
+      };
+      assert!(
+        validate_repository_definition(&repository).is_err(),
+        "accepted noncanonical path {path:?}"
+      );
+    }
+  }
+
+  #[test]
   fn selected_restore_publishes_only_selected_subtrees() {
     let roots =
       vec![periphery_client::api::backup::RestorePublishPath {
@@ -5492,6 +5806,8 @@ mod tests {
       },
       publish: Vec::new(),
       recovered_stack_name: None,
+      recovered_stack_id: None,
+      recovered_stack_finalized: false,
       recovered_stack_run_directory: None,
       destination_volume_name: None,
       create_volume_if_missing: false,
