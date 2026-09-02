@@ -7,6 +7,7 @@ members = [
 	"client/core/rs",
 	"client/periphery/rs",
 ]
+# Shell tests are not Cargo workspace members.
 exclude = ["bin/tests"]
 
 [workspace.package]
