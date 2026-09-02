@@ -128,6 +128,33 @@ After API changes, rebuild the client with
 run gen-client  # Rebuild client (after API changes)
 ```
 
+## Verify a branch before merging
+
+Run the **CI** workflow against a pushed branch to check Rust formatting, Clippy,
+isolated unit tests, the workspace build, and the maintained Compose models on
+GitHub's Linux runners. You need write access to the repository.
+
+1. Push your branch to GitHub.
+2. Open the repository's **Actions** tab and select **CI**.
+3. Select **Run workflow**, choose your branch, and select **Run workflow** again.
+4. Wait for **Lint**, **Unit Tests**, and **Build** to pass for the commit you
+   intend to merge.
+
+With an authenticated GitHub CLI, you can start the same checks from the
+repository checkout:
+
+```sh
+gh workflow run CI.yaml --ref YOUR_BRANCH
+```
+
+Manual runs perform verification only. Container publication remains limited to
+pushes to `main` and release tags. If a job fails, open its first failing step,
+fix the reported error, push the correction, and run CI for the updated branch.
+
+The Rust workspace lists `bin/cli`, `bin/core`, and `bin/periphery` explicitly.
+Keep shell test and helper directories such as `bin/tests` outside the Cargo
+member list; add a new Rust binary crate to the list when introducing one.
+
 ## Build identity
 
 Komodo uses Git metadata as its product version. Release builds report the

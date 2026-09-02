@@ -1,4 +1,4 @@
-use std::{str::FromStr as _, sync::Arc};
+use std::sync::Arc;
 
 use anyhow::{Context, anyhow};
 use axum::http::{self, HeaderValue};

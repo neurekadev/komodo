@@ -1,7 +1,9 @@
 [workspace]
 resolver = "2"
 members = [
-	"bin/*",
+	"bin/cli",
+	"bin/core",
+	"bin/periphery",
 	"lib/*",
 	"xtask",
 	"client/core/rs",
