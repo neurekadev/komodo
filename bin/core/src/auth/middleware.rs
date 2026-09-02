@@ -7,6 +7,18 @@ use crate::{
   auth::JWT_PROVIDER, helpers::query::get_user, state::db_client,
 };
 
+/// Hold the snapshot barrier for the entire auth request, including OAuth
+/// callbacks and login-time MFA updates. Guarding the router avoids recursive
+/// acquisition when AuthImpl is called by an already guarded write/execute.
+pub async fn backup_mutation_guard(
+  request: axum::extract::Request,
+  next: axum::middleware::Next,
+) -> axum::response::Response {
+  let _mutation_guard =
+    crate::backup::mutation_barrier().read().await;
+  next.run(request).await
+}
+
 pub async fn extract_user_from_auth(
   auth: RequestAuthentication,
   require_user_enabled: bool,

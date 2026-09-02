@@ -595,22 +595,28 @@ function BackupSettingsForm({
         </Accordion.Item>
       </Accordion>
 
+      {settingsDirty && (
+        <Text size="sm" c="dimmed">
+          Save the displayed settings before initializing, verifying, promoting, or running backups.
+        </Text>
+      )}
       <Group justify="end">
-        <Button variant="default" loading={verifying} onClick={() => verify({ mirror: false, full: true })}>
+        <Button variant="default" loading={verifying} disabled={settingsDirty || saving} onClick={() => verify({ mirror: false, full: true })}>
           Verify primary
         </Button>
         {settings.mirror && (
           <>
-            <Button variant="default" loading={verifying} onClick={() => verify({ mirror: true, full: true })}>
+            <Button variant="default" loading={verifying} disabled={settingsDirty || saving} onClick={() => verify({ mirror: true, full: true })}>
               Verify mirror
             </Button>
-            <Button color="orange" loading={promoting} onClick={() => promote({ allow_primary_unavailable: false })}>
+            <Button color="orange" loading={promoting} disabled={settingsDirty || saving} onClick={() => promote({ allow_primary_unavailable: false })}>
               Verify and promote mirror
             </Button>
             <Button
               color="red"
               variant="light"
               loading={promoting}
+              disabled={settingsDirty || saving}
               onClick={() => {
                 if (globalThis.confirm("The primary repository is unavailable. Fully verify and promote the mirror without comparing it to the primary inventory?")) {
                   promote({ allow_primary_unavailable: true });
@@ -624,7 +630,7 @@ function BackupSettingsForm({
         <Button
           variant="default"
           loading={initializing}
-          disabled={settingsDirty}
+          disabled={settingsDirty || saving}
           title={
             settingsDirty
               ? "Save the displayed settings before initializing repositories."
@@ -634,12 +640,13 @@ function BackupSettingsForm({
         >
           Initialize repositories
         </Button>
-        <Button variant="light" loading={running} onClick={() => run({})}>
+        <Button variant="light" loading={running} disabled={settingsDirty || saving} onClick={() => run({})}>
           Back up fleet now
         </Button>
         <Button
           variant="light"
           loading={running}
+          disabled={settingsDirty || saving}
           onClick={() => run({ target: { type: "Core" } })}
         >
           Back up Core now

@@ -113,6 +113,10 @@ struct StoredRestorePlan {
   publish: Vec<periphery_client::api::backup::RestorePublishPath>,
   #[serde(default)]
   recovered_stack_name: Option<String>,
+  /// Set durably before the first publication request. Legacy plans have
+  /// unknown execution state and must still be reconciled conservatively.
+  #[serde(default = "legacy_restore_execution_started")]
+  recovered_stack_execution_started: bool,
   /// Stack identity written after the atomically marked resource insert.
   #[serde(default)]
   recovered_stack_id: Option<String>,
@@ -145,6 +149,10 @@ struct StoredRestorePlan {
   /// with the confirmed plan so execution cannot substitute new mappings.
   #[serde(default)]
   bind_path_mappings: HashMap<String, String>,
+}
+
+fn legacy_restore_execution_started() -> bool {
+  true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4135,13 +4143,10 @@ pub async fn plan_restore(
     }
   }
   validate_non_overlapping_destinations(&publish)?;
-  let volume_destination_changed = matches!(
+  let volume_confirmation_required = volume_requires_confirmation(
     &snapshot.target,
-    BackupTarget::Volume {
-      server_id,
-      volume_name,
-    } if destination_server_id.as_deref() != Some(server_id)
-      || destination_volume_name.as_ref().is_some_and(|name| name != volume_name)
+    destination_server_id.as_deref(),
+    destination_volume_name.as_deref(),
   );
   let destination_server = destination_server_id
     .clone()
@@ -4172,12 +4177,12 @@ pub async fn plan_restore(
       publish: publish.clone(),
     })
     .await?;
-  if volume_destination_changed
+  if volume_confirmation_required
     && !confirm_existing_volume
     && preflight.destination_exists
   {
     return Err(anyhow!(
-      "Restore into a different existing volume requires explicit confirmation"
+      "Restore into an explicitly selected or different existing volume requires confirmation"
     ));
   }
   let create_volume_if_missing =
@@ -4202,6 +4207,7 @@ pub async fn plan_restore(
       plan: plan.clone(),
       publish,
       recovered_stack_name,
+      recovered_stack_execution_started: false,
       recovered_stack_id: None,
       recovered_stack_finalized: false,
       recovered_stack_run_directory,
@@ -4218,6 +4224,16 @@ pub async fn plan_restore(
     })
     .await?;
   Ok(plan)
+}
+
+fn volume_requires_confirmation(
+  source: &BackupTarget,
+  destination_server_id: Option<&str>,
+  destination_volume_name: Option<&str>,
+) -> bool {
+  matches!(source, BackupTarget::Volume { server_id, .. }
+    if destination_volume_name.is_some()
+      || destination_server_id.is_some_and(|destination| destination != server_id))
 }
 
 fn selected_publish_paths(
@@ -4490,7 +4506,8 @@ pub async fn execute_restore(
     .await?
     .context("Restore plan does not exist")?;
   if stored.plan.expires_at < komodo_timestamp()
-    && stored.recovered_stack_name.is_none()
+    && (stored.recovered_stack_name.is_none()
+      || !stored.recovered_stack_execution_started)
   {
     plans_collection()
       .delete_one(doc! { "_id": &stored.id })
@@ -4701,6 +4718,7 @@ pub async fn execute_restore(
     };
     if recovered_creation.is_some()
       && existing_recovered_stack.is_none()
+      && stored.recovered_stack_execution_started
     {
       // A prior attempt can crash after publication but before the marked
       // Stack insert. Reset only that stable plan journal before replaying.
@@ -4724,6 +4742,20 @@ pub async fn execute_restore(
       }
     }
     if existing_recovered_stack.is_none() {
+      if recovered_creation.is_some() {
+        // Persist before the RPC: an interrupted or lost response may already
+        // have published files and must be reconciled after Core restarts.
+        let updated = plans_collection()
+          .update_one(
+            doc! { "_id": &stored.id },
+            doc! { "$set": { "recovered_stack_execution_started": true } },
+          )
+          .await?;
+        if updated.matched_count != 1 {
+          return Err(anyhow!("Restore plan expired before execution"));
+        }
+        stored.recovered_stack_execution_started = true;
+      }
       let response = periphery
         .request(TransactionalVykarRestore {
           target,
@@ -4759,6 +4791,14 @@ pub async fn execute_restore(
         .await;
       }
       if !response.complete {
+        if recovered_creation.is_some() && response.rolled_back {
+          plans_collection()
+            .update_one(
+              doc! { "_id": &stored.id },
+              doc! { "$set": { "recovered_stack_execution_started": false } },
+            )
+            .await?;
+        }
         return finish_run(
           run.clone(),
           BackupRunState::Failed,
@@ -4829,7 +4869,14 @@ pub async fn execute_restore(
             Ok(response)
               if response.complete
                 && response.rolled_back
-                && response.critical_error.is_none() => {}
+                && response.critical_error.is_none() => {
+                  plans_collection()
+                    .update_one(
+                      doc! { "_id": &stored.id },
+                      doc! { "$set": { "recovered_stack_execution_started": false } },
+                    )
+                    .await?;
+                }
             Ok(response) => {
               let message = response.critical_error.unwrap_or_else(|| {
                 "Periphery did not confirm restore rollback".into()
@@ -4967,6 +5014,7 @@ async fn cleanup_expired_restore_plans() -> anyhow::Result<()> {
       "$or": [
         { "recovered_stack_name": Bson::Null },
         { "recovered_stack_name": { "$exists": false } },
+        { "recovered_stack_execution_started": false },
       ],
     })
     .await?;
@@ -4977,7 +5025,12 @@ async fn reconcile_recovered_stack_restores() -> anyhow::Result<()> {
   let _operation = backup_operation_lock().lock().await;
   let _mutation = mutation_barrier().write().await;
   let collection = plans_collection();
-  let plans = find_collect(&collection, None, None).await?;
+  let plans = find_collect(
+    &collection,
+    doc! { "recovered_stack_execution_started": { "$ne": false } },
+    None,
+  )
+  .await?;
   let mut errors = Vec::new();
   for mut stored in plans {
     let Some(name) = stored.recovered_stack_name.clone() else {
@@ -5037,6 +5090,15 @@ async fn reconcile_recovered_stack_restores() -> anyhow::Result<()> {
       if stored.plan.expires_at < komodo_timestamp() {
         plans_collection()
           .delete_one(doc! { "_id": &stored.id })
+          .await?;
+      } else {
+        // A proven rollback no longer needs the destination online. A later
+        // explicit execution will set this marker again before publishing.
+        plans_collection()
+          .update_one(
+            doc! { "_id": &stored.id },
+            doc! { "$set": { "recovered_stack_execution_started": false } },
+          )
           .await?;
       }
       anyhow::Ok(())
@@ -6214,6 +6276,63 @@ mod tests {
   }
 
   #[test]
+  fn explicit_volume_recovery_requires_existing_destination_confirmation()
+   {
+    let source = BackupTarget::Volume {
+      server_id: "server".into(),
+      volume_name: "data".into(),
+    };
+    assert!(!volume_requires_confirmation(
+      &source,
+      Some("server"),
+      None
+    ));
+    assert!(!volume_requires_confirmation(&source, None, None));
+    assert!(volume_requires_confirmation(
+      &source,
+      Some("server"),
+      Some("data")
+    ));
+    assert!(volume_requires_confirmation(
+      &source,
+      Some("server"),
+      Some("new")
+    ));
+    assert!(volume_requires_confirmation(
+      &source,
+      Some("other"),
+      None
+    ));
+    assert!(!volume_requires_confirmation(
+      &BackupTarget::Core,
+      None,
+      Some("data")
+    ));
+  }
+
+  #[test]
+  fn unstarted_restore_plans_are_distinct_from_legacy_unknown_state()
+  {
+    let mut document = serde_json::json!({
+      "_id": "plan",
+      "plan": BackupRestorePlan::default(),
+      "publish": [],
+      "recovered_stack_name": "recovered",
+    });
+    let legacy: StoredRestorePlan =
+      serde_json::from_value(document.clone()).unwrap();
+    assert!(legacy.recovered_stack_execution_started);
+    document["recovered_stack_execution_started"] = false.into();
+    let unstarted: StoredRestorePlan =
+      serde_json::from_value(document.clone()).unwrap();
+    assert!(!unstarted.recovered_stack_execution_started);
+    document["recovered_stack_execution_started"] = true.into();
+    let started: StoredRestorePlan =
+      serde_json::from_value(document).unwrap();
+    assert!(started.recovered_stack_execution_started);
+  }
+
+  #[test]
   fn restore_preview_must_still_match_at_execution() {
     let stored = StoredRestorePlan {
       id: "plan".into(),
@@ -6225,6 +6344,7 @@ mod tests {
       },
       publish: Vec::new(),
       recovered_stack_name: None,
+      recovered_stack_execution_started: false,
       recovered_stack_id: None,
       recovered_stack_finalized: false,
       recovered_stack_run_directory: None,

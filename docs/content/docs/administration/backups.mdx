@@ -18,7 +18,10 @@ Komodo uses the pinned Rust libraries from [Vykar v0.19.1](https://github.com/bo
 5. Choose how many complete snapshots to retain for each category. The value applies separately to Core, every Stack, and every Server/Volume pair.
 6. Keep **Stop affected containers while backing up** enabled unless your applications provide their own consistency guarantees.
 7. Review the bind-mount and anonymous-volume safety controls under **What to protect**.
-8. Save, initialize the repositories, and run the first fleet backup. Check **Fleet status** for partial nodes or integrity failures.
+8. Select **Save settings**. If you added a Core-local mirror or changed a Core-local path, restart Core now so its Periphery endpoints use the saved locations.
+9. Select **Initialize repositories**, then **Back up fleet now**. Check **Fleet status** for partial nodes or integrity failures.
+
+Save form changes before initializing, verifying, promoting a mirror, or starting a manual backup. Those actions are disabled while displayed settings are unsaved or being saved, so they cannot act on an older repository or protection policy.
 
 Defaults are daily at 01:00 in the Core timezone, 14 complete backups per category, all eligible named resources included, and safe container stopping enabled. Cross-filesystem mount content and anonymous Docker volumes are excluded unless explicitly enabled.
 
@@ -26,7 +29,7 @@ Defaults are daily at 01:00 in the Core timezone, 14 complete backups per catego
 
 ### Core
 
-A Core backup is a consistent, versioned export of Komodo's restorable database collections. It is a control-plane backup, not an operating-system image. Secrets used to access repositories, including encryption passphrases, are sealed with a persistent Core key and are never returned by the API or included in Core exports. Back up `/core-secrets/backup.key` separately with the deployment configuration; Core snapshots intentionally do not contain that key.
+A Core backup is a consistent, versioned export of Komodo's restorable database collections. Authentication requests, including account creation, password changes, linked logins, passkeys, and MFA updates, wait while the logical export holds its snapshot barrier. It is a control-plane backup, not an operating-system image. Secrets used to access repositories, including encryption passphrases, are sealed with a persistent Core key and are never returned by the API or included in Core exports. Back up `/core-secrets/backup.key` separately with the deployment configuration; Core snapshots intentionally do not contain that key.
 
 ### Stacks
 
@@ -88,7 +91,11 @@ Before confirmation, Komodo lists paths that will be created, overwritten, and d
 
 Restore preflight and execution both reject any destination that overlaps a configured Core-local repository, including the matching repository subtree in a bind mount or named volume attached to Core. Other directories in the same shared volume remain available as backup and restore roots. This prevents Volume recovery and recovered Stack bind mappings from replacing the active backup repository.
 
+The preview treats destination symlinks as entries to replace, not directories to traverse. Files behind those links are neither listed as deleted nor changed by replacing the link.
+
 When a restore creates a recovered Stack, Core marks that new resource with the restore-plan identity before it asks Periphery to commit the filesystem publication. Periphery retains the rollback journal and the final commit receipt until Core acknowledges the matching database state. After an interrupted Core or Periphery restart, Komodo reconciles that marker automatically; do not delete or repurpose the recovered Stack while reconciliation is pending.
+
+Creating a preflight does not start a restore. Unexecuted plans expire after 15 minutes without contacting the destination or raising a recovery alert if that Server goes offline. Core durably marks execution before sending a publication request; only started or legacy plans with unknown execution state require restart reconciliation. A confirmed rollback clears that execution marker.
 
 ### Restore to another Periphery
 
@@ -96,7 +103,7 @@ The source Periphery does not need to be online. Choose any connected destinatio
 
 - A cross-node Stack restore requires a unique new Stack name and explicit absolute bind-path mappings. Komodo creates a recovered Stack; the original is not retargeted. Snapshot manifests retain absolute Compose symlink aliases so recovered Compose files are rewritten through the canonical mapped source rather than keeping a stale alias from the old host.
 - A cross-node Volume restore creates a new local volume, unless you explicitly confirm restoring into an existing local destination volume.
-- A resource-tab same-node restore defaults to the original location. The administrator inventory asks for a destination volume name even on the original Server, so it can recover a deleted Volume under a new name.
+- A resource-tab same-node restore defaults to the original location. The administrator inventory asks for a destination volume name even on the original Server, so it can recover a deleted Volume under a new name. Explicitly selecting any existing volume requires the existing-destination confirmation, including the original Server and volume name.
 
 After recovery, review application-specific ownership, external databases, DNS, secrets, and hardware dependencies before starting unrelated workloads.
 

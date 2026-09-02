@@ -64,7 +64,11 @@ pub async fn app() -> anyhow::Result<Router> {
       .route("/version", get(|| async { env!("CARGO_PKG_VERSION") }))
       .nest(
         "/auth",
-        mogh_auth_server::api::router::<KomodoAuthImpl>(),
+        mogh_auth_server::api::router::<KomodoAuthImpl>().layer(
+          axum::middleware::from_fn(
+            crate::auth::middleware::backup_mutation_guard,
+          ),
+        ),
       )
       .nest("/user", user_router())
       .nest("/read", read::router())

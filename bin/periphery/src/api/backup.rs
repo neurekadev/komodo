@@ -1970,10 +1970,17 @@ fn compare_restore_paths(
       Path::new(&mapping.destination).join(relative)
     };
     expected.insert(destination.clone());
-    if !path_lexists(&destination) {
-      created.push(destination.to_string_lossy().into_owned());
-    } else if !item.directory || !destination.is_dir() {
-      overwritten.push(destination.to_string_lossy().into_owned());
+    match restore_preview_metadata(
+      Path::new(&mapping.destination),
+      &destination,
+    )? {
+      None => {
+        created.push(destination.to_string_lossy().into_owned())
+      }
+      Some(metadata) if !item.directory || !metadata.is_dir() => {
+        overwritten.push(destination.to_string_lossy().into_owned());
+      }
+      Some(_) => {}
     }
   }
 
@@ -2009,6 +2016,33 @@ fn compare_restore_paths(
   Ok((created, overwritten, deleted))
 }
 
+/// Publication replaces symlinks instead of following them. Descendants of
+/// a replaced symlink (or file) are therefore created, regardless of what
+/// exists beyond that link in the host filesystem.
+fn restore_preview_metadata(
+  root: &Path,
+  destination: &Path,
+) -> anyhow::Result<Option<std::fs::Metadata>> {
+  let mut path = root.to_path_buf();
+  let mut components = destination.strip_prefix(root)?.components();
+  loop {
+    let metadata = match std::fs::symlink_metadata(&path) {
+      Ok(metadata) => metadata,
+      Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        return Ok(None);
+      }
+      Err(error) => return Err(error.into()),
+    };
+    let Some(component) = components.next() else {
+      return Ok(Some(metadata));
+    };
+    if !metadata.is_dir() {
+      return Ok(None);
+    }
+    path.push(component.as_os_str());
+  }
+}
+
 fn map_snapshot_path<'a>(
   snapshot_path: &str,
   publish: &'a [RestorePublishPath],
@@ -2038,13 +2072,17 @@ fn collect_unexpected_paths(
   expected: &HashSet<PathBuf>,
   deleted: &mut Vec<String>,
 ) -> anyhow::Result<()> {
-  if !path_lexists(root) {
-    return Ok(());
-  }
+  let metadata = match std::fs::symlink_metadata(root) {
+    Ok(metadata) => metadata,
+    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+      return Ok(());
+    }
+    Err(error) => return Err(error.into()),
+  };
   if !expected.contains(root) {
     deleted.push(root.to_string_lossy().into_owned());
   }
-  if root.is_dir() {
+  if metadata.is_dir() {
     for entry in std::fs::read_dir(root)? {
       let entry = entry?;
       let path = entry.path();
@@ -3735,6 +3773,69 @@ mod tests {
     assert!(created.iter().any(|path| path.ends_with("new.txt")));
     assert!(overwritten.iter().any(|path| path.ends_with("old.txt")));
     assert!(deleted.iter().any(|path| path.ends_with("extra.txt")));
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn restore_preflight_never_follows_destination_symlinks() {
+    let destination = tempfile::tempdir().unwrap();
+    let unrelated = tempfile::tempdir().unwrap();
+    std::fs::write(unrelated.path().join("private.txt"), b"private")
+      .unwrap();
+    std::fs::write(unrelated.path().join("restored.txt"), b"old")
+      .unwrap();
+    for nested in [false, true] {
+      let publish_root = destination.path().join(if nested {
+        "directory"
+      } else {
+        "root-link"
+      });
+      let link = if nested {
+        std::fs::create_dir(&publish_root).unwrap();
+        publish_root.join("nested-link")
+      } else {
+        publish_root.clone()
+      };
+      std::os::unix::fs::symlink(unrelated.path(), &link).unwrap();
+      let snapshot_root = if nested {
+        "source/root/nested-link"
+      } else {
+        "source/root"
+      };
+      let mut paths = vec![
+        komodo_backup::SnapshotPath {
+          path: snapshot_root.into(),
+          directory: true,
+        },
+        komodo_backup::SnapshotPath {
+          path: format!("{snapshot_root}/restored.txt"),
+          directory: false,
+        },
+      ];
+      if nested {
+        paths.push(komodo_backup::SnapshotPath {
+          path: "source/root".into(),
+          directory: true,
+        });
+      }
+      let publish = vec![RestorePublishPath {
+        snapshot_path: "source/root".into(),
+        destination: publish_root.to_string_lossy().into_owned(),
+      }];
+      let (created, overwritten, deleted) =
+        compare_restore_paths(&paths, &publish, &[]).unwrap();
+      assert_eq!(
+        created,
+        vec![
+          link.join("restored.txt").to_string_lossy().into_owned()
+        ]
+      );
+      assert_eq!(
+        overwritten,
+        vec![link.to_string_lossy().into_owned()]
+      );
+      assert!(deleted.is_empty());
+    }
   }
 
   #[test]
