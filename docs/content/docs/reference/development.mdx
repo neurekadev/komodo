@@ -136,9 +136,12 @@ GitHub's Linux runners. You need write access to the repository.
 
 1. Push your branch to GitHub.
 2. Open the repository's **Actions** tab and select **CI**.
-3. Select **Run workflow**, choose your branch, and select **Run workflow** again.
-4. Wait for **Lint**, **Unit Tests**, and **Build** to pass for the commit you
-   intend to merge.
+3. Select **Run workflow** and choose your branch. To verify container builds,
+   enable **Build all container images without publishing.**
+4. Select **Run workflow** again.
+5. Wait for **Lint**, **Unit Tests**, and **Build** to pass for the commit you
+   intend to merge. When image builds are enabled, also wait for the Core,
+   Periphery, CLI, and Docs builds on AMD64 and ARM64.
 
 With an authenticated GitHub CLI, you can start the same checks from the
 repository checkout:
@@ -147,13 +150,21 @@ repository checkout:
 gh workflow run CI.yaml --ref YOUR_BRANCH
 ```
 
+Include the container builds when changing Cargo workspace membership,
+Dockerfiles, build contexts, or image dependencies:
+
+```sh
+gh workflow run CI.yaml --ref YOUR_BRANCH -f build-images=true
+```
+
 Manual runs perform verification only. Container publication remains limited to
 pushes to `main` and release tags. If a job fails, open its first failing step,
 fix the reported error, push the correction, and run CI for the updated branch.
 
-The Rust workspace lists `bin/cli`, `bin/core`, and `bin/periphery` explicitly.
-Keep shell test and helper directories such as `bin/tests` outside the Cargo
-member list; add a new Rust binary crate to the list when introducing one.
+The Rust workspace uses `bin/*` so each Docker build can copy only the binary
+crates needed by that image. Its `exclude` list keeps `bin/tests` out of Cargo's
+member list. Add other non-crate directories under `bin/` to that exclusion list;
+do not require absent binary crates in these partial build contexts.
 
 ## Build identity
 
