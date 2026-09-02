@@ -88,6 +88,20 @@ pub struct VykarBackupTask {
   /// replaces once at least one repository commits the new snapshot.
   #[serde(default)]
   pub superseded_snapshot_names: Vec<String>,
+  /// Prior attempts that may still be the newest complete copy for an
+  /// individual repository. Copies are retired independently as that role
+  /// commits a newer attempt.
+  #[serde(default)]
+  pub retained_snapshots: Vec<VykarRetainedSnapshot>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct VykarRetainedSnapshot {
+  pub snapshot_name: String,
+  #[serde(default)]
+  pub retain_primary: bool,
+  #[serde(default)]
+  pub retain_mirror: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Resolve)]

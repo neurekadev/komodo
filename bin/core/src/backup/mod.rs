@@ -45,7 +45,7 @@ use komodo_client::{
 use periphery_client::api::backup::{
   CancelVykarOperation, PeripheryBackupTarget, PreflightVykarRestore,
   RunVykarBackup, RunVykarBackupBatch, TransactionalVykarRestore,
-  VykarBackupTask,
+  VykarBackupTask, VykarRetainedSnapshot,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -812,9 +812,48 @@ pub async fn initialize_repositories() -> anyhow::Result<BackupRun> {
   }
 }
 
+pub async fn finalize_interrupted_runs() -> anyhow::Result<u64> {
+  let result = runs_collection()
+    .update_many(
+      doc! {
+        "state": {
+          "$in": [
+            to_bson(&BackupRunState::Queued)?,
+            to_bson(&BackupRunState::Running)?,
+          ]
+        }
+      },
+      doc! {
+        "$set": {
+          "state": to_bson(&BackupRunState::Failed)?,
+          "message": "Core restarted before the backup operation completed",
+          "finished_at": komodo_timestamp(),
+        }
+      },
+    )
+    .await
+    .context("Failed to finalize interrupted backup runs")?;
+  Ok(result.modified_count)
+}
+
 async fn new_run(
   target: Option<BackupTarget>,
   message: &str,
+) -> anyhow::Result<BackupRun> {
+  create_run(target, message, true).await
+}
+
+async fn new_non_cancellable_run(
+  target: Option<BackupTarget>,
+  message: &str,
+) -> anyhow::Result<BackupRun> {
+  create_run(target, message, false).await
+}
+
+async fn create_run(
+  target: Option<BackupTarget>,
+  message: &str,
+  cancellable: bool,
 ) -> anyhow::Result<BackupRun> {
   let run = BackupRun {
     id: Uuid::new_v4().to_string(),
@@ -824,7 +863,16 @@ async fn new_run(
     started_at: komodo_timestamp(),
     ..Default::default()
   };
-  runs_collection().insert_one(&run).await?;
+  if !cancellable {
+    non_cancellable_runs()
+      .lock()
+      .unwrap()
+      .insert(run.id.clone());
+  }
+  if let Err(error) = runs_collection().insert_one(&run).await {
+    non_cancellable_runs().lock().unwrap().remove(&run.id);
+    return Err(error.into());
+  }
   Ok(run)
 }
 
@@ -853,6 +901,7 @@ async fn finish_run(
       .await?
       .context("Backup run disappeared while finishing");
   }
+  non_cancellable_runs().lock().unwrap().remove(&run.id);
   Ok(run)
 }
 
@@ -1026,11 +1075,23 @@ fn backup_operation_lock() -> &'static tokio::sync::Mutex<()> {
   LOCK.get_or_init(Default::default)
 }
 
+fn schedule_core_restart() {
+  tokio::spawn(async {
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    std::process::exit(75);
+  });
+}
+
 fn cancellation_tokens()
 -> &'static Mutex<HashMap<String, Arc<AtomicBool>>> {
   static TOKENS: OnceLock<Mutex<HashMap<String, Arc<AtomicBool>>>> =
     OnceLock::new();
   TOKENS.get_or_init(Default::default)
+}
+
+fn non_cancellable_runs() -> &'static Mutex<HashSet<String>> {
+  static RUNS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+  RUNS.get_or_init(Default::default)
 }
 
 fn register_cancellation_token(run_id: &str) -> Arc<AtomicBool> {
@@ -1344,6 +1405,9 @@ async fn run_fleet(
     let servers =
       find_collect(&db_client().servers, None, None).await?;
     for server in servers {
+      if !server.config.enabled {
+        continue;
+      }
       let client = match periphery_client(&server).await {
         Ok(client) => client,
         Err(error) => {
@@ -1825,6 +1889,7 @@ async fn build_node_backup_tasks(
         mirror_only: false,
         primary_only: false,
         superseded_snapshot_names: Vec::new(),
+        retained_snapshots: Vec::new(),
       }))
     }
     .await;
@@ -1866,13 +1931,19 @@ fn fresh_retry_snapshot_name(
 fn retry_tasks_after_unknown_result(
   tasks: Vec<VykarBackupTask>,
   run_id: &str,
+  mirror_configured: bool,
 ) -> Vec<VykarBackupTask> {
   tasks
     .into_iter()
     .map(|mut task| {
-      task
-        .superseded_snapshot_names
-        .push(task.snapshot_name.clone());
+      migrate_legacy_retained_snapshots(&mut task, mirror_configured);
+      task.retained_snapshots.push(VykarRetainedSnapshot {
+        snapshot_name: task.snapshot_name.clone(),
+        // A lost response is ambiguous. Preserve both possible copies until
+        // a later authoritative success replaces each repository role.
+        retain_primary: true,
+        retain_mirror: mirror_configured,
+      });
       task.mirror_only = false;
       task.primary_only = false;
       task.snapshot_name = fresh_retry_snapshot_name(&task, run_id);
@@ -1881,23 +1952,44 @@ fn retry_tasks_after_unknown_result(
     .collect()
 }
 
+fn migrate_legacy_retained_snapshots(
+  task: &mut VykarBackupTask,
+  mirror_configured: bool,
+) {
+  task.retained_snapshots.extend(
+    std::mem::take(&mut task.superseded_snapshot_names)
+      .into_iter()
+      .map(|snapshot_name| VykarRetainedSnapshot {
+        snapshot_name,
+        retain_primary: true,
+        retain_mirror: mirror_configured,
+      }),
+  );
+}
+
 async fn delete_node_snapshot_copies(
   settings: &BackupSettings,
   snapshot_name: String,
+  delete_primary: bool,
+  delete_mirror: bool,
 ) {
-  let repositories = std::iter::once(settings.primary.clone())
-    .chain(settings.mirror.clone())
-    .collect::<Vec<_>>();
+  let mut repositories = Vec::new();
+  if delete_primary {
+    repositories.push(("primary", settings.primary.clone()));
+  }
+  if delete_mirror && let Some(mirror) = settings.mirror.clone() {
+    repositories.push(("mirror", mirror));
+  }
   let settings = settings.clone();
   let cleanup = tokio::task::spawn_blocking(move || {
-    for repository in repositories {
+    for (role, repository) in repositories {
       if let Err(error) = core_repository(&repository, &settings)
         .and_then(|repository| {
           repository.delete_snapshot_if_present(&snapshot_name)
         })
       {
         warn!(
-          "Could not remove superseded node snapshot {snapshot_name}: {error:#}"
+          "Could not remove superseded {role} node snapshot {snapshot_name}: {error:#}"
         );
       }
     }
@@ -1906,6 +1998,42 @@ async fn delete_node_snapshot_copies(
   if let Err(error) = cleanup {
     warn!("Node snapshot cleanup worker failed: {error}");
   }
+}
+
+async fn retire_retained_repository_copies(
+  settings: &BackupSettings,
+  retained: &mut Vec<VykarRetainedSnapshot>,
+  primary: bool,
+) {
+  let snapshots = take_retained_repository_copies(retained, primary);
+  for snapshot in snapshots {
+    delete_node_snapshot_copies(
+      settings, snapshot, primary, !primary,
+    )
+    .await;
+  }
+}
+
+fn take_retained_repository_copies(
+  retained: &mut Vec<VykarRetainedSnapshot>,
+  primary: bool,
+) -> Vec<String> {
+  let mut snapshots = Vec::new();
+  for snapshot in retained.iter_mut() {
+    let retain = if primary {
+      &mut snapshot.retain_primary
+    } else {
+      &mut snapshot.retain_mirror
+    };
+    if *retain {
+      *retain = false;
+      snapshots.push(snapshot.snapshot_name.clone());
+    }
+  }
+  retained.retain(|snapshot| {
+    snapshot.retain_primary || snapshot.retain_mirror
+  });
+  snapshots
 }
 
 async fn run_node_batch(
@@ -1942,7 +2070,11 @@ async fn run_node_batch(
       );
       return Ok(NodeBatchOutcome {
         partial: true,
-        retry_tasks: retry_tasks_after_unknown_result(tasks, &run.id),
+        retry_tasks: retry_tasks_after_unknown_result(
+          tasks,
+          &run.id,
+          settings.mirror.is_some(),
+        ),
         retry_blocked: false,
       });
     }
@@ -1963,41 +2095,67 @@ async fn run_node_batch(
   let mut retry_tasks = Vec::new();
   for mut task in tasks {
     let Some(result) = results.remove(&task.source_label) else {
-      retry_tasks.push(task);
+      retry_tasks.extend(retry_tasks_after_unknown_result(
+        vec![task],
+        &run.id,
+        settings.mirror.is_some(),
+      ));
       continue;
     };
+    let mirror_configured = settings.mirror.is_some();
     let primary_complete =
       result.primary.complete && result.primary.error.is_none();
-    let mirror_complete = settings.mirror.is_none()
+    let mirror_complete = !mirror_configured
       || result.mirror.as_ref().is_some_and(|mirror| {
         mirror.complete && mirror.error.is_none()
       });
-    let current_complete = primary_complete
-      || settings.mirror.is_some() && mirror_complete;
-    if primary_complete && mirror_complete {
-      for superseded in
-        std::mem::take(&mut task.superseded_snapshot_names)
-      {
-        delete_node_snapshot_copies(settings, superseded).await;
-      }
+    migrate_legacy_retained_snapshots(&mut task, mirror_configured);
+    if primary_complete {
+      retire_retained_repository_copies(
+        settings,
+        &mut task.retained_snapshots,
+        true,
+      )
+      .await;
     } else {
-      let attempted = task.snapshot_name.clone();
-      if current_complete {
-        for superseded in
-          std::mem::take(&mut task.superseded_snapshot_names)
-        {
-          delete_node_snapshot_copies(settings, superseded).await;
-        }
-        task.superseded_snapshot_names.push(attempted);
+      delete_node_snapshot_copies(
+        settings,
+        task.snapshot_name.clone(),
+        true,
+        false,
+      )
+      .await;
+    }
+    if mirror_configured {
+      if mirror_complete {
+        retire_retained_repository_copies(
+          settings,
+          &mut task.retained_snapshots,
+          false,
+        )
+        .await;
       } else {
-        // Neither repository has an authoritative copy. Remove any committed
-        // partials and retain the previous successful attempt, if one exists.
-        delete_node_snapshot_copies(settings, attempted).await;
+        delete_node_snapshot_copies(
+          settings,
+          task.snapshot_name.clone(),
+          false,
+          true,
+        )
+        .await;
       }
+    }
+    if primary_complete || mirror_configured && mirror_complete {
+      task.retained_snapshots.push(VykarRetainedSnapshot {
+        snapshot_name: task.snapshot_name.clone(),
+        retain_primary: primary_complete,
+        retain_mirror: mirror_configured && mirror_complete,
+      });
+    }
+    if !(primary_complete && mirror_complete) {
       // A repository-specific retry against rediscovered live paths could put
       // different bytes under one name. Every retry is therefore a fresh,
-      // node-quiesced attempt against both repositories; the previous good
-      // attempt is retained until its replacement commits somewhere.
+      // node-quiesced attempt against both repositories. Each role's previous
+      // good attempt remains until that same role commits a replacement.
       task.mirror_only = false;
       task.primary_only = false;
       task.snapshot_name = fresh_retry_snapshot_name(&task, &run.id);
@@ -3400,6 +3558,7 @@ pub async fn execute_core_recovery(
   user_id: &str,
 ) -> anyhow::Result<BackupRun> {
   let _operation = core_recovery_operation_lock().lock().await;
+  let backup_operation = backup_operation_lock().lock().await;
   let stored = core_recovery_collection()
     .find_one(doc! { "_id": plan_id, "created_by": user_id })
     .await?
@@ -3438,10 +3597,10 @@ pub async fn execute_core_recovery(
     .await;
   // Once the durable pointer is published, restart even if recording the
   // final audit result encounters a transient database error.
-  tokio::spawn(async {
-    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-    std::process::exit(75);
-  });
+  schedule_core_restart();
+  // The durable activation pointer is now authoritative. Keep new backup and
+  // restore operations blocked until the process restarts into that database.
+  std::mem::forget(backup_operation);
   delete_result?;
   let run =
     new_run(Some(BackupTarget::Core), "Core recovery activating")
@@ -3517,6 +3676,7 @@ pub async fn verify(
   mirror: bool,
   full: bool,
 ) -> anyhow::Result<BackupRun> {
+  let _operation = backup_operation_lock().lock().await;
   let _repository_roles =
     repository_role_barrier().clone().read_owned().await;
   let settings = get_settings().await?;
@@ -3537,7 +3697,9 @@ async fn verify_repository(
     settings.primary.clone()
   };
   let health_id = if mirror { "mirror" } else { "primary" };
-  let run = new_run(None, "Repository verification running").await?;
+  let run =
+    new_non_cancellable_run(None, "Repository verification running")
+      .await?;
   let operation = async {
     let settings_for_worker = settings.clone();
     let result = tokio::task::spawn_blocking(move || {
@@ -3591,11 +3753,22 @@ fn mirror_copy_is_sufficient(
 }
 
 pub async fn promote_mirror() -> anyhow::Result<BackupSettings> {
+  let backup_operation = backup_operation_lock().lock().await;
   // Keep the exclusive role barrier from the start of mandatory verification
   // through the settings swap. No unverified mirror write can land in between.
-  let _repository_roles =
+  let repository_roles =
     repository_role_barrier().clone().write_owned().await;
   let mut settings = get_settings().await?;
+  let restart_required =
+    matches!(
+      &settings.primary.backend,
+      BackupRepositoryBackend::CoreLocal { .. }
+    ) || settings.mirror.as_ref().is_some_and(|repository| {
+      matches!(
+        &repository.backend,
+        BackupRepositoryBackend::CoreLocal { .. }
+      )
+    });
   let verification =
     verify_repository(settings.clone(), true, true).await?;
   if verification.state != BackupRunState::Complete {
@@ -3653,7 +3826,16 @@ pub async fn promote_mirror() -> anyhow::Result<BackupSettings> {
     settings.mirror.take().context("Mirror is not configured")?;
   settings.mirror =
     Some(std::mem::replace(&mut settings.primary, mirror));
-  save_settings_after_promotion(settings).await
+  let saved = save_settings_after_promotion(settings).await?;
+  if restart_required {
+    schedule_core_restart();
+    // Embedded REST handlers capture their data directories at startup. Keep
+    // both operation gates closed until restart re-registers the promoted
+    // primary and mirror routes with their new role paths.
+    std::mem::forget(repository_roles);
+    std::mem::forget(backup_operation);
+  }
+  Ok(saved)
 }
 
 pub async fn cancel_run(run_id: &str) -> anyhow::Result<BackupRun> {
@@ -3667,6 +3849,11 @@ pub async fn cancel_run(run_id: &str) -> anyhow::Result<BackupRun> {
   ) {
     return Err(anyhow!(
       "Only an active backup run can be cancelled"
+    ));
+  }
+  if non_cancellable_runs().lock().unwrap().contains(run_id) {
+    return Err(anyhow!(
+      "Repository verification cannot be cancelled once it has started"
     ));
   }
   if let Some(token) = cancellation_token(run_id) {
@@ -4012,5 +4199,39 @@ mod tests {
     assert!(!mirror_copy_is_sufficient(false, Some(true)));
     assert!(mirror_copy_is_sufficient(false, Some(false)));
     assert!(mirror_copy_is_sufficient(true, Some(true)));
+  }
+
+  #[test]
+  fn retry_retention_replaces_repository_roles_independently() {
+    let mut retained = vec![VykarRetainedSnapshot {
+      snapshot_name: "attempt-a".into(),
+      retain_primary: true,
+      retain_mirror: false,
+    }];
+
+    // Attempt B succeeds only on the mirror. Nothing may remove attempt A's
+    // primary copy merely because the mirror has a newer successful attempt.
+    assert!(
+      take_retained_repository_copies(&mut retained, false)
+        .is_empty()
+    );
+    retained.push(VykarRetainedSnapshot {
+      snapshot_name: "attempt-b".into(),
+      retain_primary: false,
+      retain_mirror: true,
+    });
+    assert!(retained.iter().any(|snapshot| {
+      snapshot.snapshot_name == "attempt-a" && snapshot.retain_primary
+    }));
+    assert!(retained.iter().any(|snapshot| {
+      snapshot.snapshot_name == "attempt-b" && snapshot.retain_mirror
+    }));
+
+    assert_eq!(
+      take_retained_repository_copies(&mut retained, true),
+      vec!["attempt-a".to_string()]
+    );
+    assert_eq!(retained.len(), 1);
+    assert_eq!(retained[0].snapshot_name, "attempt-b");
   }
 }

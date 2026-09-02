@@ -117,7 +117,20 @@ pub async fn on_startup() {
     clean_up_server_templates(),
     v2_init_missing_resource_info(),
     warn_legacy_backup_schedules(),
+    backup_run_cleanup(),
   );
+}
+
+async fn backup_run_cleanup() {
+  match crate::backup::finalize_interrupted_runs().await {
+    Ok(0) => {}
+    Ok(count) => info!(
+      "Finalized {count} interrupted backup run(s) during startup"
+    ),
+    Err(error) => {
+      error!("Failed to finalize interrupted backup runs: {error:#}")
+    }
+  }
 }
 
 async fn warn_legacy_backup_schedules() {
