@@ -255,7 +255,12 @@ function StatusSection({ status }: { status?: Types.BackupStatus }) {
         />
       </SimpleGrid>
       {status?.critical_alert && (
-        <Alert color="red" mt="md" icon={<ICONS.Alert size="1rem" />}>
+        <Alert
+          color="red"
+          mt="md"
+          icon={<ICONS.Alert size="1rem" />}
+          style={{ whiteSpace: "pre-wrap" }}
+        >
           {status.critical_alert}
         </Alert>
       )}
@@ -504,9 +509,12 @@ function BackupSettingsForm({
         </Alert>
         <Alert color="orange" mb="md">
           Every Periphery that writes to a shared Vykar repository receives
-          its encryption passphrase and can read that repository. Use separate
-          Komodo deployments and repositories for hosts that must not share
-          backup-read trust.
+          its encryption passphrase and can read that repository. Workers must
+          also trust each other's writes: a compromised worker can replace
+          another worker's Stack or Volume snapshot. Do not use cross-node
+          restore across untrusted hosts. Use separate Komodo deployments,
+          repositories, credentials, and passphrases for hosts that must not
+          share this mutual read/write trust.
         </Alert>
         <RepositoryEditor
           label="Primary"

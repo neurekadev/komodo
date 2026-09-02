@@ -236,6 +236,17 @@ pub fn router() -> Router {
     ))
 }
 
+const UPLOAD_BODY_DEADLINE: Duration = Duration::from_secs(10 * 60);
+
+async fn bounded_upload_body<T>(
+  deadline: tokio::time::Instant,
+  body: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+  tokio::time::timeout_at(deadline, body).await.context(
+    "Upload exceeded its 10-minute total transfer deadline",
+  )?
+}
+
 async fn upload(
   Extension(user): Extension<User>,
   Path(token): Path<String>,
@@ -245,6 +256,7 @@ async fn upload(
   // forwarding, Periphery publication acknowledgement, and the audit write.
   let _mutation_guard =
     crate::backup::mutation_barrier().read().await;
+  let deadline = tokio::time::Instant::now() + UPLOAD_BODY_DEADLINE;
   let session = consume_transfer_session(&token, &user.id)?;
   let TransferSessionKind::Upload {
     destination,
@@ -281,6 +293,9 @@ async fn upload(
     format!("{destination}/{file_name}")
   };
   let result = async {
+    // The deadline is fixed, not renewed by chunks. On expiry the transfer
+    // drops and sends Cancel; Complete is never sent, so staging cannot publish.
+    let (mut transfer, bytes, sha256) = bounded_upload_body(deadline, async {
     let mut transfer = periphery_client(&resolved.server)
       .await?
       .start_file_manager_upload(StartFileManagerUpload {
@@ -333,6 +348,9 @@ async fn upload(
       }
     }
     let sha256: [u8; 32] = hasher.finalize().into();
+    anyhow::Ok((transfer, bytes, sha256))
+    }).await?;
+    // Retain the barrier through publication and its bounded acknowledgement.
     transfer
       .send(FileTransferMessage::Complete { bytes, sha256 })
       .await?;
@@ -595,4 +613,39 @@ async fn audit_transfer(
   update.finalize();
   add_update(update).await?;
   Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[tokio::test]
+  async fn upload_deadline_releases_barrier_without_publication() {
+    let barrier = tokio::sync::RwLock::new(());
+    let guard = barrier.read().await;
+    let result =
+      bounded_upload_body(tokio::time::Instant::now(), async move {
+        let _guard = guard;
+        std::future::pending::<anyhow::Result<()>>().await
+      })
+      .await;
+    assert!(
+      result
+        .unwrap_err()
+        .to_string()
+        .contains("total transfer deadline")
+    );
+    assert!(barrier.try_write().is_ok());
+  }
+
+  #[tokio::test]
+  async fn upload_body_can_complete_before_its_fixed_deadline() {
+    let result = bounded_upload_body(
+      tokio::time::Instant::now() + UPLOAD_BODY_DEADLINE,
+      async { Ok(42) },
+    )
+    .await
+    .unwrap();
+    assert_eq!(result, 42);
+  }
 }

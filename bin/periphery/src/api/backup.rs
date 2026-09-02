@@ -180,6 +180,8 @@ impl Resolve<Args> for RunVykarBackup {
     _: &Args,
   ) -> anyhow::Result<RunVykarBackupResponse> {
     let _operation = backup_operation_lock().lock().await;
+    let _filesystem = protected_filesystem_guard()?;
+    ensure_no_pending_recovery()?;
     let (_cancellation, _cancellation_registration) =
       register_operation_cancellation(&self.run_id);
     let discovered = discover_source(
@@ -274,6 +276,8 @@ impl Resolve<Args> for RunVykarBackupBatch {
     _: &Args,
   ) -> anyhow::Result<RunVykarBackupBatchResponse> {
     let _operation = backup_operation_lock().lock().await;
+    let _filesystem = protected_filesystem_guard()?;
+    ensure_no_pending_recovery()?;
     let (_cancellation, _cancellation_registration) =
       register_operation_cancellation(&self.run_id);
     let mut discovered = Vec::new();
@@ -1817,9 +1821,30 @@ fn resolve_volume_publish_destinations(
 impl Resolve<Args> for TransactionalVykarRestore {
   async fn resolve(
     mut self,
-    _: &Args,
+    args: &Args,
   ) -> anyhow::Result<TransactionalVykarRestoreResponse> {
     let _operation = backup_operation_lock().lock().await;
+    let _filesystem = protected_filesystem_guard()?;
+    ensure_no_pending_recovery()?;
+    let current_preview = PreflightVykarRestore {
+      target: self.target.clone(),
+      repository: self.repository.clone(),
+      protected_repository_paths: self
+        .protected_repository_paths
+        .clone(),
+      advanced: self.advanced.clone(),
+      hostname: self.hostname.clone(),
+      snapshot_name: self.snapshot_name.clone(),
+      selected_paths: self.selected_paths.clone(),
+      publish: self.publish.clone(),
+    }
+    .resolve(args)
+    .await?;
+    if !self.expected_preview.matches(&current_preview) {
+      return Err(anyhow!(
+        "Restore preview changed before the destination filesystem was locked; create and review a fresh preflight"
+      ));
+    }
     let (_cancellation, _cancellation_registration) =
       register_operation_cancellation(&self.journal_id);
     let owned_volume_journal =
@@ -2541,6 +2566,52 @@ fn restore_journal_dir() -> anyhow::Result<PathBuf> {
     .join("restore-journals");
   std::fs::create_dir_all(&directory)?;
   Ok(directory)
+}
+
+/// Check durable journals under the operation lock before any new side effect.
+/// Even a completed deferred receipt remains owned until Core acknowledges it.
+/// Finalize and startup recovery deliberately bypass this gate to repair state.
+pub(crate) fn ensure_no_pending_recovery() -> anyhow::Result<()> {
+  ensure_recovery_directories_empty(&[
+    restore_journal_dir()?,
+    container_quiesce_journal_dir()?,
+    restore_staging_journal_dir()?,
+  ])
+}
+
+fn ensure_recovery_directories_empty(
+  directories: &[PathBuf],
+) -> anyhow::Result<()> {
+  for directory in directories {
+    for entry in std::fs::read_dir(directory)? {
+      let path = entry?.path();
+      if path.extension().and_then(|value| value.to_str())
+        == Some("json")
+      {
+        return Err(anyhow!(
+          "Backup/restore blocked by unresolved recovery journal '{}'; finish Core reconciliation or restart Periphery to recover it before retrying",
+          path.display()
+        ));
+      }
+    }
+  }
+  Ok(())
+}
+
+/// A terminal shell outlives its HTTP/WebSocket connection. Exclude it for the
+/// actual process lifetime, on the node that owns the backup/restore filesystem.
+pub(crate) fn filesystem_barrier()
+-> &'static Arc<tokio::sync::RwLock<()>> {
+  static BARRIER: OnceLock<Arc<tokio::sync::RwLock<()>>> =
+    OnceLock::new();
+  BARRIER.get_or_init(|| Arc::new(tokio::sync::RwLock::new(())))
+}
+
+fn protected_filesystem_guard()
+-> anyhow::Result<tokio::sync::OwnedRwLockWriteGuard<()>> {
+  filesystem_barrier().clone().try_write_owned().context(
+    "Backup/restore blocked by a running terminal on this Server; exit or delete its terminals, then retry",
+  )
 }
 
 fn restore_journal_path(journal_id: &str) -> anyhow::Result<PathBuf> {
@@ -3488,6 +3559,7 @@ impl Resolve<Args> for FinalizeVykarRestore {
     _: &Args,
   ) -> anyhow::Result<FinalizeVykarRestoreResponse> {
     let _operation = backup_operation_lock().lock().await;
+    let _filesystem = protected_filesystem_guard()?;
     finalize_restore_publication(
       &self.journal_id,
       self.commit,
@@ -3511,6 +3583,67 @@ impl Resolve<Args> for CancelVykarOperation {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn pending_journals_gate_new_work_until_recovery_removes_them() {
+    let directory = tempfile::tempdir().unwrap();
+    let directories = vec![directory.path().to_path_buf()];
+    assert!(ensure_recovery_directories_empty(&directories).is_ok());
+    for contents in
+      ["indeterminate", r#"{"completed":true,"deferred":true}"#]
+    {
+      let journal = directory.path().join("earlier-operation.json");
+      std::fs::write(&journal, contents).unwrap();
+      // No in-memory latch or current operation ID: a new process sees the
+      // same gate, and even an unreadable journal fails closed.
+      assert!(
+        ensure_recovery_directories_empty(&directories).is_err()
+      );
+      std::fs::remove_file(journal).unwrap();
+      assert!(
+        ensure_recovery_directories_empty(&directories).is_ok()
+      );
+    }
+    assert!(
+      ensure_recovery_directories_empty(&[directory
+        .path()
+        .join("missing")])
+      .is_err()
+    );
+  }
+
+  #[test]
+  fn terminal_and_protected_filesystem_leases_exclude_each_other() {
+    let barrier = Arc::new(tokio::sync::RwLock::new(()));
+    let terminal = barrier.clone().try_read_owned().unwrap();
+    assert!(barrier.clone().try_write_owned().is_err());
+    drop(terminal);
+    let backup = barrier.clone().try_write_owned().unwrap();
+    assert!(barrier.clone().try_read_owned().is_err());
+    drop(backup);
+    assert!(barrier.try_read_owned().is_ok());
+  }
+
+  #[test]
+  fn locked_preview_rejects_changed_paths_and_containers() {
+    let preview = PreflightVykarRestoreResponse {
+      destination_exists: true,
+      created_paths: vec!["b".into(), "a".into()],
+      containers_to_stop: vec!["application".into()],
+      ..Default::default()
+    };
+    let mut reordered = preview.clone();
+    reordered.created_paths.reverse();
+    assert!(preview.matches(&reordered));
+    reordered.deleted_paths.push("new-file".into());
+    assert!(!preview.matches(&reordered));
+    let mut changed = preview.clone();
+    changed.containers_to_stop.clear();
+    assert!(!preview.matches(&changed));
+    changed = preview.clone();
+    changed.destination_exists = false;
+    assert!(!preview.matches(&changed));
+  }
 
   #[test]
   fn cancellation_registration_shares_and_cleans_up_token() {

@@ -253,6 +253,15 @@ impl PeripheryTerminal {
   ) -> anyhow::Result<PeripheryTerminal> {
     trace!("Creating Terminal | Command: {command}");
 
+    // Keep this lease in the child reaper, not the browser/HTTP stream. A
+    // disconnected shell (including one running /terminal/execute) is still
+    // capable of changing backup roots until the actual child exits.
+    let filesystem_guard = crate::api::backup::filesystem_barrier()
+      .clone()
+      .try_read_owned()
+      .context("Terminals are unavailable during backup/restore on this Server")?;
+    crate::api::backup::ensure_no_pending_recovery()?;
+
     let terminal = native_pty_system()
       .openpty(PtySize::default())
       .context("Failed to open terminal")?;
@@ -272,23 +281,6 @@ impl PeripheryTerminal {
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
 
-    let mut child = terminal
-      .slave
-      .spawn_command(cmd)
-      .context("Failed to spawn child command")?;
-
-    // Check the child didn't stop immediately (after a little wait) with error
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    if let Some(status) = child
-      .try_wait()
-      .context("Failed to check child process exit status")?
-    {
-      return Err(anyhow!(
-        "Child process exited immediately with code {}",
-        status.exit_code()
-      ));
-    }
-
     let mut terminal_write = terminal
       .master
       .take_writer()
@@ -299,15 +291,31 @@ impl PeripheryTerminal {
       .context("Failed to clone terminal reader")?;
 
     let cancel = CancellationToken::new();
+    let initialization_cancel = cancel.clone().drop_guard();
+    // Initialize fallible PTY handles before launching a child. There is no
+    // await between spawn and transferring the lease to its lifetime task.
+    let mut child = terminal
+      .slave
+      .spawn_command(cmd)
+      .context("Failed to spawn child command")?;
 
     // CHILD WAIT TASK
     let _cancel = cancel.clone();
     tokio::task::spawn_blocking(move || {
+      let _filesystem_guard = filesystem_guard;
       loop {
         if _cancel.is_cancelled() {
           trace!("child wait handle cancelled from outside");
           if let Err(e) = child.kill() {
             debug!("Failed to kill child | {e:?}");
+          }
+          // A kill request is not proof of exit. Keep the lease until wait
+          // confirms termination; fail closed if the process cannot be reaped.
+          if let Err(e) = child.wait() {
+            error!(
+              "Failed to reap terminal; backups remain blocked until Periphery restarts | {e:?}"
+            );
+            std::mem::forget(_filesystem_guard);
           }
           break;
         }
@@ -322,6 +330,13 @@ impl PeripheryTerminal {
           }
           Err(e) => {
             debug!("failed to wait for child | {e:?}");
+            let _ = child.kill();
+            if let Err(e) = child.wait() {
+              error!(
+                "Failed to reap terminal; backups remain blocked until Periphery restarts | {e:?}"
+              );
+              std::mem::forget(_filesystem_guard);
+            }
             break;
           }
         }
@@ -408,6 +423,16 @@ impl PeripheryTerminal {
     });
 
     trace!("terminal tasks spawned");
+
+    // Preserve startup failure reporting without leaving a spawned child
+    // unowned if the initializing request is cancelled during this wait.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    if cancel.is_cancelled() {
+      return Err(anyhow!(
+        "Terminal process exited during initialization"
+      ));
+    }
+    initialization_cancel.disarm();
 
     Ok(PeripheryTerminal {
       name,

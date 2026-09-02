@@ -192,6 +192,9 @@ pub struct TransactionalVykarRestore {
   pub selected_paths: Vec<String>,
   /// Snapshot-relative path to absolute destination path.
   pub publish: Vec<RestorePublishPath>,
+  /// Confirmed preview, revalidated under the destination's filesystem guard
+  /// before creating volumes, stopping containers, or publishing files.
+  pub expected_preview: PreflightVykarRestoreResponse,
   pub journal_id: String,
   /// Stable restore-plan identity used to recognize a Volume created by an
   /// earlier execution attempt of the same plan.
@@ -250,6 +253,23 @@ pub struct PreflightVykarRestoreResponse {
   pub overwritten_paths: Vec<String>,
   pub deleted_paths: Vec<String>,
   pub containers_to_stop: Vec<String>,
+}
+
+impl PreflightVykarRestoreResponse {
+  pub fn matches(&self, other: &Self) -> bool {
+    fn same(left: &[String], right: &[String]) -> bool {
+      let mut left = left.to_vec();
+      let mut right = right.to_vec();
+      left.sort();
+      right.sort();
+      left == right
+    }
+    self.destination_exists == other.destination_exists
+      && same(&self.created_paths, &other.created_paths)
+      && same(&self.overwritten_paths, &other.overwritten_paths)
+      && same(&self.deleted_paths, &other.deleted_paths)
+      && same(&self.containers_to_stop, &other.containers_to_stop)
+  }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]

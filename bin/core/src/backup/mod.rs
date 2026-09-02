@@ -1581,25 +1581,28 @@ fn repository_health_cache_is_fresh(
 #[derive(Default)]
 struct CriticalAlerts {
   configuration: Option<String>,
-  operational: Option<String>,
+  operational: Vec<String>,
   maintenance: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
-struct PersistedOperationalAlert {
-  message: String,
+struct PersistedOperationalAlerts {
+  #[serde(default)]
+  messages: Vec<String>,
+  /// Preserve the previous single-alert format on upgrade.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  message: Option<String>,
 }
 
 impl CriticalAlerts {
   fn current(&self) -> Option<String> {
-    let messages = [
-      self.configuration.as_deref(),
-      self.operational.as_deref(),
-      self.maintenance.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    .collect::<Vec<_>>();
+    let messages = self
+      .configuration
+      .iter()
+      .chain(self.operational.iter())
+      .chain(self.maintenance.iter())
+      .map(String::as_str)
+      .collect::<Vec<_>>();
     (!messages.is_empty()).then(|| messages.join("\n"))
   }
 }
@@ -1611,9 +1614,9 @@ fn critical_alerts() -> &'static RwLock<CriticalAlerts> {
       OPERATIONAL_ALERT_PATH,
     )) {
       Ok(message) => message,
-      Err(error) => Some(format!(
+      Err(error) => vec![format!(
         "Persisted backup operational alert is unreadable: {error:#}"
-      )),
+      )],
     };
     RwLock::new(CriticalAlerts {
       operational,
@@ -1628,39 +1631,51 @@ fn current_critical_alert() -> Option<String> {
 
 fn record_operational_alert(message: String) {
   let mut alerts = critical_alerts().write().unwrap();
-  let message = match persist_operational_alert(
+  append_operational_alert(&mut alerts.operational, message);
+  if let Err(error) = persist_operational_alert(
     Path::new(OPERATIONAL_ALERT_PATH),
-    &message,
+    &alerts.operational,
   ) {
-    Ok(()) => message,
-    Err(error) => {
-      error!("Failed to persist backup operational alert: {error:#}");
+    error!("Failed to persist backup operational alert: {error:#}");
+    append_operational_alert(
+      &mut alerts.operational,
       format!(
-        "{message}\nThis alert could not be persisted across restart: {error:#}"
-      )
-    }
-  };
-  alerts.operational = Some(message);
+        "Operational alerts could not be persisted across restart: {error:#}"
+      ),
+    );
+  }
+}
+
+fn append_operational_alert(
+  messages: &mut Vec<String>,
+  message: String,
+) {
+  if !messages.contains(&message) {
+    messages.push(message);
+  }
 }
 
 fn read_operational_alert(
   path: &Path,
-) -> anyhow::Result<Option<String>> {
+) -> anyhow::Result<Vec<String>> {
   let bytes = match std::fs::read(path) {
     Ok(bytes) => bytes,
     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-      return Ok(None);
+      return Ok(Vec::new());
     }
     Err(error) => return Err(error.into()),
   };
-  let alert: PersistedOperationalAlert =
+  let mut alerts: PersistedOperationalAlerts =
     serde_json::from_slice(&bytes)?;
-  Ok(Some(alert.message))
+  if let Some(message) = alerts.message {
+    append_operational_alert(&mut alerts.messages, message);
+  }
+  Ok(alerts.messages)
 }
 
 fn persist_operational_alert(
   path: &Path,
-  message: &str,
+  messages: &[String],
 ) -> anyhow::Result<()> {
   let parent =
     path.parent().context("Operational alert has no parent")?;
@@ -1675,8 +1690,9 @@ fn persist_operational_alert(
     .mode(0o600)
     .open(&temporary)?;
   file.write_all(&serde_json::to_vec(
-    &PersistedOperationalAlert {
-      message: message.to_string(),
+    &PersistedOperationalAlerts {
+      messages: messages.to_vec(),
+      message: None,
     },
   )?)?;
   file.sync_all()?;
@@ -3739,7 +3755,9 @@ async fn backup_stack(
     .await?;
   if !response.restart_errors.is_empty() {
     record_operational_alert(format!(
-      "Containers could not be restarted after stack backup: {}",
+      "Containers could not be restarted after Stack backup on {} ({}): {}",
+      server.name,
+      server.id,
       response.restart_errors.join("; ")
     ));
   }
@@ -3801,7 +3819,9 @@ async fn backup_volume(
     .await?;
   if !response.restart_errors.is_empty() {
     record_operational_alert(format!(
-      "Containers could not be restarted after volume backup: {}",
+      "Containers could not be restarted after Volume backup on {} ({}): {}",
+      server.name,
+      server.id,
       response.restart_errors.join("; ")
     ));
   }
@@ -4929,6 +4949,7 @@ pub async fn execute_restore(
           snapshot_name: stored.plan.snapshot.clone(),
           selected_paths: stored.plan.selected_paths.clone(),
           publish: stored.publish.clone(),
+          expected_preview: refreshed_preview,
           journal_id,
           volume_restore_plan_id: stored.id.clone(),
           create_volume_if_missing: stored.create_volume_if_missing,
@@ -4940,7 +4961,7 @@ pub async fn execute_restore(
         })
         .await?;
       if let Some(error) = response.critical_error {
-        record_operational_alert(error.clone());
+        record_operational_alert(format!("Restore {} on {} ({}): {error}", stored.id, server.name, server.id));
         return finish_run(
           run.clone(),
           BackupRunState::Failed,
@@ -5039,14 +5060,14 @@ pub async fn execute_restore(
               let message = response.critical_error.unwrap_or_else(|| {
                 "Periphery did not confirm restore rollback".into()
               });
-              record_operational_alert(message.clone());
+              record_operational_alert(format!("Restore {} on {} ({}): {message}", stored.id, server.name, server.id));
               return Err(create_error.context(message));
             }
             Err(rollback_error) => {
               let message = format!(
                 "Recovered Stack creation failed and restore rollback could not be confirmed: {rollback_error:#}"
               );
-              record_operational_alert(message.clone());
+              record_operational_alert(format!("Restore {} on {} ({}): {message}", stored.id, server.name, server.id));
               return Err(create_error.context(message));
             }
           }
@@ -5075,7 +5096,7 @@ pub async fn execute_restore(
         let message = format!(
           "Recovered Stack finalization requires reconciliation: {error:#}"
         );
-        record_operational_alert(message.clone());
+        record_operational_alert(format!("Restore {} on {} ({}): {message}", stored.id, server.name, server.id));
         return Err(anyhow!(message));
       }
     }
@@ -6209,18 +6230,44 @@ mod tests {
   fn operational_alerts_survive_a_fresh_read() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("operational-alert.json");
-    assert_eq!(read_operational_alert(&path).unwrap(), None);
-    persist_operational_alert(&path, "Containers remain stopped")
-      .unwrap();
-    assert_eq!(
-      read_operational_alert(&path).unwrap().as_deref(),
-      Some("Containers remain stopped")
+    let mut messages = read_operational_alert(&path).unwrap();
+    assert!(messages.is_empty());
+    append_operational_alert(
+      &mut messages,
+      "Node A: containers remain stopped".into(),
     );
-    persist_operational_alert(&path, "Restore needs reconciliation")
-      .unwrap();
+    persist_operational_alert(&path, &messages).unwrap();
+    let mut messages = read_operational_alert(&path).unwrap();
+    append_operational_alert(
+      &mut messages,
+      "Node B: restore needs reconciliation".into(),
+    );
+    append_operational_alert(
+      &mut messages,
+      "Node A: containers remain stopped".into(),
+    );
+    persist_operational_alert(&path, &messages).unwrap();
     assert_eq!(
-      read_operational_alert(&path).unwrap().as_deref(),
-      Some("Restore needs reconciliation")
+      read_operational_alert(&path).unwrap(),
+      vec![
+        "Node A: containers remain stopped",
+        "Node B: restore needs reconciliation",
+      ]
+    );
+  }
+
+  #[test]
+  fn legacy_operational_alert_is_preserved() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("alert.json");
+    std::fs::write(&path, br#"{"message":"Earlier incident"}"#)
+      .unwrap();
+    let mut messages = read_operational_alert(&path).unwrap();
+    append_operational_alert(&mut messages, "New incident".into());
+    persist_operational_alert(&path, &messages).unwrap();
+    assert_eq!(
+      read_operational_alert(&path).unwrap(),
+      vec!["Earlier incident", "New incident"]
     );
   }
 
@@ -6252,7 +6299,7 @@ mod tests {
   #[test]
   fn maintenance_alerts_do_not_replace_operational_alerts() {
     let mut alerts = CriticalAlerts {
-      operational: Some("Containers remain stopped".into()),
+      operational: vec!["Containers remain stopped".into()],
       maintenance: Some("Repository prune failed".into()),
       ..Default::default()
     };
