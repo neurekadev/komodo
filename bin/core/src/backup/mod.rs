@@ -143,7 +143,7 @@ struct RepositoryHealthRecord {
   checked_at: i64,
   #[serde(default)]
   last_full_verification_at: i64,
-  /// Remains set after an integrity check fails until a later check succeeds.
+  /// Remains set after an integrity check fails until a full check succeeds.
   #[serde(default)]
   verification_failed: bool,
 }
@@ -342,9 +342,7 @@ fn validate_settings(
   validate_repository_definition(&settings.primary)?;
   if let Some(mirror) = &settings.mirror {
     validate_repository_definition(mirror)?;
-    if repository_location(&settings.primary)
-      == repository_location(mirror)
-    {
+    if repositories_share_location(&settings.primary, mirror)? {
       return Err(anyhow!(
         "Primary and mirror must use different repository locations"
       ));
@@ -367,24 +365,23 @@ fn validate_repository_definition(
         ));
       }
       let normalized = normalize_core_local_path(path);
-      let resolved = normalized
-        .canonicalize()
-        .unwrap_or_else(|_| normalized.clone());
-      if [
+      let resolved = resolve_existing_path_ancestor(&normalized)?;
+      for reserved in [
         CORE_STAGING_PATH,
         CORE_CACHE_PATH,
         CORE_RECOVERY_STAGING_PATH,
         STACK_MANIFEST_STAGING_PATH,
-      ]
-      .iter()
-      .any(|reserved| {
-        let reserved = Path::new(*reserved);
-        normalized.starts_with(reserved)
-          || resolved.starts_with(reserved)
-      }) {
-        return Err(anyhow!(
-          "Core-local repository path is reserved for internal backup staging or cache data"
-        ));
+      ] {
+        let reserved = normalize_core_local_path(reserved);
+        let resolved_reserved =
+          resolve_existing_path_ancestor(&reserved)?;
+        if paths_overlap(&normalized, &reserved)
+          || paths_overlap(&resolved, &resolved_reserved)
+        {
+          return Err(anyhow!(
+            "Core-local repository path overlaps internal backup staging or cache data"
+          ));
+        }
       }
     }
     BackupRepositoryBackend::S3 { url, region, .. } => {
@@ -439,6 +436,29 @@ fn repository_location(repository: &BackupRepository) -> String {
   }
 }
 
+fn repositories_share_location(
+  primary: &BackupRepository,
+  mirror: &BackupRepository,
+) -> anyhow::Result<bool> {
+  match (&primary.backend, &mirror.backend) {
+    (
+      BackupRepositoryBackend::CoreLocal { path: primary },
+      BackupRepositoryBackend::CoreLocal { path: mirror },
+    ) => {
+      let primary = resolve_existing_path_ancestor(
+        &normalize_core_local_path(primary),
+      )?;
+      let mirror = resolve_existing_path_ancestor(
+        &normalize_core_local_path(mirror),
+      )?;
+      Ok(primary == mirror)
+    }
+    _ => {
+      Ok(repository_location(primary) == repository_location(mirror))
+    }
+  }
+}
+
 fn normalize_core_local_path(path: &str) -> PathBuf {
   let mut normalized = PathBuf::new();
   for component in Path::new(path.trim()).components() {
@@ -451,6 +471,50 @@ fn normalize_core_local_path(path: &str) -> PathBuf {
     }
   }
   normalized
+}
+
+fn resolve_existing_path_ancestor(
+  path: &Path,
+) -> anyhow::Result<PathBuf> {
+  let mut ancestor = path;
+  let mut missing = Vec::new();
+  loop {
+    match ancestor.canonicalize() {
+      Ok(mut resolved) => {
+        while let Some(component) = missing.pop() {
+          resolved.push(component);
+        }
+        return Ok(resolved);
+      }
+      Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        let name = ancestor.file_name().with_context(|| {
+          format!(
+            "Path has no resolvable ancestor: {}",
+            path.display()
+          )
+        })?;
+        missing.push(name.to_os_string());
+        ancestor = ancestor.parent().with_context(|| {
+          format!(
+            "Path has no resolvable ancestor: {}",
+            path.display()
+          )
+        })?;
+      }
+      Err(error) => {
+        return Err(error).with_context(|| {
+          format!(
+            "Failed to resolve path ancestor: {}",
+            path.display()
+          )
+        });
+      }
+    }
+  }
+}
+
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+  left == right || left.starts_with(right) || right.starts_with(left)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -780,10 +844,13 @@ fn repository_for_periphery(
 }
 
 pub async fn initialize_repositories() -> anyhow::Result<BackupRun> {
+  let _operation = backup_operation_lock().lock().await;
   let _repository_roles =
     repository_role_barrier().clone().read_owned().await;
   let settings = get_settings().await?;
-  let run = new_run(None, "Initializing repositories").await?;
+  let run =
+    new_non_cancellable_run(None, "Initializing repositories")
+      .await?;
   let result = async {
     for repository in
       std::iter::once(&settings.primary).chain(settings.mirror.iter())
@@ -1261,6 +1328,17 @@ async fn record_repository_verification(
       "last_full_verification_at": now,
       "verification_failed": false,
     } }
+  } else if succeeded {
+    // A sample that happens not to encounter previously-recorded corruption
+    // cannot prove that corruption is gone. Only a successful full check may
+    // clear the failure latch.
+    doc! {
+      "$set": { "checked_at": now },
+      "$setOnInsert": {
+        "healthy": true,
+        "verification_failed": false,
+      }
+    }
   } else {
     doc! { "$set": {
       "healthy": succeeded,
@@ -2601,12 +2679,17 @@ pub async fn authorize_snapshot(
 
 async fn snapshot_stack_source(
   snapshot: &BackupSnapshot,
+  destination_server_id: Option<&str>,
 ) -> anyhow::Result<(Stack, bool)> {
   let BackupTarget::Stack { stack_id } = &snapshot.target else {
     return Err(anyhow!("Snapshot is not a Stack backup"));
   };
-  if let Some(stack) =
-    Stack::coll().find_one(id_or_name_filter(stack_id)).await?
+  let current =
+    Stack::coll().find_one(id_or_name_filter(stack_id)).await?;
+  let source_stack_missing = current.is_none();
+  if let Some(stack) = current
+    && destination_server_id
+      .is_none_or(|destination| destination == stack.config.server_id)
   {
     return Ok((stack, false));
   }
@@ -2675,7 +2758,7 @@ async fn snapshot_stack_source(
       "Stack snapshot recovery manifest does not match its source label"
     ));
   }
-  Ok((*stack, true))
+  Ok((*stack, source_stack_missing))
 }
 
 pub async fn plan_restore(
@@ -2703,7 +2786,11 @@ pub async fn plan_restore(
   let selected_paths = normalize_selected_paths(&selected_paths)?;
   let (snapshot_stack, source_stack_missing) =
     if matches!(&snapshot.target, BackupTarget::Stack { .. }) {
-      let (stack, missing) = snapshot_stack_source(&snapshot).await?;
+      let (stack, missing) = snapshot_stack_source(
+        &snapshot,
+        destination_server_id.as_deref(),
+      )
+      .await?;
       (Some(stack), missing)
     } else {
       (None, false)
@@ -3517,6 +3604,13 @@ pub async fn plan_core_recovery(
           "Failed to carry active repository settings into recovery database",
         )?;
     }
+    validation
+      .collection::<RepositoryHealthRecord>(HEALTH_COLLECTION)
+      .delete_many(doc! {})
+      .await
+      .context(
+        "Failed to invalidate repository health in recovery database",
+      )?;
     let enabled_admins = validation
       .collection::<komodo_client::entities::user::User>("User")
       .count_documents(doc! { "enabled": true, "admin": true })
@@ -4105,6 +4199,19 @@ mod tests {
       repository_location(&rest("https://backup.example/repo")),
       repository_location(&rest("https://backup.example/repo/"))
     );
+
+    let root = tempfile::tempdir().unwrap();
+    let actual = root.path().join("actual");
+    std::fs::create_dir(&actual).unwrap();
+    let alias = root.path().join("alias");
+    std::os::unix::fs::symlink(&actual, &alias).unwrap();
+    assert!(
+      repositories_share_location(
+        &local(&actual.to_string_lossy()),
+        &local(&alias.to_string_lossy())
+      )
+      .unwrap()
+    );
   }
 
   #[test]
@@ -4115,6 +4222,8 @@ mod tests {
       CORE_RECOVERY_STAGING_PATH,
       STACK_MANIFEST_STAGING_PATH,
       "/data/backups/.komodo-core-staging/repository",
+      "/data/backups",
+      "/data",
     ] {
       let repository = BackupRepository {
         name: "reserved".into(),
@@ -4125,6 +4234,21 @@ mod tests {
       };
       assert!(validate_repository_definition(&repository).is_err());
     }
+  }
+
+  #[test]
+  fn path_overlap_resolution_follows_symlinked_ancestors() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let actual = root.path().join("actual");
+    let reserved = actual.join("internal/staging");
+    std::fs::create_dir_all(&reserved).unwrap();
+    let alias = root.path().join("alias");
+    symlink(&actual, &alias).unwrap();
+    let repository = resolve_existing_path_ancestor(&alias).unwrap();
+    let reserved = resolve_existing_path_ancestor(&reserved).unwrap();
+    assert!(paths_overlap(&repository, &reserved));
   }
 
   #[test]

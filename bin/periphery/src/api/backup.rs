@@ -53,17 +53,47 @@ enum BackupComposeMount {
   },
 }
 
-fn cancelled_operations() -> &'static Mutex<HashSet<String>> {
-  static CANCELLED: OnceLock<Mutex<HashSet<String>>> =
+fn cancellation_tokens()
+-> &'static Mutex<HashMap<String, Arc<AtomicBool>>> {
+  static TOKENS: OnceLock<Mutex<HashMap<String, Arc<AtomicBool>>>> =
     OnceLock::new();
-  CANCELLED.get_or_init(Default::default)
+  TOKENS.get_or_init(Default::default)
+}
+
+fn operation_cancellation_token(
+  operation_id: &str,
+) -> Arc<AtomicBool> {
+  cancellation_tokens()
+    .lock()
+    .unwrap()
+    .entry(operation_id.to_string())
+    .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+    .clone()
+}
+
+struct OperationCancellationRegistration(String);
+
+impl Drop for OperationCancellationRegistration {
+  fn drop(&mut self) {
+    cancellation_tokens().lock().unwrap().remove(&self.0);
+  }
+}
+
+fn register_operation_cancellation(
+  operation_id: &str,
+) -> (Arc<AtomicBool>, OperationCancellationRegistration) {
+  (
+    operation_cancellation_token(operation_id),
+    OperationCancellationRegistration(operation_id.to_string()),
+  )
 }
 
 fn operation_cancelled(operation_id: &str) -> bool {
-  cancelled_operations()
+  cancellation_tokens()
     .lock()
     .unwrap()
-    .contains(operation_id)
+    .get(operation_id)
+    .is_some_and(|token| token.load(Ordering::SeqCst))
 }
 
 fn backup_operation_lock() -> &'static tokio::sync::Mutex<()> {
@@ -86,6 +116,8 @@ impl Resolve<Args> for RunVykarBackup {
     _: &Args,
   ) -> anyhow::Result<RunVykarBackupResponse> {
     let _operation = backup_operation_lock().lock().await;
+    let (_cancellation, _cancellation_registration) =
+      register_operation_cancellation(&self.run_id);
     let discovered = discover_source(&self.target).await?;
     let container_journal = if self.stop_containers {
       persist_container_quiesce_journal(
@@ -142,7 +174,6 @@ impl Resolve<Args> for RunVykarBackup {
       remove_container_quiesce_journal(container_journal.as_deref())?;
     }
 
-    cancelled_operations().lock().unwrap().remove(&self.run_id);
     let (primary, mirror) = match result {
       Ok(result) => result,
       Err(error) if !restart_errors.is_empty() => {
@@ -175,6 +206,8 @@ impl Resolve<Args> for RunVykarBackupBatch {
     _: &Args,
   ) -> anyhow::Result<RunVykarBackupBatchResponse> {
     let _operation = backup_operation_lock().lock().await;
+    let (_cancellation, _cancellation_registration) =
+      register_operation_cancellation(&self.run_id);
     let mut discovered = Vec::new();
     let mut discovery_errors = Vec::new();
     let mut running = BTreeSet::new();
@@ -263,7 +296,6 @@ impl Resolve<Args> for RunVykarBackupBatch {
     if restart_errors.is_empty() {
       remove_container_quiesce_journal(container_journal.as_deref())?;
     }
-    cancelled_operations().lock().unwrap().remove(&self.run_id);
     Ok(RunVykarBackupBatchResponse {
       results,
       discovery_errors,
@@ -312,6 +344,7 @@ async fn run_backup_repositories(
       request.snapshot_name.clone(),
       request.source_label.clone(),
       paths.clone(),
+      operation_cancellation_token(&request.run_id),
     )
     .await
   };
@@ -335,6 +368,7 @@ async fn run_backup_repositories(
         request.snapshot_name.clone(),
         request.source_label.clone(),
         paths,
+        operation_cancellation_token(&request.run_id),
       )
       .await,
     )
@@ -351,6 +385,7 @@ async fn run_repository_backup(
   snapshot_name: String,
   source_label: String,
   source_paths: Vec<String>,
+  cancellation: Arc<AtomicBool>,
 ) -> VykarBackupRepositoryResult {
   let result = tokio::task::spawn_blocking(move || {
     let cache = vykar_cache_dir(&hostname)?;
@@ -360,7 +395,12 @@ async fn run_repository_backup(
       &cache,
       &advanced,
     )?;
-    repository.backup(&snapshot_name, &source_label, &source_paths)
+    repository.backup_cancellable(
+      &snapshot_name,
+      &source_label,
+      &source_paths,
+      Some(cancellation.as_ref()),
+    )
   })
   .await;
   match result {
@@ -862,6 +902,8 @@ impl Resolve<Args> for TransactionalVykarRestore {
     _: &Args,
   ) -> anyhow::Result<TransactionalVykarRestoreResponse> {
     let _operation = backup_operation_lock().lock().await;
+    let (_cancellation, _cancellation_registration) =
+      register_operation_cancellation(&self.journal_id);
     if let PeripheryBackupTarget::Volume { volume_name } =
       &self.target
     {
@@ -974,10 +1016,6 @@ impl Resolve<Args> for TransactionalVykarRestore {
     }
 
     let restore_result = transactional_restore(&self).await;
-    cancelled_operations()
-      .lock()
-      .unwrap()
-      .remove(&self.journal_id);
     let rolled_back = match restore_result {
       RestoreTransactionResult::Published { rolled_back } => {
         rolled_back
@@ -1257,6 +1295,17 @@ async fn transactional_restore(
       anyhow!("Restore staging path already exists"),
     );
   }
+  let staging_journal = match persist_restore_staging_journal(
+    &request.journal_id,
+    std::slice::from_ref(&staging),
+  ) {
+    Ok(path) => path,
+    Err(error) => {
+      return RestoreTransactionResult::FailedBeforePublication(
+        error,
+      );
+    }
+  };
 
   let repository = request.repository.clone();
   let advanced = request.advanced.clone();
@@ -1278,13 +1327,13 @@ async fn transactional_restore(
   match restore_result {
     Ok(Ok(())) => {}
     Ok(Err(error)) => {
-      let _ = std::fs::remove_dir_all(&staging);
+      let _ = cleanup_restore_staging_journal(&staging_journal);
       return RestoreTransactionResult::FailedBeforePublication(
         error,
       );
     }
     Err(error) => {
-      let _ = std::fs::remove_dir_all(&staging);
+      let _ = cleanup_restore_staging_journal(&staging_journal);
       return RestoreTransactionResult::FailedBeforePublication(
         anyhow::Error::new(error)
           .context("Vykar restore worker failed"),
@@ -1293,7 +1342,7 @@ async fn transactional_restore(
   }
 
   if operation_cancelled(&request.journal_id) {
-    let _ = std::fs::remove_dir_all(&staging);
+    let _ = cleanup_restore_staging_journal(&staging_journal);
     return RestoreTransactionResult::Published { rolled_back: true };
   }
 
@@ -1302,12 +1351,14 @@ async fn transactional_restore(
   let publication_started = Arc::new(AtomicBool::new(false));
   let worker_started = publication_started.clone();
   let publish_staging = staging.clone();
+  let publication_staging_journal = staging_journal.clone();
   let result = tokio::task::spawn_blocking(move || {
     publish_restore(
       &publish_staging,
       &publish,
       &journal_id,
       &worker_started,
+      Some(&publication_staging_journal),
     )
   })
   .await;
@@ -1319,7 +1370,7 @@ async fn transactional_restore(
       if publication_started.load(Ordering::SeqCst) {
         RestoreTransactionResult::Indeterminate(error)
       } else {
-        let _ = std::fs::remove_dir_all(&staging);
+        let _ = cleanup_restore_staging_journal(&staging_journal);
         RestoreTransactionResult::FailedBeforePublication(error)
       }
     }
@@ -1329,7 +1380,7 @@ async fn transactional_restore(
       if publication_started.load(Ordering::SeqCst) {
         RestoreTransactionResult::Indeterminate(error)
       } else {
-        let _ = std::fs::remove_dir_all(&staging);
+        let _ = cleanup_restore_staging_journal(&staging_journal);
         RestoreTransactionResult::FailedBeforePublication(error)
       }
     }
@@ -1357,6 +1408,11 @@ struct RestoreJournal {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct RestoreStagingJournal {
+  paths: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ContainerQuiesceJournal {
   containers: Vec<String>,
 }
@@ -1379,6 +1435,53 @@ fn restore_journal_dir() -> anyhow::Result<PathBuf> {
     .join("restore-journals");
   std::fs::create_dir_all(&directory)?;
   Ok(directory)
+}
+
+fn restore_staging_journal_dir() -> anyhow::Result<PathBuf> {
+  let directory = periphery_config()
+    .stack_dir()
+    .join(".komodo-vykar")
+    .join("restore-staging-journals");
+  std::fs::create_dir_all(&directory)?;
+  Ok(directory)
+}
+
+fn persist_restore_staging_journal(
+  journal_id: &str,
+  paths: &[PathBuf],
+) -> anyhow::Result<PathBuf> {
+  let path =
+    restore_staging_journal_dir()?.join(format!("{journal_id}.json"));
+  persist_journal(
+    &path,
+    &RestoreStagingJournal {
+      paths: paths.to_vec(),
+    },
+  )?;
+  Ok(path)
+}
+
+fn cleanup_restore_staging_journal(
+  path: &Path,
+) -> anyhow::Result<()> {
+  let bytes = std::fs::read(path).with_context(|| {
+    format!(
+      "Failed to read restore staging journal {}",
+      path.display()
+    )
+  })?;
+  let journal: RestoreStagingJournal = serde_json::from_slice(&bytes)
+    .with_context(|| {
+      format!(
+        "Failed to decode restore staging journal {}",
+        path.display()
+      )
+    })?;
+  for owned in journal.paths.iter().rev() {
+    remove_path(owned)?;
+  }
+  remove_path(path)?;
+  fsync_parent(path)
 }
 
 fn container_quiesce_journal_dir() -> anyhow::Result<PathBuf> {
@@ -1453,6 +1556,20 @@ pub(crate) async fn recover_restore_journals() -> anyhow::Result<()> {
     fsync_parent(&path)?;
     warn!("Recovered interrupted restore journal {}", path.display());
   }
+  let directory = restore_staging_journal_dir()?;
+  for entry in std::fs::read_dir(&directory)? {
+    let path = entry?.path();
+    if path.extension().and_then(|value| value.to_str())
+      != Some("json")
+    {
+      continue;
+    }
+    cleanup_restore_staging_journal(&path)?;
+    warn!(
+      "Removed staging from interrupted restore journal {}",
+      path.display()
+    );
+  }
   let directory = container_quiesce_journal_dir()?;
   for entry in std::fs::read_dir(&directory)? {
     let path = entry?.path();
@@ -1497,6 +1614,7 @@ fn publish_restore(
   publish: &[RestorePublishPath],
   journal_id: &str,
   publication_started: &AtomicBool,
+  staging_journal_path: Option<&Path>,
 ) -> anyhow::Result<bool> {
   let journal_directory = restore_journal_dir()?;
   publish_restore_in(
@@ -1505,6 +1623,7 @@ fn publish_restore(
     journal_id,
     publication_started,
     &journal_directory,
+    staging_journal_path,
   )
 }
 
@@ -1529,10 +1648,14 @@ fn publish_restore_in(
   journal_id: &str,
   publication_started: &AtomicBool,
   journal_directory: &Path,
+  staging_journal_path: Option<&Path>,
 ) -> anyhow::Result<bool> {
   let mut entries = Vec::new();
   let mut rollback_paths = HashSet::new();
   let mut preparation_cleanup = RemovePathsOnDrop::default();
+  let mut staging_ownership = RestoreStagingJournal {
+    paths: vec![staging.to_path_buf()],
+  };
   for (index, item) in publish.iter().enumerate() {
     let relative = Path::new(&item.snapshot_path);
     if relative.is_absolute()
@@ -1579,6 +1702,10 @@ fn publish_restore_in(
         source.display()
       ));
     }
+    if let Some(staging_journal_path) = staging_journal_path {
+      staging_ownership.paths.push(source.clone());
+      persist_journal(staging_journal_path, &staging_ownership)?;
+    }
     preparation_cleanup.0.push(source.clone());
     let copy = std::process::Command::new("cp")
       .arg("-a")
@@ -1608,6 +1735,15 @@ fn publish_restore_in(
     });
   }
 
+  if entries
+    .iter()
+    .any(|entry| !destination_existence_matches(entry))
+  {
+    return Err(anyhow!(
+      "Restore destination existence changed during publication preparation"
+    ));
+  }
+
   std::fs::create_dir_all(journal_directory)?;
   let journal_path =
     journal_directory.join(format!("{journal_id}.json"));
@@ -1620,8 +1756,17 @@ fn publish_restore_in(
   // The durable journal owns cleanup from this point onward.
   preparation_cleanup.0.clear();
   publication_started.store(true, Ordering::SeqCst);
+  if let Some(staging_journal_path) = staging_journal_path {
+    remove_path(staging_journal_path)?;
+    fsync_parent(staging_journal_path)?;
+  }
 
   for index in 0..journal.entries.len() {
+    if !destination_existence_matches(&journal.entries[index]) {
+      rollback_published(&mut journal, &journal_path)?;
+      cleanup_rolled_back_restore(&journal, &journal_path)?;
+      return Ok(true);
+    }
     if path_lexists(&journal.entries[index].destination) {
       if let Err(error) = std::fs::rename(
         &journal.entries[index].destination,
@@ -1668,6 +1813,12 @@ fn publish_restore_in(
   fsync_parent(&journal_path)?;
   let _ = std::fs::remove_dir_all(staging);
   Ok(false)
+}
+
+fn destination_existence_matches(
+  entry: &RestoreJournalEntry,
+) -> bool {
+  entry.original_existed == Some(path_lexists(&entry.destination))
 }
 
 fn cleanup_rolled_back_restore(
@@ -1853,10 +2004,8 @@ impl Resolve<Args> for CancelVykarOperation {
     self,
     _: &Args,
   ) -> anyhow::Result<CancelVykarOperationResponse> {
-    cancelled_operations()
-      .lock()
-      .unwrap()
-      .insert(self.operation_id);
+    operation_cancellation_token(&self.operation_id)
+      .store(true, Ordering::SeqCst);
     Ok(CancelVykarOperationResponse { cancelled: true })
   }
 }
@@ -1864,6 +2013,16 @@ impl Resolve<Args> for CancelVykarOperation {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn cancellation_registration_shares_and_cleans_up_token() {
+    let id = "cancellable-backup-test";
+    let (worker, registration) = register_operation_cancellation(id);
+    operation_cancellation_token(id).store(true, Ordering::SeqCst);
+    assert!(worker.load(Ordering::SeqCst));
+    drop(registration);
+    assert!(!operation_cancelled(id));
+  }
 
   fn container(
     name: &str,
@@ -2124,6 +2283,7 @@ mod tests {
         "rollback-test",
         &AtomicBool::new(false),
         &root.path().join("journals"),
+        None,
       )
       .unwrap()
     );
@@ -2190,6 +2350,7 @@ mod tests {
         "unique-rollback-test",
         &AtomicBool::new(false),
         &root.path().join("journals"),
+        None,
       )
       .unwrap()
     );
@@ -2228,6 +2389,7 @@ mod tests {
         "prepare-cleanup-test",
         &AtomicBool::new(false),
         &root.path().join("journals"),
+        None,
       )
       .is_err()
     );
@@ -2237,5 +2399,42 @@ mod tests {
         .join(".komodo-restore-prepare-cleanup-test-0")
         .exists()
     );
+  }
+
+  #[test]
+  fn destination_existence_changes_are_detected_before_publish() {
+    let root = tempfile::tempdir().unwrap();
+    let destination = root.path().join("destination");
+    let entry = RestoreJournalEntry {
+      source: root.path().join("source"),
+      destination: destination.clone(),
+      rollback: root.path().join("rollback"),
+      original_existed: Some(false),
+      published: false,
+    };
+    assert!(destination_existence_matches(&entry));
+    std::fs::write(destination, b"concurrent data").unwrap();
+    assert!(!destination_existence_matches(&entry));
+  }
+
+  #[test]
+  fn staging_journal_removes_all_owned_restore_paths() {
+    let root = tempfile::tempdir().unwrap();
+    let staging = root.path().join("staging");
+    let destination_copy = root.path().join("destination-copy");
+    std::fs::create_dir_all(&staging).unwrap();
+    std::fs::write(&destination_copy, b"prepared").unwrap();
+    let journal_path = root.path().join("staging.json");
+    persist_journal(
+      &journal_path,
+      &RestoreStagingJournal {
+        paths: vec![staging.clone(), destination_copy.clone()],
+      },
+    )
+    .unwrap();
+    cleanup_restore_staging_journal(&journal_path).unwrap();
+    assert!(!staging.exists());
+    assert!(!destination_copy.exists());
+    assert!(!journal_path.exists());
   }
 }

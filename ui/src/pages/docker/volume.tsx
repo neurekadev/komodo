@@ -82,6 +82,10 @@ function VolumeInner({
     },
     { refetchInterval: 10_000 },
   );
+  const backupsSupported = volume
+    ? volume.Driver === "local" &&
+      volume.Scope === Types.VolumeScopeEnum.Local
+    : undefined;
 
   const { mutate: deleteVolume, isPending: deletePending } = useExecute(
     "DeleteVolume",
@@ -100,7 +104,8 @@ function VolumeInner({
 
   const view =
     (storedView === "Files" && !specificFileManager) ||
-    (storedView === "Backups" && !specificBackups)
+    (storedView === "Backups" &&
+      (!specificBackups || backupsSupported === false))
       ? "Info"
       : storedView;
   useEffect(() => {
@@ -114,12 +119,13 @@ function VolumeInner({
     if (
       permissionsLoaded &&
       storedView === "Backups" &&
-      !specificBackups
+      (!specificBackups || backupsSupported === false)
     ) {
       setView("Info");
     }
   }, [
     permissionsLoaded,
+    backupsSupported,
     setView,
     specificBackups,
     specificFileManager,
@@ -160,7 +166,10 @@ function VolumeInner({
         tab.value === "Files"
           ? { ...tab, hidden: !specificFileManager }
           : tab.value === "Backups"
-            ? { ...tab, hidden: !specificBackups }
+            ? {
+                ...tab,
+                hidden: !specificBackups || backupsSupported !== true,
+              }
             : tab,
       )}
       value={view}
@@ -215,7 +224,9 @@ function VolumeInner({
               params: { server_id: serverId, volume_name: volumeName },
             }}
             sourceServerId={serverId}
-            canExecute={canExecute && specificBackups}
+            canExecute={
+              canExecute && specificBackups && backupsSupported === true
+            }
             titleOther={selector}
           />
         ) : (
