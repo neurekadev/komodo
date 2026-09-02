@@ -1,0 +1,38 @@
+---
+title: MongoDB
+description: Install and operate Komodo with the recommended MongoDB database.
+---
+
+
+[**MongoDB**](https://www.mongodb.com) is the recommended database for Komodo. It stores all resource configuration, user accounts, audit logs, and system state. Komodo Core communicates with it directly using the MongoDB driver.
+
+## Quick Start
+
+1. Create the installation directory and download the MongoDB template as `compose.yaml` and the environment file as `.env`:
+
+```bash
+mkdir -p komodo
+cd komodo
+curl -fsSL -o compose.yaml https://raw.githubusercontent.com/neurekadev/komodo/main/compose/mongo.compose.yaml
+curl -fsSL -o .env https://raw.githubusercontent.com/neurekadev/komodo/main/compose/compose.env
+```
+
+2. Edit `.env`, replacing the example host, credentials, and secrets.
+3. Review the resolved configuration and deploy:
+
+```bash
+docker compose config
+docker compose up -d
+```
+
+Docker Compose discovers `compose.yaml` and `.env` automatically. The `.env` file sets `COMPOSE_PROJECT_NAME=komodo`, preserving the established `komodo_*` volume names.
+
+The expected result is healthy `komodo-mongo`, `komodo-core`, and `komodo-periphery` containers and a working sign-in page. If MongoDB does not become healthy, inspect its logs, verify the host CPU supports the selected image, and confirm the `komodo_mongo-data` volume is writable. Do not remove the volume while troubleshooting.
+
+[View the current MongoDB Compose template](https://github.com/neurekadev/komodo/blob/main/compose/mongo.compose.yaml) and [environment example](https://github.com/neurekadev/komodo/blob/main/compose/compose.env).
+
+<Callout title="Periphery host access" type="warn">
+
+The template intentionally mounts Docker's named-volume root read/write into Periphery for host-visible workspaces and Docker-volume File Manager access. This makes Periphery Docker-host trusted. File Manager refuses to open `komodo_data` because it contains Periphery's private journal and credentials, but Server-level `FileManager` permission covers every other eligible named volume. Review the [File Manager trust boundary and permission scope](/features/file-manager#containerized-periphery) before deploying.
+
+</Callout>

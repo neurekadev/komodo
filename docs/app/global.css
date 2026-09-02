@@ -1,0 +1,73 @@
+@import 'tailwindcss';
+@import 'fumadocs-ui/css/neutral.css';
+@import 'fumadocs-ui/css/preset.css';
+
+@theme {
+  --color-komodo-50: #e9efeb;
+  --color-komodo-100: #d3ded8;
+  --color-komodo-200: #adc3b1;
+  --color-komodo-300: #96ae9f;
+  --color-komodo-400: #779485;
+  --color-komodo-500: #678777;
+  --color-komodo-600: #466559;
+  --color-komodo-700: #355349;
+  --color-komodo-800: #28443c;
+  --color-komodo-900: #183029;
+  --color-komodo-950: #050a09;
+}
+
+:root {
+  --fd-layout-width: 1440px;
+  --color-fd-primary: #466559;
+  --color-fd-primary-foreground: #ffffff;
+  --color-fd-ring: #466559;
+  scrollbar-gutter: stable;
+}
+
+.dark {
+  --color-fd-primary: #96ae9f;
+  --color-fd-primary-foreground: #050a09;
+  --color-fd-ring: #96ae9f;
+}
+
+html > body[data-scroll-locked] {
+  margin-right: 0 !important;
+  --removed-body-scroll-bar-size: 0px !important;
+}
+
+::selection {
+  color: #050a09;
+  background: #adc3b1;
+}
+
+.hero-grid {
+  background-image:
+    linear-gradient(to right, color-mix(in srgb, var(--color-fd-border) 45%, transparent) 1px, transparent 1px),
+    linear-gradient(to bottom, color-mix(in srgb, var(--color-fd-border) 45%, transparent) 1px, transparent 1px);
+  background-size: 3rem 3rem;
+  mask-image: linear-gradient(to bottom, black 0%, transparent 85%);
+}
+
+.screenshot-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 18rem), 1fr));
+  gap: 1.25rem;
+}
+
+.screenshot-grid figure {
+  overflow: hidden;
+  border: 1px solid var(--color-fd-border);
+  border-radius: 0.75rem;
+  background: var(--color-fd-card);
+}
+
+.screenshot-grid img {
+  width: 100%;
+  height: auto;
+}
+
+.screenshot-grid figcaption {
+  padding: 0.75rem 1rem;
+  color: var(--color-fd-muted-foreground);
+  font-size: 0.875rem;
+}

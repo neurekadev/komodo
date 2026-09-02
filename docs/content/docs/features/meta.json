@@ -1,0 +1,20 @@
+{
+  "title": "Features",
+  "pages": [
+    "index",
+    "servers-and-monitoring",
+    "stacks",
+    "containers",
+    "automatic-updates",
+    "file-manager",
+    "docker-swarm",
+    "builds-and-builders",
+    "terminals",
+    "automation-overview",
+    "procedures-and-actions",
+    "schedules",
+    "webhooks",
+    "resource-sync",
+    "variables-and-secrets"
+  ]
+}

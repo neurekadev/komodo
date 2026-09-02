@@ -167,8 +167,8 @@ jobs:
             component: docs
             cache: false
             description: Komodo Documentation
-            context: docsite
-            dockerfile: docsite/Dockerfile
+            context: docs
+            dockerfile: docs/Dockerfile
             arch: amd64
             runner: ubuntu-24.04
             platform: linux/amd64
@@ -176,8 +176,8 @@ jobs:
             component: docs
             cache: false
             description: Komodo Documentation
-            context: docsite
-            dockerfile: docsite/Dockerfile
+            context: docs
+            dockerfile: docs/Dockerfile
             arch: arm64
             runner: ubuntu-24.04-arm
             platform: linux/arm64

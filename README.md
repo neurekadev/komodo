@@ -17,16 +17,16 @@ Komodo is a self-hosted system for building, deploying, and automating software 
 > [!NOTE]
 > This repository is a hard fork of [Komodo](https://github.com/moghtech/komodo), initially created to add a File Manager and now maintained to deliver additional features.
 
-## Quickstart
+## Quick Start
 
-Download the latest binaries from [Releases](https://github.com/neurekadev/komodo/releases).
+Follow the [Quick Start](https://komodo.docs.neureka.dev/quick-start) to install Core, connect a server, and deploy a first Stack. Download versioned binaries from [Releases](https://github.com/neurekadev/komodo/releases) when you need a non-container installation.
 
 ## Usage
 
-Run Core to host the API and browser interface, then connect Periphery agents on the servers you want to manage. Follow the [setup guide](https://komodo.docs.neureka.dev/docs/setup) for supported deployment options and configuration.
+Run Core to host the API and browser interface, then connect Periphery agents on the servers you want to manage.
 
-- Read the [documentation](https://komodo.docs.neureka.dev/docs/intro).
-- Use the [CLI and API](https://komodo.docs.neureka.dev/docs/ecosystem) for automation.
+- Read the [documentation](https://komodo.docs.neureka.dev/).
+- Use the [CLI](https://komodo.docs.neureka.dev/reference/cli) and [API clients](https://komodo.docs.neureka.dev/reference/api-and-client-libraries) for automation.
 
 ## Features
 

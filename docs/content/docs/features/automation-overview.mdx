@@ -1,0 +1,35 @@
+---
+title: Automation Overview
+description: Choose the Komodo automation resource that fits a repeatable operation.
+---
+
+Komodo automation turns repeatable deployment and maintenance work into reviewed resources that can run manually, on a schedule, or from a webhook.
+
+## Choose an automation type
+
+| Need | Use |
+| --- | --- |
+| Run resource operations in ordered stages | [Procedure](/features/procedures-and-actions#procedures) |
+| Write custom TypeScript against the Komodo API | [Action](/features/procedures-and-actions#actions) |
+| Run a Procedure or Action at a regular time | [Schedule](/features/schedules) |
+| Trigger a Build, Repo, Stack, Procedure, or Action from Git | [Webhook](/features/webhooks) |
+| Declare resources in TOML and reconcile them from Git | [Resource Sync](/features/resource-sync) |
+
+## Recommended workflow
+
+1. Build and test the operation manually.
+2. Create the smallest Procedure or Action that reproduces it.
+3. Run it manually and inspect the update log.
+4. Add a schedule or webhook only after the manual run is reliable.
+5. Configure failure alerts and assign the narrowest permissions that let operators run it.
+
+## Expected result
+
+The automation creates an auditable update with the triggering user or integration, each step, its output, and the final status.
+
+## Troubleshooting
+
+- Test the underlying resource operation before debugging its automation wrapper.
+- Disable schedules while editing a production Procedure or Action.
+- Confirm webhook secrets and repository permissions when Git events do not arrive.
+- Keep secrets in Komodo variables or providers, not in Resource Sync files committed to Git.

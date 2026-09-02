@@ -1,0 +1,11 @@
+{
+  "title": "Reference",
+  "pages": [
+    "index",
+    "resource-model",
+    "cli",
+    "api-and-client-libraries",
+    "community-integrations",
+    "development"
+  ]
+}

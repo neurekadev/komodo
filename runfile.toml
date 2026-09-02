@@ -20,7 +20,7 @@ alias = "yi"
 description = "downloads latest javacript dependencies for client and ui"
 cmd = """
 cd ui && yarn && \
-cd ../docsite && yarn && \
+cd ../docs && yarn && \
 cd ../client/core/ts && yarn
 """
 
