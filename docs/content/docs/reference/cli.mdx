@@ -94,9 +94,11 @@ docker exec -it komodo km db backup -y
 For a standalone CLI, use the official distroless container image. Mount the directory containing your CLI configuration:
 
 ```bash
-alias km='docker run --rm -v $HOME/.config/komodo:/config ghcr.io/neurekadev/komodo-cli:3 km'
+alias km='docker run --rm -it -v "$HOME/.config/komodo:/config" ghcr.io/neurekadev/komodo-cli:3 km'
 km config
 ```
+
+Keep `-it` for interactive `km connect`, `km exec`, and `km attach` sessions: `-i` keeps standard input open, and `-t` supplies the terminal required for raw mode and resizing. For unattended commands, use `docker run --rm` without `-it`, and pass `-y` where confirmation is required.
 
 Komodo does not publish or support native CLI binaries. Advanced users may compile `km` from the repository source for self-supported use; see [Development](/reference/development).
 
