@@ -261,6 +261,30 @@ where
   .context("File Manager read job stopped unexpectedly")?
 }
 
+async fn cleanup_download_staging(
+  staging: PathBuf,
+  barrier: Arc<tokio::sync::RwLock<()>>,
+) -> anyhow::Result<()> {
+  // Cleanup owns no earlier filesystem lease and cannot fail just because a
+  // protected operation started while the download was streaming.
+  let filesystem = barrier.read_owned().await;
+  run_heavy_blocking_with_lease(filesystem, move || {
+    match fs::remove_dir_all(&staging) {
+      Ok(()) => Ok(()),
+      Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        Ok(())
+      }
+      Err(error) => Err(error).with_context(|| {
+        format!(
+          "Failed to remove download staging {}",
+          staging.display()
+        )
+      }),
+    }
+  })
+  .await
+}
+
 async fn run_root_blocking<T, F>(
   root_key: &str,
   task: F,
@@ -4283,16 +4307,20 @@ pub async fn start_download(
       Err(error) => progress.fail(error),
     }
     file_transfer_channels().remove(&channel).await;
-    let _ = run_heavy_blocking(move || {
-      let _ = fs::remove_dir_all(staging);
-      Ok(())
-    })
-    .await;
+    // Notify the client before waiting for a backup to release cleanup access.
     spawn_file_transfer_final(
       connection.sender.clone(),
       channel,
       result.map(FileTransferMessage::into_raw),
     );
+    if let Err(error) = cleanup_download_staging(
+      staging,
+      crate::api::backup::filesystem_barrier().clone(),
+    )
+    .await
+    {
+      warn!("Download staging cleanup failed: {error:#}");
+    }
   });
   Ok(StartFileManagerDownloadResponse {
     channel,
@@ -8338,6 +8366,28 @@ fn path_string(path: &Path) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[tokio::test]
+  async fn download_cleanup_waits_for_protected_work_and_then_removes_staging()
+   {
+    let root = tempfile::tempdir().unwrap();
+    let staging = root.path().join("download");
+    fs::create_dir(&staging).unwrap();
+    fs::write(staging.join("private-copy"), b"download").unwrap();
+    let barrier = Arc::new(tokio::sync::RwLock::new(()));
+    let protected = barrier.clone().write_owned().await;
+    let mut cleanup = Box::pin(cleanup_download_staging(
+      staging.clone(),
+      barrier.clone(),
+    ));
+    assert!(futures_util::poll!(cleanup.as_mut()).is_pending());
+    assert!(staging.join("private-copy").exists());
+    drop(protected);
+    cleanup.await.unwrap();
+    assert!(!staging.exists());
+    // Repeated cleanup is harmless if another cleanup already removed it.
+    cleanup_download_staging(staging, barrier).await.unwrap();
+  }
 
   #[tokio::test]
   async fn cancelled_waiter_keeps_running_filesystem_work_guarded() {

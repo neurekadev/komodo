@@ -1790,35 +1790,69 @@ fn core_recovery_operation_lock() -> &'static tokio::sync::Mutex<()> {
   LOCK.get_or_init(Default::default)
 }
 
-pub async fn list_snapshots()
--> anyhow::Result<(Vec<BackupSnapshot>, u64)> {
+pub async fn list_snapshots() -> anyhow::Result<(
+  Vec<BackupSnapshot>,
+  u64,
+  tokio::sync::OwnedSemaphorePermit,
+)> {
+  let permit = snapshot_inventory_slots().clone().try_acquire_owned()
+    .context("Another snapshot inventory request is still running; retry after it finishes")?;
+  let deadline =
+    std::time::Instant::now() + std::time::Duration::from_secs(60);
   let settings = get_settings().await?;
-  tokio::task::spawn_blocking(move || {
-    let inventory = core_repository(&settings.primary, &settings)?
-      .list_snapshots()?;
-    let snapshots = inventory
-      .snapshots
-      .into_iter()
-      .map(|mut snapshot| {
-        snapshot.target = authenticated_snapshot_target(&snapshot);
-        if snapshot.target == BackupTarget::Core
-          && let Ok((_, _, created_at)) =
-            crypto::authenticate_core_source_label(
-              &snapshot.source_label,
-              &snapshot.hostname,
-              &snapshot.name,
-            )
-        {
-          // A repository replay must not present an old export as a new one.
-          snapshot.created_at = created_at;
-        }
-        snapshot
-      })
-      .collect();
-    Ok((snapshots, inventory.hidden))
-  })
-  .await
-  .context("Vykar inventory worker failed")?
+  let ((snapshots, hidden), permit) =
+    run_snapshot_inventory_worker(permit, deadline, move || {
+      let inventory = core_repository(&settings.primary, &settings)?
+        .list_snapshots()?;
+      let snapshots = inventory
+        .snapshots
+        .into_iter()
+        .map(|mut snapshot| {
+          snapshot.target = authenticated_snapshot_target(&snapshot);
+          if snapshot.target == BackupTarget::Core
+            && let Ok((_, _, created_at)) =
+              crypto::authenticate_core_source_label(
+                &snapshot.source_label,
+                &snapshot.hostname,
+                &snapshot.name,
+              )
+          {
+            // A repository replay must not present an old export as a new one.
+            snapshot.created_at = created_at;
+          }
+          snapshot
+        })
+        .collect();
+      Ok((snapshots, inventory.hidden))
+    })
+    .await?;
+  // The caller retains admission until it has filtered/paged or selected from
+  // the inventory, so finished workers cannot accumulate full result vectors.
+  Ok((snapshots, hidden, permit))
+}
+
+fn snapshot_inventory_slots() -> &'static Arc<tokio::sync::Semaphore>
+{
+  static SLOTS: OnceLock<Arc<tokio::sync::Semaphore>> =
+    OnceLock::new();
+  SLOTS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
+}
+
+async fn run_snapshot_inventory_worker<T: Send + 'static>(
+  permit: tokio::sync::OwnedSemaphorePermit,
+  deadline: std::time::Instant,
+  work: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
+) -> anyhow::Result<(T, tokio::sync::OwnedSemaphorePermit)> {
+  let worker = tokio::task::spawn_blocking(move || {
+    // Cancellation/timeout leaves admission with the actual blocking worker.
+    // Success transfers it with the inventory until the caller consumes it.
+    let result = work()?;
+    anyhow::Ok((result, permit))
+  });
+  tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), worker)
+    .await
+    .context("Snapshot inventory request exceeded 60 seconds; its worker may still be finishing")?
+    .context("Vykar inventory worker failed")?
 }
 
 fn authorized_source_label(
@@ -3915,11 +3949,13 @@ pub async fn authorize_snapshot(
   user: &User,
   level: komodo_client::entities::permission::PermissionLevel,
 ) -> anyhow::Result<BackupSnapshot> {
-  let (snapshots, _) = list_snapshots().await?;
-  let snapshot = snapshots
-    .into_iter()
-    .find(|snapshot| snapshot.name == snapshot_name)
-    .context("Snapshot does not exist in the primary repository")?;
+  let snapshot = {
+    let (snapshots, _, _inventory) = list_snapshots().await?;
+    snapshots
+      .into_iter()
+      .find(|snapshot| snapshot.name == snapshot_name)
+      .context("Snapshot does not exist in the primary repository")?
+  };
   let source_resource_missing = match &snapshot.target {
     BackupTarget::Stack { stack_id } => Stack::coll()
       .find_one(id_or_name_filter(stack_id))
@@ -5543,14 +5579,12 @@ pub async fn plan_core_recovery(
   reconcile_core_recovery_state_inner().await?;
   let _repository_roles =
     repository_role_barrier().clone().read_owned().await;
-  let snapshot = list_snapshots()
-    .await?
-    .0
-    .into_iter()
-    .find(|snapshot| snapshot.name == snapshot_name)
-    .context(
-      "Core snapshot does not exist in the active primary repository",
-    )?;
+  let snapshot = {
+    let (snapshots, _, _inventory) = list_snapshots().await?;
+    snapshots.into_iter()
+      .find(|snapshot| snapshot.name == snapshot_name)
+      .context("Core snapshot does not exist in the active primary repository")?
+  };
   if snapshot.target != BackupTarget::Core {
     return Err(anyhow!("Selected snapshot is not a Core backup"));
   }
@@ -6982,6 +7016,94 @@ mod tests {
       "unrelated",
       None
     ));
+  }
+
+  #[tokio::test]
+  async fn completed_inventory_keeps_its_slot_until_consumed() {
+    let slots = Arc::new(tokio::sync::Semaphore::new(1));
+    let permit = slots.clone().try_acquire_owned().unwrap();
+    let (snapshots, permit) = run_snapshot_inventory_worker(
+      permit,
+      std::time::Instant::now() + std::time::Duration::from_secs(60),
+      || Ok(vec![1]),
+    )
+    .await
+    .unwrap();
+    assert!(slots.clone().try_acquire_owned().is_err());
+    assert_eq!(snapshots, [1]);
+    drop(snapshots);
+    drop(permit);
+    assert!(slots.try_acquire_owned().is_ok());
+  }
+
+  #[tokio::test]
+  async fn failed_inventory_releases_its_slot() {
+    let slots = Arc::new(tokio::sync::Semaphore::new(1));
+    let permit = slots.clone().try_acquire_owned().unwrap();
+    let result = run_snapshot_inventory_worker(
+      permit,
+      std::time::Instant::now() + std::time::Duration::from_secs(60),
+      || anyhow::bail!("inventory failed"),
+    )
+    .await;
+    let result: anyhow::Result<((), _)> = result;
+    assert!(
+      result.unwrap_err().to_string().contains("inventory failed")
+    );
+    assert!(slots.try_acquire_owned().is_ok());
+  }
+
+  #[tokio::test]
+  async fn timed_out_inventory_keeps_its_worker_slot_until_exit() {
+    let slots = Arc::new(tokio::sync::Semaphore::new(1));
+    let permit = slots.clone().try_acquire_owned().unwrap();
+    let (started, ready) = tokio::sync::oneshot::channel();
+    let (finish, wait) = std::sync::mpsc::channel();
+    let result = run_snapshot_inventory_worker(
+      permit,
+      std::time::Instant::now(),
+      move || {
+        let _ = started.send(());
+        let _ = wait.recv();
+        Ok(())
+      },
+    )
+    .await;
+    assert!(
+      result
+        .unwrap_err()
+        .to_string()
+        .contains("exceeded 60 seconds")
+    );
+    ready.await.unwrap();
+    assert!(slots.clone().try_acquire_owned().is_err());
+    finish.send(()).unwrap();
+    drop(slots.clone().acquire_owned().await.unwrap());
+    assert!(slots.try_acquire_owned().is_ok());
+  }
+
+  #[tokio::test]
+  async fn abandoned_inventory_keeps_its_worker_slot_until_exit() {
+    let slots = Arc::new(tokio::sync::Semaphore::new(1));
+    let permit = slots.clone().try_acquire_owned().unwrap();
+    let (started, ready) = tokio::sync::oneshot::channel();
+    let (finish, wait) = std::sync::mpsc::channel();
+    let job = tokio::spawn(run_snapshot_inventory_worker(
+      permit,
+      std::time::Instant::now() + std::time::Duration::from_secs(60),
+      move || {
+        let _ = started.send(());
+        let _ = wait.recv();
+        Ok(())
+      },
+    ));
+    ready.await.unwrap();
+    job.abort();
+    assert!(job.await.unwrap_err().is_cancelled());
+    assert!(slots.clone().try_acquire_owned().is_err());
+    finish.send(()).unwrap();
+    drop(slots.clone().acquire_owned().await.unwrap());
+    assert!(slots.try_acquire_owned().is_ok());
   }
 
   #[tokio::test]

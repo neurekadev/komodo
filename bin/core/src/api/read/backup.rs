@@ -96,7 +96,7 @@ impl Resolve<ReadArgs> for ListBackupSnapshots {
           .status_code(StatusCode::FORBIDDEN),
       );
     }
-    let (mut snapshots, hidden) =
+    let (mut snapshots, hidden, _inventory) =
       crate::backup::list_snapshots().await?;
     if let Some(target) = self.target {
       snapshots.retain(|snapshot| snapshot.target == target);
