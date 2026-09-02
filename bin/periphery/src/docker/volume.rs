@@ -36,6 +36,8 @@ impl DockerClient {
         let in_use = containers.iter().any(|container| {
           container.volumes.iter().any(|name| &volume.name == name)
         });
+        let anonymous =
+          is_anonymous_volume(&volume.name, &volume.labels);
         VolumeListItem {
           disk_usage: volume_disk_usage(&volume.name, &volume.driver),
           name: volume.name,
@@ -44,6 +46,7 @@ impl DockerClient {
           created: volume.created_at,
           size: volume.usage_data.map(|data| data.size),
           scope,
+          anonymous,
           in_use,
         }
       })

@@ -5960,6 +5960,8 @@ export interface VolumeListItem {
 	mountpoint: string;
 	created?: string;
 	scope: VolumeScopeEnum;
+	/** Whether Docker created the volume without an explicit name. */
+	anonymous?: boolean;
 	/** Amount of disk space used by the volume (in bytes). This information is only available for volumes created with the `\"local\"` volume driver. For volumes created with other volume drivers, this field is set to `-1` (\"not available\") */
 	size?: I64;
 	/** Whether the volume is currently attached to any container */
@@ -6386,6 +6388,14 @@ export interface BackupSettings {
 	volume_selection: BackupVolumeSelection;
 	/** Quiesce the affected running containers during backup. */
 	stop_containers: boolean;
+	/** Include Stack bind mounts that live on a different filesystem than the Stack run directory. Disabled by default. */
+	include_cross_filesystem_mounts?: boolean;
+	/** Include anonymous Docker volumes in volume backups. Disabled by default. */
+	include_anonymous_volumes?: boolean;
+	/** Vykar/gitignore-style patterns selecting Stack bind-mount source roots. An empty list includes every eligible root. */
+	bind_mount_include_patterns?: string[];
+	/** Vykar/gitignore-style patterns excluding Stack bind-mount source roots after include matching. */
+	bind_mount_exclude_patterns?: string[];
 	primary: BackupRepository;
 	mirror?: BackupRepository;
 	advanced: BackupAdvancedSettings;

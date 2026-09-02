@@ -45,8 +45,8 @@ use komodo_client::{
   },
 };
 use periphery_client::api::backup::{
-  CancelVykarOperation, DiscoverBackupSource, FinalizeVykarRestore,
-  PeripheryBackupTarget, PreflightVykarRestore,
+  BackupSourceFilters, CancelVykarOperation, DiscoverBackupSource,
+  FinalizeVykarRestore, PeripheryBackupTarget, PreflightVykarRestore,
   PreflightVykarRestoreResponse, RunVykarBackup, RunVykarBackupBatch,
   TransactionalVykarRestore, VykarBackupTask, VykarRetainedSnapshot,
 };
@@ -267,6 +267,12 @@ async fn save_settings_inner(
   mut proposed: BackupSettings,
   allow_primary_location_change: bool,
 ) -> anyhow::Result<BackupSettings> {
+  normalize_bind_mount_patterns(
+    &mut proposed.bind_mount_include_patterns,
+  );
+  normalize_bind_mount_patterns(
+    &mut proposed.bind_mount_exclude_patterns,
+  );
   validate_settings(&proposed)?;
   let (existing, primary_initialized, mirror_initialized) =
     match settings_collection()
@@ -402,6 +408,14 @@ async fn save_settings_inner(
   Ok(redacted)
 }
 
+fn normalize_bind_mount_patterns(patterns: &mut Vec<String>) {
+  *patterns = patterns
+    .drain(..)
+    .map(|pattern| pattern.trim_end_matches('\r').to_string())
+    .filter(|pattern| !pattern.trim().is_empty())
+    .collect();
+}
+
 async fn mark_repository_initialized(
   mut settings: BackupSettings,
   mirror: bool,
@@ -500,6 +514,14 @@ fn validate_settings(
       "Verification interval must be positive and sample percentage must be between 1 and 100"
     ));
   }
+  komodo_backup::VykarPatternMatcher::new(
+    &settings.bind_mount_include_patterns,
+  )
+  .context("Invalid bind-mount include patterns")?;
+  komodo_backup::VykarPatternMatcher::new(
+    &settings.bind_mount_exclude_patterns,
+  )
+  .context("Invalid bind-mount exclude patterns")?;
   validate_repository_definition(&settings.primary)?;
   if let Some(mirror) = &settings.mirror {
     validate_repository_definition(mirror)?;
@@ -1147,6 +1169,22 @@ fn core_local_repository_paths(
     .collect()
 }
 
+fn backup_source_filters(
+  settings: &BackupSettings,
+) -> BackupSourceFilters {
+  BackupSourceFilters {
+    include_cross_filesystem_mounts: settings
+      .include_cross_filesystem_mounts,
+    include_anonymous_volumes: settings.include_anonymous_volumes,
+    bind_mount_include_patterns: settings
+      .bind_mount_include_patterns
+      .clone(),
+    bind_mount_exclude_patterns: settings
+      .bind_mount_exclude_patterns
+      .clone(),
+  }
+}
+
 pub async fn initialize_repositories() -> anyhow::Result<BackupRun> {
   let _operation = backup_operation_lock().lock().await;
   let _repository_roles =
@@ -1671,6 +1709,12 @@ pub async fn run_backup(
   target: Option<BackupTarget>,
 ) -> anyhow::Result<BackupRun> {
   let _operation = backup_operation_lock().lock().await;
+  run_backup_locked(target).await
+}
+
+async fn run_backup_locked(
+  target: Option<BackupTarget>,
+) -> anyhow::Result<BackupRun> {
   let _repository_roles =
     repository_role_barrier().clone().read_owned().await;
   let mut run = new_run(target.clone(), "Backup running").await?;
@@ -1747,6 +1791,33 @@ pub async fn run_backup(
     queue_maintenance();
   }
   Ok(finished)
+}
+
+async fn run_scheduled_backup() -> anyhow::Result<Option<BackupRun>> {
+  let Ok(_operation) = backup_operation_lock().try_lock() else {
+    tracing::info!(
+      "Skipping scheduled fleet backup because another backup operation is active"
+    );
+    return Ok(None);
+  };
+  let active = runs_collection()
+    .find_one(doc! {
+      "state": {
+        "$in": [
+          to_bson(&BackupRunState::Queued)?,
+          to_bson(&BackupRunState::Running)?,
+        ]
+      }
+    })
+    .await?;
+  if let Some(active) = active {
+    tracing::info!(
+      run_id = active.id,
+      "Skipping scheduled fleet backup because an earlier run is still active"
+    );
+    return Ok(None);
+  }
+  run_backup_locked(None).await.map(Some)
 }
 
 fn spawn_fleet_retry_finalizer(
@@ -2602,6 +2673,7 @@ async fn refresh_node_targets(
     .filter(|volume| {
       volume.driver == "local"
         && volume.scope == VolumeScopeEnum::Local
+        && (settings.include_anonymous_volumes || !volume.anonymous)
     })
   {
     let identity = BackupVolumeTarget {
@@ -2887,6 +2959,7 @@ async fn run_node_batch(
       protected_repository_paths: core_local_repository_paths(
         settings,
       ),
+      filters: backup_source_filters(settings),
       stop_containers: settings.stop_containers,
     })
     .await;
@@ -3311,6 +3384,7 @@ async fn backup_stack(
       protected_repository_paths: core_local_repository_paths(
         settings,
       ),
+      filters: backup_source_filters(settings),
       stop_containers: settings.stop_containers,
       mirror_only: false,
       primary_only: false,
@@ -3372,6 +3446,7 @@ async fn backup_volume(
       protected_repository_paths: core_local_repository_paths(
         settings,
       ),
+      filters: backup_source_filters(settings),
       stop_containers: settings.stop_containers,
       mirror_only: false,
       primary_only: false,
@@ -3548,6 +3623,7 @@ async fn snapshot_stack_source(
 pub async fn current_stack_backup_source(
   stack_id: &str,
 ) -> anyhow::Result<(String, Vec<String>)> {
+  let settings = get_settings().await?;
   let stack = resource::get::<Stack>(stack_id).await?;
   let server =
     resource::get::<Server>(&stack.config.server_id).await?;
@@ -3563,6 +3639,10 @@ pub async fn current_stack_backup_source(
         stack: Box::new(stack),
         repo: repo.map(Box::new),
       },
+      filters: backup_source_filters(&settings),
+      protected_repository_paths: core_local_repository_paths(
+        &settings,
+      ),
     })
     .await?;
   Ok((server.id, source.paths))
@@ -5577,7 +5657,7 @@ pub fn spawn_scheduler() {
       // after disable or reschedule. `current` is intentionally kept alive so
       // this validation cannot be optimized into the earlier snapshot.
       drop(current);
-      if let Err(error) = run_backup(None).await {
+      if let Err(error) = run_scheduled_backup().await {
         error!("Scheduled fleet backup failed: {error:#}");
       }
     }

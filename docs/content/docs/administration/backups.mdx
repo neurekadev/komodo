@@ -17,9 +17,10 @@ Komodo uses the pinned Rust libraries from [Vykar v0.19.1](https://github.com/bo
 4. Choose one schedule and timezone, then enable Core, Stacks, and/or Volumes.
 5. Choose how many complete snapshots to retain for each category. The value applies separately to Core, every Stack, and every Server/Volume pair.
 6. Keep **Stop affected containers while backing up** enabled unless your applications provide their own consistency guarantees.
-7. Save, initialize the repositories, and run the first fleet backup. Check **Fleet status** for partial nodes or integrity failures.
+7. Review the bind-mount and anonymous-volume safety controls under **What to protect**.
+8. Save, initialize the repositories, and run the first fleet backup. Check **Fleet status** for partial nodes or integrity failures.
 
-Defaults are daily at 01:00 in the Core timezone, 14 complete backups per category, all eligible resources included, and safe container stopping enabled.
+Defaults are daily at 01:00 in the Core timezone, 14 complete backups per category, all eligible named resources included, and safe container stopping enabled. Cross-filesystem mount content and anonymous Docker volumes are excluded unless explicitly enabled.
 
 ## What is backed up
 
@@ -29,17 +30,37 @@ A Core backup is a consistent, versioned export of Komodo's restorable database 
 
 ### Stacks
 
-A Stack backup contains its Compose run directory and normalized local bind-mounted paths. Docker named volumes are intentionally excluded because each is backed up and retained independently as a Volume. Swarm Stacks are rejected in this version.
+A Stack backup contains its Compose run directory and eligible normalized local bind-mount source roots. Docker named volumes are intentionally excluded because each is backed up and retained independently as a Volume. Swarm Stacks are rejected in this version.
+
+By default, Komodo does not cross a filesystem boundary beneath any backup source, and it omits an explicit bind source when that source is on a different filesystem from the Stack run directory. This prevents rclone, FUSE, NFS, and similar mounts from being copied unexpectedly. Enable **Include cross-filesystem mount content** only when those mounted files are intentionally part of the backup. The Compose run directory itself is always included; this toggle and the bind rules only control bind-mount source roots.
+
+The **Bind mount include patterns** and **Bind mount exclude patterns** fields accept one Vykar/gitignore-style rule per line and match the absolute bind source path. An empty include field permits every otherwise eligible bind root. Excludes are evaluated after includes and take precedence. Rules select whole bind roots, not individual files inside those roots; use `!` negation with the usual gitignore semantics when a rule set needs an exception. For example:
+
+```text
+# Include patterns
+/srv/apps/**
+!/srv/apps/temporary/**
+
+# Exclude patterns
+/mnt/rclone/**
+**/.cache/**
+```
+
+Pattern selection and filesystem-boundary protection are independent: a path must pass the patterns, and cross-filesystem content still requires the toggle.
 
 ### Volumes
 
-Every eligible local Docker named volume is included by default, including volumes not managed by a Komodo Stack. Komodo checks the driver and mountpoint at backup time. Docker mounts that expose a configured Core-local repository are excluded so a repository cannot recursively back up itself. Remote/plugin volume drivers and non-local volume scope are rejected in this version.
+Every eligible local Docker named volume is included by default, including volumes not managed by a Komodo Stack. Anonymous volumes are excluded by default; enable **Include anonymous Docker volumes** to include them in fleet discovery and direct Volume backups. Komodo recognizes Docker's internal `com.docker.volume.anonymous` label and also treats the daemon-generated 64-character lowercase hexadecimal name form as anonymous for older Docker creation paths that omitted the label. Ordinary unlabeled named volumes remain included.
+
+Komodo checks the driver and mountpoint again at backup time. Docker mounts that expose a configured Core-local repository are excluded so a repository cannot recursively back up itself. Remote/plugin volume drivers and non-local volume scope are rejected in this version.
 
 Use **All**, **Include**, or **Exclude** selection for Stacks and Volumes. Volumes are identified directly by Server and Docker volume name, so unmanaged volumes can be selected without inventing a Stack association. Core has no include/exclude filter.
 
 ## Backing up a fleet
 
-At the beginning of every run, Core discovers the currently configured Periphery nodes and resolves live Docker state. New nodes join the next run automatically. A disconnected or failed node makes the fleet run partial or failed, but successful snapshots remain valid while failed work retries with backoff until the next scheduled run supersedes it.
+At the beginning of every run, Core discovers the currently configured Periphery nodes and resolves live Docker state. New nodes join the next run automatically. A disconnected or failed node makes the fleet run partial or failed, but successful snapshots remain valid while failed work retries with backoff.
+
+Backup operations never overlap. If a backup, retry, restore, repository maintenance operation, or another serialized backup operation is still active when a scheduled occurrence arrives, Core skips that occurrence without queuing or cancelling anything. The active work continues and the scheduler waits for the next normal occurrence. Manual backup requests wait for the current operation rather than creating concurrent repository writers.
 
 If safe container stopping is enabled, Komodo calculates the affected running containers once per node, stops only that set, writes the primary and mirror while the data is quiesced, and restarts exactly the containers that were previously running. Missing or unreadable files make a snapshot partial even when Vykar can commit it. Partial snapshots remain visible for diagnosis, never count as retained complete snapshots, and cannot be restored silently.
 
@@ -126,6 +147,10 @@ Vykar supports [local, S3-compatible, SFTP, and REST backends](https://vykar.bor
 For every external backend, the worker identity must be distinct and its storage-side policy must permit the reads and writes needed for backups while denying deletion, compaction, and other maintenance. Only Core receives the authoritative maintenance-capable credentials.
 
 Encryption is mandatory on every repository. Store the persisted Core backup key with the rest of your disaster-recovery material; losing both Core state and this key prevents Komodo from unsealing repository credentials.
+
+## Vykar cache persistence
+
+The official Compose files persist Vykar's cache in the existing named `data` volume. Core uses `/data/backups/.komodo-vykar-cache`; the colocated Periphery uses `.komodo-vykar` beneath its Stack directory, whose default host path is an alias into the same `data` volume. No separate cache volume is required. The cache can be rebuilt from a repository, but keeping it across container recreation avoids unnecessary index downloads and preserves normal deduplication performance.
 
 ## Legacy database backup migration
 

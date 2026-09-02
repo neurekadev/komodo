@@ -260,6 +260,22 @@ pub struct BackupSettings {
   pub volume_selection: BackupVolumeSelection,
   /// Quiesce the affected running containers during backup.
   pub stop_containers: bool,
+  /// Traverse filesystem boundaries encountered beneath a backup source and
+  /// include Stack bind roots stored on a different filesystem.
+  #[serde(default)]
+  pub include_cross_filesystem_mounts: bool,
+  /// Include Docker volumes with daemon-generated anonymous names in Volume
+  /// backups. Disabled by default.
+  #[serde(default)]
+  pub include_anonymous_volumes: bool,
+  /// Vykar/gitignore-style patterns selecting eligible absolute Stack bind
+  /// source paths. An empty list includes every otherwise eligible bind.
+  #[serde(default)]
+  pub bind_mount_include_patterns: Vec<String>,
+  /// Vykar/gitignore-style patterns excluding absolute Stack bind source
+  /// paths after the include rules are evaluated.
+  #[serde(default)]
+  pub bind_mount_exclude_patterns: Vec<String>,
   pub primary: BackupRepository,
   pub mirror: Option<BackupRepository>,
   pub advanced: BackupAdvancedSettings,
@@ -283,6 +299,10 @@ impl Default for BackupSettings {
       stack_selection: Default::default(),
       volume_selection: Default::default(),
       stop_containers: true,
+      include_cross_filesystem_mounts: false,
+      include_anonymous_volumes: false,
+      bind_mount_include_patterns: Vec::new(),
+      bind_mount_exclude_patterns: Vec::new(),
       primary: BackupRepository {
         name: "Primary".into(),
         ..Default::default()
@@ -497,6 +517,15 @@ mod tests {
       &selected,
       &"c"
     ));
+  }
+
+  #[test]
+  fn mount_and_anonymous_volume_safety_defaults_are_disabled() {
+    let settings = BackupSettings::default();
+    assert!(!settings.include_cross_filesystem_mounts);
+    assert!(!settings.include_anonymous_volumes);
+    assert!(settings.bind_mount_include_patterns.is_empty());
+    assert!(settings.bind_mount_exclude_patterns.is_empty());
   }
 
   #[test]

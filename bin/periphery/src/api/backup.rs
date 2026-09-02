@@ -13,10 +13,12 @@ use std::{
 
 use anyhow::{Context, anyhow};
 use command::{CommandOptions, run_komodo_standard_command};
-use komodo_backup::{VykarRepository, backup_manifest_source_name};
+use komodo_backup::{
+  VykarPatternMatcher, VykarRepository, backup_manifest_source_name,
+};
 use komodo_client::entities::docker::{
   container::{ContainerListItem, ContainerStateStatusEnum},
-  volume::VolumeScopeEnum,
+  volume::{VolumeScopeEnum, is_anonymous_volume},
 };
 use mogh_resolver::Resolve;
 use periphery_client::api::backup::*;
@@ -162,7 +164,12 @@ impl Resolve<Args> for DiscoverBackupSource {
     self,
     _: &Args,
   ) -> anyhow::Result<DiscoverBackupSourceResponse> {
-    discover_source(&self.target, &[]).await
+    discover_source(
+      &self.target,
+      &self.protected_repository_paths,
+      &self.filters,
+    )
+    .await
   }
 }
 
@@ -174,9 +181,12 @@ impl Resolve<Args> for RunVykarBackup {
     let _operation = backup_operation_lock().lock().await;
     let (_cancellation, _cancellation_registration) =
       register_operation_cancellation(&self.run_id);
-    let discovered =
-      discover_source(&self.target, &self.protected_repository_paths)
-        .await?;
+    let discovered = discover_source(
+      &self.target,
+      &self.protected_repository_paths,
+      &self.filters,
+    )
+    .await?;
     let container_journal = if self.stop_containers {
       persist_container_quiesce_journal(
         &self.run_id,
@@ -273,6 +283,7 @@ impl Resolve<Args> for RunVykarBackupBatch {
       match discover_source(
         &task.target,
         &self.protected_repository_paths,
+        &self.filters,
       )
       .await
       {
@@ -338,6 +349,7 @@ impl Resolve<Args> for RunVykarBackupBatch {
         protected_repository_paths: self
           .protected_repository_paths
           .clone(),
+        filters: self.filters.clone(),
         stop_containers: false,
         mirror_only: task.mirror_only,
         primary_only: task.primary_only,
@@ -427,6 +439,7 @@ async fn run_backup_repositories(
       request.source_label.clone(),
       paths.clone(),
       operation_cancellation_token(&request.run_id),
+      !request.filters.include_cross_filesystem_mounts,
     )
     .await
   };
@@ -451,6 +464,7 @@ async fn run_backup_repositories(
         request.source_label.clone(),
         paths,
         operation_cancellation_token(&request.run_id),
+        !request.filters.include_cross_filesystem_mounts,
       )
       .await,
     )
@@ -475,6 +489,7 @@ async fn run_repository_backup(
   source_label: String,
   source_paths: Vec<String>,
   cancellation: Arc<AtomicBool>,
+  one_file_system: bool,
 ) -> VykarBackupRepositoryResult {
   let result = tokio::task::spawn_blocking(move || {
     let cache = vykar_cache_dir(&hostname)?;
@@ -484,11 +499,12 @@ async fn run_repository_backup(
       &cache,
       &advanced,
     )?;
-    repository.backup_cancellable(
+    repository.backup_cancellable_with_options(
       &snapshot_name,
       &source_label,
       &source_paths,
       Some(cancellation.as_ref()),
+      one_file_system,
     )
   })
   .await;
@@ -928,6 +944,7 @@ async fn affected_running_containers(
 async fn discover_source(
   target: &PeripheryBackupTarget,
   protected_repository_paths: &[String],
+  filters: &BackupSourceFilters,
 ) -> anyhow::Result<DiscoverBackupSourceResponse> {
   let docker_guard = docker_client().load();
   let docker = docker_guard
@@ -978,6 +995,11 @@ async fn discover_source(
           )?;
         }
       }
+      let bind_paths = select_bind_backup_roots(
+        bind_paths,
+        &run_directory,
+        filters,
+      )?;
       let internal_storage =
         periphery_config().stack_dir().join(".komodo-vykar");
       validate_path_outside_internal_storage(
@@ -1036,6 +1058,14 @@ async fn discover_source(
           volume.scope
         ));
       }
+      if !filters.include_anonymous_volumes
+        && is_anonymous_volume(&volume.name, &volume.labels)
+      {
+        return Err(anyhow!(
+          "Anonymous Docker volume '{}' is excluded by backup settings",
+          volume.name
+        ));
+      }
       let running_containers = containers
         .into_iter()
         .filter(|container| {
@@ -1060,6 +1090,59 @@ async fn discover_source(
         running_containers,
       })
     }
+  }
+}
+
+fn select_bind_backup_roots(
+  paths: BTreeSet<PathBuf>,
+  run_directory: &Path,
+  filters: &BackupSourceFilters,
+) -> anyhow::Result<BTreeSet<PathBuf>> {
+  let include =
+    VykarPatternMatcher::new(&filters.bind_mount_include_patterns)
+      .context("Invalid bind-mount include patterns")?;
+  let exclude =
+    VykarPatternMatcher::new(&filters.bind_mount_exclude_patterns)
+      .context("Invalid bind-mount exclude patterns")?;
+  let run_device = std::fs::metadata(run_directory)
+    .with_context(|| {
+      format!(
+        "Failed to inspect Stack run-directory filesystem: {}",
+        run_directory.display()
+      )
+    })?
+    .dev();
+  let mut selected = BTreeSet::new();
+  for path in paths {
+    let metadata = std::fs::metadata(&path).with_context(|| {
+      format!(
+        "Failed to inspect bind-mount filesystem: {}",
+        path.display()
+      )
+    })?;
+    if !filters.bind_mount_include_patterns.is_empty()
+      && !include.matches(&path, metadata.is_dir())
+    {
+      continue;
+    }
+    if exclude.matches(&path, metadata.is_dir()) {
+      continue;
+    }
+    if !filters.include_cross_filesystem_mounts {
+      if metadata.dev() != run_device {
+        continue;
+      }
+    }
+    selected.insert(path);
+  }
+  Ok(selected)
+}
+
+fn unfiltered_source_filters() -> BackupSourceFilters {
+  BackupSourceFilters {
+    include_cross_filesystem_mounts: true,
+    include_anonymous_volumes: true,
+    ..Default::default()
   }
 }
 
@@ -1411,12 +1494,16 @@ impl Resolve<Args> for TransactionalVykarRestore {
       if let PeripheryBackupTarget::Volume { volume_name } =
         &self.target
       {
-        let mountpoint = discover_source(&self.target, &[])
-          .await?
-          .paths
-          .into_iter()
-          .next()
-          .context("Destination volume has no mountpoint")?;
+        let mountpoint = discover_source(
+          &self.target,
+          &[],
+          &unfiltered_source_filters(),
+        )
+        .await?
+        .paths
+        .into_iter()
+        .next()
+        .context("Destination volume has no mountpoint")?;
         resolve_volume_publish_destinations(
           &mut self.publish,
           volume_name,
@@ -1654,7 +1741,13 @@ impl Resolve<Args> for PreflightVykarRestore {
       PeripheryBackupTarget::Stack { .. } => {
         // A missing Stack destination can legitimately be planned as a
         // recovered Stack; execution recreates its mapped filesystem roots.
-        discover_source(&self.target, &[]).await.ok()
+        discover_source(
+          &self.target,
+          &[],
+          &unfiltered_source_filters(),
+        )
+        .await
+        .ok()
       }
       PeripheryBackupTarget::Volume { volume_name } => {
         let docker_guard = docker_client().load();
@@ -1672,7 +1765,14 @@ impl Resolve<Args> for PreflightVykarRestore {
           // Once Docker confirms the Volume exists, an unsupported driver or
           // inspect failure is a real preflight error, not evidence that the
           // destination is absent.
-          Some(discover_source(&self.target, &[]).await?)
+          Some(
+            discover_source(
+              &self.target,
+              &[],
+              &unfiltered_source_filters(),
+            )
+            .await?,
+          )
         } else {
           None
         }
@@ -3077,6 +3177,33 @@ mod tests {
       &[repository],
     )
     .unwrap();
+  }
+
+  #[test]
+  fn bind_root_filters_use_vykar_path_rules() {
+    let root = tempfile::tempdir().unwrap();
+    let run = root.path().join("run");
+    let included = root.path().join("binds/application");
+    let excluded = root.path().join("binds/cache");
+    let outside = root.path().join("other/data");
+    for path in [&run, &included, &excluded, &outside] {
+      std::fs::create_dir_all(path).unwrap();
+    }
+    let root_pattern =
+      root.path().to_string_lossy().replace('\\', "/");
+    let selected = select_bind_backup_roots(
+      [included.clone(), excluded, outside].into_iter().collect(),
+      &run,
+      &BackupSourceFilters {
+        bind_mount_include_patterns: vec![format!(
+          "{root_pattern}/binds/**"
+        )],
+        bind_mount_exclude_patterns: vec!["**/cache".into()],
+        ..Default::default()
+      },
+    )
+    .unwrap();
+    assert_eq!(selected, [included].into_iter().collect());
   }
 
   fn container(

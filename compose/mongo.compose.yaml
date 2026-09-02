@@ -37,7 +37,7 @@ services:
     environment:
       KOMODO_DATABASE_ADDRESS: mongo:27017
     volumes:
-      ## Share keys, backups, syncs, and repository cache with Periphery.
+      ## Share keys, backups, syncs, and repository and Vykar caches with Periphery.
       - data:/data
       ## Optionally mount a custom core.config.toml
       # - /path/to/core.config.toml:/config/config.toml
@@ -62,7 +62,7 @@ services:
       PERIPHERY_STACK_DIR: ${PERIPHERY_STACK_DIR:-${PERIPHERY_DOCKER_VOLUME_ROOT:-/var/lib/docker/volumes}/${COMPOSE_PROJECT_NAME:-komodo}_data/_data/stacks}
       PERIPHERY_BUILD_DIR: ${PERIPHERY_BUILD_DIR:-${PERIPHERY_DOCKER_VOLUME_ROOT:-/var/lib/docker/volumes}/${COMPOSE_PROJECT_NAME:-komodo}_data/_data/builds}
     volumes:
-      ## Share keys and Periphery-managed state with Core.
+      ## Share keys and Periphery-managed state, including its Vykar cache, with Core.
       - data:/data
       ## Mount external docker socket
       - /var/run/docker.sock:/var/run/docker.sock

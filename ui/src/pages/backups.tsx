@@ -22,6 +22,7 @@ import {
   Switch,
   Text,
   TextInput,
+  Textarea,
 } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import { Types } from "komodo_client";
@@ -65,6 +66,9 @@ const backendDefaults = (
       return { type: "CoreLocal", params: { path: "/data/backups/vykar" } };
   }
 };
+
+const patternLines = (value: string) =>
+  value.split("\n").map((line) => line.replace(/\r$/, ""));
 
 export default function Backups() {
   useSetTitle("Backups");
@@ -432,6 +436,58 @@ function BackupSettingsForm({
           />
         </SimpleGrid>
         <Divider my="md" />
+        <Stack mb="md">
+          <Switch
+            label="Include cross-filesystem mount content"
+            description="Disabled by default. Enable only when Stack bind mounts or nested source directories on other filesystems, including rclone/FUSE mounts, must be backed up."
+            checked={settings.include_cross_filesystem_mounts ?? false}
+            onChange={(event) =>
+              patch({
+                include_cross_filesystem_mounts: event.currentTarget.checked,
+              })
+            }
+          />
+          <Switch
+            label="Include anonymous Docker volumes"
+            description="Disabled by default. Anonymous daemon-generated volumes are omitted from Volume backups unless enabled."
+            checked={settings.include_anonymous_volumes ?? false}
+            onChange={(event) =>
+              patch({ include_anonymous_volumes: event.currentTarget.checked })
+            }
+          />
+          <SimpleGrid cols={{ base: 1, md: 2 }}>
+            <Textarea
+              label="Bind mount include patterns"
+              description="Optional Vykar/gitignore-style absolute path rules, one per line. Empty includes every eligible bind mount."
+              placeholder={"/srv/**\n!/srv/cache/**"}
+              value={(settings.bind_mount_include_patterns ?? []).join("\n")}
+              onChange={(event) =>
+                patch({
+                  bind_mount_include_patterns: patternLines(
+                    event.currentTarget.value,
+                  ),
+                })
+              }
+              autosize
+              minRows={3}
+            />
+            <Textarea
+              label="Bind mount exclude patterns"
+              description="Vykar/gitignore-style absolute path rules, one per line. Excludes are applied after includes."
+              placeholder={"/mnt/rclone/**\n**/.cache/**"}
+              value={(settings.bind_mount_exclude_patterns ?? []).join("\n")}
+              onChange={(event) =>
+                patch({
+                  bind_mount_exclude_patterns: patternLines(
+                    event.currentTarget.value,
+                  ),
+                })
+              }
+              autosize
+              minRows={3}
+            />
+          </SimpleGrid>
+        </Stack>
         <StackSelectionEditor settings={settings} patch={patch} />
         <VolumeSelectionEditor settings={settings} patch={patch} />
       </Section>

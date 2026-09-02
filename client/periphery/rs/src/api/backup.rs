@@ -19,11 +19,34 @@ pub enum PeripheryBackupTarget {
   },
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct BackupSourceFilters {
+  /// Traverse mount boundaries beneath a source and include Stack bind roots
+  /// stored on a different filesystem. Disabled by default.
+  #[serde(default)]
+  pub include_cross_filesystem_mounts: bool,
+  /// Include Docker volumes with daemon-generated anonymous names.
+  #[serde(default)]
+  pub include_anonymous_volumes: bool,
+  /// Vykar/gitignore-style rules selecting absolute Stack bind source paths.
+  #[serde(default)]
+  pub bind_mount_include_patterns: Vec<String>,
+  /// Vykar/gitignore-style rules excluding absolute Stack bind source paths.
+  #[serde(default)]
+  pub bind_mount_exclude_patterns: Vec<String>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Resolve)]
 #[response(DiscoverBackupSourceResponse)]
 #[error(anyhow::Error)]
 pub struct DiscoverBackupSource {
   pub target: PeripheryBackupTarget,
+  #[serde(default)]
+  pub filters: BackupSourceFilters,
+  /// Core-local repository paths as mounted inside Core. Periphery resolves
+  /// their Docker mount sources and refuses to capture those sources.
+  #[serde(default)]
+  pub protected_repository_paths: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -49,6 +72,8 @@ pub struct RunVykarBackup {
   /// their Docker mount sources and refuses to capture those sources.
   #[serde(default)]
   pub protected_repository_paths: Vec<String>,
+  #[serde(default)]
+  pub filters: BackupSourceFilters,
   #[serde(default)]
   pub stop_containers: bool,
   /// Retry only the mirror for a snapshot already committed to primary.
@@ -124,6 +149,8 @@ pub struct RunVykarBackupBatch {
   /// their Docker mount sources and refuses to capture those sources.
   #[serde(default)]
   pub protected_repository_paths: Vec<String>,
+  #[serde(default)]
+  pub filters: BackupSourceFilters,
   #[serde(default)]
   pub stop_containers: bool,
 }

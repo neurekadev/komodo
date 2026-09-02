@@ -49,7 +49,7 @@ services:
       PERIPHERY_INCLUDE_DISK_MOUNTS: ${PERIPHERY_INCLUDE_DISK_MOUNTS:-/etc/hostname}
       # PERIPHERY_EXCLUDE_DISK_MOUNTS: ${PERIPHERY_EXCLUDE_DISK_MOUNTS:-/snap,/etc/repos}
     volumes:
-      ## Persist keys and all Periphery-managed state.
+      ## Persist keys and all Periphery-managed state, including its Vykar cache.
       - data:/data
       ## Mount external docker socket
       - /var/run/docker.sock:/var/run/docker.sock

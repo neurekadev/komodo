@@ -25,6 +25,37 @@ use vykar_core::{
   snapshot::item::ItemType,
 };
 
+/// Matcher for the gitignore-style path syntax used by Vykar exclude rules.
+/// Komodo also uses it to select absolute Stack bind roots, with `/` as the
+/// matcher root so rules remain stable across Periphery working directories.
+pub struct VykarPatternMatcher(ignore::gitignore::Gitignore);
+
+impl VykarPatternMatcher {
+  pub fn new(patterns: &[String]) -> anyhow::Result<Self> {
+    let mut builder =
+      ignore::gitignore::GitignoreBuilder::new(Path::new("/"));
+    for pattern in patterns {
+      if pattern.contains(['\n', '\r', '\0']) {
+        return Err(anyhow!(
+          "Vykar path patterns must contain exactly one rule per entry"
+        ));
+      }
+      builder.add_line(None, pattern).with_context(|| {
+        format!("Invalid Vykar path pattern '{pattern}'")
+      })?;
+    }
+    Ok(Self(
+      builder
+        .build()
+        .context("Failed to build Vykar path-pattern matcher")?,
+    ))
+  }
+
+  pub fn matches(&self, path: &Path, is_dir: bool) -> bool {
+    self.0.matched_path_or_any_parents(path, is_dir).is_ignore()
+  }
+}
+
 /// A configured repository plus temporary secret material kept alive for the
 /// duration of an operation.
 pub struct VykarRepository {
@@ -171,6 +202,24 @@ impl VykarRepository {
     source_paths: &[String],
     shutdown: Option<&AtomicBool>,
   ) -> anyhow::Result<BackupResult> {
+    self.backup_cancellable_with_options(
+      snapshot_name,
+      source_label,
+      source_paths,
+      shutdown,
+      false,
+    )
+  }
+
+  /// Run a cancellable backup with explicit filesystem traversal behavior.
+  pub fn backup_cancellable_with_options(
+    &self,
+    snapshot_name: &str,
+    source_label: &str,
+    source_paths: &[String],
+    shutdown: Option<&AtomicBool>,
+    one_file_system: bool,
+  ) -> anyhow::Result<BackupResult> {
     let outcome = commands::backup::run_with_progress(
       &self.config,
       commands::backup::BackupRequest {
@@ -180,7 +229,7 @@ impl VykarRepository {
         source_label,
         exclude_patterns: &[],
         exclude_if_present: &[],
-        one_file_system: false,
+        one_file_system,
         git_ignore: false,
         xattrs_enabled: true,
         compression: Compression::Lz4,
@@ -801,6 +850,22 @@ mod tests {
     assert_eq!(first, backup_manifest_source_name("snapshot-one"));
     assert_ne!(first, backup_manifest_source_name("snapshot-two"));
     assert_eq!(first.len(), "komodo-backup-manifest-".len() + 64);
+  }
+
+  #[test]
+  fn vykar_path_patterns_match_absolute_bind_roots() {
+    let matcher = VykarPatternMatcher::new(&[
+      "/mnt/**".into(),
+      "!/mnt/local/**".into(),
+      "**/.cache/**".into(),
+    ])
+    .unwrap();
+    assert!(matcher.matches(Path::new("/mnt/rclone/media"), true));
+    assert!(!matcher.matches(Path::new("/mnt/local/data"), true));
+    assert!(
+      matcher.matches(Path::new("/srv/app/.cache/files"), true)
+    );
+    assert!(!matcher.matches(Path::new("/srv/app/data"), true));
   }
 
   #[test]
