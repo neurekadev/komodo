@@ -69,7 +69,7 @@ pub async fn app() -> anyhow::Result<Router> {
         "/auth",
         mogh_auth_server::api::router::<KomodoAuthImpl>().layer(
           axum::middleware::from_fn(
-            crate::auth::middleware::backup_mutation_guard,
+            crate::auth::middleware::backup_mutation_scope,
           ),
         ),
       )

@@ -76,12 +76,18 @@ const CORE_RECOVERY_COLLECTION: &str = "CoreRecoveryPlan";
 const HEALTH_COLLECTION: &str = "BackupRepositoryHealth";
 const OPERATIONAL_ALERT_PATH: &str =
   "/data/backup-operational-alert.json";
-const CORE_STAGING_PATH: &str = "/data/backups/.komodo-core-staging";
+const CORE_PRIVATE_PATH: &str = "/core-secrets";
+const CORE_STAGING_PATH: &str = "/core-secrets/.komodo-core-staging";
 const CORE_CACHE_PATH: &str = "/data/backups/.komodo-vykar-cache";
 const CORE_RECOVERY_STAGING_PATH: &str =
-  "/data/backups/.komodo-core-recovery";
+  "/core-secrets/.komodo-core-recovery";
 const STACK_MANIFEST_STAGING_PATH: &str =
-  "/data/backups/.komodo-stack-manifest";
+  "/core-secrets/.komodo-stack-manifest";
+const LEGACY_CORE_STAGING_PATHS: [&str; 3] = [
+  "/data/backups/.komodo-core-staging",
+  "/data/backups/.komodo-core-recovery",
+  "/data/backups/.komodo-stack-manifest",
+];
 const CORE_INSTANCE_ID_PATH: &str = "/data/keys/backup-instance-id";
 const LEGACY_CORE_INSTANCE_ID_PATH: &str =
   "/config/keys/backup-instance-id";
@@ -578,12 +584,10 @@ fn validate_repository_definition(
         ));
       }
       let resolved = resolve_existing_path_ancestor(&normalized)?;
-      for reserved in [
-        CORE_STAGING_PATH,
-        CORE_CACHE_PATH,
-        CORE_RECOVERY_STAGING_PATH,
-        STACK_MANIFEST_STAGING_PATH,
-      ] {
+      for reserved in [CORE_PRIVATE_PATH, CORE_CACHE_PATH]
+        .into_iter()
+        .chain(LEGACY_CORE_STAGING_PATHS)
+      {
         let reserved = normalize_core_local_path(reserved);
         let resolved_reserved =
           resolve_existing_path_ancestor(&reserved)?;
@@ -1109,6 +1113,12 @@ fn core_cache_dir() -> anyhow::Result<PathBuf> {
   Ok(directory)
 }
 
+fn core_secret_dir() -> anyhow::Result<PathBuf> {
+  let directory = PathBuf::from(CORE_PRIVATE_PATH);
+  std::fs::create_dir_all(&directory)?;
+  Ok(directory)
+}
+
 fn core_repository(
   repository: &BackupRepository,
   settings: &BackupSettings,
@@ -1117,6 +1127,7 @@ fn core_repository(
     repository,
     &format!("komodo-core-{}", core_instance_id()?),
     &core_cache_dir()?,
+    &core_secret_dir()?,
     &settings.advanced,
   )
 }
@@ -1126,8 +1137,9 @@ fn core_repository(
 /// backend. Authoritative maintenance credentials never cross the
 /// Core/Periphery boundary. Vykar writers do receive the repository
 /// passphrase because its client-side encryption and deduplication require
-/// read access; participating Periphery agents are therefore repository-read
-/// trusted as documented in the administrator guide.
+/// read access. Workers sharing a repository must also trust each other's
+/// backup writes: worker labels do not authenticate immutable contents or
+/// isolate writers, as documented in the administrator guide.
 fn repository_for_periphery(
   repository: &BackupRepository,
   mirror: bool,
@@ -1780,6 +1792,17 @@ pub async fn list_snapshots()
       .into_iter()
       .map(|mut snapshot| {
         snapshot.target = authenticated_snapshot_target(&snapshot);
+        if snapshot.target == BackupTarget::Core
+          && let Ok((_, _, created_at)) =
+            crypto::authenticate_core_source_label(
+              &snapshot.source_label,
+              &snapshot.hostname,
+              &snapshot.name,
+            )
+        {
+          // A repository replay must not present an old export as a new one.
+          snapshot.created_at = created_at;
+        }
         snapshot
       })
       .collect();
@@ -1850,8 +1873,10 @@ fn authenticated_retention_deletions(
   snapshots: &[BackupSnapshot],
   settings: &BackupSettings,
 ) -> Vec<String> {
-  let mut by_source: HashMap<String, (u64, Vec<&BackupSnapshot>)> =
-    HashMap::new();
+  let mut by_source: HashMap<
+    String,
+    (u64, Vec<(&BackupSnapshot, i64)>),
+  > = HashMap::new();
   for snapshot in snapshots {
     let Some((target, raw_source)) =
       authenticated_snapshot_source(snapshot)
@@ -1864,27 +1889,52 @@ fn authenticated_retention_deletions(
       BackupTarget::Volume { .. } => settings.volume_keep_last,
       BackupTarget::Unbound { .. } => continue,
     };
+    let created_at = if target == BackupTarget::Core {
+      let Ok((_, _, created_at)) =
+        crypto::authenticate_core_source_label(
+          &snapshot.source_label,
+          &snapshot.hostname,
+          &snapshot.name,
+        )
+      else {
+        continue;
+      };
+      created_at
+    } else {
+      snapshot.created_at
+    };
     let entry =
       by_source.entry(raw_source).or_insert((keep, Vec::new()));
-    entry.1.push(snapshot);
+    entry.1.push((snapshot, created_at));
   }
   let mut delete = Vec::new();
-  for (_, (keep_last, mut snapshots)) in by_source {
-    snapshots
-      .sort_by_key(|snapshot| std::cmp::Reverse(snapshot.created_at));
-    let mut complete_seen = 0_u64;
-    let mut partial_seen = 0_u64;
-    for snapshot in snapshots {
-      let keep = if snapshot.partial {
-        partial_seen += 1;
-        partial_seen == 1
-      } else {
-        complete_seen += 1;
-        complete_seen <= keep_last.max(1)
-      };
-      if !keep {
-        delete.push(snapshot.name.clone());
-      }
+  for (_, (keep_last, snapshots)) in by_source {
+    delete.extend(retention_deletions_by_creation_time(
+      snapshots, keep_last,
+    ));
+  }
+  delete
+}
+
+fn retention_deletions_by_creation_time(
+  mut snapshots: Vec<(&BackupSnapshot, i64)>,
+  keep_last: u64,
+) -> Vec<String> {
+  snapshots
+    .sort_by_key(|(_, created_at)| std::cmp::Reverse(*created_at));
+  let mut delete = Vec::new();
+  let mut complete_seen = 0_u64;
+  let mut partial_seen = 0_u64;
+  for (snapshot, _) in snapshots {
+    let keep = if snapshot.partial {
+      partial_seen += 1;
+      partial_seen == 1
+    } else {
+      complete_seen += 1;
+      complete_seen <= keep_last.max(1)
+    };
+    if !keep {
+      delete.push(snapshot.name.clone());
     }
   }
   delete
@@ -3537,12 +3587,13 @@ async fn backup_core(
     .into_iter()
     .filter(|name| core_export_includes_collection(name))
     .collect::<Vec<_>>();
+  let created_at = komodo_timestamp();
   let manifest = serde_json::json!({
     "schema": "komodo.core-export/v1",
     "version": komodo_build_info::version(),
     "core_instance_id": core_instance_id()?,
     "collections": exported_collections,
-    "created_at": komodo_timestamp(),
+    "created_at": created_at,
   });
   tokio::fs::write(
     staging.join("komodo-core-manifest.json"),
@@ -3562,6 +3613,7 @@ async fn backup_core(
     &hostname,
     &name,
     &digest,
+    created_at,
   )?;
   let path = staging.to_string_lossy().into_owned();
   let mut retry = CoreRepositoryRetry {
@@ -3873,6 +3925,7 @@ async fn snapshot_stack_source(
       &repository,
       &hostname,
       &core_cache_dir()?,
+      &core_secret_dir()?,
       &advanced,
     )?
     .restore(&snapshot_name, &destination, &[manifest_source])
@@ -5089,11 +5142,15 @@ impl Drop for RemoveDirectoryOnDrop {
 }
 
 fn purge_abandoned_core_staging() -> anyhow::Result<()> {
-  for path in [
+  for (path, recreate) in [
     CORE_STAGING_PATH,
     CORE_RECOVERY_STAGING_PATH,
     STACK_MANIFEST_STAGING_PATH,
-  ] {
+  ]
+  .into_iter()
+  .map(|path| (path, true))
+  .chain(LEGACY_CORE_STAGING_PATHS.map(|path| (path, false)))
+  {
     let path = Path::new(path);
     match std::fs::remove_dir_all(path) {
       Ok(()) => {}
@@ -5105,9 +5162,11 @@ fn purge_abandoned_core_staging() -> anyhow::Result<()> {
         )));
       }
     }
-    std::fs::create_dir_all(path).with_context(|| {
-      format!("Failed to create Core staging at {}", path.display())
-    })?;
+    if recreate {
+      std::fs::create_dir_all(path).with_context(|| {
+        format!("Failed to create Core staging at {}", path.display())
+      })?;
+    }
   }
   Ok(())
 }
@@ -5449,11 +5508,12 @@ pub async fn plan_core_recovery(
     .parent()
     .context("Core manifest has no export root")?
     .to_path_buf();
-  let (_, expected_digest) = crypto::authenticate_core_source_label(
-    &snapshot.source_label,
-    &snapshot.hostname,
-    &snapshot.name,
-  )?;
+  let (_, expected_digest, expected_created_at) =
+    crypto::authenticate_core_source_label(
+      &snapshot.source_label,
+      &snapshot.hostname,
+      &snapshot.name,
+    )?;
   let digest_root = authenticated_root.clone();
   let actual_digest = tokio::task::spawn_blocking(move || {
     core_export_digest(&digest_root)
@@ -5467,6 +5527,15 @@ pub async fn plan_core_recovery(
   }
   let manifest: serde_json::Value =
     serde_json::from_slice(&tokio::fs::read(&manifest_path).await?)?;
+  if manifest
+    .get("created_at")
+    .and_then(serde_json::Value::as_i64)
+    != Some(expected_created_at)
+  {
+    return Err(anyhow!(
+      "Core manifest creation time does not match its authorization"
+    ));
+  }
   let backup_schema = manifest
     .get("schema")
     .and_then(serde_json::Value::as_str)
@@ -6366,10 +6435,12 @@ mod tests {
   #[test]
   fn core_local_repositories_reject_internal_work_directories() {
     for path in [
+      CORE_PRIVATE_PATH,
       CORE_STAGING_PATH,
       CORE_CACHE_PATH,
       CORE_RECOVERY_STAGING_PATH,
       STACK_MANIFEST_STAGING_PATH,
+      "/core-secrets/.komodo-core-staging/repository",
       "/data/backups/.komodo-core-staging/repository",
       "/data/backups",
       "/data",
@@ -6383,6 +6454,64 @@ mod tests {
       };
       assert!(validate_repository_definition(&repository).is_err());
     }
+  }
+
+  #[test]
+  fn core_sensitive_work_stays_outside_shared_data() {
+    for path in [
+      CORE_STAGING_PATH,
+      CORE_RECOVERY_STAGING_PATH,
+      STACK_MANIFEST_STAGING_PATH,
+    ] {
+      assert!(Path::new(path).starts_with(CORE_PRIVATE_PATH));
+      assert!(!paths_overlap(Path::new(path), Path::new("/data")));
+    }
+    assert!(Path::new(CORE_CACHE_PATH).starts_with("/data"));
+  }
+
+  #[test]
+  fn exact_core_replays_cannot_advance_retention_order() {
+    let replay = BackupSnapshot {
+      name: "old-replayed-export".into(),
+      created_at: 90_000,
+      ..Default::default()
+    };
+    let recent = BackupSnapshot {
+      name: "recent".into(),
+      created_at: 20,
+      ..Default::default()
+    };
+    let newest = BackupSnapshot {
+      name: "newest".into(),
+      created_at: 30,
+      ..Default::default()
+    };
+    // The replay has fresh repository metadata, but its signed export time
+    // remains 10. It must never displace either newer genuine recovery point.
+    assert_eq!(
+      retention_deletions_by_creation_time(
+        vec![(&replay, 10), (&recent, 20), (&newest, 30)],
+        2,
+      ),
+      vec!["old-replayed-export"],
+    );
+    let partial = BackupSnapshot {
+      name: "partial".into(),
+      partial: true,
+      ..Default::default()
+    };
+    assert_eq!(
+      retention_deletions_by_creation_time(
+        vec![
+          (&replay, 10),
+          (&recent, 20),
+          (&newest, 30),
+          (&partial, 40)
+        ],
+        2,
+      ),
+      vec!["old-replayed-export"],
+    );
   }
 
   #[test]

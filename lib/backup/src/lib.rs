@@ -67,11 +67,13 @@ pub struct VykarRepository {
 }
 
 impl VykarRepository {
-  /// Build an encrypted Vykar config. Callers must unseal secrets first.
+  /// Build an encrypted Vykar config. Callers must unseal secrets first and
+  /// provide an existing private secret directory, separate from shared caches.
   pub fn new(
     repository: &BackupRepository,
     hostname: &str,
     cache_dir: &Path,
+    secret_dir: &Path,
     advanced: &BackupAdvancedSettings,
   ) -> anyhow::Result<Self> {
     let passphrase = repository.passphrase.value.trim().to_string();
@@ -137,7 +139,8 @@ impl VykarRepository {
         ..
       } => {
         config.repository.url = url.clone();
-        let mut key = NamedTempFile::new_in(cache_dir)
+        // Callers choose private storage independently of any shared cache.
+        let mut key = NamedTempFile::new_in(secret_dir)
           .context("Failed to create protected SFTP key file")?;
         key
           .as_file()
@@ -1003,6 +1006,7 @@ mod tests {
         &repository,
         "komodo-test-host",
         cache.path(),
+        cache.path(),
         &advanced,
       )
       .is_err()
@@ -1012,10 +1016,58 @@ mod tests {
       &repository,
       "komodo-test-host",
       cache.path(),
+      cache.path(),
       &advanced,
     )
     .unwrap();
     assert_eq!(vykar.config.limits.upload_mib_per_sec, 3);
+  }
+
+  #[test]
+  fn sftp_keys_use_private_storage_not_the_repository_cache() {
+    let cache = tempfile::tempdir().unwrap();
+    let secrets = tempfile::tempdir().unwrap();
+    let repository = BackupRepository {
+      name: "test".into(),
+      backend: BackupRepositoryBackend::Sftp {
+        url: "sftp://test.invalid/repository".into(),
+        private_key: BackupSecret {
+          value: "test-only-key-material".into(),
+          configured: false,
+        },
+        worker_private_key: Default::default(),
+        known_hosts: "test-only-host-key".into(),
+        timeout_seconds: 10,
+      },
+      passphrase: BackupSecret {
+        value: "test-only-passphrase".into(),
+        configured: false,
+      },
+    };
+    let vykar = VykarRepository::new(
+      &repository,
+      "core",
+      cache.path(),
+      secrets.path(),
+      &BackupAdvancedSettings::default(),
+    )
+    .unwrap();
+    let key = std::path::PathBuf::from(
+      vykar.config.repository.sftp_key.as_ref().unwrap(),
+    );
+    assert!(key.starts_with(secrets.path()));
+    assert!(!key.starts_with(cache.path()));
+    assert_eq!(
+      std::fs::read_to_string(&key).unwrap(),
+      "test-only-key-material"
+    );
+    assert_eq!(
+      std::fs::metadata(&key).unwrap().permissions().mode() & 0o777,
+      0o600
+    );
+    assert_eq!(std::fs::read_dir(cache.path()).unwrap().count(), 0);
+    drop(vykar);
+    assert!(!key.exists());
   }
 
   fn exercise_repository(repository: BackupRepository) {
@@ -1029,6 +1081,7 @@ mod tests {
     let vykar = VykarRepository::new(
       &repository,
       "komodo-test-host",
+      cache.path(),
       cache.path(),
       &BackupAdvancedSettings::default(),
     )

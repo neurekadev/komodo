@@ -29,7 +29,7 @@ Defaults are daily at 01:00 in the Core timezone, 14 complete backups per catego
 
 ### Core
 
-A Core backup is a consistent, versioned export of Komodo's restorable database collections. Authentication requests, including account creation, password changes, linked logins, passkeys, and MFA updates, wait while the logical export holds its snapshot barrier. It is a control-plane backup, not an operating-system image. Secrets used to access repositories, including encryption passphrases, are sealed with a persistent Core key and are never returned by the API or included in Core exports. Back up `/core-secrets/backup.key` separately with the deployment configuration; Core snapshots intentionally do not contain that key.
+A Core backup is a consistent, versioned export of Komodo's restorable database collections. Authentication database mutations, including account creation, password changes, linked logins, passkeys, MFA updates, and API keys, wait while the logical export holds its snapshot barrier. Request-body parsing, password hashing, and OAuth provider calls do not hold that barrier, so slow public auth requests cannot block an export. It is a control-plane backup, not an operating-system image. Secrets used to access repositories, including encryption passphrases, are sealed with a persistent Core key and are never returned by the API or included in Core exports. Back up `/core-secrets/backup.key` separately with the deployment configuration; Core snapshots intentionally do not contain that key.
 
 ### Stacks
 
@@ -83,7 +83,7 @@ Each Periphery also has a stable Vykar hostname so snapshots remain attributable
 
 Backup manifests record the running product's build version, as shown by Core, rather than Cargo's internal `0.0.0` workspace placeholder. Core recovery compares that recorded version with the running build before activating a restored database.
 
-Core snapshot authorization also binds the snapshot identity to a digest of the exact export file names and contents, including its manifest. Recovery verifies that digest before importing any database records; reusing an older authorized snapshot name cannot authorize replacement contents. Legacy Core snapshots without this content-bound authorization remain visible as unbound snapshots and are not eligible for automatic Core recovery. Create a fresh Core snapshot with this version before relying on the recovery workflow.
+Core snapshot authorization binds the snapshot identity to the export's creation time and a digest of its exact file names and contents, including its manifest. Recovery verifies that digest and the manifest's creation time before importing any database records; reusing an older authorized snapshot name cannot authorize replacement contents. Core inventory and retention use the signed export time, not the repository upload time, so uploading an exact copy of an old export cannot make it a newer recovery point or displace newer backups. Legacy Core snapshots without this content-and-time authorization remain visible as unbound snapshots and are not eligible for automatic Core recovery or managed retention. Create a fresh Core snapshot with this version before relying on the recovery workflow.
 
 Fleet run status polls every 15 seconds, while repository health and mirror lag share a five-minute cache across browsers. Snapshot inventories are loaded on demand; use **Refresh inventory** or **Refresh snapshots** to fetch new repository contents.
 
@@ -119,6 +119,8 @@ After recovery, review application-specific ownership, external databases, DNS, 
 
 The original `/core-secrets/backup.key` is required before Komodo can identify or decrypt a Core snapshot. It authenticates snapshot identities and opens the repository credentials stored in the restored database. The official Compose templates keep it in the Core-only `core-secrets` volume rather than the `/data` volume shared with Periphery.
 
+Core also uses this private volume for temporary export, recovery, and manifest staging and for temporary authoritative SFTP key files. Keep enough free space there for a complete logical database export and recovery workspace, and do not share or bind these paths into other containers. Normal completion cleans up temporary files; startup discards abandoned staging, including staging left in the former shared-data locations. This protects direct shared-volume access, not a compromised Docker host.
+
 1. Stop the fresh Core before connecting the old repository.
 2. Replace the fresh installation's generated `/core-secrets/backup.key` in the persistent `core-secrets` volume with the separately retained key from the original installation. Keep the file readable only by the Core service account.
 3. Start Core again. Core loads this key only at process startup, so copying it into a running container is not sufficient.
@@ -148,11 +150,13 @@ The primary repository is authoritative. Snapshot lists, manifests, file trees, 
 
 After initialization, a Core-local repository is the same location only when its resolved path is equal. Moving to a parent or child directory is a location change and requires verified promotion; overlapping primary and mirror paths remain forbidden.
 
-<Callout title="Periphery backup-read trust" type="warn">
-Vykar encrypts and deduplicates on the client, so every Periphery that writes to a shared repository receives its encryption passphrase and the worker-scoped storage access needed to read repository metadata and packs. The passphrase protects backups from the storage provider; it does not isolate one participating Periphery from another or from Core snapshots in the same repository. Treat every participating Server as backup-read trusted. If hosts must not share that trust, manage them with separate Komodo deployments and separate repositories.
+<Callout title="Shared-repository worker trust" type="warn">
+Only enable backups for mutually trusted Servers in the same Komodo deployment. Vykar encrypts and deduplicates on the client, so every participating Periphery receives the shared repository passphrase and worker-scoped access to read metadata and packs and append backup data. The passphrase protects backups from the storage provider; it does not isolate participating Peripheries from each other or prevent them from reading Core snapshots in the same repository.
+
+Workers must also trust each other's backup writes. A compromised worker can replay another worker's previously issued label and hostname, including after retention removes the original snapshot name, and replace that Stack or Volume backup with different contents. Worker manifest checksums detect corruption, not a malicious participating writer; source labels and hostnames are not proof of the current writer's identity or immutable worker contents. Storage-side maintenance restrictions do not provide cross-worker authenticity. Do not use cross-node restore across mutually untrusted hosts. If hosts must not share this read/write trust, manage them with separate Komodo deployments, repositories, credentials, and encryption passphrases.
 </Callout>
 
-Periphery never receives the Core backup authentication key and therefore cannot mint trusted source identities from its repository credentials alone. The official colocated agent still controls its Docker host through the socket and must be treated as host-trusted; use a remote Periphery or a separate host when that boundary matters.
+Periphery never receives the Core backup authentication key. Core's content-and-time authorization prevents repository credentials alone from authenticating modified Core exports; it does not make the repository immune to availability attacks or protect worker snapshots from other participating workers. The official colocated agent controls its Docker host through the socket and Docker volume-root access and must be treated as host-trusted. A Core-only container mount is not an isolation boundary against that host-level access; use a separate host when that boundary matters.
 
 For an off-site mirror, use a different provider or failure domain. Core-local storage is exposed to Periphery through separate authenticated embedded [`vykar-server`](https://vykar.borgbase.com/server-setup) endpoints for primary and mirror storage, which also enables server-side encrypted repacking. Restart Core after adding a Core-local mirror, changing a Core-local path, or promoting a Core-local mirror; Komodo blocks Periphery access until the endpoint matches the saved role.
 
@@ -194,7 +198,7 @@ Encryption is mandatory on every repository. Store the persisted Core-only `/cor
 
 ## Vykar cache persistence
 
-The official Compose files persist Vykar's cache in the existing named `data` volume. Core uses `/data/backups/.komodo-vykar-cache`; the colocated Periphery uses `.komodo-vykar` beneath its Stack directory, whose default host path is an alias into the same `data` volume. No separate cache volume is required. The cache can be rebuilt from a repository, but keeping it across container recreation avoids unnecessary index downloads and preserves normal deduplication performance.
+The official Compose files persist Vykar's cache in the existing named `data` volume. Core uses `/data/backups/.komodo-vykar-cache`; the colocated Periphery uses `.komodo-vykar` beneath its Stack directory, whose default host path is an alias into the same `data` volume. No separate cache volume is required. Core's plaintext staging and temporary authoritative SFTP keys use `core-secrets`, not this shared cache. The cache can be rebuilt from a repository, but keeping it across container recreation avoids unnecessary index downloads and preserves normal deduplication performance.
 
 ## Legacy database backup migration
 

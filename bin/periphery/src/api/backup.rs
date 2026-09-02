@@ -496,6 +496,7 @@ async fn run_repository_backup(
       &repository,
       &hostname,
       &cache,
+      &cache,
       &advanced,
     )?;
     repository.backup_cancellable_with_options(
@@ -2139,8 +2140,14 @@ impl Resolve<Args> for PreflightVykarRestore {
     let selected = self.selected_paths.clone();
     let snapshot_paths = tokio::task::spawn_blocking(move || {
       let cache = vykar_cache_dir(&hostname)?;
-      VykarRepository::new(&repository, &hostname, &cache, &advanced)?
-        .snapshot_paths(&snapshot, &selected)
+      VykarRepository::new(
+        &repository,
+        &hostname,
+        &cache,
+        &cache,
+        &advanced,
+      )?
+      .snapshot_paths(&snapshot, &selected)
     })
     .await
     .context("Vykar preflight worker failed")??;
@@ -2379,6 +2386,7 @@ async fn transactional_restore(
     let repository = VykarRepository::new(
       &repository,
       &hostname,
+      &cache,
       &cache,
       &advanced,
     )?;

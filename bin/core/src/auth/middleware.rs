@@ -7,16 +7,34 @@ use crate::{
   auth::JWT_PROVIDER, helpers::query::get_user, state::db_client,
 };
 
-/// Hold the snapshot barrier for the entire auth request, including OAuth
-/// callbacks and login-time MFA updates. Guarding the router avoids recursive
-/// acquisition when AuthImpl is called by an already guarded write/execute.
-pub async fn backup_mutation_guard(
+tokio::task_local! {
+  static AUTH_REQUEST_MUTATIONS: ();
+}
+
+/// Mark auth requests without holding the snapshot barrier while parsing bodies,
+/// hashing passwords, or awaiting OAuth providers. The AuthImpl database
+/// callbacks acquire it only for their mutation. Other AuthImpl callers are
+/// already protected by the write/execute barrier and must not lock recursively.
+pub async fn backup_mutation_scope(
   request: axum::extract::Request,
   next: axum::middleware::Next,
 ) -> axum::response::Response {
-  let _mutation_guard =
-    crate::backup::mutation_barrier().read().await;
-  next.run(request).await
+  AUTH_REQUEST_MUTATIONS.scope((), next.run(request)).await
+}
+
+pub(super) async fn mutation_guard()
+-> Option<tokio::sync::RwLockReadGuard<'static, ()>> {
+  auth_mutation_guard_for(crate::backup::mutation_barrier()).await
+}
+
+async fn auth_mutation_guard_for(
+  barrier: &tokio::sync::RwLock<()>,
+) -> Option<tokio::sync::RwLockReadGuard<'_, ()>> {
+  if AUTH_REQUEST_MUTATIONS.try_with(|_| ()).is_ok() {
+    Some(barrier.read().await)
+  } else {
+    None
+  }
 }
 
 pub async fn extract_user_from_auth(
@@ -91,5 +109,50 @@ async fn check_enabled(user_id: &str) -> anyhow::Result<User> {
     Ok(user)
   } else {
     Err(anyhow!("Invalid user credentials"))
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use futures_util::poll;
+  use std::{future::pending, pin::pin, task::Poll};
+  use tokio::sync::RwLock;
+
+  #[tokio::test]
+  async fn stalled_auth_preparation_does_not_hold_the_barrier() {
+    let barrier = RwLock::new(());
+    let mut preparation =
+      pin!(AUTH_REQUEST_MUTATIONS.scope((), pending::<()>()));
+    assert!(poll!(&mut preparation).is_pending());
+    assert!(barrier.try_write().is_ok());
+  }
+
+  #[tokio::test]
+  async fn auth_mutations_wait_for_exports_and_hold_the_barrier() {
+    let barrier = RwLock::new(());
+    let export = barrier.write().await;
+    let mut mutation = pin!(
+      AUTH_REQUEST_MUTATIONS
+        .scope((), auth_mutation_guard_for(&barrier),)
+    );
+    assert!(poll!(&mut mutation).is_pending());
+    drop(export);
+    let Poll::Ready(Some(guard)) = poll!(&mut mutation) else {
+      panic!("Auth mutation should acquire the released barrier");
+    };
+    assert!(barrier.try_write().is_err());
+    drop(guard);
+    assert!(barrier.try_write().is_ok());
+  }
+
+  #[tokio::test]
+  async fn already_guarded_internal_callers_do_not_reacquire() {
+    let barrier = RwLock::new(());
+    let _outer = barrier.read().await;
+    let mut export = pin!(barrier.write());
+    assert!(poll!(&mut export).is_pending());
+    // A second read would wait behind the queued writer and deadlock.
+    assert!(auth_mutation_guard_for(&barrier).await.is_none());
   }
 }
