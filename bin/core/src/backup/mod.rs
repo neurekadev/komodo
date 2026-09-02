@@ -1951,13 +1951,40 @@ pub async fn list_directory(
   page: u64,
   limit: u64,
 ) -> anyhow::Result<SnapshotDirectoryPage> {
+  let permit = snapshot_tree_slots().clone().try_acquire_owned()
+    .context("Another snapshot tree request is still running; retry after it finishes")?;
+  let deadline =
+    std::time::Instant::now() + std::time::Duration::from_secs(60);
   let settings = get_settings().await?;
-  tokio::task::spawn_blocking(move || {
-    core_repository(&settings.primary, &settings)?
-      .list_directory(&snapshot, &parent, &search, page, limit)
+  run_snapshot_tree_worker(permit, deadline, move || {
+    core_repository(&settings.primary, &settings)?.list_directory(
+      &snapshot, &parent, &search, page, limit, deadline,
+    )
   })
   .await
+}
+
+async fn run_snapshot_tree_worker<T: Send + 'static>(
+  permit: tokio::sync::OwnedSemaphorePermit,
+  deadline: std::time::Instant,
+  work: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
+) -> anyhow::Result<T> {
+  let worker = tokio::task::spawn_blocking(move || {
+    // An expired/disconnected request cannot release the slot while its
+    // blocking backend read is still running.
+    let _permit = permit;
+    work()
+  });
+  tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), worker)
+  .await
+  .context("Snapshot tree request exceeded 60 seconds; its worker may still be finishing")?
   .context("Vykar tree worker failed")?
+}
+
+fn snapshot_tree_slots() -> &'static Arc<tokio::sync::Semaphore> {
+  static SLOTS: OnceLock<Arc<tokio::sync::Semaphore>> =
+    OnceLock::new();
+  SLOTS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
 }
 
 pub async fn run_backup(
@@ -5362,12 +5389,25 @@ fn core_recovery_database_is_orphaned(
   active_databases: &HashSet<String>,
   previous_database: Option<&str>,
 ) -> bool {
+  core_recovery_database_can_be_dropped(
+    current_database,
+    candidate,
+    previous_database,
+  ) && !active_databases.contains(candidate)
+}
+
+fn core_recovery_database_can_be_dropped(
+  current_database: &str,
+  candidate: &str,
+  previous_database: Option<&str>,
+) -> bool {
   is_managed_core_recovery_database(current_database, candidate)
-    && !active_databases.contains(candidate)
     && previous_database != Some(candidate)
 }
 
 async fn reconcile_core_recovery_state_inner() -> anyhow::Result<()> {
+  let current_database = db_client().db.name();
+  let previous_database = previous_core_recovery_database()?;
   let expired = find_collect(
     &core_recovery_collection(),
     doc! { "plan.expires_at": { "$lt": komodo_timestamp() } },
@@ -5375,18 +5415,24 @@ async fn reconcile_core_recovery_state_inner() -> anyhow::Result<()> {
   )
   .await?;
   for stored in expired {
-    db_client()
-      .db
-      .client()
-      .database(&stored.plan.validation_database)
-      .drop()
-      .await
-      .with_context(|| {
-        format!(
-          "Failed to drop expired Core recovery database '{}'",
-          stored.plan.validation_database
-        )
-      })?;
+    if core_recovery_database_can_be_dropped(
+      current_database,
+      &stored.plan.validation_database,
+      previous_database.as_deref(),
+    ) {
+      db_client()
+        .db
+        .client()
+        .database(&stored.plan.validation_database)
+        .drop()
+        .await
+        .with_context(|| {
+          format!(
+            "Failed to drop expired Core recovery database '{}'",
+            stored.plan.validation_database
+          )
+        })?;
+    }
     core_recovery_collection()
       .delete_one(doc! { "_id": &stored.id })
       .await?;
@@ -5398,8 +5444,6 @@ async fn reconcile_core_recovery_state_inner() -> anyhow::Result<()> {
       .map(|stored| stored.plan.validation_database)
       .collect::<HashSet<_>>();
   let client = db_client().db.client();
-  let current_database = db_client().db.name();
-  let previous_database = previous_core_recovery_database()?;
   for database_name in client.list_database_names().await? {
     if core_recovery_database_is_orphaned(
       current_database,
@@ -5600,6 +5644,12 @@ pub async fn plan_core_recovery(
     .context("Failed to restore the Core validation database")?;
     normalize_historical_restore_sagas(&validation).await
       .context("Failed to normalize historical recovered-Stack receipts")?;
+    // Historical recovery plans belong to the old database, not this new
+    // activation. Never resurrect their expiry/activation side effects.
+    validation.collection::<StoredCoreRecoveryPlan>(CORE_RECOVERY_COLLECTION)
+      .delete_many(doc! {})
+      .await
+      .context("Failed to discard historical Core recovery plans")?;
     // Repository credentials are deliberately excluded from Core snapshots.
     // Carry forward the freshly configured, locally sealed repository settings
     // so recovery can still access its primary after the database switch.
@@ -5673,16 +5723,28 @@ pub async fn execute_core_recovery(
     .await?
     .context("Core recovery plan does not exist")?;
   if stored.plan.expires_at < komodo_timestamp() {
-    db_client()
-      .db
-      .client()
-      .database(&stored.plan.validation_database)
-      .drop()
-      .await?;
+    let previous_database = previous_core_recovery_database()?;
+    if core_recovery_database_can_be_dropped(
+      db_client().db.name(),
+      &stored.plan.validation_database,
+      previous_database.as_deref(),
+    ) {
+      db_client()
+        .db
+        .client()
+        .database(&stored.plan.validation_database)
+        .drop()
+        .await?;
+    }
     core_recovery_collection()
       .delete_one(doc! { "_id": &stored.id })
       .await?;
     return Err(anyhow!("Core recovery plan has expired"));
+  }
+  if stored.plan.current_database != db_client().db.name() {
+    return Err(anyhow!(
+      "Core recovery plan belongs to a previous database; create a fresh plan"
+    ));
   }
   let validation = db_client()
     .db
@@ -6863,6 +6925,54 @@ mod tests {
     assert!(core_recovery_database_is_orphaned(
       &current, &previous, &active, None,
     ));
+  }
+
+  #[test]
+  fn expired_core_plans_cannot_drop_current_or_rollback_databases() {
+    let previous = core_recovery_database_name("komodo");
+    let current = core_recovery_database_name(&previous);
+    let temporary = core_recovery_database_name(&current);
+    for protected in [&current, &previous] {
+      assert!(!core_recovery_database_can_be_dropped(
+        &current,
+        protected,
+        Some(&previous)
+      ));
+    }
+    assert!(core_recovery_database_can_be_dropped(
+      &current,
+      &temporary,
+      Some(&previous)
+    ));
+    assert!(!core_recovery_database_can_be_dropped(
+      &current,
+      "unrelated",
+      None
+    ));
+  }
+
+  #[tokio::test]
+  async fn abandoned_tree_request_keeps_its_worker_slot_until_exit() {
+    let slots = Arc::new(tokio::sync::Semaphore::new(1));
+    let permit = slots.clone().try_acquire_owned().unwrap();
+    let (started, ready) = tokio::sync::oneshot::channel();
+    let (finish, wait) = std::sync::mpsc::channel();
+    let job = tokio::spawn(run_snapshot_tree_worker(
+      permit,
+      std::time::Instant::now() + std::time::Duration::from_secs(60),
+      move || {
+        let _ = started.send(());
+        let _ = wait.recv();
+        Ok(())
+      },
+    ));
+    ready.await.unwrap();
+    job.abort();
+    assert!(job.await.unwrap_err().is_cancelled());
+    assert!(slots.clone().try_acquire_owned().is_err());
+    finish.send(()).unwrap();
+    drop(slots.clone().acquire_owned().await.unwrap());
+    assert!(slots.try_acquire_owned().is_ok());
   }
 
   #[test]

@@ -25,6 +25,8 @@ Save form changes before initializing, verifying, promoting a mirror, or startin
 
 Defaults are daily at 01:00 in the Core timezone, 14 complete backups per category, all eligible named resources included, and safe container stopping enabled. Cross-filesystem mount content and anonymous Docker volumes are excluded unless explicitly enabled.
 
+The Stack and Server selectors load the complete permitted resource list, including fleets with more than 500 resources. Search **Selected Stacks** by name, or choose volumes beneath their Server in the volume selection accordion.
+
 ## What is backed up
 
 ### Core
@@ -34,6 +36,8 @@ A Core backup is a consistent, versioned export of Komodo's restorable database 
 ### Stacks
 
 A Stack backup contains its Compose run directory and eligible normalized local bind-mount source roots. Docker named volumes are intentionally excluded because each is backed up and retained independently as a Volume. Swarm Stacks are rejected in this version.
+
+With safe container stopping enabled, Komodo also stops other running containers whose bind or named-volume storage overlaps a selected Stack source. This includes a container using a named volume when the Stack binds a directory inside that volume's storage; it does not add unrelated named volumes to the Stack snapshot.
 
 By default, Komodo does not cross a filesystem boundary beneath any backup source, and it omits an explicit bind source when that source is on a different filesystem from the Stack run directory. This prevents rclone, FUSE, NFS, and similar mounts from being copied unexpectedly. Enable **Include cross-filesystem mount content** only when those mounted files are intentionally part of the backup. The Compose run directory itself is always included; this toggle and the bind rules only control bind-mount source roots.
 
@@ -73,6 +77,8 @@ Exit or delete running terminals on the destination Server before a backup or re
 
 Periphery onboarding database writes also wait for Core's export barrier. Server creation, optional Builder creation, permissions, and the onboarding-key record are covered together; network login and success/close handshakes do not hold the barrier.
 
+Actions and Procedures do not hold the backup barrier for their whole runtime. Mutating API calls made by an Action and individual mutating Procedure steps coordinate with backups separately, so backups can run between steps. Action API-key creation and cleanup remain protected. Cancellation requests can still signal running Actions, Procedures, builds, and repository builds while a backup waits; execution audit progress can continue to be recorded. Direct filesystem or Docker commands issued by an Action outside Komodo's API are external writers and must be quiesced by the operator.
+
 Backup operations never overlap. If a backup, retry, restore, repository maintenance operation, or another serialized backup operation is still active when a scheduled occurrence arrives, Core skips that occurrence without queuing or cancelling anything. The active work continues and the scheduler waits for the next normal occurrence. Manual backup requests wait for the current operation rather than creating concurrent repository writers.
 
 If safe container stopping is enabled, Komodo calculates the affected running containers once per node, durably records and stops that set, writes the primary and mirror while the data is quiesced, and restarts exactly the containers that were previously running. A retry with the same run ID merges its newly discovered set into the existing restart journal, so a lost response cannot discard an earlier restart failure. Missing or unreadable files make a snapshot partial even when Vykar can commit it. Partial snapshots remain visible for diagnosis, never count as retained complete snapshots, and cannot be restored silently.
@@ -99,11 +105,17 @@ Critical operational alerts accumulate independently in the `messages` array in 
 
 Open the resource's **Backups** tab, choose a complete snapshot, and select **Restore**. Administrators can also select **Recover** beside any complete Stack or Volume snapshot in the primary inventory on **Backups**. That inventory remains available after the original resource is deleted: Stack recovery creates a new recovered Stack, while Volume recovery lets you select the destination Server and volume. Leave the picker empty for a full restore, or expand folders and select multiple files and directories. The tree starts fully collapsed and loads from the primary repository as you expand it.
 
+Tree browsing uses the same bounded snapshot metadata reader as restore preflight: at most 32 MiB of encoded items, 100,000 entries, 16 MiB of path text, and 128 path components. Core permits one tree inventory worker at a time with a 60-second response deadline. If a backend read continues after timeout, later tree requests are refused until that worker exits. Limits apply before paging or search; an oversized snapshot produces an explicit error, not a silently incomplete tree.
+
 Before confirmation, Komodo lists paths that will be created, overwritten, and deleted, plus containers that will stop. A Volume restore stops every running container that mounts the destination volume, even when those containers belong to different Stacks. A Stack restore stops every running container in the deployed Compose project and every other container whose bind or named-volume storage overlaps a destination path. Containers that were already stopped remain stopped. Restore data is written to staging on the destination filesystem, verified with its metadata, and then published using a persisted rollback journal and directory synchronization. Komodo restarts exactly the previously running containers after successful publication or a proven rollback. If state becomes indeterminate, they remain stopped and Komodo raises a critical recovery alert.
+
+For a new Volume, preview paths use `volume://<name>/<relative-path>` because Docker has not assigned an inspectable host mountpoint yet. These are paths inside the selected Volume, not guessed `/var/lib/docker` paths. After confirmation, Komodo creates and inspects the Volume and checks its actual mountpoint before stopping containers or publishing files. Existing-volume previews use the inspected host paths.
 
 Periphery rechecks the confirmed preview while holding its filesystem guard, before creating a Volume or stopping any container. Changed path lists, destination existence, or affected containers require a fresh preview. Use matching Core and Periphery versions; restore requests require that confirmed preview.
 
 Restore previews are complete or fail: Komodo never confirms a truncated path list. Each Periphery permits one inventory worker at a time, with a 60-second inventory deadline, at most 32 MiB of encoded snapshot items, 100,000 snapshot entries, and 16 MiB of snapshot path text. The mapped-path/destination walk has its own combined 100,000-entry and 16 MiB path budget and refuses directory nesting beyond 128 levels. The returned preview is limited to 10,000 changed paths and 1 MiB of path text across all three lists. Select a smaller subtree if the changed-path or destination-walk limit is reached. Snapshots exceeding the snapshot-inventory limit cannot be restored through this UI, even with a smaller selection. No volume creation, container stopping, or publication starts on a failed preview. A timed-out backend read may finish in the background; further previews on that Periphery are refused until its worker exits.
+
+Snapshot paths themselves are checked against the 128-component depth limit before filtering a selection, including when the destination does not exist. Excessively nested snapshots are rejected before creating a Volume or stopping workloads, rather than reaching recursive staging verification.
 
 Any remaining restore, staging, or container-quiesce journal persistently blocks new backups and restores on that node, even under a new operation ID or after Core restarts. This includes a deferred recovered-Stack receipt awaiting Core acknowledgement. Let Core reconciliation finish for recovered Stacks; for an ordinary interrupted restore or restart failure, restart Periphery and verify its startup recovery succeeds. Finalization and startup recovery remain available to repair the existing operation. Never delete a journal to bypass the gate: an older rollback could otherwise overwrite a newer restore. Inspect Periphery logs and repair the reported filesystem or container problem if recovery cannot finish.
 
@@ -145,6 +157,8 @@ Core also uses this private volume for temporary export, recovery, and manifest 
 Komodo restores the snapshot into a validation database, checks the backup schema/version and confirms that an administrator account remains available. It then atomically writes `/core-secrets/backup-recovery-activation.json` and restarts. This Core-only record selects the active database and retains the previous database for rollback. Core never imports an unsigned database pointer from shared `/data` or `/config`; if such a pointer exists without a private activation, startup stops for administrator verification instead of silently selecting a database. Preserve the private activation with Core's other recovery material.
 
 If the restored database contains a pending Stack recovery record with its matching recovered Stack already inserted, Komodo normalizes it to the idempotent acknowledgement phase. Startup can then clear that historical record even if Periphery already discarded its completed receipt. Unmatched records retain the normal reconciliation checks; a contradictory receipt still blocks completion.
+
+Historical Core-recovery plans are discarded from the validation database during recovery. Expiry cleanup never drops the active database or the previous database retained by the private activation record. A recovery plan from a different active database cannot be activated; create a fresh plan instead.
 
 ### Roll back a Core recovery
 

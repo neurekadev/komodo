@@ -198,6 +198,8 @@ async fn execute_execution(
   macro_rules! resolve_execute {
     ($Variant:ident, $req:expr) => {{
       let req = ExecuteRequest::$Variant($req);
+      let _mutation_guard =
+        crate::api::execute::execution_mutation_guard(&req).await;
       let update = init_execution_update(&req, &user).await?;
       let ExecuteRequest::$Variant(req) = req else {
         unreachable!()
@@ -243,11 +245,15 @@ async fn execute_execution(
       resolve_execute!(CancelProcedure, req)
     }
     // Special: write operation
-    Execution::CommitSync(req) => req
-      .resolve(&WriteArgs { user })
-      .await
-      .map_err(|e| e.error)
-      .context("Failed at CommitSync")?,
+    Execution::CommitSync(req) => {
+      let _mutation_guard =
+        crate::backup::mutation_barrier().read().await;
+      req
+        .resolve(&WriteArgs { user })
+        .await
+        .map_err(|e| e.error)
+        .context("Failed at CommitSync")?
+    }
     // Special: sleep
     Execution::Sleep(req) => {
       let duration = Duration::from_millis(req.duration_ms as u64);

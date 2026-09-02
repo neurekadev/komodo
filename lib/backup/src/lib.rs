@@ -25,7 +25,7 @@ use vykar_core::{
   commands,
   compress::Compression,
   config::{EncryptionModeConfig, VykarConfig},
-  snapshot::item::ItemType,
+  snapshot::item::{Item, ItemType},
 };
 
 /// Matcher for the gitignore-style path syntax used by Vykar exclude rules.
@@ -70,6 +70,7 @@ pub struct VykarRepository {
 const MAX_RESTORE_METADATA_BYTES: usize = 32 * 1024 * 1024;
 const MAX_RESTORE_INVENTORY_ITEMS: usize = 100_000;
 const MAX_RESTORE_INVENTORY_PATH_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_RESTORE_PATH_DEPTH: usize = 128;
 
 /// Fail closed instead of returning a truncated destructive-restore plan.
 pub struct RestoreInventoryBudget {
@@ -91,6 +92,13 @@ impl RestoreInventoryBudget {
     if Instant::now() >= self.deadline {
       return Err(anyhow!(
         "Restore preflight exceeded its time limit"
+      ));
+    }
+    if path.split('/').filter(|part| !part.is_empty()).count()
+      > MAX_RESTORE_PATH_DEPTH
+    {
+      return Err(anyhow!(
+        "Snapshot paths exceed the 128-component depth limit; no restore changes were started"
       ));
     }
     if self.remaining_items == 0
@@ -413,13 +421,22 @@ impl VykarRepository {
     search: &str,
     page: u64,
     limit: u64,
+    deadline: Instant,
   ) -> anyhow::Result<SnapshotDirectoryPage> {
-    let (items, source_paths) =
-      commands::list::list_snapshot_items_with_source_paths(
-        &self.config,
-        Some(&self.passphrase),
-        snapshot_name,
-      )?;
+    let mut items = Vec::new();
+    let source_paths = self.visit_bounded_snapshot_items(
+      snapshot_name,
+      deadline,
+      |item| {
+        items.push(ItemView {
+          path: item.path,
+          directory: item.entry_type == ItemType::Directory,
+          size: item.size,
+          modified_at: item.mtime / 1_000_000,
+        });
+        Ok(())
+      },
+    )?;
     let manifest_source_name =
       backup_manifest_source_name(snapshot_name);
     let manifest_roots = source_paths
@@ -431,21 +448,13 @@ impl VykarRepository {
       .map(|path| path.trim_matches('/').to_string())
       .collect::<HashSet<_>>();
     Ok(build_directory_page(
-      items
-        .into_iter()
-        .filter(|item| {
-          let item_path = item.path.trim_matches('/');
-          !manifest_roots.iter().any(|root| {
-            item_path == root
-              || item_path.starts_with(&format!("{root}/"))
-          })
+      items.into_iter().filter(|item| {
+        let item_path = item.path.trim_matches('/');
+        !manifest_roots.iter().any(|root| {
+          item_path == root
+            || item_path.starts_with(&format!("{root}/"))
         })
-        .map(|item| ItemView {
-          path: item.path,
-          directory: item.entry_type == ItemType::Directory,
-          size: item.size,
-          modified_at: item.mtime / 1_000_000,
-        }),
+      }),
       parent,
       search,
       page,
@@ -499,6 +508,37 @@ impl VykarRepository {
     deadline: Instant,
   ) -> anyhow::Result<Vec<SnapshotPath>> {
     let selected = normalize_selected_paths(selected_paths)?;
+    let mut paths = Vec::new();
+    self.visit_bounded_snapshot_items(
+      snapshot_name,
+      deadline,
+      |item| {
+        let path = item.path.trim_matches('/').to_string();
+        let included = selected.is_empty()
+          || selected.iter().any(|selection| {
+            path == *selection
+              || path.starts_with(&format!("{selection}/"))
+          });
+        if included {
+          paths.push(SnapshotPath {
+            path,
+            directory: item.entry_type == ItemType::Directory,
+          });
+        }
+        Ok(())
+      },
+    )?;
+    Ok(paths)
+  }
+
+  /// Shared by preflight and lazy browsing: apply limits before retaining an
+  /// item, including items outside the requested selection or directory page.
+  fn visit_bounded_snapshot_items(
+    &self,
+    snapshot_name: &str,
+    deadline: Instant,
+    mut visit: impl FnMut(Item) -> anyhow::Result<()>,
+  ) -> anyhow::Result<Vec<String>> {
     let (mut repo, _session) =
       commands::util::open_repo_with_read_session(
         &self.config,
@@ -540,24 +580,12 @@ impl VykarRepository {
       append_restore_metadata(&mut stream, &chunk)?;
     }
     let mut budget = RestoreInventoryBudget::new(deadline);
-    let mut paths = Vec::new();
     commands::list::for_each_decoded_item(&stream, |item| {
       budget.consume(&item.path).map_err(std::io::Error::other)?;
-      let path = item.path.trim_matches('/').to_string();
-      let included = selected.is_empty()
-        || selected.iter().any(|selection| {
-          path == *selection
-            || path.starts_with(&format!("{selection}/"))
-        });
-      if included {
-        paths.push(SnapshotPath {
-          path,
-          directory: item.entry_type == ItemType::Directory,
-        });
-      }
+      visit(item).map_err(std::io::Error::other)?;
       Ok(())
     })?;
-    Ok(paths)
+    Ok(metadata.source_paths)
   }
 
   /// Apply retention per logical source, preserving partial snapshots in
@@ -962,6 +990,17 @@ mod tests {
     assert!(budget.consume("b").is_err());
     budget.deadline = Instant::now();
     assert!(budget.consume("").is_err());
+  }
+
+  #[test]
+  fn snapshot_inventory_rejects_excessive_depth_before_selection() {
+    let mut budget = RestoreInventoryBudget::new(
+      Instant::now() + std::time::Duration::from_secs(60),
+    );
+    let at_limit = vec!["x"; MAX_RESTORE_PATH_DEPTH].join("/");
+    budget.consume(&at_limit).unwrap();
+    assert!(budget.consume(&format!("{at_limit}/x")).is_err());
+    assert!(budget.consume(&vec!["x"; 4_000].join("/")).is_err());
   }
 
   fn snapshot(

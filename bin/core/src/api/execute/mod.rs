@@ -214,6 +214,46 @@ pub enum ExecutionResult {
   Batch(String),
 }
 
+impl ExecuteRequest {
+  /// Orchestrators must not retain a lease while awaiting nested API calls.
+  /// Cancellation only signals existing work and records audit progress; it
+  /// must remain reachable when a queued backup is waiting for that work.
+  pub(crate) fn needs_mutation_guard(&self) -> bool {
+    !matches!(
+      self,
+      Self::RunAction(_)
+        | Self::BatchRunAction(_)
+        | Self::RunProcedure(_)
+        | Self::BatchRunProcedure(_)
+        | Self::CancelAction(_)
+        | Self::CancelProcedure(_)
+        | Self::CancelBuild(_)
+        | Self::CancelRepoBuild(_)
+    )
+  }
+}
+
+pub(crate) async fn execution_mutation_guard(
+  request: &ExecuteRequest,
+) -> Option<tokio::sync::OwnedRwLockReadGuard<()>> {
+  execution_mutation_guard_on(
+    request,
+    crate::backup::mutation_barrier().clone(),
+  )
+  .await
+}
+
+async fn execution_mutation_guard_on(
+  request: &ExecuteRequest,
+  barrier: std::sync::Arc<tokio::sync::RwLock<()>>,
+) -> Option<tokio::sync::OwnedRwLockReadGuard<()>> {
+  if request.needs_mutation_guard() {
+    Some(barrier.read_owned().await)
+  } else {
+    None
+  }
+}
+
 pub fn inner_handler(
   request: ExecuteRequest,
   user: User,
@@ -224,17 +264,16 @@ pub fn inner_handler(
   >,
 > {
   Box::pin(async move {
-    let mutation_guard =
-      if super::write::mutation_guard_held_by_write_request() {
-        None
-      } else {
-        Some(
-          crate::backup::mutation_barrier()
-            .clone()
-            .read_owned()
-            .await,
-        )
-      };
+    let needs_mutation_guard = request.needs_mutation_guard();
+    let mutation_guard = if !needs_mutation_guard
+      || super::write::mutation_guard_held_by_write_request()
+    {
+      None
+    } else {
+      Some(
+        crate::backup::mutation_barrier().clone().read_owned().await,
+      )
+    };
     let task_id = Uuid::new_v4();
 
     // Need to validate no cancel is active before any update is created.
@@ -266,10 +305,12 @@ pub fn inner_handler(
       // second read guard synchronously: a queued writer would deadlock it
       // behind the outer read guard. Acquire in the detached execution task
       // instead, after inner_handler returns and the outer request can finish.
-      let _mutation_guard = match mutation_guard {
-        Some(guard) => guard,
-        None => {
-          crate::backup::mutation_barrier().clone().read_owned().await
+      let _mutation_guard = if !needs_mutation_guard {
+        None
+      } else {
+        match mutation_guard {
+          Some(guard) => Some(guard),
+          None => execution_mutation_guard(&request).await,
         }
       };
       task(task_id, request, user, task_update).await
@@ -430,4 +471,64 @@ async fn batch_execute<E: BatchExecute>(
     }
   });
   Ok(join_all(futures).await)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use futures_util::FutureExt;
+
+  fn request(
+    kind: &str,
+    params: serde_json::Value,
+  ) -> ExecuteRequest {
+    serde_json::from_value(json!({ "type": kind, "params": params }))
+      .unwrap()
+  }
+
+  #[tokio::test]
+  async fn orchestrators_and_cancellations_do_not_wait_behind_backup()
+  {
+    let barrier = std::sync::Arc::new(tokio::sync::RwLock::new(()));
+    let running = barrier.clone().read_owned().await;
+    let mut backup = Box::pin(barrier.clone().write_owned());
+    assert!(futures_util::poll!(backup.as_mut()).is_pending());
+    for (kind, params) in [
+      ("RunAction", json!({ "action": "id" })),
+      ("BatchRunAction", json!({ "pattern": "*", "tags": [] })),
+      ("RunProcedure", json!({ "procedure": "id" })),
+      ("BatchRunProcedure", json!({ "pattern": "*", "tags": [] })),
+      ("CancelAction", json!({ "action": "id" })),
+      ("CancelProcedure", json!({ "procedure": "id" })),
+      ("CancelBuild", json!({ "build": "id" })),
+      ("CancelRepoBuild", json!({ "repo": "id" })),
+    ] {
+      let request = request(kind, params);
+      assert!(
+        execution_mutation_guard_on(&request, barrier.clone())
+          .now_or_never()
+          .expect("Control request must not queue")
+          .is_none()
+      );
+    }
+    drop(running);
+    drop(backup.await);
+  }
+
+  #[tokio::test]
+  async fn individual_mutating_steps_still_wait_for_backup() {
+    let barrier = std::sync::Arc::new(tokio::sync::RwLock::new(()));
+    let backup = barrier.clone().write_owned().await;
+    let request = request("RunBuild", json!({ "build": "id" }));
+    let mut step = Box::pin(execution_mutation_guard_on(
+      &request,
+      barrier.clone(),
+    ));
+    assert!(futures_util::poll!(step.as_mut()).is_pending());
+    drop(backup);
+    let guard = step.await.expect("Mutation must retain a lease");
+    assert!(barrier.try_write().is_err());
+    drop(guard);
+    assert!(barrier.try_write().is_ok());
+  }
 }

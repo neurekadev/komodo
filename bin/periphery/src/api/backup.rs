@@ -37,7 +37,8 @@ const MAX_PENDING_CANCELLATIONS: usize = 1_024;
 const RESTORE_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_RESTORE_PREVIEW_ROWS: usize = 10_000;
 const MAX_RESTORE_PREVIEW_BYTES: usize = 1024 * 1024;
-const MAX_RESTORE_PREVIEW_DEPTH: usize = 128;
+const MAX_RESTORE_PREVIEW_DEPTH: usize =
+  komodo_backup::MAX_RESTORE_PATH_DEPTH;
 
 fn preflight_slots() -> &'static Arc<tokio::sync::Semaphore> {
   static SLOTS: OnceLock<Arc<tokio::sync::Semaphore>> =
@@ -1274,7 +1275,6 @@ async fn affected_running_containers(
   containers: &[ContainerListItem],
   project_name: Option<&str>,
   paths: &BTreeSet<PathBuf>,
-  include_named_volume_mounts: bool,
 ) -> anyhow::Result<Vec<String>> {
   let mut affected = BTreeSet::new();
   for container in containers.iter().filter(|container| {
@@ -1295,12 +1295,7 @@ async fn affected_running_containers(
     if inspected
       .mounts
       .into_iter()
-      .filter(|mount| {
-        mount_type_affects_paths(
-          mount.typ.as_deref(),
-          include_named_volume_mounts,
-        )
-      })
+      .filter(|mount| mount_type_affects_paths(mount.typ.as_deref()))
       .filter_map(|mount| mount.source)
       .map(|source| {
         let source = PathBuf::from(source);
@@ -1316,12 +1311,8 @@ async fn affected_running_containers(
   Ok(affected.into_iter().collect())
 }
 
-fn mount_type_affects_paths(
-  mount_type: Option<&str>,
-  include_named_volume_mounts: bool,
-) -> bool {
-  mount_type == Some("bind")
-    || include_named_volume_mounts && mount_type == Some("volume")
+fn mount_type_affects_paths(mount_type: Option<&str>) -> bool {
+  matches!(mount_type, Some("bind" | "volume"))
 }
 
 async fn discover_source(
@@ -1414,7 +1405,6 @@ async fn discover_source(
         &containers,
         Some(&project_name),
         &affected_paths,
-        false,
       )
       .await?;
       let mut paths =
@@ -1685,7 +1675,6 @@ async fn discover_running_containers(
         &containers,
         Some(&project_name),
         &paths,
-        true,
       )
       .await
     }
@@ -2245,6 +2234,14 @@ impl Resolve<Args> for PreflightVykarRestore {
       }
     };
     let destination_exists = discovered.is_some();
+    let missing_volume = match &self.target {
+      PeripheryBackupTarget::Volume { volume_name }
+        if !destination_exists =>
+      {
+        Some(volume_name.clone())
+      }
+      _ => None,
+    };
     if let PeripheryBackupTarget::Volume { volume_name } =
       &self.target
       && let Some(mountpoint) =
@@ -2257,14 +2254,19 @@ impl Resolve<Args> for PreflightVykarRestore {
         self.selected_paths.is_empty(),
       )?;
     }
-    validate_restore_destinations(
-      &self.publish,
-      &self.protected_repository_paths,
-    )
-    .await?;
-    let running_containers =
-      discover_running_containers(&self.target, &self.publish)
-        .await?;
+    // A new Volume has no inspectable mountpoint. Its preview names paths
+    // inside that Volume, never guessed host paths. After creation, execution
+    // validates the inspected mountpoint before stopping/publishing anything.
+    let running_containers = if missing_volume.is_some() {
+      Vec::new()
+    } else {
+      validate_restore_destinations(
+        &self.publish,
+        &self.protected_repository_paths,
+      )
+      .await?;
+      discover_running_containers(&self.target, &self.publish).await?
+    };
     let repository = self.repository.clone();
     let advanced = self.advanced.clone();
     let hostname = self.hostname.clone();
@@ -2285,6 +2287,14 @@ impl Resolve<Args> for PreflightVykarRestore {
         &advanced,
       )?
       .snapshot_paths(&snapshot, &selected, deadline)?;
+      if let Some(volume_name) = missing_volume {
+        return compare_missing_volume_paths(
+          &snapshot_paths,
+          &publish,
+          &volume_name,
+          deadline,
+        );
+      }
       compare_restore_paths(
         &snapshot_paths,
         &publish,
@@ -2305,6 +2315,47 @@ impl Resolve<Args> for PreflightVykarRestore {
       containers_to_stop: running_containers,
     })
   }
+}
+
+fn compare_missing_volume_paths(
+  snapshot_paths: &[komodo_backup::SnapshotPath],
+  publish: &[RestorePublishPath],
+  volume_name: &str,
+  deadline: Instant,
+) -> anyhow::Result<(Vec<String>, Vec<String>, Vec<String>)> {
+  let logical_root = Path::new("/var/lib/docker/volumes")
+    .join(volume_name)
+    .join("_data");
+  let mut budget = RestorePreviewBudget::new(deadline);
+  let mut created = Vec::new();
+  for item in snapshot_paths {
+    let Some((mapping, relative)) =
+      map_snapshot_path(&item.path, publish)?
+    else {
+      continue;
+    };
+    let destination = Path::new(&mapping.destination).join(relative);
+    let relative = destination.strip_prefix(&logical_root).context(
+      "New Volume preview destination is outside its logical root",
+    )?;
+    if relative
+      .components()
+      .any(|part| !matches!(part, std::path::Component::Normal(_)))
+    {
+      return Err(anyhow!(
+        "New Volume preview contains an unsafe relative path"
+      ));
+    }
+    let display = PathBuf::from(format!(
+      "volume://{volume_name}/{}",
+      relative.to_string_lossy()
+    ));
+    budget.inventory.consume(&display.to_string_lossy())?;
+    budget.push(&mut created, &display)?;
+  }
+  created.sort();
+  created.dedup();
+  Ok((created, Vec::new(), Vec::new()))
 }
 
 fn compare_restore_paths(
@@ -4902,10 +4953,48 @@ mod tests {
   }
 
   #[test]
-  fn restore_quiescing_includes_named_volume_mounts() {
-    assert!(mount_type_affects_paths(Some("bind"), false));
-    assert!(!mount_type_affects_paths(Some("volume"), false));
-    assert!(mount_type_affects_paths(Some("volume"), true));
-    assert!(!mount_type_affects_paths(Some("tmpfs"), true));
+  fn backup_and_restore_quiescing_include_named_volume_mounts() {
+    assert!(mount_type_affects_paths(Some("bind")));
+    assert!(mount_type_affects_paths(Some("volume")));
+    assert!(!mount_type_affects_paths(Some("tmpfs")));
+    assert!(!mount_type_affects_paths(None));
+  }
+
+  #[test]
+  fn missing_volume_preview_is_relative_and_does_not_inspect_host_paths()
+   {
+    let publish = vec![RestorePublishPath {
+      destination_root: None,
+      snapshot_path: "snapshot/data".into(),
+      destination: "/var/lib/docker/volumes/new-volume/_data".into(),
+    }];
+    let items = vec![komodo_backup::SnapshotPath {
+      path: "snapshot/data/config.toml".into(),
+      directory: false,
+    }];
+    let (created, overwritten, deleted) =
+      compare_missing_volume_paths(
+        &items,
+        &publish,
+        "new-volume",
+        Instant::now() + RESTORE_PREFLIGHT_TIMEOUT,
+      )
+      .unwrap();
+    assert_eq!(created, ["volume://new-volume/config.toml"]);
+    assert!(overwritten.is_empty());
+    assert!(deleted.is_empty());
+    let outside = vec![RestorePublishPath {
+      destination: "/etc".into(),
+      ..publish[0].clone()
+    }];
+    assert!(
+      compare_missing_volume_paths(
+        &items,
+        &outside,
+        "new-volume",
+        Instant::now() + RESTORE_PREFLIGHT_TIMEOUT
+      )
+      .is_err()
+    );
   }
 }

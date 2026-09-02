@@ -47,10 +47,8 @@ pub fn spawn_schedule_executor() {
         match next_run {
           Ok(next_run_time) if current_time >= next_run_time => {
             tokio::spawn(async move {
-              let _mutation_guard = crate::backup::mutation_barrier()
-                .clone()
-                .read_owned()
-                .await;
+              // Actions call back into the API and Procedures guard each
+              // mutating step. Holding an outer lease here can deadlock them.
               match target {
                 ResourceTarget::Action(id) => {
                   let action = match crate::resource::get::<Action>(

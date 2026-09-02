@@ -554,8 +554,6 @@ pub async fn handle_procedure_webhook<B: super::ExtractBranch>(
   if !procedure.config.webhook_enabled {
     return Ok(());
   }
-  let _mutation_guard =
-    crate::backup::mutation_barrier().clone().read_owned().await;
 
   // Acquire and hold lock to make a task queue for
   // subsequent listener calls on same resource.
@@ -612,8 +610,6 @@ pub async fn handle_action_webhook<B: super::ExtractBranch>(
   if !action.config.webhook_enabled {
     return Ok(());
   }
-  let _mutation_guard =
-    crate::backup::mutation_barrier().clone().read_owned().await;
 
   // Acquire and hold lock to make a task queue for
   // subsequent listener calls on same resource.

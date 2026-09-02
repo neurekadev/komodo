@@ -798,7 +798,8 @@ function StackSelectionEditor({
   settings: Types.BackupSettings;
   patch: (value: Partial<Types.BackupSettings>) => void;
 }) {
-  const stacks = useRead("ListStacks", { query: {}, limit: 500 }).data ?? [];
+  // The resource-list API explicitly uses zero for an unlimited result set.
+  const stacks = useRead("ListStacks", { query: {}, limit: 0 }).data ?? [];
   return (
     <Grid align="end">
       <Grid.Col span={{ base: 12, md: 3 }}>
@@ -831,7 +832,7 @@ function VolumeSelectionEditor({
   settings: Types.BackupSettings;
   patch: (value: Partial<Types.BackupSettings>) => void;
 }) {
-  const servers = useRead("ListServers", { query: {}, limit: 500 }).data ?? [];
+  const servers = useRead("ListServers", { query: {}, limit: 0 }).data ?? [];
   const mode = settings.volume_selection.mode ?? Types.BackupSelectionMode.All;
   const selected = settings.volume_selection.volumes ?? [];
   const toggle = (target: Types.BackupVolumeTarget) => {

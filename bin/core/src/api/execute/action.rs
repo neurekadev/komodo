@@ -152,15 +152,19 @@ impl Resolve<ExecuteArgs> for RunAction {
     let args = serde_json::to_string(&args)
       .context("Failed to serialize action run arguments")?;
 
-    let CreateApiKeyResponse { key, secret } = create_api_key(
-      &KomodoAuthImpl,
-      action_user().id.clone(),
-      CreateApiKey {
-        name: update.id.clone(),
-        expires: 0,
-      },
-    )
-    .await?;
+    let CreateApiKeyResponse { key, secret } = {
+      let _mutation_guard =
+        crate::backup::mutation_barrier().read().await;
+      create_api_key(
+        &KomodoAuthImpl,
+        action_user().id.clone(),
+        CreateApiKey {
+          name: update.id.clone(),
+          expires: 0,
+        },
+      )
+      .await?
+    };
 
     // Do next steps in seperate error handling block,
     // and delete the API key before unwrapping the error.
@@ -237,9 +241,12 @@ impl Resolve<ExecuteArgs> for RunAction {
     }
     .await;
 
-    if let Err(e) =
+    let key_cleanup = {
+      let _mutation_guard =
+        crate::backup::mutation_barrier().read().await;
       delete_api_key(&KomodoAuthImpl, &action_user().id, key).await
-    {
+    };
+    if let Err(e) = key_cleanup {
       warn!(
         "Failed to delete API key after action execution | {:#}",
         e.error
