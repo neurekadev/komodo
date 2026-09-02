@@ -157,6 +157,7 @@ Dockerfiles, build contexts, or image dependencies:
 gh workflow run CI.yaml --ref YOUR_BRANCH -f build-images=true
 ```
 
+Image jobs allow up to 45 minutes for release compilation and cache export.
 Manual runs perform verification only. Container publication remains limited to
 pushes to `main` and release tags. If a job fails, open its first failing step,
 fix the reported error, push the correction, and run CI for the updated branch.
