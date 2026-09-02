@@ -1,0 +1,42 @@
+---
+title: Security and Deployment Trust Boundaries
+description: Protect Core, Periphery, credentials, host paths, and File Manager access.
+---
+
+Komodo is a deployment control plane. A user or process with broad Komodo permissions can affect workloads and data on every connected server.
+
+## Before exposing Komodo
+
+1. Put Core behind an HTTPS reverse proxy you operate.
+2. Restrict network access to Core, database services, and Periphery endpoints.
+3. Configure authentication and disable unused login providers.
+4. Create groups for operators and developers, then grant the minimum resource and specific permissions they need.
+5. Configure database backups and test a restore.
+6. Protect onboarding keys, API keys, provider tokens, and generated Core/Periphery private keys.
+
+## Expected result
+
+Only intended users can reach the interface, connected servers authenticate successfully, and a test operator can perform approved actions without gaining unrelated host access.
+
+## Containerized Periphery is Docker-host trusted
+
+The official Compose templates mount the Docker socket and Docker's named-volume root into Periphery. Those mounts let Periphery deploy workloads, expose host-visible build and Stack paths, and provide Docker-volume File Manager operations. They also place Periphery on the Docker-host trust boundary.
+
+Making the volume-root mount read-only or mounting only `komodo_data` breaks supported File Manager and host-visible workspace behavior. Protect the Periphery-to-Core connection instead of treating the container as an unprivileged tenant.
+
+## File Manager permission scope
+
+A Server-level `FileManager` permission deliberately covers every eligible named volume on that Server. The API refuses roots that overlap Periphery's private File Manager journal, including filesystem aliases. The shared `komodo_data` volume remains visible but its Files tab is unavailable because it contains Periphery credentials and private state.
+
+Grant `FileManager` only to users trusted with other named-volume data on the host. Read or Execute permits browsing; Write permits changes on writable targets.
+
+## Credentials and keys
+
+- Core and Periphery authenticate with generated key pairs. Persist their private-key paths and back them up with the deployment configuration.
+- An onboarding key is a bootstrap secret. Disable or delete it after onboarding unless reuse is intentional.
+- Store Git and registry tokens under **Settings → Providers** or in protected config files.
+- Store sensitive values as Komodo secrets. Do not commit them to Resource Sync repositories.
+
+## Recovery
+
+If a key or provider token may be exposed, rotate it before investigating convenience issues. If host integrity is uncertain, stop Periphery, isolate the host, preserve audit and update logs, and restore service only after credentials and workloads are verified.

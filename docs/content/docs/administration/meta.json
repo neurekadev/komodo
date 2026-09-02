@@ -1,0 +1,13 @@
+{
+  "title": "Administration",
+  "pages": [
+    "index",
+    "databases",
+    "core-configuration",
+    "authentication-and-providers",
+    "users-groups-permissions",
+    "backups",
+    "backup-restore",
+    "security-and-trust"
+  ]
+}

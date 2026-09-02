@@ -1,0 +1,17 @@
+.spinner {
+  display: block;
+  color: var(--mantine-color-dimmed);
+  animation: metric-spinner-rotate 1s linear infinite;
+}
+
+@keyframes metric-spinner-rotate {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .spinner {
+    animation-duration: 2s;
+  }
+}

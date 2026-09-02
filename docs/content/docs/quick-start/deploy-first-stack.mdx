@@ -1,0 +1,43 @@
+---
+title: Deploy the First Stack
+description: Create and deploy a Compose Stack from the Komodo interface.
+---
+
+A Stack lets Komodo create, update, inspect, and redeploy a Docker Compose project on a connected server.
+
+## Prerequisites
+
+- At least one Server reports **OK**.
+- Your account can create Stacks on that Server.
+- You have a small Compose file that does not expose sensitive services directly to the internet.
+
+## Create the Stack
+
+1. Open **Stacks** and choose **New Stack**.
+2. Enter a name such as `hello-komodo` and select the connected Server.
+3. Choose the UI-managed file option and add `compose.yaml`:
+
+   ```yaml
+   services:
+     web:
+       image: nginx:1.29
+       restart: unless-stopped
+       ports:
+         - "127.0.0.1:8080:80"
+   ```
+
+4. Save the Stack, review the change preview, and choose **Deploy**.
+5. Open the Stack's service list and logs.
+
+## Expected result
+
+The Stack status is **Running**, the `web` service is healthy, and `curl http://127.0.0.1:8080` on the target server returns the Nginx page.
+
+## Troubleshooting
+
+- Open the deploy update to find the first failing Compose command.
+- Check that another process is not already bound to `127.0.0.1:8080`.
+- Pull the image from the server manually if a registry or network error is unclear.
+- Keep the Compose file and generated environment file at different paths.
+
+Continue with [Stacks](/features/stacks) for host files, Git repositories, multiple Compose files, File Manager behavior, and Swarm targets.

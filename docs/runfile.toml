@@ -1,0 +1,22 @@
+# Runfile | https://crates.io/crates/runnables-cli
+
+[dev-docs]
+alias = "dd"
+description = "starts the Fumadocs documentation site in development mode"
+cmd = "yarn && yarn dev"
+
+[check-docs]
+alias = "cdocs"
+description = "type checks, lints, validates links, builds, and verifies static output"
+cmd = "yarn && yarn verify"
+
+[build-docs]
+alias = "bd"
+description = "builds the static documentation site"
+cmd = "yarn && yarn build && yarn check:static"
+
+[serve-docs]
+alias = "sd"
+description = "serves the built static documentation site"
+after = ["build-docs"]
+cmd = "yarn serve"

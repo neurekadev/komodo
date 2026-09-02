@@ -1,0 +1,63 @@
+---
+title: Automatic Updates
+description: Detect and deploy newer container images automatically.
+---
+
+
+Komodo can automatically check for newer Docker image digests and redeploy resources when updates are found.
+
+## Enable Update Checks
+
+### Prerequisites
+
+- The Stack or Deployment already deploys successfully.
+- The selected image tag is expected to move to new digests.
+- Registry credentials are configured on the target Server when the image is private.
+
+1. Open the Stack or Deployment configuration.
+2. Enable **Poll for Updates** to report newer digests without changing the workload.
+3. Run the update check and confirm Komodo can query every registry.
+4. Enable **Auto Update** only after a manual redeploy of the newer digest succeeds.
+5. Configure an Alerter so operators see successful and failed update attempts.
+
+The expected result is an update indicator in polling mode or an audited redeploy in automatic mode. For failures, verify registry access, confirm the tag resolves to a different digest, and run a normal redeploy before retrying automation.
+
+## Update Modes and Configuration
+
+Both **Stacks** and **Deployments** support two update modes:
+
+| Mode | Behavior |
+|---|---|
+| **Poll for Updates** | Checks for newer images with the same tag. Displays an update indicator in the UI and sends an alert (if an Alerter is configured). Does not redeploy. |
+| **Auto Update** | Same check, but automatically redeploys services with newer images. Also sends an alert. |
+
+<Callout title="Note" type="info">
+
+Auto-update requires a "rolling" image tag like `:latest`. For pinned tags in git-sourced stacks, consider [Renovate](https://github.com/renovatebot/renovate).
+
+</Callout>
+
+## Global Auto Update Procedure
+
+New installs include a **Global Auto Update** Procedure, scheduled daily. It loops through all resources with either mode enabled and checks registries for newer digests.
+
+```toml
+[[procedure]]
+name = "Global Auto Update"
+description = "Pulls and auto updates Stacks and Deployments using 'poll_for_updates' or 'auto_update'."
+tags = ["system"]
+config.schedule = "Every day at 03:00"
+
+[[procedure.config.stage]]
+name = "Stage 1"
+enabled = true
+executions = [
+  { execution.type = "GlobalAutoUpdate", execution.params = {}, enabled = true }
+]
+```
+
+<Callout title="Information" type="info">
+
+`GlobalAutoUpdate` can be integrated into other Procedures to coordinate timing with processes like backups. There is nothing special about the default Procedure — it is created for convenience.
+
+</Callout>

@@ -1,0 +1,57 @@
+---
+title: Install Core
+description: Start Komodo Core, MongoDB, and the local Periphery agent with the recommended Compose template.
+---
+
+The recommended installation runs Komodo Core with MongoDB and a Periphery agent in one Compose project.
+
+## Prerequisites
+
+- Docker Engine and the Docker Compose plugin are installed.
+- Ports used by your reverse proxy can reach Core.
+- You have chosen a durable installation directory.
+
+## Install Komodo
+
+1. Create the installation directory and download the repository-provided template and environment file:
+
+   ```bash
+   mkdir -p komodo
+   cd komodo
+   curl -fsSL -o compose.yaml https://raw.githubusercontent.com/neurekadev/komodo/main/compose/mongo.compose.yaml
+   curl -fsSL -o .env https://raw.githubusercontent.com/neurekadev/komodo/main/compose/compose.env
+   ```
+
+2. Edit `.env`. Replace the example hostname, credentials, and secrets before starting the services.
+
+3. Review the fully resolved Compose configuration:
+
+   ```bash
+   docker compose config
+   ```
+
+4. Start Komodo:
+
+   ```bash
+   docker compose up -d
+   docker compose ps
+   ```
+
+5. Put Core behind your operator-managed HTTPS reverse proxy, then open the configured Komodo URL and create the first administrator account.
+
+## Expected result
+
+`docker compose ps` reports the Core, Periphery, and MongoDB services as running, and the sign-in page loads through your HTTPS URL.
+
+## Troubleshooting
+
+- Run `docker compose logs --tail=200 core` when the UI does not load.
+- Re-run `docker compose config` and look for unchanged example values or missing variables.
+- If MongoDB cannot start on the host CPU, use the [FerretDB installation](/administration/databases/ferretdb).
+- Do not delete named volumes while troubleshooting; they contain the database, identities, and Komodo working data.
+
+<Callout title="Docker host access" type="warn">
+  The official template gives containerized Periphery control of the Docker socket and read/write access to Docker's named-volume root. Treat Periphery as Docker-host trusted. Review [Security and trust boundaries](/administration/security-and-trust) before granting access to other users.
+</Callout>
+
+For database selection and storage details, see [MongoDB](/administration/databases/mongodb).

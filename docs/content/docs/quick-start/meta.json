@@ -1,0 +1,9 @@
+{
+  "title": "Quick Start",
+  "pages": [
+    "index",
+    "install-core",
+    "connect-server",
+    "deploy-first-stack"
+  ]
+}

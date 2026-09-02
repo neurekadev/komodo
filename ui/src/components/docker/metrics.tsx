@@ -1,5 +1,7 @@
 import { Text, Tooltip } from "@mantine/core";
+import { LoaderCircle } from "lucide-react";
 import { fmtDateWithMinutes, fmtRateBytes, fmtSizeBytes } from "mogh_ui";
+import classes from "./metrics.module.scss";
 
 type MetricStatus = "pending" | "available" | "unavailable";
 
@@ -11,6 +13,17 @@ type DiskMetricProps = {
   approximate?: boolean;
 };
 
+function MetricSpinner() {
+  return (
+    <LoaderCircle
+      aria-label="Measuring"
+      className={classes.spinner}
+      role="status"
+      size="1rem"
+    />
+  );
+}
+
 export function DockerDiskMetric({
   status = "pending",
   bytes,
@@ -19,7 +32,7 @@ export function DockerDiskMetric({
   approximate,
 }: DiskMetricProps) {
   if (status === "pending") {
-    return <Text c="dimmed">Measuring…</Text>;
+    return <MetricSpinner />;
   }
   if (status !== "available" || bytes === undefined) {
     return (
@@ -64,10 +77,10 @@ export function DockerNetworkMetric({
   direction,
 }: NetworkMetricProps) {
   if (!traffic) {
-    return <Text c="dimmed">Measuring…</Text>;
+    return <MetricSpinner />;
   }
   if (traffic.status === "pending") {
-    return <Text c="dimmed">Measuring…</Text>;
+    return <MetricSpinner />;
   }
   if (traffic.status !== "available") {
     return (

@@ -1,0 +1,48 @@
+---
+title: Connect a Server
+description: Install Periphery and connect a Docker server to Komodo Core.
+---
+
+Every server managed by Komodo runs the small Periphery agent. The recommended systemd installation keeps the agent outside a container and avoids host-path translation.
+
+## Prerequisites
+
+- Komodo Core is running at an HTTPS URL reachable from the server.
+- Docker is installed, and the Periphery service user can use Docker without `sudo`.
+- You are signed in as a Komodo administrator.
+
+## Connect the server
+
+1. In Komodo, open **Settings → Onboarding**.
+2. Create an onboarding key and copy it. Core returns the secret only when the key is created.
+3. On the server, run the installer with your Core address and onboarding key:
+
+   ```bash
+   curl -sSL https://raw.githubusercontent.com/neurekadev/komodo/main/scripts/setup-periphery.py \
+     | python3 - \
+     --core-address="https://komodo.example.com" \
+     --connect-as="$(hostname)" \
+     --onboarding-key="O-..."
+   ```
+
+4. Enable the service after reboot:
+
+   ```bash
+   sudo systemctl enable periphery
+   ```
+
+5. Return to Komodo, open **Servers**, select the new server, and confirm its connection status is **OK**.
+6. Disable or delete the onboarding key if it is no longer needed.
+
+## Expected result
+
+The server appears in Komodo with live CPU, memory, disk, and container information.
+
+## Troubleshooting
+
+- Check `systemctl status periphery` and the service journal when the server stays disconnected.
+- Confirm the Core URL is reachable from the server and uses a certificate the host trusts.
+- Confirm the service user can run `docker ps` without `sudo`.
+- For a user service, enable lingering with `sudo loginctl enable-linger <user>`.
+
+Container, binary, inbound-connection, and key-rotation options are documented under [Servers and monitoring](/features/servers-and-monitoring).
