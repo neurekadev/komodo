@@ -66,6 +66,7 @@ pub enum PeripheryRequest {
   RunVykarBackupBatch(RunVykarBackupBatch),
   PreflightVykarRestore(PreflightVykarRestore),
   TransactionalVykarRestore(TransactionalVykarRestore),
+  FinalizeVykarRestore(FinalizeVykarRestore),
   CancelVykarOperation(CancelVykarOperation),
 
   // File Manager

@@ -5,6 +5,7 @@ use komodo_client::entities::{
 };
 use mogh_resolver::Resolve;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type", content = "params")]
@@ -153,6 +154,14 @@ pub struct TransactionalVykarRestore {
   /// Create a local destination volume when it does not exist.
   #[serde(default)]
   pub create_volume_if_missing: bool,
+  /// Source absolute bind path to destination absolute bind path. Recovered
+  /// Stack Compose files are rewritten in staging before publication.
+  #[serde(default)]
+  pub bind_path_mappings: HashMap<String, String>,
+  /// Keep the durable filesystem rollback journal until Core confirms the
+  /// recovered Stack resource was inserted successfully.
+  #[serde(default)]
+  pub defer_finalize: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -187,6 +196,28 @@ pub struct PreflightVykarRestoreResponse {
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct TransactionalVykarRestoreResponse {
+  pub complete: bool,
+  pub rolled_back: bool,
+  /// Publication succeeded, but its rollback data is intentionally retained
+  /// until `FinalizeVykarRestore` commits or rolls it back.
+  #[serde(default)]
+  pub finalization_pending: bool,
+  pub containers_restarted: Vec<String>,
+  pub critical_error: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Resolve)]
+#[response(FinalizeVykarRestoreResponse)]
+#[error(anyhow::Error)]
+pub struct FinalizeVykarRestore {
+  pub journal_id: String,
+  /// Commit the publication when true; restore the original filesystem when
+  /// false.
+  pub commit: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct FinalizeVykarRestoreResponse {
   pub complete: bool,
   pub rolled_back: bool,
   pub containers_restarted: Vec<String>,

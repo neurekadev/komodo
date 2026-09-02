@@ -11009,6 +11009,12 @@ export interface PrepareManagedFileManagerRenderedDownload {
 
 /** Admin-only. Performs full verification before changing the active primary. */
 export interface PromoteBackupMirror {
+	/**
+	 * Explicit disaster-recovery acknowledgement. This permits promotion
+	 * after the mirror passes full verification even when the old primary is
+	 * unavailable for the final inventory comparison.
+	 */
+	allow_primary_unavailable?: boolean;
 }
 
 /**

@@ -166,7 +166,10 @@ impl Resolve<WriteArgs> for PromoteBackupMirror {
     WriteArgs { user }: &WriteArgs,
   ) -> mogh_error::Result<BackupSettings> {
     require_admin(user)?;
-    Ok(crate::backup::promote_mirror().await?)
+    Ok(
+      crate::backup::promote_mirror(self.allow_primary_unavailable)
+        .await?,
+    )
   }
 }
 

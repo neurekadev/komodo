@@ -484,8 +484,20 @@ function BackupSettingsForm({
             <Button variant="default" loading={verifying} onClick={() => verify({ mirror: true, full: true })}>
               Verify mirror
             </Button>
-            <Button color="orange" loading={promoting} onClick={() => promote({})}>
+            <Button color="orange" loading={promoting} onClick={() => promote({ allow_primary_unavailable: false })}>
               Verify and promote mirror
+            </Button>
+            <Button
+              color="red"
+              variant="light"
+              loading={promoting}
+              onClick={() => {
+                if (globalThis.confirm("The primary repository is unavailable. Fully verify and promote the mirror without comparing it to the primary inventory?")) {
+                  promote({ allow_primary_unavailable: true });
+                }
+              }}
+            >
+              Disaster recovery promotion
             </Button>
           </>
         )}

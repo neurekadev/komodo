@@ -707,6 +707,156 @@ fn compose_bind_paths(
   Ok(paths)
 }
 
+fn remap_absolute_bind_source(
+  source: &str,
+  mappings: &HashMap<String, String>,
+) -> Option<String> {
+  let source = Path::new(source);
+  if !source.is_absolute() {
+    return None;
+  }
+  mappings
+    .iter()
+    .filter_map(|(from, to)| {
+      let from = Path::new(from);
+      source.strip_prefix(from).ok().map(|relative| {
+        (
+          from.components().count(),
+          Path::new(to).join(relative).to_string_lossy().into_owned(),
+        )
+      })
+    })
+    .max_by_key(|(depth, _)| *depth)
+    .map(|(_, mapped)| mapped)
+}
+
+fn rewrite_compose_bind_mappings(
+  document: &mut serde_yaml_ng::Value,
+  mappings: &HashMap<String, String>,
+) -> usize {
+  use serde_yaml_ng::Value;
+
+  let key = |value: &str| Value::String(value.into());
+  let Some(services) = document
+    .as_mapping_mut()
+    .and_then(|root| root.get_mut(&key("services")))
+    .and_then(Value::as_mapping_mut)
+  else {
+    return 0;
+  };
+  let mut rewritten = 0;
+  for service in services.values_mut() {
+    let Some(volumes) = service
+      .as_mapping_mut()
+      .and_then(|service| service.get_mut(&key("volumes")))
+      .and_then(Value::as_sequence_mut)
+    else {
+      continue;
+    };
+    for volume in volumes {
+      match volume {
+        Value::String(short) => {
+          let Some((source, suffix)) = short.split_once(':') else {
+            continue;
+          };
+          if let Some(mapped) =
+            remap_absolute_bind_source(source, mappings)
+          {
+            *short = format!("{mapped}:{suffix}");
+            rewritten += 1;
+          }
+        }
+        Value::Mapping(long) => {
+          let mount_type = long
+            .get(&key("type"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+          let Some(source) = long
+            .get_mut(&key("source"))
+            .and_then(|value| value.as_str())
+            .map(str::to_owned)
+          else {
+            continue;
+          };
+          if mount_type.as_deref().is_some_and(|kind| kind != "bind")
+          {
+            continue;
+          }
+          if let Some(mapped) =
+            remap_absolute_bind_source(&source, mappings)
+          {
+            long.insert(key("source"), Value::String(mapped));
+            rewritten += 1;
+          }
+        }
+        _ => {}
+      }
+    }
+  }
+  rewritten
+}
+
+fn rewrite_recovered_stack_compose_files(
+  request: &TransactionalVykarRestore,
+  staging: &Path,
+) -> anyhow::Result<()> {
+  let PeripheryBackupTarget::Stack { stack, .. } = &request.target
+  else {
+    return Ok(());
+  };
+  if request.bind_path_mappings.is_empty() {
+    return Ok(());
+  }
+  let run_directory = Path::new(&stack.config.run_directory);
+  let run_root = request
+    .publish
+    .iter()
+    .find(|item| Path::new(&item.destination) == run_directory)
+    .context(
+      "Recovered Stack publish plan has no run-directory root",
+    )?;
+  let staged_run_directory = staging.join(&run_root.snapshot_path);
+  for compose_file in stack.compose_file_paths() {
+    let relative = Path::new(compose_file);
+    if relative.is_absolute()
+      || relative.components().any(|component| {
+        matches!(component, std::path::Component::ParentDir)
+      })
+    {
+      return Err(anyhow!(
+        "Recovered Stack Compose path is unsafe: {compose_file}"
+      ));
+    }
+    let path = staged_run_directory.join(relative);
+    let text = std::fs::read_to_string(&path).with_context(|| {
+      format!(
+        "Failed to read recovered Compose file {}",
+        path.display()
+      )
+    })?;
+    let mut document: serde_yaml_ng::Value =
+      serde_yaml_ng::from_str(&text).with_context(|| {
+        format!(
+          "Failed to parse recovered Compose file {}",
+          path.display()
+        )
+      })?;
+    if rewrite_compose_bind_mappings(
+      &mut document,
+      &request.bind_path_mappings,
+    ) == 0
+    {
+      continue;
+    }
+    let rewritten = serde_yaml_ng::to_string(&document)?;
+    let mut file =
+      OpenOptions::new().truncate(true).write(true).open(&path)?;
+    file.write_all(rewritten.as_bytes())?;
+    file.sync_all()?;
+  }
+  Ok(())
+}
+
 async fn affected_running_containers(
   docker: &crate::docker::DockerClient,
   containers: &[ContainerListItem],
@@ -1223,6 +1373,7 @@ impl Resolve<Args> for TransactionalVykarRestore {
         return Ok(TransactionalVykarRestoreResponse {
           complete: false,
           rolled_back: volume_cleanup_error.is_none(),
+          finalization_pending: false,
           containers_restarted: if restart_errors.is_empty()
             && volume_cleanup_error.is_none()
           {
@@ -1254,7 +1405,10 @@ impl Resolve<Args> for TransactionalVykarRestore {
 
     let restore_result = transactional_restore(&self).await;
     let rolled_back = match restore_result {
-      RestoreTransactionResult::Published { rolled_back } => {
+      RestoreTransactionResult::Published {
+        rolled_back,
+        finalization_pending,
+      } => {
         if rolled_back
           && let Some(journal) = owned_volume_journal.as_deref()
           && let Err(error) =
@@ -1263,10 +1417,20 @@ impl Resolve<Args> for TransactionalVykarRestore {
           return Ok(TransactionalVykarRestoreResponse {
             complete: false,
             rolled_back: false,
+            finalization_pending: false,
             containers_restarted: Vec::new(),
             critical_error: Some(format!(
               "Restore rolled back but its created Volume could not be removed; affected containers remain stopped: {error:#}"
             )),
+          });
+        }
+        if finalization_pending {
+          return Ok(TransactionalVykarRestoreResponse {
+            complete: true,
+            rolled_back: false,
+            finalization_pending: true,
+            containers_restarted: Vec::new(),
+            critical_error: None,
           });
         }
         rolled_back
@@ -1299,6 +1463,7 @@ impl Resolve<Args> for TransactionalVykarRestore {
         return Ok(TransactionalVykarRestoreResponse {
           complete: false,
           rolled_back: cleanup_error.is_none(),
+          finalization_pending: false,
           containers_restarted: if restart_errors.is_empty()
             && cleanup_error.is_none()
           {
@@ -1329,6 +1494,7 @@ impl Resolve<Args> for TransactionalVykarRestore {
         return Ok(TransactionalVykarRestoreResponse {
           complete: false,
           rolled_back: false,
+          finalization_pending: false,
           containers_restarted: Vec::new(),
           critical_error: Some(format!(
             "Restore state is indeterminate; affected containers remain stopped: {error:#}"
@@ -1351,6 +1517,7 @@ impl Resolve<Args> for TransactionalVykarRestore {
       Ok(TransactionalVykarRestoreResponse {
         complete: !rolled_back,
         rolled_back,
+        finalization_pending: false,
         containers_restarted: restarted,
         critical_error: None,
       })
@@ -1361,6 +1528,7 @@ impl Resolve<Args> for TransactionalVykarRestore {
       Ok(TransactionalVykarRestoreResponse {
         complete: false,
         rolled_back,
+        finalization_pending: false,
         containers_restarted: Vec::new(),
         critical_error: Some(format!(
           "Container state is indeterminate; keep affected containers stopped: {}",
@@ -1562,7 +1730,10 @@ fn collect_unexpected_paths(
 }
 
 enum RestoreTransactionResult {
-  Published { rolled_back: bool },
+  Published {
+    rolled_back: bool,
+    finalization_pending: bool,
+  },
   FailedBeforePublication(anyhow::Error),
   Indeterminate(anyhow::Error),
 }
@@ -1576,7 +1747,10 @@ async fn transactional_restore(
     );
   }
   if operation_cancelled(&request.journal_id) {
-    return RestoreTransactionResult::Published { rolled_back: true };
+    return RestoreTransactionResult::Published {
+      rolled_back: true,
+      finalization_pending: false,
+    };
   }
   if let Err(error) =
     validate_resolved_restore_destinations(&request.publish)
@@ -1644,9 +1818,19 @@ async fn transactional_restore(
     }
   }
 
+  if let Err(error) =
+    rewrite_recovered_stack_compose_files(request, &staging)
+  {
+    let _ = cleanup_restore_staging_journal(&staging_journal);
+    return RestoreTransactionResult::FailedBeforePublication(error);
+  }
+
   if operation_cancelled(&request.journal_id) {
     let _ = cleanup_restore_staging_journal(&staging_journal);
-    return RestoreTransactionResult::Published { rolled_back: true };
+    return RestoreTransactionResult::Published {
+      rolled_back: true,
+      finalization_pending: false,
+    };
   }
 
   let publish = request.publish.clone();
@@ -1662,13 +1846,15 @@ async fn transactional_restore(
       &journal_id,
       &worker_started,
       Some(&publication_staging_journal),
+      request.defer_finalize,
     )
   })
   .await;
   match result {
-    Ok(Ok(rolled_back)) => {
-      RestoreTransactionResult::Published { rolled_back }
-    }
+    Ok(Ok(rolled_back)) => RestoreTransactionResult::Published {
+      rolled_back,
+      finalization_pending: request.defer_finalize && !rolled_back,
+    },
     Ok(Err(error)) => {
       if publication_started.load(Ordering::SeqCst) {
         RestoreTransactionResult::Indeterminate(error)
@@ -2019,6 +2205,7 @@ fn publish_restore(
   journal_id: &str,
   publication_started: &AtomicBool,
   staging_journal_path: Option<&Path>,
+  defer_finalize: bool,
 ) -> anyhow::Result<bool> {
   let journal_directory = restore_journal_dir()?;
   publish_restore_in(
@@ -2028,6 +2215,7 @@ fn publish_restore(
     publication_started,
     &journal_directory,
     staging_journal_path,
+    defer_finalize,
   )
 }
 
@@ -2053,6 +2241,7 @@ fn publish_restore_in(
   publication_started: &AtomicBool,
   journal_directory: &Path,
   staging_journal_path: Option<&Path>,
+  defer_finalize: bool,
 ) -> anyhow::Result<bool> {
   validate_resolved_restore_destinations(publish)?;
   let mut entries = Vec::new();
@@ -2226,6 +2415,13 @@ fn publish_restore_in(
       return Ok(true);
     }
     fsync_parent(&journal.entries[index].destination)?;
+  }
+
+  if defer_finalize {
+    // Core creates the recovered Stack only after publication. Preserve the
+    // uncommitted durable journal and rollback trees until it explicitly
+    // confirms that the database insert succeeded.
+    return Ok(false);
   }
 
   journal.committed = true;
@@ -2444,6 +2640,108 @@ fn fsync_parent(path: &Path) -> anyhow::Result<()> {
   let parent = path.parent().context("Path has no parent")?;
   std::fs::File::open(parent)?.sync_all()?;
   Ok(())
+}
+
+async fn finalize_restore_publication(
+  journal_id: &str,
+  commit: bool,
+) -> anyhow::Result<FinalizeVykarRestoreResponse> {
+  let journal_path =
+    restore_journal_dir()?.join(format!("{journal_id}.json"));
+  let bytes = std::fs::read(&journal_path).with_context(|| {
+    format!(
+      "Pending restore publication does not exist: {}",
+      journal_path.display()
+    )
+  })?;
+  let mut journal: RestoreJournal = serde_json::from_slice(&bytes)
+    .with_context(|| {
+      format!(
+        "Failed to decode pending restore publication {}",
+        journal_path.display()
+      )
+    })?;
+  if journal.committed {
+    return Err(anyhow!(
+      "Restore publication was already committed but not cleaned up"
+    ));
+  }
+
+  if commit {
+    // Make the decision durable before discarding rollback data. Startup
+    // recovery will finish a committed cleanup after a power loss.
+    journal.committed = true;
+    persist_journal(&journal_path, &journal)?;
+    for entry in &journal.entries {
+      remove_path(&entry.rollback)?;
+      fsync_parent(&entry.destination)?;
+      remove_path(&entry.source)?;
+      fsync_parent(&entry.source)?;
+    }
+    if !journal.staging.as_os_str().is_empty() {
+      remove_path(&journal.staging)?;
+      fsync_parent(&journal.staging)?;
+    }
+  } else {
+    rollback_published(&mut journal, &journal_path)?;
+    for entry in &journal.entries {
+      remove_path(&entry.source)?;
+      fsync_parent(&entry.source)?;
+    }
+    if !journal.staging.as_os_str().is_empty() {
+      remove_path(&journal.staging)?;
+      fsync_parent(&journal.staging)?;
+    }
+    if let Some(owned) = &journal.owned_volume {
+      remove_owned_restore_volume(owned).await?;
+    }
+  }
+  remove_path(&journal_path)?;
+  fsync_parent(&journal_path)?;
+
+  let container_journal_path = container_quiesce_journal_dir()?
+    .join(format!("{journal_id}.json"));
+  let containers = if path_lexists(&container_journal_path) {
+    let journal: ContainerQuiesceJournal = serde_json::from_slice(
+      &std::fs::read(&container_journal_path)?,
+    )?;
+    journal.containers
+  } else {
+    Vec::new()
+  };
+  let (restarted, restart_errors) =
+    restart_containers(&containers).await;
+  if !restart_errors.is_empty() {
+    return Ok(FinalizeVykarRestoreResponse {
+      complete: false,
+      rolled_back: !commit,
+      containers_restarted: Vec::new(),
+      critical_error: Some(format!(
+        "Restore was finalized but affected containers could not all be restarted: {}",
+        restart_errors.join("; ")
+      )),
+    });
+  }
+  remove_container_quiesce_journal(
+    path_lexists(&container_journal_path)
+      .then_some(container_journal_path.as_path()),
+  )?;
+  Ok(FinalizeVykarRestoreResponse {
+    complete: true,
+    rolled_back: !commit,
+    containers_restarted: restarted,
+    critical_error: None,
+  })
+}
+
+impl Resolve<Args> for FinalizeVykarRestore {
+  async fn resolve(
+    self,
+    _: &Args,
+  ) -> anyhow::Result<FinalizeVykarRestoreResponse> {
+    let _operation = backup_operation_lock().lock().await;
+    finalize_restore_publication(&self.journal_id, self.commit).await
+  }
 }
 
 impl Resolve<Args> for CancelVykarOperation {
@@ -2730,6 +3028,27 @@ mod tests {
   }
 
   #[test]
+  fn recovered_compose_rewrites_long_and_short_absolute_binds() {
+    let mut document: serde_yaml_ng::Value = serde_yaml_ng::from_str(
+      "services:\n  app:\n    volumes:\n      - type: bind\n        source: /srv/old/data\n        target: /data\n      - /srv/old/cache:/cache:ro\n      - named-data:/named\n",
+    )
+    .unwrap();
+    let mappings = HashMap::from([(
+      "/srv/old".to_string(),
+      "/srv/recovered".to_string(),
+    )]);
+    assert_eq!(
+      rewrite_compose_bind_mappings(&mut document, &mappings),
+      2
+    );
+    let rewritten = serde_yaml_ng::to_string(&document).unwrap();
+    assert!(rewritten.contains("/srv/recovered/data"));
+    assert!(rewritten.contains("/srv/recovered/cache:/cache:ro"));
+    assert!(rewritten.contains("named-data:/named"));
+    assert!(!rewritten.contains("/srv/old"));
+  }
+
+  #[test]
   fn nested_stack_bind_roots_collapse_to_the_ancestor() {
     let run_directory = tempfile::tempdir().unwrap();
     let binds = tempfile::tempdir().unwrap();
@@ -2817,6 +3136,7 @@ mod tests {
         &AtomicBool::new(false),
         &root.path().join("journals"),
         None,
+        false,
       )
       .unwrap()
     );
@@ -2825,6 +3145,42 @@ mod tests {
       b"original"
     );
     assert!(!first.join("new.txt").exists());
+  }
+
+  #[test]
+  fn deferred_publication_retains_rollback_until_finalized() {
+    let root = tempfile::tempdir().unwrap();
+    let download = root.path().join("download");
+    std::fs::create_dir(&download).unwrap();
+    std::fs::write(download.join("new.txt"), b"new").unwrap();
+    let destination = root.path().join("destination.txt");
+    std::fs::write(&destination, b"original").unwrap();
+    let publish = [RestorePublishPath {
+      snapshot_path: "new.txt".into(),
+      destination: destination.to_string_lossy().into_owned(),
+    }];
+    let journal_directory = root.path().join("journals");
+    assert!(
+      !publish_restore_in(
+        &download,
+        &publish,
+        "deferred-test",
+        &AtomicBool::new(false),
+        &journal_directory,
+        None,
+        true,
+      )
+      .unwrap()
+    );
+    assert_eq!(std::fs::read(&destination).unwrap(), b"new");
+    let journal_path = journal_directory.join("deferred-test.json");
+    let mut journal: RestoreJournal =
+      serde_json::from_slice(&std::fs::read(&journal_path).unwrap())
+        .unwrap();
+    assert!(!journal.committed);
+    assert!(journal.entries[0].rollback.exists());
+    rollback_published(&mut journal, &journal_path).unwrap();
+    assert_eq!(std::fs::read(&destination).unwrap(), b"original");
   }
 
   #[test]
@@ -2916,6 +3272,7 @@ mod tests {
         &AtomicBool::new(false),
         &root.path().join("journals"),
         None,
+        false,
       )
       .unwrap()
     );
@@ -2955,6 +3312,7 @@ mod tests {
         &AtomicBool::new(false),
         &root.path().join("journals"),
         None,
+        false,
       )
       .is_err()
     );

@@ -45,10 +45,10 @@ use komodo_client::{
   },
 };
 use periphery_client::api::backup::{
-  CancelVykarOperation, DiscoverBackupSource, PeripheryBackupTarget,
-  PreflightVykarRestore, PreflightVykarRestoreResponse,
-  RunVykarBackup, RunVykarBackupBatch, TransactionalVykarRestore,
-  VykarBackupTask, VykarRetainedSnapshot,
+  CancelVykarOperation, DiscoverBackupSource, FinalizeVykarRestore,
+  PeripheryBackupTarget, PreflightVykarRestore,
+  PreflightVykarRestoreResponse, RunVykarBackup, RunVykarBackupBatch,
+  TransactionalVykarRestore, VykarBackupTask, VykarRetainedSnapshot,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -129,6 +129,10 @@ struct StoredRestorePlan {
   /// exact roots.
   #[serde(default)]
   snapshot_stack_source_paths: Vec<String>,
+  /// Source absolute bind path to destination absolute bind path. Retained
+  /// with the confirmed plan so execution cannot substitute new mappings.
+  #[serde(default)]
+  bind_path_mappings: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -578,7 +582,7 @@ fn repositories_share_location(
       let mirror = resolve_existing_path_ancestor(
         &normalize_core_local_path(mirror),
       )?;
-      Ok(primary == mirror)
+      Ok(paths_overlap(&primary, &mirror))
     }
     _ => {
       Ok(repository_location(primary) == repository_location(mirror))
@@ -1877,6 +1881,15 @@ async fn run_fleet(
       if enabled_server_ids.contains(stack.config.server_id.as_str())
       {
         targets.push(BackupTarget::Stack { stack_id: stack.id });
+      } else if settings.stack_selection.mode
+        == BackupSelectionMode::Include
+        && settings.stack_selection.stack_ids.contains(&stack.id)
+      {
+        warn!(
+          "Explicitly selected Stack '{}' belongs to a missing or disabled Server",
+          stack.name
+        );
+        partial = true;
       }
     }
   }
@@ -3409,6 +3422,7 @@ pub async fn plan_restore(
     },
   };
   let mut publish = Vec::new();
+  let mut confirmed_bind_path_mappings = HashMap::new();
   let mut recovered_stack_source = None;
   let mut recovered_stack_run_directory = None;
   match &snapshot.target {
@@ -3522,6 +3536,10 @@ pub async fn plan_restore(
           return Err(anyhow!(
             "Restore destination must be absolute: {destination_path}"
           ));
+        }
+        if recovering_stack {
+          confirmed_bind_path_mappings
+            .insert(source.clone(), destination_path.clone());
         }
         publish.push(
           periphery_client::api::backup::RestorePublishPath {
@@ -3663,6 +3681,7 @@ pub async fn plan_restore(
       recovered_stack_source,
       source_stack_missing,
       snapshot_stack_source_paths: authenticated_snapshot_stack_paths,
+      bind_path_mappings: confirmed_bind_path_mappings,
     })
     .await?;
   Ok(plan)
@@ -3989,8 +4008,41 @@ pub async fn execute_restore(
       stored.recovered_stack_run_directory.clone().or_else(|| {
         stored.publish.first().map(|path| path.destination.clone())
       });
-    let response = periphery_client(&server)
-      .await?
+    // Rebuild and validate the exact recovered Stack config under the
+    // mutation barrier immediately before Periphery publishes any files.
+    // Publication remains reversible until this config is inserted.
+    let recovered_creation =
+      if let Some(stack) = recovered_stack.as_ref() {
+        let name = stored
+          .recovered_stack_name
+          .clone()
+          .context("Recovered stack name is missing")?;
+        let mut config:
+          komodo_client::entities::stack::PartialStackConfig =
+          stack.clone().config.into();
+        config.server_id = Some(server_id.clone());
+        config.swarm_id = Some(String::new());
+        config.project_name = Some(name.clone());
+        config.files_on_host = Some(true);
+        config.run_directory = recovered_run_directory.clone();
+        config.repo = Some(String::new());
+        config.linked_repo = Some(String::new());
+        Stack::validate_create_config(&mut config, user).await?;
+        if Stack::coll()
+          .find_one(doc! { "name": &name })
+          .await?
+          .is_some()
+        {
+          return Err(anyhow!(
+            "A Stack named '{name}' now exists; create a new preflight"
+          ));
+        }
+        Some((name, config))
+      } else {
+        None
+      };
+    let periphery = periphery_client(&server).await?;
+    let response = periphery
       .request(TransactionalVykarRestore {
         target,
         repository: repository_for_periphery(
@@ -3999,12 +4051,14 @@ pub async fn execute_restore(
         )?,
         advanced: settings.advanced,
         hostname: format!("komodo-periphery-{}", server.id),
-        snapshot_name: stored.plan.snapshot,
-        selected_paths: stored.plan.selected_paths,
-        publish: stored.publish,
+        snapshot_name: stored.plan.snapshot.clone(),
+        selected_paths: stored.plan.selected_paths.clone(),
+        publish: stored.publish.clone(),
         journal_id: run.id.clone(),
         volume_restore_plan_id: stored.id.clone(),
         create_volume_if_missing: stored.create_volume_if_missing,
+        bind_path_mappings: stored.bind_path_mappings.clone(),
+        defer_finalize: recovered_creation.is_some(),
       })
       .await?;
     if let Some(error) = response.critical_error {
@@ -4028,34 +4082,88 @@ pub async fn execute_restore(
       )
       .await;
     }
-    if let Some(stack) = recovered_stack {
-      let name = stored
-        .recovered_stack_name
-        .context("Recovered stack name is missing")?;
-      let mut config:
-        komodo_client::entities::stack::PartialStackConfig =
-        stack.config.into();
-      config.server_id = Some(server_id);
-      config.swarm_id = Some(String::new());
-      config.project_name = Some(name.clone());
-      config.files_on_host = Some(true);
-      config.run_directory = recovered_run_directory;
-      config.repo = Some(String::new());
-      config.linked_repo = Some(String::new());
-      if let Err(error) =
-        resource::create::<Stack>(&name, config, None, user).await
-      {
-        if Stack::coll()
-          .find_one(doc! { "name": &name })
-          .await?
-          .is_none()
+    if recovered_creation.is_some() != response.finalization_pending {
+      return Err(anyhow!(
+        "Periphery returned an inconsistent restore finalization state"
+      ));
+    }
+    if let Some((name, config)) = recovered_creation {
+      let create_error =
+        match resource::create::<Stack>(&name, config, None, user).await
         {
-          return Err(error.error);
+          Ok(_) => None,
+          Err(error) => {
+            match Stack::coll().find_one(doc! { "name": &name }).await
+            {
+              Ok(Some(_)) => {
+                warn!(
+                  "Recovered Stack '{name}' was inserted but post-create bookkeeping failed: {:#}",
+                  error.error
+                );
+                None
+              }
+              Ok(None) => Some(error.error),
+              Err(check_error) => Some(check_error.context(format!(
+                "Recovered Stack creation failed and insertion could not be confirmed: {:#}",
+                error.error
+              ))),
+            }
+          }
+        };
+      if let Some(create_error) = create_error {
+        let rollback = periphery
+          .request(FinalizeVykarRestore {
+            journal_id: run.id.clone(),
+            commit: false,
+          })
+          .await;
+        match rollback {
+          Ok(response)
+            if response.complete
+              && response.rolled_back
+              && response.critical_error.is_none() => {}
+          Ok(response) => {
+            let message = response.critical_error.unwrap_or_else(|| {
+              "Periphery did not confirm restore rollback".into()
+            });
+            *critical_alert().write().unwrap() = Some(message.clone());
+            return Err(create_error.context(message));
+          }
+          Err(rollback_error) => {
+            let message = format!(
+              "Recovered Stack creation failed and restore rollback could not be confirmed: {rollback_error:#}"
+            );
+            *critical_alert().write().unwrap() = Some(message.clone());
+            return Err(create_error.context(message));
+          }
         }
-        warn!(
-          "Recovered Stack '{name}' was inserted but post-create bookkeeping failed: {:#}",
-          error.error
-        );
+        return Err(create_error);
+      }
+      let finalized = match periphery
+        .request(FinalizeVykarRestore {
+          journal_id: run.id.clone(),
+          commit: true,
+        })
+        .await
+      {
+        Ok(finalized) => finalized,
+        Err(error) => {
+          let message = format!(
+            "Recovered Stack was inserted but restore commit could not be confirmed: {error:#}"
+          );
+          *critical_alert().write().unwrap() = Some(message.clone());
+          return Err(anyhow!(message));
+        }
+      };
+      if !finalized.complete
+        || finalized.rolled_back
+        || finalized.critical_error.is_some()
+      {
+        let message = finalized.critical_error.unwrap_or_else(|| {
+          "Periphery did not confirm recovered Stack restore commit".into()
+        });
+        *critical_alert().write().unwrap() = Some(message.clone());
+        return Err(anyhow!(message));
       }
     }
     // Keep the exclusive mutation barrier through recovered Stack creation so
@@ -4661,7 +4769,9 @@ fn mirror_copy_is_sufficient(
   }
 }
 
-pub async fn promote_mirror() -> anyhow::Result<BackupSettings> {
+pub async fn promote_mirror(
+  allow_primary_unavailable: bool,
+) -> anyhow::Result<BackupSettings> {
   let backup_operation = backup_operation_lock().lock().await;
   // Keep the exclusive role barrier from the start of mandatory verification
   // through the settings swap. No unverified mirror write can land in between.
@@ -4692,16 +4802,35 @@ pub async fn promote_mirror() -> anyhow::Result<BackupSettings> {
     .context("Mirror is not configured")?;
   let inventory_settings = settings.clone();
   let missing = tokio::task::spawn_blocking(move || {
-    let primary = core_repository(&primary, &inventory_settings)?
-      .list_snapshots()?;
     let mirror = core_repository(
       &mirror_for_inventory,
       &inventory_settings,
     )?
     .list_snapshots()?;
-    if primary.hidden > 0 || mirror.hidden > 0 {
+    if mirror.hidden > 0 {
       return Err(anyhow!(
-        "Promotion blocked because a repository inventory is incomplete"
+        "Promotion blocked because the mirror inventory is incomplete"
+      ));
+    }
+    let primary = match core_repository(&primary, &inventory_settings)
+      .and_then(|repository| repository.list_snapshots())
+    {
+      Ok(primary) => primary,
+      Err(error) if allow_primary_unavailable => {
+        warn!(
+          "Promoting a fully verified mirror without comparing the unavailable primary inventory: {error:#}"
+        );
+        return Ok::<_, anyhow::Error>(Vec::new());
+      }
+      Err(error) => {
+        return Err(error.context(
+          "Primary inventory is unavailable; retry with explicit disaster-recovery acknowledgement only if the old primary cannot be recovered",
+        ));
+      }
+    };
+    if primary.hidden > 0 {
+      return Err(anyhow!(
+        "Promotion blocked because the primary inventory is incomplete"
       ));
     }
     let mirror_snapshots = mirror
@@ -5072,6 +5201,13 @@ mod tests {
       )
       .unwrap()
     );
+    assert!(
+      repositories_share_location(
+        &local(&actual.to_string_lossy()),
+        &local(&actual.join("nested").to_string_lossy())
+      )
+      .unwrap()
+    );
   }
 
   #[test]
@@ -5162,6 +5298,7 @@ mod tests {
       recovered_stack_source: None,
       source_stack_missing: false,
       snapshot_stack_source_paths: Vec::new(),
+      bind_path_mappings: HashMap::new(),
     };
     let mut current = PreflightVykarRestoreResponse {
       destination_exists: true,

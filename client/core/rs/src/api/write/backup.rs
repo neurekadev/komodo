@@ -96,7 +96,13 @@ pub struct VerifyBackupRepository {
 #[empty_traits(KomodoWriteRequest)]
 #[response(BackupSettings)]
 #[error(mogh_error::Error)]
-pub struct PromoteBackupMirror {}
+pub struct PromoteBackupMirror {
+  /// Explicit disaster-recovery acknowledgement. This permits promotion
+  /// after the mirror passes full verification even when the old primary is
+  /// unavailable for the final inventory comparison.
+  #[serde(default)]
+  pub allow_primary_unavailable: bool,
+}
 
 #[typeshare]
 #[derive(Serialize, Deserialize, Debug, Clone, Resolve)]
