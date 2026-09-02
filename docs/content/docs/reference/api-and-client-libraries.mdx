@@ -8,11 +8,14 @@ Komodo Core exposes an RPC-like HTTP API to read data, write configuration, and 
 There are typesafe clients available in
 [**Rust**](/reference/api-and-client-libraries#rust-client) and [**Typescript**](/reference/api-and-client-libraries#typescript-client).
 
-The full API documentation is [**available here**](https://docs.rs/komodo_client/latest/komodo_client/api/index.html).
+The fork-generated client sources live under `client/core` in the Komodo
+repository. They are not currently published by this fork. Packages named
+`komodo_client` on crates.io and NPM are upstream artifacts and may not match
+the fork API.
 
 ## Rust Client
 
-The Rust client is published to crates.io at [komodo_client](https://crates.io/crates/komodo_client).
+Build the Rust client from `client/core/rs` in the same Git revision as Core.
 
 ```rust
 let komodo = KomodoClient::new("https://komodo.example.com", "your_key", "your_secret")
@@ -31,7 +34,8 @@ let update = komodo
 
 ## Typescript Client
 
-The Typescript client is published to NPM at [komodo_client](https://www.npmjs.com/package/komodo_client).
+Build the TypeScript client from `client/core/ts` in the same Git revision as
+Core.
 
 ```ts
 import { KomodoClient, Types } from "komodo_client";

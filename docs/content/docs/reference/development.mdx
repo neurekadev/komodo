@@ -136,11 +136,11 @@ arguments and preserves both values in the final image. The Core version API
 also returns the full tag and hash for diagnostics, while the top bar links a
 release build to its exact release and an edge build to its exact commit.
 
-The unpublished Rust workspace packages use the sentinel version `0.0.0`.
-Cargo package metadata is not a Komodo release version and does not change for
-fork releases or upstream synchronization. If the fork publishes a Rust crate
-in the future, give that crate an explicit, independently maintained semantic
-version instead of inheriting the workspace sentinel.
+The unpublished Rust workspace packages and private TypeScript client use the
+sentinel version `0.0.0`. Package metadata is not a Komodo release version and
+does not change for fork releases or upstream synchronization. The UI builds
+the TypeScript client directly from the same repository revision; the fork does
+not publish it to NPM.
 
 ## Docsite Development
 

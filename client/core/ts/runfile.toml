@@ -1,3 +1,0 @@
-[publish-ts-client]
-description = "publish the typescript client to npm"
-cmd = "npm publish"
