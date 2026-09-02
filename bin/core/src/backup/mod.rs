@@ -3964,6 +3964,9 @@ fn is_managed_core_recovery_database(
   current_database: &str,
   candidate: &str,
 ) -> bool {
+  if candidate == current_database {
+    return false;
+  }
   let current_namespace =
     core_recovery_database_namespace(current_database);
   parse_core_recovery_database(candidate)
@@ -4962,6 +4965,7 @@ mod tests {
     let second = core_recovery_database_name(&first);
     assert!(is_managed_core_recovery_database("komodo", &first));
     assert!(is_managed_core_recovery_database(&first, &second));
+    assert!(!is_managed_core_recovery_database(&first, &first));
     assert!(first.len() <= 63);
     assert!(second.len() <= 63);
     assert!(!second.contains(first.as_str()));
