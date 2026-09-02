@@ -114,7 +114,7 @@ async fn report(
 
   let report = KomodoReport {
     public_key: keys.public().to_string(),
-    version: String::from(env!("CARGO_PKG_VERSION")),
+    version: komodo_build_info::version().to_string(),
     users,
     count,
   };

@@ -359,8 +359,11 @@ impl Resolve<ReadArgs> for GetVersion {
     self,
     _: &ReadArgs,
   ) -> mogh_error::Result<GetVersionResponse> {
+    let identity = komodo_build_info::build_identity();
     Ok(GetVersionResponse {
-      version: env!("CARGO_PKG_VERSION").to_string(),
+      version: identity.version.clone(),
+      git_tag: identity.git_tag.clone(),
+      git_hash: identity.git_hash.clone(),
     })
   }
 }

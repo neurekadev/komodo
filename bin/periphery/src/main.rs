@@ -31,7 +31,10 @@ async fn app() -> anyhow::Result<()> {
   stack::delete::initialize().await?;
 
   let mut handles = async {
-    info!("Komodo Periphery version: v{}", env!("CARGO_PKG_VERSION"));
+    info!(
+      "Komodo Periphery version: {}",
+      komodo_build_info::version()
+    );
 
     if config.pretty_startup_config {
       info!("{:#?}", config.sanitized());

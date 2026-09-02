@@ -35,6 +35,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use api::read::GetVersion;
+use komodo_build_info as _;
 use serde::Deserialize;
 
 pub mod api;

@@ -11,6 +11,9 @@ COPY ./client/periphery ./client/periphery
 COPY ./bin/cli ./bin/cli
 COPY ./xtask ./xtask
 
+ARG GIT_TAG=dev
+ARG GIT_HASH=unknown
+
 # Compile bin
 RUN cargo build -p komodo_cli --release && cargo strip
 
@@ -18,6 +21,11 @@ RUN cargo build -p komodo_cli --release && cargo strip
 FROM gcr.io/distroless/cc
 
 COPY --from=builder /builder/target/release/km /usr/local/bin/km
+
+ARG GIT_TAG=dev
+ARG GIT_HASH=unknown
+ENV GIT_TAG=$GIT_TAG \
+  GIT_HASH=$GIT_HASH
 
 ENV KOMODO_CLI_CONFIG_PATHS="/config"
 

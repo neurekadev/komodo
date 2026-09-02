@@ -2,7 +2,7 @@ import { ICONS } from "@/lib/icons";
 import { usableResourcePath } from "@/lib/utils";
 import { SIDEBAR_RESOURCES } from "@/resources";
 import { Button, Divider, ScrollArea, Stack, Text } from "@mantine/core";
-import { ReactNode } from "react";
+import { Fragment, ReactNode } from "react";
 import { Link, useLocation } from "react-router-dom";
 
 const Sidebar = ({ close }: { close: () => void }) => {
@@ -17,12 +17,6 @@ const Sidebar = ({ close }: { close: () => void }) => {
             label="Dashboard"
             icon={<ICONS.Dashboard size="1rem" />}
             to="/"
-            {...linkProps}
-          />
-          <SidebarLink
-            label="Containers"
-            icon={<ICONS.Container size="1rem" />}
-            to="/containers"
             {...linkProps}
           />
           <SidebarLink
@@ -50,13 +44,22 @@ const Sidebar = ({ close }: { close: () => void }) => {
           {SIDEBAR_RESOURCES.map((type) => {
             const Icon = ICONS[type];
             return (
-              <SidebarLink
-                key={type}
-                label={type === "ResourceSync" ? "Syncs" : type + "s"}
-                icon={<Icon size="1rem" />}
-                to={`/${usableResourcePath(type)}`}
-                {...linkProps}
-              />
+              <Fragment key={type}>
+                <SidebarLink
+                  label={type === "ResourceSync" ? "Syncs" : type + "s"}
+                  icon={<Icon size="1rem" />}
+                  to={`/${usableResourcePath(type)}`}
+                  {...linkProps}
+                />
+                {type === "Stack" && (
+                  <SidebarLink
+                    label="Containers"
+                    icon={<ICONS.Container size="1rem" />}
+                    to="/containers"
+                    {...linkProps}
+                  />
+                )}
+              </Fragment>
             );
           })}
 

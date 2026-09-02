@@ -124,6 +124,22 @@ After API changes, rebuild the client with
 run gen-client  # Rebuild client (after API changes)
 ```
 
+## Build identity
+
+Komodo uses Git metadata as its product version. Release builds report the
+exact bare tag, such as `3.0.0`. Images built from `main` report `edge@<hash>`,
+using the first 12 characters of the commit hash. Local builds without
+complete metadata report `dev`.
+
+The official container workflow passes `GIT_TAG` and `GIT_HASH` as build
+arguments and preserves both values in the final image. The Core version API
+also returns the full tag and hash for diagnostics, while the top bar links a
+release build to its exact release and an edge build to its exact commit.
+
+The inherited Cargo package version remains `2.3.2`. It identifies package
+metadata for the fork's Rust workspace; it is not a Komodo release version and
+does not need to change when a Git release is created.
+
 ## Docsite Development
 
 From `docs/`, use `run dev-docs` to start the Fumadocs site in development mode. Changes made under `docs/content/docs/` reload automatically.

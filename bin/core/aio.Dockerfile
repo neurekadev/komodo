@@ -17,8 +17,6 @@ COPY ./xtask ./xtask
 RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS core-builder
-ARG GIT_TAG=dev
-ARG GIT_HASH=unknown
 COPY --from=planner /builder/recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json
 
@@ -29,6 +27,9 @@ COPY ./client/periphery/rs ./client/periphery/rs
 COPY ./bin/core ./bin/core
 COPY ./bin/cli ./bin/cli
 COPY ./xtask ./xtask
+
+ARG GIT_TAG=dev
+ARG GIT_HASH=unknown
 
 # Compile app, retain only final binaries in this source-sensitive layer.
 RUN cargo build -p komodo_core --release && \
@@ -57,10 +58,6 @@ RUN cd /builder/client && yarn link && \
 
 # Final Image
 FROM debian:trixie-slim
-ARG GIT_TAG=dev
-ARG GIT_HASH=unknown
-ENV GIT_TAG=$GIT_TAG \
-  GIT_HASH=$GIT_HASH
 
 COPY ./bin/core/starship.toml /starship.toml
 COPY ./bin/core/debian-deps.sh .
@@ -84,6 +81,11 @@ RUN mkdir /action-cache && \
 
 COPY ./bin/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
+
+ARG GIT_TAG=dev
+ARG GIT_HASH=unknown
+ENV GIT_TAG=$GIT_TAG \
+  GIT_HASH=$GIT_HASH
 
 # Hint at the port
 EXPOSE 9120

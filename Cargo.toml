@@ -19,6 +19,7 @@ homepage = "https://komodo.docs.neureka.dev/"
 # LOCAL
 komodo_client = { path = "client/core/rs" }
 periphery_client = { path = "client/periphery/rs" }
+komodo_build_info = { path = "lib/build_info" }
 environment = { path = "lib/environment" }
 interpolate = { path = "lib/interpolate" }
 formatting = { path = "lib/formatting" }

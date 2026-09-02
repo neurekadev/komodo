@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 # local
 komodo_client = { workspace = true, features = ["cli"] }
+komodo_build_info.workspace = true
 mogh_secret_file.workspace = true
 mogh_pki.workspace = true
 database.workspace = true

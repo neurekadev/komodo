@@ -54,6 +54,8 @@ pub struct GetVersion {}
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct GetVersionResponse {
   pub version: String,
+  pub git_tag: Option<String>,
+  pub git_hash: Option<String>,
 }
 
 //

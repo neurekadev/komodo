@@ -29,7 +29,7 @@ pub fn app() -> Router {
   let config = core_config();
   Router::new()
     .merge(openapi::serve_docs())
-    .route("/version", get(|| async { env!("CARGO_PKG_VERSION") }))
+    .route("/version", get(|| async { komodo_build_info::version() }))
     .nest("/auth", mogh_auth_server::api::router::<KomodoAuthImpl>())
     .nest("/user", user_router())
     .nest("/read", read::router())

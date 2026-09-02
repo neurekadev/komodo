@@ -3534,6 +3534,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "komodo_build_info"
+version = "2.3.2"
+
+[[package]]
 name = "komodo_cli"
 version = "2.3.2"
 dependencies = [
@@ -3548,6 +3552,7 @@ dependencies = [
  "dotenvy",
  "envy",
  "futures-util",
+ "komodo_build_info",
  "komodo_client",
  "mogh_config",
  "mogh_logger",
@@ -3578,6 +3583,7 @@ dependencies = [
  "futures-util",
  "indexmap 2.14.0",
  "ipnetwork",
+ "komodo_build_info",
  "mogh_auth_client",
  "mogh_error",
  "mogh_logger",
@@ -3637,6 +3643,7 @@ dependencies = [
  "hmac 0.13.0",
  "indexmap 2.14.0",
  "interpolate",
+ "komodo_build_info",
  "komodo_client",
  "mogh_auth_client",
  "mogh_auth_server",
@@ -3705,6 +3712,7 @@ dependencies = [
  "hex",
  "hickory-resolver",
  "interpolate",
+ "komodo_build_info",
  "komodo_client",
  "libc",
  "mogh_cache",
@@ -7262,6 +7270,7 @@ dependencies = [
  "data-encoding",
  "encoding",
  "futures-util",
+ "komodo_build_info",
  "mogh_error",
  "mogh_pki",
  "periphery_client",

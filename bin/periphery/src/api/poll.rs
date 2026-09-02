@@ -49,7 +49,7 @@ impl Resolve<crate::api::Args> for PollStatus {
 async fn periphery_information() -> PeripheryInformation {
   let config = periphery_config();
   PeripheryInformation {
-    version: env!("CARGO_PKG_VERSION").to_string(),
+    version: komodo_build_info::version().to_string(),
     public_key: periphery_keys().load().public.to_string(),
     terminals_disabled: config.disable_terminals,
     container_terminals_disabled: config.disable_container_terminals,

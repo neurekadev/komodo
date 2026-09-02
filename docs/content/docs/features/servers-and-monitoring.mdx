@@ -31,8 +31,12 @@ interval.
 
 If a storage metric remains unavailable, inspect the Periphery logs for a
 Docker disk-usage error and run `docker system df -v` on the host. Confirm that
-the Periphery user can access Docker and that the command completes. Docker
-may take longer on hosts with many or very large images and volumes.
+the Periphery user can access Docker and that the command completes. If the UI
+shows **The initial Docker disk usage measurement failed**, upgrade Periphery
+to a build containing the disk-usage request fix, then restart it. Current
+Periphery builds request the complete verbose snapshot and read the image and
+volume sections from Docker's response. Docker may take longer on hosts with
+many or very large images and volumes.
 
 ## Install Periphery
 

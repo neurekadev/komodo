@@ -43,7 +43,7 @@ pub async fn run()
   }
 
   let app = Router::new()
-    .route("/version", get(|| async { env!("CARGO_PKG_VERSION") }))
+    .route("/version", get(|| async { komodo_build_info::version() }))
     .route("/", get(crate::connection::server::handler))
     .layer(middleware::from_fn(guard_request_by_ip));
 

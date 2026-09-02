@@ -93,8 +93,12 @@ pub struct GetVersion {}
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 pub struct GetVersionResponse {
-  /// The version of the Komodo Core API.
+  /// Canonical Git-derived product identity for the Komodo Core API.
   pub version: String,
+  /// Exact Git tag supplied when the binary was built, when available.
+  pub git_tag: Option<String>,
+  /// Full Git commit hash supplied when the binary was built, when available.
+  pub git_hash: Option<String>,
 }
 
 //

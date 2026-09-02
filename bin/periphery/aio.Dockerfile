@@ -13,6 +13,9 @@ COPY ./client/periphery ./client/periphery
 COPY ./bin/periphery ./bin/periphery
 COPY ./xtask ./xtask
 
+ARG GIT_TAG=dev
+ARG GIT_HASH=unknown
+
 # Compile app
 RUN cargo build -p komodo_periphery --release && cargo strip
 
@@ -27,6 +30,11 @@ COPY --from=builder /builder/target/release/periphery /usr/local/bin/periphery
 
 COPY ./bin/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
+
+ARG GIT_TAG=dev
+ARG GIT_HASH=unknown
+ENV GIT_TAG=$GIT_TAG \
+  GIT_HASH=$GIT_HASH
 
 EXPOSE 8120
 
