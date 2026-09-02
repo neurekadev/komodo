@@ -47,8 +47,9 @@ use komodo_client::{
 use periphery_client::api::backup::{
   BackupSourceFilters, CancelVykarOperation, DiscoverBackupSource,
   FinalizeVykarRestore, PeripheryBackupTarget, PreflightVykarRestore,
-  PreflightVykarRestoreResponse, RunVykarBackup, RunVykarBackupBatch,
-  TransactionalVykarRestore, VykarBackupTask, VykarRetainedSnapshot,
+  PreflightVykarRestoreResponse, ProtectedRepositoryPath,
+  RunVykarBackup, RunVykarBackupBatch, TransactionalVykarRestore,
+  VykarBackupTask, VykarRetainedSnapshot,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1180,12 +1181,17 @@ fn repository_for_periphery(
 
 fn core_local_repository_paths(
   settings: &BackupSettings,
-) -> Vec<String> {
+) -> anyhow::Result<Vec<ProtectedRepositoryPath>> {
   std::iter::once(&settings.primary)
     .chain(settings.mirror.iter())
     .filter_map(|repository| match &repository.backend {
       BackupRepositoryBackend::CoreLocal { path } => {
-        Some(path.clone())
+        Some(komodo_backup::container::current_container_id()
+          .context("Cannot identify the Core Docker container for repository protection; retain Docker's hostname mount or default container-ID hostname")
+          .map(|core_container_id| ProtectedRepositoryPath {
+            path: path.clone(),
+            core_container_id,
+          }))
       }
       _ => None,
     })
@@ -3163,7 +3169,7 @@ async fn run_node_batch(
       komodo_version: komodo_build_info::version().into(),
       protected_repository_paths: core_local_repository_paths(
         settings,
-      ),
+      )?,
       filters: backup_source_filters(settings),
       stop_containers: settings.stop_containers,
     })
@@ -3591,7 +3597,7 @@ async fn backup_stack(
       komodo_version: komodo_build_info::version().into(),
       protected_repository_paths: core_local_repository_paths(
         settings,
-      ),
+      )?,
       filters: backup_source_filters(settings),
       stop_containers: settings.stop_containers,
       mirror_only: false,
@@ -3653,7 +3659,7 @@ async fn backup_volume(
       komodo_version: komodo_build_info::version().into(),
       protected_repository_paths: core_local_repository_paths(
         settings,
-      ),
+      )?,
       filters: backup_source_filters(settings),
       stop_containers: settings.stop_containers,
       mirror_only: false,
@@ -3864,7 +3870,7 @@ pub async fn current_stack_backup_source(
       filters: backup_source_filters(&settings),
       protected_repository_paths: core_local_repository_paths(
         &settings,
-      ),
+      )?,
     })
     .await?;
   Ok((server.id, source.paths))
@@ -4169,7 +4175,7 @@ pub async fn plan_restore(
       repository: repository_for_periphery(&settings.primary, false)?,
       protected_repository_paths: core_local_repository_paths(
         &settings,
-      ),
+      )?,
       advanced: settings.advanced,
       hostname: format!("komodo-periphery-{}", server.id),
       snapshot_name: snapshot.name.clone(),
@@ -4628,7 +4634,7 @@ pub async fn execute_restore(
       repository: repository_for_periphery(&settings.primary, false)?,
       protected_repository_paths: core_local_repository_paths(
         &settings,
-      ),
+      )?,
       advanced: settings.advanced.clone(),
       hostname: format!("komodo-periphery-{}", server.id),
       snapshot_name: stored.plan.snapshot.clone(),
@@ -4765,7 +4771,7 @@ pub async fn execute_restore(
           )?,
           protected_repository_paths: core_local_repository_paths(
             &settings,
-          ),
+          )?,
           advanced: settings.advanced,
           hostname: format!("komodo-periphery-{}", server.id),
           snapshot_name: stored.plan.snapshot.clone(),

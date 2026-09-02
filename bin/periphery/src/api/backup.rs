@@ -47,7 +47,7 @@ struct BackupComposeService {
   volumes: Vec<BackupComposeMount>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(untagged)]
 enum BackupComposeMount {
   Short(String),
@@ -55,6 +55,7 @@ enum BackupComposeMount {
     #[serde(rename = "type")]
     mount_type: Option<String>,
     source: Option<String>,
+    target: Option<String>,
   },
 }
 
@@ -701,7 +702,7 @@ fn validate_resolved_restore_destinations_against(
 
 async fn validate_restore_destinations(
   publish: &[RestorePublishPath],
-  protected_repository_paths: &[String],
+  protected_repository_paths: &[ProtectedRepositoryPath],
 ) -> anyhow::Result<()> {
   validate_resolved_restore_destinations(publish)?;
   if protected_repository_paths.is_empty() {
@@ -791,14 +792,14 @@ fn compose_bind_paths(
 
 fn compose_bind_source(mount: BackupComposeMount) -> Option<String> {
   match mount {
-    BackupComposeMount::Long { mount_type, source } => {
-      source.filter(|source| {
-        mount_type.as_deref() == Some("bind")
-          || mount_type.is_none() && Path::new(source).is_absolute()
-      })
-    }
+    BackupComposeMount::Long {
+      mount_type, source, ..
+    } => source.filter(|source| {
+      mount_type.as_deref() == Some("bind")
+        || mount_type.is_none() && Path::new(source).is_absolute()
+    }),
     BackupComposeMount::Short(value) => {
-      value.split_once(':').and_then(|(source, _)| {
+      split_compose_short_mount(&value).and_then(|(source, _)| {
         (Path::new(source).is_absolute() || source.starts_with('.'))
           .then(|| source.to_string())
       })
@@ -869,6 +870,111 @@ fn remap_absolute_bind_source(
     .map(|(_, mapped)| mapped)
 }
 
+fn split_compose_short_mount(value: &str) -> Option<(&str, &str)> {
+  let mut braces = 0_u32;
+  for (index, character) in value.char_indices() {
+    match character {
+      '{' => braces += 1,
+      '}' => braces = braces.saturating_sub(1),
+      ':' if braces == 0 => {
+        return Some((&value[..index], &value[index + 1..]));
+      }
+      _ => {}
+    }
+  }
+  None
+}
+
+fn compose_mount_target(mount: &BackupComposeMount) -> Option<&str> {
+  match mount {
+    BackupComposeMount::Long { target, .. } => target.as_deref(),
+    BackupComposeMount::Short(value) => {
+      split_compose_short_mount(value)
+        .map(|(_, suffix)| suffix.split(':').next().unwrap_or(suffix))
+    }
+  }
+}
+
+/// Associate expressions with the authenticated, interpolated deployment by
+/// service and mount target. Do not expand using the recovery host's env.
+fn resolve_recovered_bind_expressions(
+  document: &mut serde_yaml_ng::Value,
+  deployed_config: Option<&str>,
+  mappings: &HashMap<String, String>,
+  aliases: &HashMap<String, String>,
+) -> anyhow::Result<()> {
+  use serde_yaml_ng::Value;
+  let deployed = deployed_config
+    .map(serde_yaml_ng::from_str::<BackupComposeConfig>)
+    .transpose()
+    .context(
+      "Failed to parse snapshot's deployed Compose configuration",
+    )?;
+  let key = |value: &str| Value::String(value.into());
+  let Some(services) =
+    document.get_mut("services").and_then(Value::as_mapping_mut)
+  else {
+    return Ok(());
+  };
+  for (service_name, service) in services {
+    let Some(volumes) =
+      service.get_mut("volumes").and_then(Value::as_sequence_mut)
+    else {
+      continue;
+    };
+    for volume in volumes {
+      let parsed: BackupComposeMount =
+        serde_yaml_ng::from_value(volume.clone())?;
+      let source = match &parsed {
+        BackupComposeMount::Short(value) => {
+          split_compose_short_mount(value).map(|(source, _)| source)
+        }
+        BackupComposeMount::Long {
+          mount_type, source, ..
+        } => {
+          if mount_type.as_deref().is_some_and(|kind| kind != "bind")
+          {
+            continue;
+          }
+          source.as_deref()
+        }
+      };
+      if !source.is_some_and(|source| source.contains('$')) {
+        continue;
+      }
+      let target = compose_mount_target(&parsed)
+        .context("Cannot identify an environment-expanded Compose mount target")?;
+      let deployed_mount = deployed.as_ref()
+        .and_then(|config| config.services.get(service_name.as_str()?))
+        .and_then(|service| service.volumes.iter().find(|mount| compose_mount_target(mount) == Some(target)))
+        .context("Cannot resolve an environment-expanded Compose mount from snapshot deployment metadata")?;
+      let Some(expanded) =
+        compose_bind_source(deployed_mount.clone())
+      else {
+        // The deployed expression names a Docker volume, not a bind source.
+        continue;
+      };
+      if remap_absolute_bind_source(&expanded, mappings, aliases)
+        .is_none()
+      {
+        // Intentionally excluded roots have no confirmed mapping.
+        continue;
+      }
+      match volume {
+        Value::String(short) => {
+          let (_, suffix) = split_compose_short_mount(short).unwrap();
+          *short = format!("{expanded}:{suffix}");
+        }
+        Value::Mapping(long) => {
+          long.insert(key("source"), Value::String(expanded));
+        }
+        _ => unreachable!(),
+      }
+    }
+  }
+  Ok(())
+}
+
 fn rewrite_compose_bind_mappings(
   document: &mut serde_yaml_ng::Value,
   mappings: &HashMap<String, String>,
@@ -896,7 +1002,9 @@ fn rewrite_compose_bind_mappings(
     for volume in volumes {
       match volume {
         Value::String(short) => {
-          let Some((source, suffix)) = short.split_once(':') else {
+          let Some((source, suffix)) =
+            split_compose_short_mount(short)
+          else {
             continue;
           };
           if let Some(mapped) =
@@ -983,6 +1091,12 @@ fn rewrite_recovered_stack_compose_files(
           path.display()
         )
       })?;
+    resolve_recovered_bind_expressions(
+      &mut document,
+      stack.info.deployed_config.as_deref(),
+      &request.bind_path_mappings,
+      &request.bind_path_aliases,
+    )?;
     if rewrite_compose_bind_mappings(
       &mut document,
       &request.bind_path_mappings,
@@ -1057,7 +1171,7 @@ fn mount_type_affects_paths(
 
 async fn discover_source(
   target: &PeripheryBackupTarget,
-  protected_repository_paths: &[String],
+  protected_repository_paths: &[ProtectedRepositoryPath],
   filters: &BackupSourceFilters,
 ) -> anyhow::Result<DiscoverBackupSourceResponse> {
   let docker_guard = docker_client().load();
@@ -1267,21 +1381,17 @@ fn unfiltered_source_filters() -> BackupSourceFilters {
 async fn resolve_protected_repository_sources(
   docker: &crate::docker::DockerClient,
   containers: &[ContainerListItem],
-  protected_repository_paths: &[String],
+  protected_repository_paths: &[ProtectedRepositoryPath],
 ) -> anyhow::Result<Vec<PathBuf>> {
   if protected_repository_paths.is_empty() {
     return Ok(Vec::new());
   }
-  let protected = protected_repository_paths
-    .iter()
-    .map(PathBuf::from)
-    .collect::<Vec<_>>();
-  let mut sources = protected
-    .iter()
-    .cloned()
-    .map(|path| path.canonicalize().unwrap_or(path))
-    .collect::<BTreeSet<_>>();
-  for container in containers {
+  let mut sources = BTreeSet::new();
+  for container in containers.iter().filter(|container| {
+    protected_repository_paths.iter().any(|repository| {
+      container_matches_id(container, &repository.core_container_id)
+    })
+  }) {
     let inspected = docker.inspect_container(&container.name).await?;
     for mount in inspected.mounts {
       let Some(destination) = mount.destination.map(PathBuf::from)
@@ -1291,17 +1401,70 @@ async fn resolve_protected_repository_sources(
       let Some(source) = mount.source.map(PathBuf::from) else {
         continue;
       };
-      for repository in &protected {
-        let Some(mapped) =
-          map_path_through_mount(repository, &destination, &source)
-        else {
+      for repository in
+        protected_repository_paths.iter().filter(|repository| {
+          container_matches_id(
+            container,
+            &repository.core_container_id,
+          )
+        })
+      {
+        let Some(mapped) = map_path_through_mount(
+          Path::new(&repository.path),
+          &destination,
+          &source,
+        ) else {
           continue;
         };
         sources.insert(mapped.canonicalize().unwrap_or(mapped));
       }
     }
   }
+  // Host-side sources must also be protected through Periphery's own mounts
+  // (the standard deployment shares /data with Core). Never borrow the
+  // container-side namespace of an unrelated application or a remote Core.
+  if !sources.is_empty() {
+    let own_id = komodo_backup::container::current_container_id()
+      .context("Cannot identify the Periphery Docker container for repository protection")?;
+    let own = containers
+      .iter()
+      .find(|container| container_matches_id(container, &own_id))
+      .context(
+        "Periphery container is not visible in its Docker daemon",
+      )?;
+    let inspected = docker.inspect_container(&own.name).await?;
+    let host_sources = sources.clone();
+    for mount in inspected.mounts {
+      let (Some(host), Some(local)) =
+        (mount.source, mount.destination)
+      else {
+        continue;
+      };
+      let host = PathBuf::from(host);
+      let host = host.canonicalize().unwrap_or(host);
+      for repository in &host_sources {
+        if let Some(alias) =
+          map_path_through_mount(repository, &host, Path::new(&local))
+        {
+          sources.insert(alias.canonicalize().unwrap_or(alias));
+        }
+      }
+    }
+  }
   Ok(sources.into_iter().collect())
+}
+
+fn container_matches_id(
+  container: &ContainerListItem,
+  id: &str,
+) -> bool {
+  (id.len() == 12 || id.len() == 64)
+    && id.bytes().all(|byte| {
+      byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+    })
+    && container.id.as_deref().is_some_and(|candidate| {
+      candidate.len() == 64 && candidate.starts_with(id)
+    })
 }
 
 fn map_path_through_mount(
@@ -3427,6 +3590,38 @@ mod tests {
   }
 
   #[test]
+  fn repository_aliases_require_the_actual_core_container_identity() {
+    let mut core = ContainerListItem::default();
+    core.id = Some("a".repeat(64));
+    let mut unrelated = core.clone();
+    unrelated.id = Some("b".repeat(64));
+    unrelated.name = "komodo".into();
+    assert!(container_matches_id(&core, &"a".repeat(64)));
+    assert!(container_matches_id(&core, &"a".repeat(12)));
+    assert!(!container_matches_id(&unrelated, &"a".repeat(64)));
+    assert!(!container_matches_id(&unrelated, "komodo"));
+    assert!(!container_matches_id(&core, ""));
+    // Translate host protection into Periphery's namespace, not /data in
+    // every application container on that Docker daemon.
+    assert_eq!(
+      map_path_through_mount(
+        Path::new("/host/core/backups/vykar"),
+        Path::new("/host/core"),
+        Path::new("/periphery/data"),
+      ),
+      Some(PathBuf::from("/periphery/data/backups/vykar"))
+    );
+    assert_eq!(
+      map_path_through_mount(
+        Path::new("/host/core/backups/vykar"),
+        Path::new("/srv/app"),
+        Path::new("/data"),
+      ),
+      None
+    );
+  }
+
+  #[test]
   fn bind_root_filters_use_vykar_path_rules() {
     let root = tempfile::tempdir().unwrap();
     let run = root.path().join("run");
@@ -3716,6 +3911,58 @@ mod tests {
     let rewritten = serde_yaml_ng::to_string(&document).unwrap();
     assert!(rewritten.contains("/srv/recovered/cache:/cache:ro"));
     assert!(!rewritten.contains("/srv/link"));
+  }
+
+  #[test]
+  fn recovered_compose_resolves_bind_expressions_from_snapshot_metadata()
+   {
+    let mut document: serde_yaml_ng::Value = serde_yaml_ng::from_str(
+      "services:\n  app:\n    volumes:\n      - ${DATA_ROOT:-/fallback}/cache:/cache:ro\n      - type: bind\n        source: ${DATA_ROOT}/data\n        target: /data\n      - ${VOLUME_NAME}:/named\n",
+    ).unwrap();
+    let deployed = "services:\n  app:\n    volumes:\n      - type: bind\n        source: /srv/link/cache\n        target: /cache\n      - type: bind\n        source: /srv/old/data\n        target: /data\n      - type: volume\n        source: named-data\n        target: /named\n";
+    let mappings =
+      HashMap::from([("/srv/old".into(), "/srv/recovered".into())]);
+    let aliases = HashMap::from([(
+      "/srv/link/cache".into(),
+      "/srv/old/cache".into(),
+    )]);
+    resolve_recovered_bind_expressions(
+      &mut document,
+      Some(deployed),
+      &mappings,
+      &aliases,
+    )
+    .unwrap();
+    assert_eq!(
+      rewrite_compose_bind_mappings(
+        &mut document,
+        &mappings,
+        &aliases
+      ),
+      2
+    );
+    let rewritten = serde_yaml_ng::to_string(&document).unwrap();
+    assert!(rewritten.contains("/srv/recovered/cache:/cache:ro"));
+    assert!(rewritten.contains("/srv/recovered/data"));
+    assert!(rewritten.contains("${VOLUME_NAME}:/named"));
+    assert!(!rewritten.contains("${DATA_ROOT"));
+  }
+
+  #[test]
+  fn recovered_bind_expressions_fail_closed_without_deployment_metadata()
+   {
+    let mut document: serde_yaml_ng::Value = serde_yaml_ng::from_str(
+      "services:\n  app:\n    volumes:\n      - ${DATA_ROOT}/cache:/cache\n",
+    ).unwrap();
+    assert!(
+      resolve_recovered_bind_expressions(
+        &mut document,
+        None,
+        &HashMap::new(),
+        &HashMap::new()
+      )
+      .is_err()
+    );
   }
 
   #[test]

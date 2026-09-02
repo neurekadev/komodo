@@ -241,6 +241,10 @@ async fn upload(
   Path(token): Path<String>,
   body: Body,
 ) -> mogh_error::Result<Json<FileManagerOperationStatus>> {
+  // A ticket can predate a backup/restore. Keep the barrier through body
+  // forwarding, Periphery publication acknowledgement, and the audit write.
+  let _mutation_guard =
+    crate::backup::mutation_barrier().read().await;
   let session = consume_transfer_session(&token, &user.id)?;
   let TransferSessionKind::Upload {
     destination,

@@ -3,6 +3,8 @@
 //! Snapshot inventory is never cached as authority here: every list/tree
 //! operation opens the selected repository and reads Vykar metadata.
 
+pub mod container;
+
 use std::{
   collections::{BTreeMap, HashMap, HashSet},
   io::Write,
