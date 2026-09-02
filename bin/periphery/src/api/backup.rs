@@ -851,12 +851,15 @@ async fn discover_source(
         })
         .map(|container| container.name)
         .collect();
+      let mountpoint =
+        validate_source_path(Path::new(&volume.mountpoint))?;
+      validate_path_outside_internal_storage(
+        &mountpoint,
+        &periphery_config().stack_dir().join(".komodo-vykar"),
+        "Backup source",
+      )?;
       Ok(DiscoverBackupSourceResponse {
-        paths: vec![
-          validate_source_path(Path::new(&volume.mountpoint))?
-            .to_string_lossy()
-            .into_owned(),
-        ],
+        paths: vec![mountpoint.to_string_lossy().into_owned()],
         running_containers,
       })
     }
@@ -975,6 +978,96 @@ async fn create_restore_volume(
   }
 }
 
+async fn remove_restore_volume(
+  volume_name: &str,
+) -> anyhow::Result<()> {
+  let log = run_komodo_standard_command(
+    &format!("Backup remove restore volume {volume_name}"),
+    &format!("docker volume rm -- {}", escape(volume_name.into())),
+    CommandOptions::default(),
+  )
+  .await;
+  if log.success {
+    Ok(())
+  } else {
+    Err(anyhow!("{}", log.stderr))
+  }
+}
+
+async fn prepare_restore_volume(
+  volume_name: &str,
+  restore_plan_id: &str,
+  journal_id: &str,
+  create_if_missing: bool,
+) -> anyhow::Result<Option<PathBuf>> {
+  let docker_guard = docker_client().load();
+  let docker = docker_guard
+    .as_ref()
+    .as_ref()
+    .context("Docker is unavailable")?;
+  let containers = docker.list_containers().await?;
+  let exists = docker
+    .list_volumes(&containers)
+    .await?
+    .into_iter()
+    .any(|volume| volume.name == volume_name);
+  if !create_if_missing {
+    if exists {
+      return Ok(None);
+    }
+    return Err(anyhow!(
+      "Destination volume '{volume_name}' no longer exists; create a new restore preflight"
+    ));
+  }
+  if exists {
+    let volume = docker.inspect_volume(volume_name).await?;
+    if volume
+      .labels
+      .get(RESTORE_PLAN_VOLUME_LABEL)
+      .map(String::as_str)
+      != Some(restore_plan_id)
+    {
+      return Err(anyhow!(
+        "Destination volume '{volume_name}' now exists; create a new restore preflight and explicitly confirm overwrite"
+      ));
+    }
+  }
+  let journal = persist_restore_volume_journal(
+    journal_id,
+    volume_name,
+    restore_plan_id,
+  )?;
+  if !exists {
+    let created = async {
+      create_restore_volume(volume_name, restore_plan_id).await?;
+      let volume = docker.inspect_volume(volume_name).await?;
+      if volume
+        .labels
+        .get(RESTORE_PLAN_VOLUME_LABEL)
+        .map(String::as_str)
+        != Some(restore_plan_id)
+      {
+        return Err(anyhow!(
+          "Destination volume '{volume_name}' was created concurrently by another process; restore aborted"
+        ));
+      }
+      Ok(())
+    }
+    .await;
+    if let Err(error) = created {
+      let cleanup =
+        cleanup_owned_restore_volume_journal(&journal).await;
+      return match cleanup {
+        Ok(()) => Err(error),
+        Err(cleanup) => Err(error.context(format!(
+          "Created restore Volume cleanup failed: {cleanup:#}"
+        ))),
+      };
+    }
+  }
+  Ok(Some(journal))
+}
+
 async fn restart_containers(
   containers: &[String],
 ) -> (Vec<String>, Vec<String>) {
@@ -1038,81 +1131,71 @@ impl Resolve<Args> for TransactionalVykarRestore {
     let _operation = backup_operation_lock().lock().await;
     let (_cancellation, _cancellation_registration) =
       register_operation_cancellation(&self.journal_id);
-    if let PeripheryBackupTarget::Volume { volume_name } =
-      &self.target
-    {
-      let volume_restore_plan_id =
-        if self.volume_restore_plan_id.is_empty() {
-          &self.journal_id
-        } else {
-          &self.volume_restore_plan_id
-        };
-      let docker_guard = docker_client().load();
-      let docker = docker_guard
-        .as_ref()
-        .as_ref()
-        .context("Docker is unavailable")?;
-      let containers = docker.list_containers().await?;
-      let exists = docker
-        .list_volumes(&containers)
+    let owned_volume_journal =
+      if let PeripheryBackupTarget::Volume { volume_name } =
+        &self.target
+      {
+        let volume_restore_plan_id =
+          if self.volume_restore_plan_id.is_empty() {
+            &self.journal_id
+          } else {
+            &self.volume_restore_plan_id
+          };
+        prepare_restore_volume(
+          volume_name,
+          volume_restore_plan_id,
+          &self.journal_id,
+          self.create_volume_if_missing,
+        )
         .await?
-        .into_iter()
-        .any(|volume| volume.name == *volume_name);
-      if self.create_volume_if_missing {
-        if exists {
-          let volume = docker.inspect_volume(volume_name).await?;
-          if volume.labels.get(RESTORE_PLAN_VOLUME_LABEL)
-            != Some(volume_restore_plan_id)
-          {
-            return Err(anyhow!(
-              "Destination volume '{volume_name}' now exists; create a new restore preflight and explicitly confirm overwrite"
-            ));
-          }
-        } else {
-          create_restore_volume(volume_name, volume_restore_plan_id)
-            .await?;
-          let volume = docker.inspect_volume(volume_name).await?;
-          if volume.labels.get(RESTORE_PLAN_VOLUME_LABEL)
-            != Some(volume_restore_plan_id)
-          {
-            return Err(anyhow!(
-              "Destination volume '{volume_name}' was created concurrently by another process; restore aborted"
-            ));
-          }
-        }
-      } else if !exists {
-        return Err(anyhow!(
-          "Destination volume '{volume_name}' no longer exists; create a new restore preflight"
-        ));
+      } else {
+        None
+      };
+    let preparation = async {
+      if let PeripheryBackupTarget::Volume { volume_name } =
+        &self.target
+      {
+        let mountpoint = discover_source(&self.target)
+          .await?
+          .paths
+          .into_iter()
+          .next()
+          .context("Destination volume has no mountpoint")?;
+        resolve_volume_publish_destinations(
+          &mut self.publish,
+          volume_name,
+          &mountpoint,
+          self.selected_paths.is_empty(),
+        )?;
       }
-    }
-    if let PeripheryBackupTarget::Volume { volume_name } =
-      &self.target
-    {
-      let mountpoint = discover_source(&self.target)
-        .await?
-        .paths
-        .into_iter()
-        .next()
-        .context("Destination volume has no mountpoint")?;
-      resolve_volume_publish_destinations(
-        &mut self.publish,
-        volume_name,
-        &mountpoint,
-        self.selected_paths.is_empty(),
+      validate_resolved_restore_destinations(&self.publish)?;
+      let running_containers =
+        discover_running_containers(&self.target, &self.publish)
+          .await?;
+      // Persist the complete pre-restore running set before the first stop.
+      // Startup recovery can then restart every affected container after
+      // repairing the filesystem and Volume ownership journal.
+      let container_journal = persist_container_quiesce_journal(
+        &self.journal_id,
+        &running_containers,
       )?;
+      anyhow::Ok((running_containers, container_journal))
     }
-    validate_resolved_restore_destinations(&self.publish)?;
-    let running_containers =
-      discover_running_containers(&self.target, &self.publish)
-        .await?;
-    // Persist the complete pre-restore running set before the first stop. If
-    // Periphery exits mid-restore, startup recovery can restart every affected
-    // container after repairing the filesystem journal.
-    let container_journal = persist_container_quiesce_journal(
-      &self.journal_id,
-      &running_containers,
-    )?;
+    .await;
+    let (running_containers, container_journal) = match preparation {
+      Ok(prepared) => prepared,
+      Err(error) => {
+        if let Some(journal) = owned_volume_journal.as_deref()
+          && let Err(cleanup) =
+            cleanup_owned_restore_volume_journal(journal).await
+        {
+          return Err(error.context(format!(
+            "Created restore Volume cleanup failed: {cleanup:#}"
+          )));
+        }
+        return Err(error);
+      }
+    };
     let mut stopped_containers: Vec<String> = Vec::new();
     for container in &running_containers {
       if let Err(stop_error) =
@@ -1126,6 +1209,12 @@ impl Resolve<Args> for TransactionalVykarRestore {
             restart_errors.push(format!("{stopped}: {error:#}"));
           }
         }
+        let volume_cleanup_error =
+          if let Some(journal) = owned_volume_journal.as_deref() {
+            cleanup_owned_restore_volume_journal(journal).await.err()
+          } else {
+            None
+          };
         if restart_errors.is_empty() {
           remove_container_quiesce_journal(
             container_journal.as_deref(),
@@ -1133,18 +1222,31 @@ impl Resolve<Args> for TransactionalVykarRestore {
         }
         return Ok(TransactionalVykarRestoreResponse {
           complete: false,
-          rolled_back: true,
-          containers_restarted: if restart_errors.is_empty() {
+          rolled_back: volume_cleanup_error.is_none(),
+          containers_restarted: if restart_errors.is_empty()
+            && volume_cleanup_error.is_none()
+          {
             stopped_containers
           } else {
             Vec::new()
           },
-          critical_error: (!restart_errors.is_empty()).then(|| {
-            format!(
-              "Restore quiesce failed ({stop_error:#}) and container state is indeterminate: {}",
-              restart_errors.join("; ")
-            )
-          }),
+          critical_error: if volume_cleanup_error.is_some()
+            || !restart_errors.is_empty()
+          {
+            Some(format!(
+              "Restore quiesce failed ({stop_error:#}); created Volume cleanup: {}; container restart: {}",
+              volume_cleanup_error
+                .map(|error| format!("failed: {error:#}"))
+                .unwrap_or_else(|| "complete".into()),
+              if restart_errors.is_empty() {
+                "complete".into()
+              } else {
+                restart_errors.join("; ")
+              }
+            ))
+          } else {
+            None
+          },
         });
       }
       stopped_containers.push(container.clone());
@@ -1153,12 +1255,32 @@ impl Resolve<Args> for TransactionalVykarRestore {
     let restore_result = transactional_restore(&self).await;
     let rolled_back = match restore_result {
       RestoreTransactionResult::Published { rolled_back } => {
+        if rolled_back
+          && let Some(journal) = owned_volume_journal.as_deref()
+          && let Err(error) =
+            cleanup_owned_restore_volume_journal(journal).await
+        {
+          return Ok(TransactionalVykarRestoreResponse {
+            complete: false,
+            rolled_back: false,
+            containers_restarted: Vec::new(),
+            critical_error: Some(format!(
+              "Restore rolled back but its created Volume could not be removed; affected containers remain stopped: {error:#}"
+            )),
+          });
+        }
         rolled_back
       }
       RestoreTransactionResult::FailedBeforePublication(error) => {
         warn!(
           "Restore failed before publication; original data is unchanged: {error:#}"
         );
+        let cleanup_error =
+          if let Some(journal) = owned_volume_journal.as_deref() {
+            cleanup_owned_restore_volume_journal(journal).await.err()
+          } else {
+            None
+          };
         let mut restarted = Vec::new();
         let mut restart_errors = Vec::new();
         for container in &stopped_containers {
@@ -1176,18 +1298,31 @@ impl Resolve<Args> for TransactionalVykarRestore {
         }
         return Ok(TransactionalVykarRestoreResponse {
           complete: false,
-          rolled_back: true,
-          containers_restarted: if restart_errors.is_empty() {
+          rolled_back: cleanup_error.is_none(),
+          containers_restarted: if restart_errors.is_empty()
+            && cleanup_error.is_none()
+          {
             restarted
           } else {
             Vec::new()
           },
-          critical_error: (!restart_errors.is_empty()).then(|| {
-            format!(
-              "Restore failed before publication ({error:#}) and affected containers could not all be restarted: {}",
-              restart_errors.join("; ")
-            )
-          }),
+          critical_error: if cleanup_error.is_some()
+            || !restart_errors.is_empty()
+          {
+            Some(format!(
+              "Restore failed before publication ({error:#}); created Volume cleanup: {}; container restart: {}",
+              cleanup_error
+                .map(|error| format!("failed: {error:#}"))
+                .unwrap_or_else(|| "complete".into()),
+              if restart_errors.is_empty() {
+                "complete".into()
+              } else {
+                restart_errors.join("; ")
+              }
+            ))
+          } else {
+            None
+          },
         });
       }
       RestoreTransactionResult::Indeterminate(error) => {
@@ -1241,7 +1376,34 @@ impl Resolve<Args> for PreflightVykarRestore {
     mut self,
     _: &Args,
   ) -> anyhow::Result<PreflightVykarRestoreResponse> {
-    let discovered = discover_source(&self.target).await.ok();
+    let discovered = match &self.target {
+      PeripheryBackupTarget::Stack { .. } => {
+        // A missing Stack destination can legitimately be planned as a
+        // recovered Stack; execution recreates its mapped filesystem roots.
+        discover_source(&self.target).await.ok()
+      }
+      PeripheryBackupTarget::Volume { volume_name } => {
+        let docker_guard = docker_client().load();
+        let docker = docker_guard
+          .as_ref()
+          .as_ref()
+          .context("Docker is unavailable")?;
+        let containers = docker.list_containers().await?;
+        let exists = docker
+          .list_volumes(&containers)
+          .await?
+          .into_iter()
+          .any(|volume| volume.name == *volume_name);
+        if exists {
+          // Once Docker confirms the Volume exists, an unsupported driver or
+          // inspect failure is a real preflight error, not evidence that the
+          // destination is absent.
+          Some(discover_source(&self.target).await?)
+        } else {
+          None
+        }
+      }
+    };
     let destination_exists = discovered.is_some();
     if let PeripheryBackupTarget::Volume { volume_name } =
       &self.target
@@ -1546,6 +1708,17 @@ struct RestoreJournal {
   entries: Vec<RestoreJournalEntry>,
   #[serde(default)]
   committed: bool,
+  /// A Volume created specifically for this restore. The same durable
+  /// journal owns both filesystem rollback and removal of the side effect
+  /// until publication is committed.
+  #[serde(default)]
+  owned_volume: Option<RestoreOwnedVolume>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RestoreOwnedVolume {
+  volume_name: String,
+  restore_plan_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1576,6 +1749,86 @@ fn restore_journal_dir() -> anyhow::Result<PathBuf> {
     .join("restore-journals");
   std::fs::create_dir_all(&directory)?;
   Ok(directory)
+}
+
+fn restore_journal_path(journal_id: &str) -> anyhow::Result<PathBuf> {
+  Ok(restore_journal_dir()?.join(format!("{journal_id}.json")))
+}
+
+fn persist_restore_volume_journal(
+  journal_id: &str,
+  volume_name: &str,
+  restore_plan_id: &str,
+) -> anyhow::Result<PathBuf> {
+  let path = restore_journal_path(journal_id)?;
+  if path_lexists(&path) {
+    return Err(anyhow!(
+      "A restore journal already exists for operation '{journal_id}'"
+    ));
+  }
+  persist_journal(
+    &path,
+    &RestoreJournal {
+      staging: PathBuf::new(),
+      entries: Vec::new(),
+      committed: false,
+      owned_volume: Some(RestoreOwnedVolume {
+        volume_name: volume_name.to_string(),
+        restore_plan_id: restore_plan_id.to_string(),
+      }),
+    },
+  )?;
+  Ok(path)
+}
+
+async fn remove_owned_restore_volume(
+  owned: &RestoreOwnedVolume,
+) -> anyhow::Result<()> {
+  let docker_guard = docker_client().load();
+  let docker = docker_guard
+    .as_ref()
+    .as_ref()
+    .context("Docker is unavailable")?;
+  let containers = docker.list_containers().await?;
+  let exists = docker
+    .list_volumes(&containers)
+    .await?
+    .into_iter()
+    .any(|volume| volume.name == owned.volume_name);
+  if !exists {
+    return Ok(());
+  }
+  let volume = docker.inspect_volume(&owned.volume_name).await?;
+  if volume
+    .labels
+    .get(RESTORE_PLAN_VOLUME_LABEL)
+    .map(String::as_str)
+    != Some(owned.restore_plan_id.as_str())
+  {
+    warn!(
+      "Restore journal no longer owns Volume '{}'; leaving it untouched",
+      owned.volume_name
+    );
+    return Ok(());
+  }
+  remove_restore_volume(&owned.volume_name).await
+}
+
+async fn cleanup_owned_restore_volume_journal(
+  path: &Path,
+) -> anyhow::Result<()> {
+  let bytes = std::fs::read(path).with_context(|| {
+    format!("Failed to read restore journal {}", path.display())
+  })?;
+  let journal: RestoreJournal = serde_json::from_slice(&bytes)
+    .with_context(|| {
+      format!("Failed to decode restore journal {}", path.display())
+    })?;
+  if let Some(owned) = &journal.owned_volume {
+    remove_owned_restore_volume(owned).await?;
+  }
+  remove_path(path)?;
+  fsync_parent(path)
 }
 
 fn restore_staging_journal_dir() -> anyhow::Result<PathBuf> {
@@ -1694,8 +1947,15 @@ pub(crate) async fn recover_restore_journals() -> anyhow::Result<()> {
       remove_path(&entry.source)?;
       fsync_parent(&entry.source)?;
     }
-    remove_path(&journal.staging)?;
-    fsync_parent(&journal.staging)?;
+    if !journal.staging.as_os_str().is_empty() {
+      remove_path(&journal.staging)?;
+      fsync_parent(&journal.staging)?;
+    }
+    if !journal.committed
+      && let Some(owned) = &journal.owned_volume
+    {
+      remove_owned_restore_volume(owned).await?;
+    }
     remove_path(&path)?;
     fsync_parent(&path)?;
     warn!("Recovered interrupted restore journal {}", path.display());
@@ -1892,10 +2152,32 @@ fn publish_restore_in(
   std::fs::create_dir_all(journal_directory)?;
   let journal_path =
     journal_directory.join(format!("{journal_id}.json"));
+  let owned_volume = if path_lexists(&journal_path) {
+    let existing: RestoreJournal =
+      serde_json::from_slice(&std::fs::read(&journal_path)?)
+        .with_context(|| {
+          format!(
+            "Failed to decode pre-publication restore journal {}",
+            journal_path.display()
+          )
+        })?;
+    if existing.committed
+      || !existing.entries.is_empty()
+      || existing.owned_volume.is_none()
+    {
+      return Err(anyhow!(
+        "Restore journal already contains publication state"
+      ));
+    }
+    existing.owned_volume
+  } else {
+    None
+  };
   let mut journal = RestoreJournal {
     staging: staging.to_path_buf(),
     entries,
     committed: false,
+    owned_volume,
   };
   persist_journal(&journal_path, &journal)?;
   // The durable journal owns cleanup from this point onward.
@@ -1975,10 +2257,27 @@ fn cleanup_rolled_back_restore(
     remove_path(&entry.source)?;
     fsync_parent(&entry.source)?;
   }
-  remove_path(&journal.staging)?;
-  fsync_parent(&journal.staging)?;
-  remove_path(journal_path)?;
-  fsync_parent(journal_path)
+  if !journal.staging.as_os_str().is_empty() {
+    remove_path(&journal.staging)?;
+    fsync_parent(&journal.staging)?;
+  }
+  if journal.owned_volume.is_some() {
+    // Keep only the durable Volume ownership record. The async caller removes
+    // that side effect after the synchronous filesystem rollback completes;
+    // startup recovery performs the same action after a crash.
+    persist_journal(
+      journal_path,
+      &RestoreJournal {
+        staging: PathBuf::new(),
+        entries: Vec::new(),
+        committed: false,
+        owned_volume: journal.owned_volume.clone(),
+      },
+    )
+  } else {
+    remove_path(journal_path)?;
+    fsync_parent(journal_path)
+  }
 }
 
 fn path_lexists(path: &Path) -> bool {
@@ -2546,10 +2845,42 @@ mod tests {
         published: true,
       }],
       committed: false,
+      owned_volume: None,
     };
     rollback_published(&mut journal, &journal_path).unwrap();
     assert_eq!(std::fs::read(destination).unwrap(), b"original");
     assert!(!journal.entries[0].published);
+  }
+
+  #[test]
+  fn rolled_back_restore_retains_created_volume_ownership() {
+    let root = tempfile::tempdir().unwrap();
+    let journal_path = root.path().join("journal.json");
+    let journal = RestoreJournal {
+      staging: root.path().join("staging"),
+      entries: Vec::new(),
+      committed: false,
+      owned_volume: Some(RestoreOwnedVolume {
+        volume_name: "recovered-data".into(),
+        restore_plan_id: "plan-id".into(),
+      }),
+    };
+    std::fs::create_dir(&journal.staging).unwrap();
+
+    cleanup_rolled_back_restore(&journal, &journal_path).unwrap();
+
+    let retained: RestoreJournal =
+      serde_json::from_slice(&std::fs::read(&journal_path).unwrap())
+        .unwrap();
+    assert!(retained.staging.as_os_str().is_empty());
+    assert!(retained.entries.is_empty());
+    assert_eq!(
+      retained
+        .owned_volume
+        .as_ref()
+        .map(|owned| owned.volume_name.as_str()),
+      Some("recovered-data")
+    );
   }
 
   #[test]

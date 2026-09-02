@@ -9,11 +9,17 @@ use chacha20poly1305::{
   aead::{Aead, KeyInit},
 };
 use data_encoding::BASE64URL_NOPAD;
+use hmac::{Hmac, Mac};
 use rand::RngExt as _;
+use sha2::Sha256;
 
 const BACKUP_KEY_PATH: &str = "/data/keys/backup.key";
 const LEGACY_BACKUP_KEY_PATH: &str = "/config/keys/backup.key";
 const AAD: &[u8] = b"komodo-backup-settings/v1";
+const SOURCE_AUTH_PREFIX: &str = "komodo-auth/v1";
+const SOURCE_AUTH_CONTEXT: &[u8] = b"komodo-backup-source/v1";
+
+type HmacSha256 = Hmac<Sha256>;
 
 fn backup_key() -> anyhow::Result<&'static [u8; 32]> {
   static KEY: OnceLock<[u8; 32]> = OnceLock::new();
@@ -159,6 +165,114 @@ pub fn embedded_server_token() -> anyhow::Result<String> {
   Ok(hex::encode(hasher.finalize()))
 }
 
+pub fn authorize_source_label(
+  source_label: &str,
+  hostname: &str,
+  snapshot_name: &str,
+) -> anyhow::Result<String> {
+  authorize_source_label_with_key(
+    source_label,
+    hostname,
+    snapshot_name,
+    backup_key()?,
+  )
+}
+
+fn authorize_source_label_with_key(
+  source_label: &str,
+  hostname: &str,
+  snapshot_name: &str,
+  key: &[u8; 32],
+) -> anyhow::Result<String> {
+  let encoded = BASE64URL_NOPAD.encode(source_label.as_bytes());
+  let signature =
+    source_label_signature(&encoded, hostname, snapshot_name, key)?;
+  Ok(format!(
+    "{SOURCE_AUTH_PREFIX}/{encoded}/{}",
+    hex::encode(signature)
+  ))
+}
+
+pub fn authenticate_source_label(
+  authorized_label: &str,
+  hostname: &str,
+  snapshot_name: &str,
+) -> anyhow::Result<String> {
+  authenticate_source_label_with_key(
+    authorized_label,
+    hostname,
+    snapshot_name,
+    backup_key()?,
+  )
+}
+
+fn authenticate_source_label_with_key(
+  authorized_label: &str,
+  hostname: &str,
+  snapshot_name: &str,
+  key: &[u8; 32],
+) -> anyhow::Result<String> {
+  let remainder = authorized_label
+    .strip_prefix(&format!("{SOURCE_AUTH_PREFIX}/"))
+    .context("Snapshot source label is not Core-authorized")?;
+  let (encoded, signature) = remainder
+    .split_once('/')
+    .context("Snapshot source authorization is malformed")?;
+  if signature.contains('/') {
+    return Err(anyhow!(
+      "Snapshot source authorization is malformed"
+    ));
+  }
+  let signature = hex::decode(signature)
+    .context("Snapshot source authorization is not valid hex")?;
+  let verifier =
+    source_label_mac(encoded, hostname, snapshot_name, key)?;
+  verifier.verify_slice(&signature).map_err(|_| {
+    anyhow!("Snapshot source authorization is invalid")
+  })?;
+  let source_label = BASE64URL_NOPAD
+    .decode(encoded.as_bytes())
+    .context("Snapshot source identity is not valid base64")?;
+  String::from_utf8(source_label)
+    .context("Snapshot source identity is not valid UTF-8")
+}
+
+fn source_label_signature(
+  encoded_source_label: &str,
+  hostname: &str,
+  snapshot_name: &str,
+  key: &[u8; 32],
+) -> anyhow::Result<Vec<u8>> {
+  Ok(
+    source_label_mac(
+      encoded_source_label,
+      hostname,
+      snapshot_name,
+      key,
+    )?
+    .finalize()
+    .into_bytes()
+    .to_vec(),
+  )
+}
+
+fn source_label_mac(
+  encoded_source_label: &str,
+  hostname: &str,
+  snapshot_name: &str,
+  key: &[u8; 32],
+) -> anyhow::Result<HmacSha256> {
+  let mut mac = HmacSha256::new_from_slice(key).map_err(|_| {
+    anyhow!("Failed to initialize source authorization")
+  })?;
+  mac.update(SOURCE_AUTH_CONTEXT);
+  for value in [encoded_source_label, hostname, snapshot_name] {
+    mac.update(&(value.len() as u64).to_be_bytes());
+    mac.update(value.as_bytes());
+  }
+  Ok(mac)
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -188,5 +302,46 @@ mod tests {
 
     assert_eq!(actual, expected);
     assert_eq!(read_key(&path).unwrap(), Some(expected));
+  }
+
+  #[test]
+  fn source_authorization_is_bound_to_writer_and_snapshot() {
+    let key = [11_u8; 32];
+    let label = "komodo/v1/volume/server-a/data";
+    let authorized = authorize_source_label_with_key(
+      label,
+      "komodo-periphery-server-a",
+      "volume-snapshot-a",
+      &key,
+    )
+    .unwrap();
+    assert_eq!(
+      authenticate_source_label_with_key(
+        &authorized,
+        "komodo-periphery-server-a",
+        "volume-snapshot-a",
+        &key,
+      )
+      .unwrap(),
+      label
+    );
+    assert!(
+      authenticate_source_label_with_key(
+        &authorized,
+        "komodo-periphery-server-b",
+        "volume-snapshot-a",
+        &key,
+      )
+      .is_err()
+    );
+    assert!(
+      authenticate_source_label_with_key(
+        &authorized,
+        "komodo-periphery-server-a",
+        "volume-snapshot-b",
+        &key,
+      )
+      .is_err()
+    );
   }
 }

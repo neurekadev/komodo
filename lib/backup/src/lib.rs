@@ -201,27 +201,49 @@ impl VykarRepository {
     &self,
     snapshot_name: &str,
   ) -> anyhow::Result<bool> {
+    Ok(
+      self
+        .delete_snapshots_if_present(&[snapshot_name.to_string()])?
+        > 0,
+    )
+  }
+
+  /// Delete exact snapshots after proving the repository inventory is
+  /// complete. Supplying several names performs one atomic Vykar delete
+  /// command and is used when authenticated labels intentionally differ per
+  /// snapshot.
+  pub fn delete_snapshots_if_present(
+    &self,
+    snapshot_names: &[String],
+  ) -> anyhow::Result<usize> {
     let inventory = self.list_snapshots()?;
     if inventory.hidden > 0 {
       return Err(anyhow!(
         "Repository inventory is incomplete; snapshot cleanup is blocked"
       ));
     }
-    if !inventory
+    let existing = inventory
       .snapshots
+      .into_iter()
+      .map(|snapshot| snapshot.name)
+      .collect::<HashSet<_>>();
+    let names = snapshot_names
       .iter()
-      .any(|snapshot| snapshot.name == snapshot_name)
-    {
-      return Ok(false);
+      .filter(|name| existing.contains(*name))
+      .cloned()
+      .collect::<Vec<_>>();
+    if names.is_empty() {
+      return Ok(0);
     }
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
     commands::delete::run(
       &self.config,
       Some(&self.passphrase),
-      &[snapshot_name],
+      &refs,
       false,
       None,
     )?;
-    Ok(true)
+    Ok(names.len())
   }
 
   /// List snapshots directly from the repository. Unknown labels remain
