@@ -11,6 +11,7 @@ use std::{
   os::unix::fs::PermissionsExt,
   path::Path,
   sync::atomic::AtomicBool,
+  time::Instant,
 };
 
 use anyhow::{Context, anyhow};
@@ -64,6 +65,68 @@ pub struct VykarRepository {
   pub config: VykarConfig,
   pub passphrase: String,
   _sftp_key: Option<NamedTempFile>,
+}
+
+const MAX_RESTORE_METADATA_BYTES: usize = 32 * 1024 * 1024;
+const MAX_RESTORE_INVENTORY_ITEMS: usize = 100_000;
+const MAX_RESTORE_INVENTORY_PATH_BYTES: usize = 16 * 1024 * 1024;
+
+/// Fail closed instead of returning a truncated destructive-restore plan.
+pub struct RestoreInventoryBudget {
+  remaining_items: usize,
+  remaining_path_bytes: usize,
+  deadline: Instant,
+}
+
+impl RestoreInventoryBudget {
+  pub fn new(deadline: Instant) -> Self {
+    Self {
+      remaining_items: MAX_RESTORE_INVENTORY_ITEMS,
+      remaining_path_bytes: MAX_RESTORE_INVENTORY_PATH_BYTES,
+      deadline,
+    }
+  }
+
+  pub fn consume(&mut self, path: &str) -> anyhow::Result<()> {
+    if Instant::now() >= self.deadline {
+      return Err(anyhow!(
+        "Restore preflight exceeded its time limit"
+      ));
+    }
+    if self.remaining_items == 0
+      || path.len() > self.remaining_path_bytes
+    {
+      return Err(anyhow!(
+        "Restore preflight inventory exceeds 100,000 entries or 16 MiB of paths; no partial preview can be confirmed"
+      ));
+    }
+    self.remaining_items -= 1;
+    self.remaining_path_bytes -= path.len();
+    Ok(())
+  }
+}
+
+fn append_restore_metadata(
+  stream: &mut Vec<u8>,
+  chunk: &[u8],
+) -> anyhow::Result<()> {
+  check_restore_metadata_size(stream.len(), chunk.len())?;
+  stream.extend_from_slice(chunk);
+  Ok(())
+}
+
+fn check_restore_metadata_size(
+  current: usize,
+  added: usize,
+) -> anyhow::Result<()> {
+  if current > MAX_RESTORE_METADATA_BYTES
+    || added > MAX_RESTORE_METADATA_BYTES.saturating_sub(current)
+  {
+    return Err(anyhow!(
+      "Restore preflight snapshot metadata exceeds 32 MiB; no partial preview can be confirmed"
+    ));
+  }
+  Ok(())
 }
 
 impl VykarRepository {
@@ -427,37 +490,74 @@ impl VykarRepository {
     Ok(())
   }
 
-  /// List every materialized snapshot path for restore preflight without
-  /// downloading pack contents.
+  /// Read a bounded metadata inventory, decoding one item at a time. Never
+  /// call Vykar's full Vec<Item> listing API on this request path.
   pub fn snapshot_paths(
     &self,
     snapshot_name: &str,
     selected_paths: &[String],
+    deadline: Instant,
   ) -> anyhow::Result<Vec<SnapshotPath>> {
-    let (items, _) =
-      commands::list::list_snapshot_items_with_source_paths(
+    let selected = normalize_selected_paths(selected_paths)?;
+    let (mut repo, _session) =
+      commands::util::open_repo_with_read_session(
         &self.config,
         Some(&self.passphrase),
-        snapshot_name,
+        vykar_core::repo::OpenOptions::new(),
       )?;
-    let selected = normalize_selected_paths(selected_paths)?;
-    Ok(
-      items
-        .into_iter()
-        .filter_map(|item| {
-          let path = item.path.trim_matches('/').to_string();
-          let included = selected.is_empty()
-            || selected.iter().any(|selection| {
-              path == *selection
-                || path.starts_with(&format!("{selection}/"))
-            });
-          included.then_some(SnapshotPath {
-            path,
-            directory: item.entry_type == ItemType::Directory,
-          })
-        })
-        .collect(),
-    )
+    let name = repo
+      .manifest()
+      .resolve_snapshot(snapshot_name)?
+      .name
+      .clone();
+    let metadata = commands::list::load_snapshot_meta(&repo, &name)?;
+    repo.set_blob_cache_max_bytes(MAX_RESTORE_METADATA_BYTES);
+    let cache = repo.open_restore_cache();
+    let mut index_loaded = false;
+    let mut stream = Vec::new();
+    for chunk_id in metadata.item_ptrs {
+      if Instant::now() >= deadline {
+        return Err(anyhow!(
+          "Restore preflight exceeded its time limit"
+        ));
+      }
+      let cached = cache
+        .as_ref()
+        .and_then(|cache| cache.lookup(&chunk_id))
+        .and_then(|(pack, offset, size)| {
+          repo.read_chunk_at(&chunk_id, &pack, offset, size).ok()
+        });
+      let chunk = match cached {
+        Some(chunk) => chunk,
+        None => {
+          if !index_loaded {
+            repo.load_chunk_index()?;
+            index_loaded = true;
+          }
+          repo.read_chunk(&chunk_id)?
+        }
+      };
+      append_restore_metadata(&mut stream, &chunk)?;
+    }
+    let mut budget = RestoreInventoryBudget::new(deadline);
+    let mut paths = Vec::new();
+    commands::list::for_each_decoded_item(&stream, |item| {
+      budget.consume(&item.path).map_err(std::io::Error::other)?;
+      let path = item.path.trim_matches('/').to_string();
+      let included = selected.is_empty()
+        || selected.iter().any(|selection| {
+          path == *selection
+            || path.starts_with(&format!("{selection}/"))
+        });
+      if included {
+        paths.push(SnapshotPath {
+          path,
+          directory: item.entry_type == ItemType::Directory,
+        });
+      }
+      Ok(())
+    })?;
+    Ok(paths)
   }
 
   /// Apply retention per logical source, preserving partial snapshots in
@@ -831,6 +931,39 @@ mod tests {
     BackupRepositoryBackend, BackupSecret,
   };
 
+  #[test]
+  fn restore_metadata_limit_is_checked_before_appending() {
+    assert!(
+      check_restore_metadata_size(MAX_RESTORE_METADATA_BYTES - 1, 1)
+        .is_ok()
+    );
+    assert!(
+      check_restore_metadata_size(MAX_RESTORE_METADATA_BYTES, 1)
+        .is_err()
+    );
+    assert!(check_restore_metadata_size(0, usize::MAX).is_err());
+    let mut bytes = vec![1];
+    append_restore_metadata(&mut bytes, &[2, 3]).unwrap();
+    assert_eq!(bytes, [1, 2, 3]);
+  }
+
+  #[test]
+  fn restore_inventory_enforces_item_bytes_and_deadline_budgets() {
+    let mut budget = RestoreInventoryBudget::new(
+      Instant::now() + std::time::Duration::from_secs(60),
+    );
+    budget.remaining_items = 1;
+    budget.consume("a").unwrap();
+    assert!(budget.consume("b").is_err());
+    budget.remaining_items = 2;
+    budget.remaining_path_bytes = 1;
+    assert!(budget.consume("ab").is_err());
+    budget.consume("a").unwrap();
+    assert!(budget.consume("b").is_err());
+    budget.deadline = Instant::now();
+    assert!(budget.consume("").is_err());
+  }
+
   fn snapshot(
     name: &str,
     created_at: i64,
@@ -1104,7 +1237,13 @@ mod tests {
     let inventory = vykar.list_snapshots().unwrap();
     assert_eq!(inventory.hidden, 0);
     assert_eq!(inventory.snapshots.len(), 2);
-    let paths = vykar.snapshot_paths("snapshot-one", &[]).unwrap();
+    let paths = vykar
+      .snapshot_paths(
+        "snapshot-one",
+        &[],
+        Instant::now() + std::time::Duration::from_secs(60),
+      )
+      .unwrap();
     let selected = paths
       .iter()
       .find(|item| item.path.ends_with("folder/keep.txt"))

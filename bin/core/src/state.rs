@@ -35,40 +35,53 @@ use crate::{
 
 static DB_CLIENT: OnceLock<database::Client> = OnceLock::new();
 
-/// A recovery-selected database name, read before the global database client
-/// is initialized. The previous database is deliberately retained.
-pub const ACTIVE_DATABASE_POINTER: &str =
-  "/data/backup-active-database";
-const LEGACY_ACTIVE_DATABASE_POINTER: &str =
-  "/config/backup-active-database";
 /// Atomic recovery activation containing both the database pointer and the
-/// restored Core backup identity.
+/// restored Core backup identity. Only Core may write this authority.
 pub const CORE_RECOVERY_ACTIVATION_PATH: &str =
-  "/data/backup-recovery-activation.json";
-pub const LEGACY_CORE_RECOVERY_ACTIVATION_PATH: &str =
-  "/config/backup-recovery-activation.json";
+  "/core-secrets/backup-recovery-activation.json";
 
-fn read_persistent_file(
-  path: &str,
-  legacy_path: &str,
+pub(crate) fn read_core_recovery_activation()
+-> std::io::Result<Option<Vec<u8>>> {
+  read_private_recovery_activation(
+    Path::new(CORE_RECOVERY_ACTIVATION_PATH),
+    &[
+      Path::new("/data/backup-recovery-activation.json"),
+      Path::new("/config/backup-recovery-activation.json"),
+      Path::new("/data/backup-active-database"),
+      Path::new("/config/backup-active-database"),
+    ],
+  )
+}
+
+fn read_private_recovery_activation(
+  path: &Path,
+  untrusted_paths: &[&Path],
 ) -> std::io::Result<Option<Vec<u8>>> {
-  match std::fs::read(path) {
-    Ok(bytes) => return Ok(Some(bytes)),
+  match std::fs::symlink_metadata(path) {
+    Ok(metadata) if !metadata.is_file() => {
+      return Err(std::io::Error::other(
+        "Core recovery activation must be a regular Core-only file",
+      ));
+    }
+    Ok(_) => return std::fs::read(path).map(Some),
     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
     Err(error) => return Err(error),
   }
-  let bytes = match std::fs::read(legacy_path) {
-    Ok(bytes) => bytes,
-    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-      return Ok(None);
+  // Never import an unsigned database selection from shared storage, even
+  // as a fallback. Refuse startup instead of silently selecting another DB.
+  for untrusted in untrusted_paths {
+    match std::fs::symlink_metadata(untrusted) {
+      Ok(_) => {
+        return Err(std::io::Error::other(format!(
+          "Untrusted recovery pointer at {}; an administrator must verify the database selection and persist it under /core-secrets before startup",
+          untrusted.display()
+        )));
+      }
+      Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+      Err(error) => return Err(error),
     }
-    Err(error) => return Err(error),
-  };
-  if let Some(parent) = Path::new(path).parent() {
-    std::fs::create_dir_all(parent)?;
   }
-  std::fs::write(path, &bytes)?;
-  Ok(Some(bytes))
+  Ok(None)
 }
 
 pub fn db_client() -> &'static database::Client {
@@ -84,10 +97,7 @@ pub fn db_client() -> &'static database::Client {
 pub async fn init_db_client() {
   let init = async {
     let mut database = core_config().database.clone();
-    let activation = match read_persistent_file(
-      CORE_RECOVERY_ACTIVATION_PATH,
-      LEGACY_CORE_RECOVERY_ACTIVATION_PATH,
-    ) {
+    let active_database = match read_core_recovery_activation() {
       Ok(Some(bytes)) => {
         let value: serde_json::Value = serde_json::from_slice(&bytes)
           .context("Invalid Core recovery activation record")?;
@@ -115,23 +125,6 @@ pub async fn init_db_client() {
         return Err(error)
           .context("Failed to read Core recovery activation record");
       }
-    };
-    let active_database = match activation {
-      Some(name) => Some(name),
-      None => match read_persistent_file(
-        ACTIVE_DATABASE_POINTER,
-        LEGACY_ACTIVE_DATABASE_POINTER,
-      ) {
-        Ok(Some(bytes)) => Some(String::from_utf8(bytes).context(
-          "Active database recovery pointer is not UTF-8",
-        )?),
-        Ok(None) => None,
-        Err(error) => {
-          return Err(error).context(
-            "Failed to read active database recovery pointer",
-          );
-        }
-      },
     };
     if let Some(name) = active_database {
       let name = name.trim();
@@ -355,4 +348,44 @@ pub fn procedure_cancel_cache() -> &'static CancelCache {
 pub fn action_cancel_cache() -> &'static CancelCache {
   static ACTION_CANCEL_CACHE: OnceLock<CancelCache> = OnceLock::new();
   ACTION_CANCEL_CACHE.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+mod recovery_activation_tests {
+  use super::*;
+
+  #[test]
+  fn shared_pointer_cannot_select_or_migrate_a_database() {
+    let directory = tempfile::tempdir().unwrap();
+    let private = directory.path().join("private.json");
+    let shared = directory.path().join("shared.json");
+    assert!(
+      read_private_recovery_activation(&private, &[&shared])
+        .unwrap()
+        .is_none()
+    );
+    std::fs::write(&shared, br#"{"database":"attacker"}"#).unwrap();
+    assert!(
+      read_private_recovery_activation(&private, &[&shared]).is_err()
+    );
+    assert!(!private.exists());
+    let trusted = br#"{"database":"verified"}"#;
+    std::fs::write(&private, trusted).unwrap();
+    assert_eq!(
+      read_private_recovery_activation(&private, &[&shared])
+        .unwrap()
+        .unwrap(),
+      trusted
+    );
+  }
+
+  #[test]
+  fn private_activation_cannot_be_a_symlink_to_shared_storage() {
+    let directory = tempfile::tempdir().unwrap();
+    let private = directory.path().join("private.json");
+    let shared = directory.path().join("shared.json");
+    std::fs::write(&shared, b"{}").unwrap();
+    std::os::unix::fs::symlink(&shared, &private).unwrap();
+    assert!(read_private_recovery_activation(&private, &[]).is_err());
+  }
 }

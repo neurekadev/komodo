@@ -61,8 +61,8 @@ use crate::{
   permission::get_check_permissions,
   resource::{self, KomodoResource},
   state::{
-    CORE_RECOVERY_ACTIVATION_PATH,
-    LEGACY_CORE_RECOVERY_ACTIVATION_PATH, db_client,
+    CORE_RECOVERY_ACTIVATION_PATH, db_client,
+    read_core_recovery_activation,
   },
 };
 
@@ -961,39 +961,27 @@ fn core_instance_id() -> anyhow::Result<&'static str> {
 }
 
 fn load_or_create_core_instance_id() -> anyhow::Result<String> {
-  for (path, migrate) in [
-    (CORE_RECOVERY_ACTIVATION_PATH, false),
-    (LEGACY_CORE_RECOVERY_ACTIVATION_PATH, true),
-  ] {
-    match std::fs::read(path) {
-      Ok(bytes) => {
-        let activation: CoreRecoveryActivation =
-          serde_json::from_slice(&bytes)
-            .context("Invalid Core recovery activation record")?;
-        if activation.core_instance_id.len() != 32
-          || !activation
-            .core_instance_id
-            .chars()
-            .all(|character| character.is_ascii_hexdigit())
-        {
-          return Err(anyhow!(
-            "Invalid recovered Core backup identity"
-          ));
-        }
-        if migrate {
-          persist_core_recovery_activation(
-            &activation.database,
-            &activation.core_instance_id,
-            activation.previous_database.as_deref(),
-          )?;
-        }
-        return Ok(activation.core_instance_id);
+  match read_core_recovery_activation() {
+    Ok(Some(bytes)) => {
+      let activation: CoreRecoveryActivation =
+        serde_json::from_slice(&bytes)
+          .context("Invalid Core recovery activation record")?;
+      if activation.core_instance_id.len() != 32
+        || !activation
+          .core_instance_id
+          .chars()
+          .all(|character| character.is_ascii_hexdigit())
+      {
+        return Err(anyhow!(
+          "Invalid recovered Core backup identity"
+        ));
       }
-      Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-      Err(error) => {
-        return Err(error)
-          .context("Failed to read Core recovery activation record");
-      }
+      return Ok(activation.core_instance_id);
+    }
+    Ok(None) => {}
+    Err(error) => {
+      return Err(error)
+        .context("Failed to read Core recovery activation record");
     }
   }
   let path = Path::new(CORE_INSTANCE_ID_PATH);
@@ -5352,9 +5340,9 @@ fn is_managed_core_recovery_database(
 
 fn previous_core_recovery_database() -> anyhow::Result<Option<String>>
 {
-  let bytes = match std::fs::read(CORE_RECOVERY_ACTIVATION_PATH) {
-    Ok(bytes) => bytes,
-    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+  let bytes = match read_core_recovery_activation() {
+    Ok(Some(bytes)) => bytes,
+    Ok(None) => {
       return Ok(None);
     }
     Err(error) => {

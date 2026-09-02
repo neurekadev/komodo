@@ -87,11 +87,11 @@ Each Periphery also has a stable Vykar hostname so snapshots remain attributable
 
 Backup manifests record the running product's build version, as shown by Core, rather than Cargo's internal `0.0.0` workspace placeholder. Core recovery compares that recorded version with the running build before activating a restored database.
 
-Core snapshot authorization binds the snapshot identity to the export's creation time and a digest of its exact file names and contents, including its manifest. Recovery verifies that digest and the manifest's creation time before importing any database records; reusing an older authorized snapshot name cannot authorize replacement contents. Core inventory and retention use the signed export time, not the repository upload time, so uploading an exact copy of an old export cannot make it a newer recovery point or displace newer backups. Legacy Core snapshots without this content-and-time authorization remain visible as unbound snapshots and are not eligible for automatic Core recovery or managed retention. Create a fresh Core snapshot with this version before relying on the recovery workflow.
+Core snapshot authorization binds the snapshot identity to the export's creation time and a digest of its exact file names and contents, including its manifest. Recovery verifies that digest and the manifest's creation time before importing any database records; reusing an older authorized snapshot name cannot authorize replacement contents. Core inventory and retention use the signed export time, not the repository upload time, so uploading an exact copy of an old export cannot make it a newer recovery point or displace newer backups. Snapshots without the required content-and-time authorization remain visible as unbound snapshots and are not eligible for automatic Core recovery or managed retention.
 
 Fleet run status polls every 15 seconds, while repository health and mirror lag share a five-minute cache across browsers. Snapshot inventories are loaded on demand; use **Refresh inventory** or **Refresh snapshots** to fetch new repository contents.
 
-Critical operational alerts accumulate independently in the `messages` array in `/data/backup-operational-alert.json` and survive Core restarts; a later failure does not erase an earlier node's incident. The previous single-`message` format is read on upgrade. To acknowledge an individual incident, first verify that its affected workloads and Periphery restore/quiesce journals have recovered, then stop Core, save a copy of the alert file, remove only that incident's entry from `messages`, and restart Core. Leave all other entries intact. Archive the whole file only after verifying every incident. Do not clear alerts while containers remain stopped or a restore is indeterminate; acknowledging a message does not clear a recovery journal or unblock unsafe operations.
+Critical operational alerts accumulate independently in the `messages` array in `/data/backup-operational-alert.json` and survive Core restarts; a later failure does not erase an earlier node's incident. To acknowledge an individual incident, first verify that its affected workloads and Periphery restore/quiesce journals have recovered, then stop Core, save a copy of the alert file, remove only that incident's entry from `messages`, and restart Core. Leave all other entries intact. Archive the whole file only after verifying every incident. Do not clear alerts while containers remain stopped or a restore is indeterminate; acknowledging a message does not clear a recovery journal or unblock unsafe operations.
 
 ## Restore a Stack or Volume
 
@@ -99,7 +99,9 @@ Open the resource's **Backups** tab, choose a complete snapshot, and select **Re
 
 Before confirmation, Komodo lists paths that will be created, overwritten, and deleted, plus containers that will stop. A Volume restore stops every running container that mounts the destination volume, even when those containers belong to different Stacks. A Stack restore stops every running container in the deployed Compose project and every other container whose bind or named-volume storage overlaps a destination path. Containers that were already stopped remain stopped. Restore data is written to staging on the destination filesystem, verified with its metadata, and then published using a persisted rollback journal and directory synchronization. Komodo restarts exactly the previously running containers after successful publication or a proven rollback. If state becomes indeterminate, they remain stopped and Komodo raises a critical recovery alert.
 
-Periphery rechecks the confirmed preview while holding its filesystem guard, before creating a Volume or stopping any container. Changed path lists, destination existence, or affected containers require a fresh preview. Upgrade Core and Periphery together; the restore request now requires that confirmed preview.
+Periphery rechecks the confirmed preview while holding its filesystem guard, before creating a Volume or stopping any container. Changed path lists, destination existence, or affected containers require a fresh preview. Use matching Core and Periphery versions; restore requests require that confirmed preview.
+
+Restore previews are complete or fail: Komodo never confirms a truncated path list. Each Periphery permits one inventory worker at a time, with a 60-second inventory deadline, at most 32 MiB of encoded snapshot items, 100,000 snapshot entries, and 16 MiB of snapshot path text. The mapped-path/destination walk has its own combined 100,000-entry and 16 MiB path budget and refuses directory nesting beyond 128 levels. The returned preview is limited to 10,000 changed paths and 1 MiB of path text across all three lists. Select a smaller subtree if the changed-path or destination-walk limit is reached. Snapshots exceeding the snapshot-inventory limit cannot be restored through this UI, even with a smaller selection. No volume creation, container stopping, or publication starts on a failed preview. A timed-out backend read may finish in the background; further previews on that Periphery are refused until its worker exits.
 
 Any remaining restore, staging, or container-quiesce journal persistently blocks new backups and restores on that node, even under a new operation ID or after Core restarts. This includes a deferred recovered-Stack receipt awaiting Core acknowledgement. Let Core reconciliation finish for recovered Stacks; for an ordinary interrupted restore or restart failure, restart Periphery and verify its startup recovery succeeds. Finalization and startup recovery remain available to repair the existing operation. Never delete a journal to bypass the gate: an older rollback could otherwise overwrite a newer restore. Inspect Periphery logs and repair the reported filesystem or container problem if recovery cannot finish.
 
@@ -111,7 +113,7 @@ For selected files or folders, Komodo retains the original confirmed destination
 
 When a restore creates a recovered Stack, Core marks that new resource with the restore-plan identity before it asks Periphery to commit the filesystem publication. Periphery retains the rollback journal and the final commit receipt until Core acknowledges the matching database state. After an interrupted Core or Periphery restart, Komodo reconciles that marker automatically; do not delete or repurpose the recovered Stack while reconciliation is pending.
 
-Creating a preflight does not start a restore. Unexecuted plans expire after 15 minutes without contacting the destination or raising a recovery alert if that Server goes offline. Core durably marks execution before sending a publication request; only started or legacy plans with unknown execution state require restart reconciliation. A confirmed rollback clears that execution marker.
+Creating a preflight does not start a restore. Unexecuted plans expire after 15 minutes without contacting the destination or raising a recovery alert if that Server goes offline. Core durably marks execution before sending a publication request; started plans require restart reconciliation. A confirmed rollback clears that execution marker.
 
 ### Restore to another Periphery
 
@@ -122,6 +124,8 @@ The source Periphery does not need to be online. Choose any connected destinatio
 - A resource-tab same-node restore defaults to the original location. The administrator inventory asks for a destination volume name even on the original Server, so it can recover a deleted Volume under a new name. Explicitly selecting any existing volume requires the existing-destination confirmation, including the original Server and volume name.
 
 After recovery, review application-specific ownership, external databases, DNS, secrets, and hardware dependencies before starting unrelated workloads.
+
+When recovered-Stack bind mappings require Compose processing, every Compose path must be a regular file beneath real staging directories. Symlinks in the Compose filename or any staged parent directory are rejected before rewriting; a snapshot cannot redirect the rewrite into an unrelated host file.
 
 ## Recover Core on a fresh install
 
@@ -134,7 +138,7 @@ Core also uses this private volume for temporary export, recovery, and manifest 
 3. Start Core again. Core loads this key only at process startup, so copying it into a running container is not sufficient.
 4. Connect the existing primary repository in **Backups**, then select a Core snapshot under **Core recovery**.
 
-Komodo restores the snapshot into a validation database, checks the backup schema/version and confirms that an administrator account remains available. It then switches the persisted active-database pointer and restarts. The fresh pre-restore database is retained for rollback.
+Komodo restores the snapshot into a validation database, checks the backup schema/version and confirms that an administrator account remains available. It then atomically writes `/core-secrets/backup-recovery-activation.json` and restarts. This Core-only record selects the active database and retains the previous database for rollback. Core never imports an unsigned database pointer from shared `/data` or `/config`; if such a pointer exists without a private activation, startup stops for administrator verification instead of silently selecting a database. Preserve the private activation with Core's other recovery material.
 
 If the restored database contains a pending Stack recovery record with its matching recovered Stack already inserted, Komodo normalizes it to the idempotent acknowledgement phase. Startup can then clear that historical record even if Periphery already discarded its completed receipt. Unmatched records retain the normal reconciliation checks; a contradictory receipt still blocks completion.
 
@@ -143,7 +147,7 @@ If the restored database contains a pending Stack recovery record with its match
 If the recovered Core starts but its application data or authentication configuration is unusable, roll back before making further changes:
 
 1. Stop Core and take an independent backup of the database service. Do not run another Core against either database while changing the pointer.
-2. Open `/data/backup-recovery-activation.json` in Core's persistent `data` volume. Confirm that `database` names the recovered database and that `previous_database` names the retained pre-recovery database. Stop if `previous_database` is absent or does not match the database you intend to restore.
+2. Open `/core-secrets/backup-recovery-activation.json` in Core's private persistent `core-secrets` volume. Confirm that `database` names the recovered database and that `previous_database` names the retained pre-recovery database. Stop if `previous_database` is absent or does not match the database you intend to restore.
 3. Preserve a copy of the activation file. Replace it atomically with valid JSON that moves the current `database` value to `previous_database`, moves the old `previous_database` value to `database`, and leaves `core_instance_id` unchanged. Keep the file owner and mode unchanged.
 4. Start Core. Its startup log must say it is using the retained database named in the updated `database` field.
 5. Sign in with an administrator account, confirm expected Servers and Stacks are present, open **Backups**, and verify the primary repository before re-enabling scheduled work.
@@ -185,7 +189,7 @@ Backups require both a base resource level and the `Backups` specific permission
 - **Read + Backups** lists and browses snapshots the user may access.
 - **Execute or Write + Backups** permits manual backup and same-target restore.
 - A Volume uses its Server permission. A Stack accepts a direct grant or an inherited Server grant.
-- New Server and Stack creators receive `Backups` automatically; existing permissions are not broadened during upgrade.
+- New Server and Stack creators receive `Backups` automatically.
 - Cross-node restore additionally requires **Execute + Backups** on the destination Server. Any restore that creates a recovered Stack requires the same destination Server permission, even when restoring onto the snapshot's historical Server, plus the existing Stack-create permission.
 - Repository settings, schedules, retention, Core recovery, unbound snapshots, mirror promotion, and maintenance are administrator-only.
 
@@ -202,12 +206,10 @@ Vykar supports [local, S3-compatible, SFTP, and REST backends](https://vykar.bor
 
 For every external backend, the worker identity must be distinct and its storage-side policy must permit the reads and writes needed for backups while denying deletion, compaction, and other maintenance. Only Core receives the authoritative maintenance-capable credentials.
 
-Encryption is mandatory on every repository. Store the persisted Core-only `/core-secrets/backup.key` with the rest of your disaster-recovery material; losing both Core state and this key prevents Komodo from unsealing repository credentials. On upgrade, Core migrates an existing `/data/keys/backup.key` into the Core-only location and removes the shared copy after the new file is durable.
+Encryption is mandatory on every repository. Store the persisted Core-only `/core-secrets/backup.key` with the rest of your disaster-recovery material; losing both Core state and this key prevents Komodo from unsealing repository credentials.
 
 ## Vykar cache persistence
 
 The official Compose files persist Vykar's cache in the existing named `data` volume. Core uses `/data/backups/.komodo-vykar-cache`; the colocated Periphery uses `.komodo-vykar` beneath its Stack directory, whose default host path is an alias into the same `data` volume. No separate cache volume is required. Core's plaintext staging and temporary authoritative SFTP keys use `core-secrets`, not this shared cache. The cache can be rebuilt from a repository, but keeping it across container recreation avoids unnecessary index downloads and preserves normal deduplication performance.
 
-## Legacy database backup migration
-
-The older `BackupCoreDatabase` CLI/API operation remains available for compatibility, but new installs no longer create its scheduled Procedure. If an existing install still schedules it, Core emits a warning. Disable that Procedure after you have configured Komodo Backups, completed a Core snapshot, and tested a restore. The legacy format is documented under [Legacy Core database backups](/administration/backup-restore).
+Development Compose uses a dedicated `core-data:/data` volume for Core's default repository, cache, and alerts. Its `core-secrets` and FerretDB `data` volumes remain separate. See [Development](/reference/development#docker) before recreating development containers with existing snapshots.

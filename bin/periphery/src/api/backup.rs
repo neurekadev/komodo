@@ -2,7 +2,7 @@ use std::{
   collections::{BTreeMap, BTreeSet, HashMap, HashSet},
   fs::OpenOptions,
   io::{Read, Write},
-  os::unix::fs::{MetadataExt, PermissionsExt},
+  os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
   path::{Path, PathBuf},
   sync::{
     Arc, Mutex, OnceLock,
@@ -34,6 +34,52 @@ const COMPOSE_PROJECT_LABEL: &str = "com.docker.compose.project";
 const RESTORE_PLAN_VOLUME_LABEL: &str = "komodo.restore-plan";
 const PENDING_CANCELLATION_TTL: Duration = Duration::from_secs(60);
 const MAX_PENDING_CANCELLATIONS: usize = 1_024;
+const RESTORE_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_RESTORE_PREVIEW_ROWS: usize = 10_000;
+const MAX_RESTORE_PREVIEW_BYTES: usize = 1024 * 1024;
+const MAX_RESTORE_PREVIEW_DEPTH: usize = 128;
+
+fn preflight_slots() -> &'static Arc<tokio::sync::Semaphore> {
+  static SLOTS: OnceLock<Arc<tokio::sync::Semaphore>> =
+    OnceLock::new();
+  SLOTS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
+}
+
+struct RestorePreviewBudget {
+  inventory: komodo_backup::RestoreInventoryBudget,
+  rows: usize,
+  path_bytes: usize,
+}
+
+impl RestorePreviewBudget {
+  fn new(deadline: Instant) -> Self {
+    Self {
+      inventory: komodo_backup::RestoreInventoryBudget::new(deadline),
+      rows: 0,
+      path_bytes: 0,
+    }
+  }
+
+  fn push(
+    &mut self,
+    output: &mut Vec<String>,
+    path: &Path,
+  ) -> anyhow::Result<()> {
+    let path = path.to_string_lossy();
+    if self.rows >= MAX_RESTORE_PREVIEW_ROWS
+      || path.len()
+        > MAX_RESTORE_PREVIEW_BYTES.saturating_sub(self.path_bytes)
+    {
+      return Err(anyhow!(
+        "Restore preview exceeds 10,000 changed paths or 1 MiB of path text; select a smaller subtree before confirming"
+      ));
+    }
+    self.rows += 1;
+    self.path_bytes += path.len();
+    output.push(path.into_owned());
+    Ok(())
+  }
+}
 
 #[derive(Deserialize)]
 struct BackupComposeConfig {
@@ -1096,6 +1142,52 @@ fn rewrite_compose_bind_mappings(
   rewritten
 }
 
+/// Open only regular files reached through real directories in staging.
+/// Use the same descriptor for reading and rewriting, never a truncating
+/// pathname open that could follow a restored link into the host.
+fn open_staged_compose_file(
+  staging: &Path,
+  path: &Path,
+) -> anyhow::Result<std::fs::File> {
+  let relative = path.strip_prefix(staging)?;
+  let mut current = staging.to_path_buf();
+  if !std::fs::symlink_metadata(&current)?.is_dir() {
+    return Err(anyhow!(
+      "Compose staging root must be a real directory"
+    ));
+  }
+  let mut components = relative.components().peekable();
+  while let Some(component) = components.next() {
+    if !matches!(component, std::path::Component::Normal(_)) {
+      return Err(anyhow!("Unsafe staged Compose path"));
+    }
+    current.push(component);
+    let metadata = std::fs::symlink_metadata(&current)?;
+    let valid = if components.peek().is_some() {
+      metadata.is_dir()
+    } else {
+      metadata.is_file()
+    };
+    if !valid {
+      return Err(anyhow!(
+        "Recovered Compose paths must not contain symlinks or special files: {}",
+        current.display()
+      ));
+    }
+  }
+  let file = OpenOptions::new()
+    .read(true)
+    .write(true)
+    .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+    .open(path)?;
+  if !file.metadata()?.is_file() {
+    return Err(anyhow!(
+      "Recovered Compose file must be a regular file"
+    ));
+  }
+  Ok(file)
+}
+
 fn rewrite_recovered_stack_compose_files(
   request: &TransactionalVykarRestore,
   staging: &Path,
@@ -1128,7 +1220,9 @@ fn rewrite_recovered_stack_compose_files(
       ));
     }
     let path = staged_run_directory.join(relative);
-    let text = std::fs::read_to_string(&path).with_context(|| {
+    let mut file = open_staged_compose_file(staging, &path)?;
+    let mut text = String::new();
+    file.read_to_string(&mut text).with_context(|| {
       format!(
         "Failed to read recovered Compose file {}",
         path.display()
@@ -1156,8 +1250,9 @@ fn rewrite_recovered_stack_compose_files(
       continue;
     }
     let rewritten = serde_yaml_ng::to_string(&document)?;
-    let mut file =
-      OpenOptions::new().truncate(true).write(true).open(&path)?;
+    use std::io::Seek;
+    file.rewind()?;
+    file.set_len(0)?;
     file.write_all(rewritten.as_bytes())?;
     file.sync_all()?;
   }
@@ -2096,6 +2191,8 @@ impl Resolve<Args> for PreflightVykarRestore {
     mut self,
     _: &Args,
   ) -> anyhow::Result<PreflightVykarRestoreResponse> {
+    let permit = preflight_slots().clone().try_acquire_owned()
+      .context("Another restore preflight is still running on this Periphery; retry after it finishes")?;
     let discovered = match &self.target {
       PeripheryBackupTarget::Stack { .. } => {
         // A missing Stack destination can legitimately be planned as a
@@ -2162,28 +2259,34 @@ impl Resolve<Args> for PreflightVykarRestore {
     let advanced = self.advanced.clone();
     let hostname = self.hostname.clone();
     let snapshot = self.snapshot_name.clone();
-    let selected = self.selected_paths.clone();
-    let snapshot_paths = tokio::task::spawn_blocking(move || {
+    let selected = self.selected_paths;
+    let publish = self.publish;
+    let deadline = Instant::now() + RESTORE_PREFLIGHT_TIMEOUT;
+    let worker = tokio::task::spawn_blocking(move || {
+      // Keep the slot inside the worker if a caller disconnects or times out.
+      // Slow backend reads must not spawn unlimited abandoned inventories.
+      let _permit = permit;
       let cache = vykar_cache_dir(&hostname)?;
-      VykarRepository::new(
+      let snapshot_paths = VykarRepository::new(
         &repository,
         &hostname,
         &cache,
         &cache,
         &advanced,
       )?
-      .snapshot_paths(&snapshot, &selected)
-    })
-    .await
-    .context("Vykar preflight worker failed")??;
-    let publish = self.publish;
-    let selected = self.selected_paths;
+      .snapshot_paths(&snapshot, &selected, deadline)?;
+      compare_restore_paths(
+        &snapshot_paths,
+        &publish,
+        &selected,
+        deadline,
+      )
+    });
     let (created_paths, overwritten_paths, deleted_paths) =
-      tokio::task::spawn_blocking(move || {
-        compare_restore_paths(&snapshot_paths, &publish, &selected)
-      })
+      tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), worker)
       .await
-      .context("Restore preflight filesystem worker failed")??;
+      .context("Restore preflight exceeded 60 seconds; no restore changes were started")?
+      .context("Restore preflight worker failed")??;
     Ok(PreflightVykarRestoreResponse {
       destination_exists,
       created_paths,
@@ -2198,11 +2301,18 @@ fn compare_restore_paths(
   snapshot_paths: &[komodo_backup::SnapshotPath],
   publish: &[RestorePublishPath],
   selected: &[String],
+  deadline: Instant,
 ) -> anyhow::Result<(Vec<String>, Vec<String>, Vec<String>)> {
+  let mut budget = RestorePreviewBudget::new(deadline);
   let mut expected = HashSet::<PathBuf>::new();
   let mut created = Vec::new();
   let mut overwritten = Vec::new();
   for item in snapshot_paths {
+    if Instant::now() >= deadline {
+      return Err(anyhow!(
+        "Restore preflight exceeded its time limit"
+      ));
+    }
     let Some((mapping, relative)) =
       map_snapshot_path(&item.path, publish)?
     else {
@@ -2213,16 +2323,17 @@ fn compare_restore_paths(
     } else {
       Path::new(&mapping.destination).join(relative)
     };
+    budget.inventory.consume(&destination.to_string_lossy())?;
     expected.insert(destination.clone());
     match restore_preview_metadata(
       Path::new(&mapping.destination),
       &destination,
     )? {
       None => {
-        created.push(destination.to_string_lossy().into_owned())
+        budget.push(&mut created, &destination)?;
       }
       Some(metadata) if !item.directory || !metadata.is_dir() => {
-        overwritten.push(destination.to_string_lossy().into_owned());
+        budget.push(&mut overwritten, &destination)?;
       }
       Some(_) => {}
     }
@@ -2249,7 +2360,12 @@ fn compare_restore_paths(
   };
   let mut deleted = Vec::new();
   for root in restore_roots {
-    collect_unexpected_paths(&root, &expected, &mut deleted)?;
+    collect_unexpected_paths(
+      &root,
+      &expected,
+      &mut deleted,
+      &mut budget,
+    )?;
   }
   created.sort();
   created.dedup();
@@ -2315,7 +2431,9 @@ fn collect_unexpected_paths(
   root: &Path,
   expected: &HashSet<PathBuf>,
   deleted: &mut Vec<String>,
+  budget: &mut RestorePreviewBudget,
 ) -> anyhow::Result<()> {
+  budget.inventory.consume(&root.to_string_lossy())?;
   let metadata = match std::fs::symlink_metadata(root) {
     Ok(metadata) => metadata,
     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -2324,19 +2442,32 @@ fn collect_unexpected_paths(
     Err(error) => return Err(error.into()),
   };
   if !expected.contains(root) {
-    deleted.push(root.to_string_lossy().into_owned());
+    budget.push(deleted, root)?;
   }
-  if metadata.is_dir() {
-    for entry in std::fs::read_dir(root)? {
-      let entry = entry?;
-      let path = entry.path();
-      let file_type = entry.file_type()?;
-      if !expected.contains(&path) {
-        deleted.push(path.to_string_lossy().into_owned());
+  if !metadata.is_dir() {
+    return Ok(());
+  }
+  // A bounded iterator stack avoids recursive stack overflow and does not
+  // collect a wide directory's entire contents before checking the budget.
+  let mut directories = vec![std::fs::read_dir(root)?];
+  while let Some(directory) = directories.last_mut() {
+    let Some(entry) = directory.next() else {
+      directories.pop();
+      continue;
+    };
+    let entry = entry?;
+    let path = entry.path();
+    budget.inventory.consume(&path.to_string_lossy())?;
+    if !expected.contains(&path) {
+      budget.push(deleted, &path)?;
+    }
+    if entry.file_type()?.is_dir() {
+      if directories.len() >= MAX_RESTORE_PREVIEW_DEPTH {
+        return Err(anyhow!(
+          "Restore preflight destination exceeds 128 directory levels"
+        ));
       }
-      if file_type.is_dir() {
-        collect_unexpected_paths(&path, expected, deleted)?;
-      }
+      directories.push(std::fs::read_dir(path)?);
     }
   }
   Ok(())
@@ -4222,6 +4353,92 @@ mod tests {
   }
 
   #[test]
+  fn recovered_compose_rewrite_rejects_leaf_and_parent_symlinks() {
+    let staging = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let original = outside.path().join("compose.yaml");
+    std::fs::write(&original, b"unrelated host file").unwrap();
+    let leaf = staging.path().join("compose.yaml");
+    std::os::unix::fs::symlink(&original, &leaf).unwrap();
+    assert!(open_staged_compose_file(staging.path(), &leaf).is_err());
+    let parent = staging.path().join("linked-directory");
+    std::os::unix::fs::symlink(outside.path(), &parent).unwrap();
+    assert!(
+      open_staged_compose_file(
+        staging.path(),
+        &parent.join("compose.yaml")
+      )
+      .is_err()
+    );
+    assert_eq!(
+      std::fs::read(&original).unwrap(),
+      b"unrelated host file"
+    );
+    let regular = staging.path().join("regular.yaml");
+    std::fs::write(&regular, b"services: {}").unwrap();
+    assert!(
+      open_staged_compose_file(staging.path(), &regular).is_ok()
+    );
+  }
+
+  #[test]
+  fn preview_rows_and_bytes_are_bounded_across_all_change_lists() {
+    let mut budget = RestorePreviewBudget::new(
+      Instant::now() + RESTORE_PREFLIGHT_TIMEOUT,
+    );
+    budget.rows = MAX_RESTORE_PREVIEW_ROWS - 1;
+    let mut created = Vec::new();
+    let mut deleted = Vec::new();
+    budget.push(&mut created, Path::new("a")).unwrap();
+    assert!(budget.push(&mut deleted, Path::new("b")).is_err());
+    assert!(deleted.is_empty());
+    budget.rows = 0;
+    budget.path_bytes = MAX_RESTORE_PREVIEW_BYTES - 1;
+    budget.push(&mut created, Path::new("c")).unwrap();
+    assert!(budget.push(&mut deleted, Path::new("d")).is_err());
+  }
+
+  #[test]
+  fn expired_preflight_fails_without_returning_a_partial_inventory() {
+    let destination = tempfile::tempdir().unwrap();
+    let publish = [RestorePublishPath {
+      destination_root: None,
+      snapshot_path: "root".into(),
+      destination: destination.path().to_string_lossy().into_owned(),
+    }];
+    assert!(
+      compare_restore_paths(&[], &publish, &[], Instant::now())
+        .is_err()
+    );
+  }
+
+  #[test]
+  fn destination_inventory_stops_when_preview_is_full() {
+    let destination = tempfile::tempdir().unwrap();
+    std::fs::write(destination.path().join("extra"), b"extra")
+      .unwrap();
+    let mut budget = RestorePreviewBudget::new(
+      Instant::now() + RESTORE_PREFLIGHT_TIMEOUT,
+    );
+    budget.rows = MAX_RESTORE_PREVIEW_ROWS;
+    let mut deleted = Vec::new();
+    assert!(
+      collect_unexpected_paths(
+        destination.path(),
+        &HashSet::new(),
+        &mut deleted,
+        &mut budget
+      )
+      .is_err()
+    );
+    assert!(deleted.is_empty());
+    assert_eq!(
+      std::fs::read(destination.path().join("extra")).unwrap(),
+      b"extra"
+    );
+  }
+
+  #[test]
   fn exact_restore_preflight_reports_create_overwrite_and_delete() {
     let destination = tempfile::tempdir().unwrap();
     std::fs::write(destination.path().join("old.txt"), b"old")
@@ -4248,8 +4465,13 @@ mod tests {
       snapshot_path: root.into(),
       destination: destination.path().to_string_lossy().into_owned(),
     }];
-    let (created, overwritten, deleted) =
-      compare_restore_paths(&paths, &publish, &[]).unwrap();
+    let (created, overwritten, deleted) = compare_restore_paths(
+      &paths,
+      &publish,
+      &[],
+      Instant::now() + RESTORE_PREFLIGHT_TIMEOUT,
+    )
+    .unwrap();
     assert!(created.iter().any(|path| path.ends_with("new.txt")));
     assert!(overwritten.iter().any(|path| path.ends_with("old.txt")));
     assert!(deleted.iter().any(|path| path.ends_with("extra.txt")));
@@ -4303,8 +4525,13 @@ mod tests {
         snapshot_path: "source/root".into(),
         destination: publish_root.to_string_lossy().into_owned(),
       }];
-      let (created, overwritten, deleted) =
-        compare_restore_paths(&paths, &publish, &[]).unwrap();
+      let (created, overwritten, deleted) = compare_restore_paths(
+        &paths,
+        &publish,
+        &[],
+        Instant::now() + RESTORE_PREFLIGHT_TIMEOUT,
+      )
+      .unwrap();
       assert_eq!(
         created,
         vec![

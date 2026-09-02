@@ -7,24 +7,19 @@ description: Configure and use the km command-line client.
 The Komodo CLI, `km`, can be used to:
   - Quickly **run executions** and update **resources** and **variables**.
   - **Reset user passwords** and elevate users to **Super Admin**.
-  - Perform legacy Database **backup**, **restore**, and **copy**.
   - **Connect to server / container shell** via Komodo Terminals.
 
 The Komodo Core image comes packaged with the Komodo CLI,
 and is available for usage inside running container with `docker exec -it komodo km ...`.
-This way, it inherits the Core database config in order to easily perform backups with `km db backup -y`.
+This way, it inherits Core's configuration for administrative commands.
 
-<Callout title="Legacy database format" type="info">
-These database commands use the legacy on-disk Core export format. The encrypted, repository-backed Core/Stack/Volume feature is managed from [Backups](/administration/backups); the legacy API remains available for compatibility.
-</Callout>
+Use [Backups](/administration/backups) for supported encrypted Core, Stack, and Volume protection and recovery in 3.0.0.
 
 ### Examples
 
   - `km --help`
   - `km deploy stack my-stack`
   - `km run action my-action -y`
-  - `km database backup`
-  - `km db restore`
   - `km set var MY_VAR my_value -y`
   - `km update build my-build "version=1.19.0&branch=release"`
   - `km x commit my-sync`
@@ -88,11 +83,10 @@ km attach <container> [options]
 
 ### Run the CLI
 
-The Core image includes `km`. Use it for database operations or other commands that should inherit Core's configuration:
+The Core image includes `km`. Use it for administrative commands that should inherit Core's configuration:
 
 ```bash
 docker exec -it komodo km --help
-docker exec -it komodo km db backup -y
 ```
 
 For a standalone CLI, use the official distroless container image. Mount the directory containing your CLI configuration:
@@ -140,7 +134,7 @@ Note that wildcards in these paths are **not supported**.
 
 In the files, you can configure multiple profiles, each with a name / aliases. Then you
 choose which config profile to use with `km -p <profile> ...`. This allows you to easily switch between
-multiple Cores you want to connect to, or different database backup / restore options.
+multiple Cores you want to connect to.
 
 In order to avoid passing `-p <profile>` every time, you can set a
 `default_profile` at the top level of the configuration file. Additionally,

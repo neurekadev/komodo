@@ -32,6 +32,8 @@ Running Komodo from [source](https://github.com/neurekadev/komodo) requires eith
 
 After making changes to the project, run `run dev-compose-build` to rebuild Komodo and then `run dev-compose-exposed` to start a Komodo container with the UI accessible at `localhost:9120`. Any changes made to source files will require re-running the `dev-compose-build` and `dev-compose-exposed` commands.
 
+Development Compose persists Core's `/data` in `core-data`, including the default `/data/backups/vykar` repository, Vykar cache, and operational alerts. The separate `core-secrets` volume holds the repository sealing/authentication key; FerretDB keeps its own `data:/state` volume. Preserve all three across rebuilds and do not use `down -v` when retaining development snapshots. A container layer created before adding `core-data` is not copied into that volume automatically: copy any existing `/data` state out before recreating that container.
+
 ## Devcontainer
 
 Use the included `.devcontainer.json` with VSCode or other compatible IDE to stand-up a full environment, including database, with one click.

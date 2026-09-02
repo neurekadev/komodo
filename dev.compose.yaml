@@ -15,6 +15,7 @@ services:
       KOMODO_LOCAL_AUTH: true
       KOMODO_JWT_SECRET: a_random_secret
     volumes:
+      - core-data:/data
       - repo-cache:/repo-cache
       - core-secrets:/core-secrets
 
@@ -53,6 +54,7 @@ networks:
 
 volumes:
   data:
+  core-data:
   repo-cache:
   core-secrets:
   repos:
