@@ -359,6 +359,9 @@ pub struct BackupSnapshot {
   pub target: BackupTarget,
   /// Absolute source roots recorded by Vykar at backup time.
   pub source_paths: Vec<String>,
+  /// Exact user-restorable roots, excluding Komodo's internal manifest.
+  #[serde(default)]
+  pub restorable_source_paths: Vec<String>,
   pub created_at: I64,
   pub original_size: U64,
   pub stored_size: U64,

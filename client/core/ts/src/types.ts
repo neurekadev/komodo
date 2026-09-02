@@ -6379,6 +6379,8 @@ export interface BackupSnapshot {
 	target: BackupTarget;
 	/** Absolute source roots recorded by Vykar at backup time. */
 	source_paths: string[];
+	/** Exact user-restorable roots, excluding Komodo's internal manifest. */
+	restorable_source_paths: string[];
 	created_at: I64;
 	original_size: U64;
 	stored_size: U64;

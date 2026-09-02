@@ -88,6 +88,9 @@ struct SealedBackupSettings {
   id: String,
   sealed: String,
   updated_at: i64,
+  /// Set only after the primary repository has initialized successfully.
+  #[serde(default)]
+  primary_initialized: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -229,26 +232,33 @@ async fn save_settings_inner(
   allow_primary_location_change: bool,
 ) -> anyhow::Result<BackupSettings> {
   validate_settings(&proposed)?;
-  let existing = match settings_collection()
+  let (existing, primary_initialized) = match settings_collection()
     .find_one(doc! { "_id": SETTINGS_ID })
     .await
     .context("Failed to load existing backup settings")?
   {
     Some(record) => {
+      let primary_initialized = record.primary_initialized;
       let bytes = crypto::open(&record.sealed)?;
-      Some(
-        serde_json::from_slice::<BackupSettings>(&bytes)
-          .context("Failed to decode sealed backup settings")?,
+      (
+        Some(
+          serde_json::from_slice::<BackupSettings>(&bytes)
+            .context("Failed to decode sealed backup settings")?,
+        ),
+        primary_initialized,
       )
     }
-    None => None,
+    None => (None, false),
   };
   if let Some(existing) = &existing {
     let primary_location_unchanged = repositories_share_location(
       &proposed.primary,
       &existing.primary,
     )?;
-    if !allow_primary_location_change && !primary_location_unchanged {
+    if primary_initialized
+      && !allow_primary_location_change
+      && !primary_location_unchanged
+    {
       return Err(anyhow!(
         "Primary repository location cannot be changed after initialization; configure a mirror and use verified promotion"
       ));
@@ -303,6 +313,8 @@ async fn save_settings_inner(
     id: SETTINGS_ID.into(),
     sealed: crypto::seal(&bytes)?,
     updated_at: proposed.updated_at,
+    primary_initialized: primary_initialized
+      || allow_primary_location_change,
   };
   settings_collection()
     .update_one(
@@ -317,6 +329,42 @@ async fn save_settings_inner(
   let mut redacted = proposed;
   redacted.redact();
   Ok(redacted)
+}
+
+async fn mark_primary_initialized(
+  mut settings: BackupSettings,
+) -> anyhow::Result<()> {
+  let updated = settings_collection()
+    .update_one(
+      doc! { "_id": SETTINGS_ID },
+      doc! { "$set": { "primary_initialized": true } },
+    )
+    .await
+    .context("Failed to record primary repository initialization")?;
+  if updated.matched_count > 0 {
+    return Ok(());
+  }
+
+  // Initialization is also available before the first explicit settings save.
+  // Persist the effective defaults so the successful primary cannot later be
+  // silently replaced by editing a newly-created settings record.
+  settings.updated_at = komodo_timestamp();
+  let bytes = serde_json::to_vec(&settings)?;
+  let record = SealedBackupSettings {
+    id: SETTINGS_ID.into(),
+    sealed: crypto::seal(&bytes)?,
+    updated_at: settings.updated_at,
+    primary_initialized: true,
+  };
+  settings_collection()
+    .update_one(
+      doc! { "_id": SETTINGS_ID },
+      doc! { "$set": to_document(&record)? },
+    )
+    .with_options(UpdateOptions::builder().upsert(true).build())
+    .await
+    .context("Failed to persist initialized backup settings")?;
+  Ok(())
 }
 
 fn validate_settings(
@@ -890,16 +938,20 @@ pub async fn initialize_repositories() -> anyhow::Result<BackupRun> {
     new_non_cancellable_run(None, "Initializing repositories")
       .await?;
   let result = async {
-    for repository in
-      std::iter::once(&settings.primary).chain(settings.mirror.iter())
+    for (index, repository) in std::iter::once(&settings.primary)
+      .chain(settings.mirror.iter())
+      .enumerate()
     {
       let repository = repository.clone();
-      let settings = settings.clone();
+      let repository_settings = settings.clone();
       tokio::task::spawn_blocking(move || {
-        core_repository(&repository, &settings)?.init()
+        core_repository(&repository, &repository_settings)?.init()
       })
       .await
       .context("Vykar initialization worker failed")??;
+      if index == 0 {
+        mark_primary_initialized(settings.clone()).await?;
+      }
     }
     anyhow::Ok(())
   }
@@ -1023,15 +1075,25 @@ pub async fn status() -> anyhow::Result<BackupStatus> {
   )
   .await
   .unwrap_or_default();
-  let active_run = recent_runs
-    .iter()
-    .find(|run| {
-      matches!(
-        run.state,
-        BackupRunState::Queued | BackupRunState::Running
-      )
-    })
-    .cloned();
+  let active_run = find_collect(
+    &runs_collection(),
+    doc! {
+      "state": {
+        "$in": [
+          to_bson(&BackupRunState::Queued)?,
+          to_bson(&BackupRunState::Running)?,
+        ]
+      }
+    },
+    FindOptions::builder()
+      .sort(doc! { "started_at": -1 })
+      .limit(1)
+      .build(),
+  )
+  .await
+  .unwrap_or_default()
+  .into_iter()
+  .next();
   let previous_primary = health_collection()
     .find_one(doc! { "_id": "primary" })
     .await
@@ -3071,23 +3133,11 @@ pub async fn plan_restore(
       let current_server_id = current_stack
         .as_ref()
         .map(|stack| stack.config.server_id.as_str());
-      let source_server_changed =
-        current_server_id.is_some_and(|server| {
-          server != snapshot_stack.config.server_id
-        });
       let recovering_stack = stack_restore_requires_recovery(
         &snapshot_stack.config.server_id,
         current_server_id,
         &destination,
       );
-      if (source_server_changed
-        || destination != snapshot_stack.config.server_id)
-        && !user.admin
-      {
-        return Err(anyhow!(
-          "Cross-node Stack restore with host path mappings is administrator only"
-        ));
-      }
       let stack = if recovering_stack {
         snapshot_stack
       } else {
@@ -3581,7 +3631,6 @@ pub async fn execute_restore(
         create_volume_if_missing: stored.create_volume_if_missing,
       })
       .await?;
-    drop(mutation_guard);
     if let Some(error) = response.critical_error {
       *critical_alert().write().unwrap() = Some(error.clone());
       return finish_run(
@@ -3617,7 +3666,6 @@ pub async fn execute_restore(
       config.run_directory = recovered_run_directory;
       config.repo = Some(String::new());
       config.linked_repo = Some(String::new());
-      let _mutation = mutation_barrier().read().await;
       if let Err(error) =
         resource::create::<Stack>(&name, config, None, user).await
       {
@@ -3634,6 +3682,10 @@ pub async fn execute_restore(
         );
       }
     }
+    // Keep the exclusive mutation barrier through recovered Stack creation so
+    // a competing create cannot be mistaken for our insert after a
+    // post-insert bookkeeping failure.
+    drop(mutation_guard);
     if let Err(error) = plans_collection()
       .delete_one(doc! { "_id": &stored.id })
       .await

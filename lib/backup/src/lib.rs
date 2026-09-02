@@ -237,12 +237,15 @@ impl VykarRepository {
       .map(|(entry, stats)| {
         let target = parse_source_label(&entry.source_label);
         let stats = stats.unwrap_or_default();
+        let restorable_source_paths =
+          restorable_source_paths(&entry.name, &entry.source_paths);
         BackupSnapshot {
           name: entry.name.clone(),
           source_label: entry.source_label,
           hostname: entry.hostname,
           target,
           source_paths: entry.source_paths,
+          restorable_source_paths,
           created_at: entry.time.timestamp_millis(),
           original_size: stats.original_size,
           stored_size: stats.deduplicated_size,
@@ -464,6 +467,22 @@ impl VykarRepository {
         .collect(),
     })
   }
+}
+
+fn restorable_source_paths(
+  snapshot_name: &str,
+  source_paths: &[String],
+) -> Vec<String> {
+  let manifest_source_name =
+    backup_manifest_source_name(snapshot_name);
+  source_paths
+    .iter()
+    .filter(|path| {
+      Path::new(path).file_name().and_then(|name| name.to_str())
+        != Some(manifest_source_name.as_str())
+    })
+    .cloned()
+    .collect()
 }
 
 fn required_secret(
@@ -756,6 +775,27 @@ mod tests {
     assert_eq!(first, backup_manifest_source_name("snapshot-one"));
     assert_ne!(first, backup_manifest_source_name("snapshot-two"));
     assert_eq!(first.len(), "komodo-backup-manifest-".len() + 64);
+  }
+
+  #[test]
+  fn restorable_roots_exclude_only_the_exact_manifest_source() {
+    let snapshot = "snapshot-one";
+    let marker = backup_manifest_source_name(snapshot);
+    let legitimate = format!("/srv/{marker}/data");
+    let paths = vec![
+      "/srv/stack".into(),
+      format!("/tmp/{marker}"),
+      legitimate.clone(),
+      format!("/srv/{marker}-user"),
+    ];
+    assert_eq!(
+      restorable_source_paths(snapshot, &paths),
+      vec![
+        "/srv/stack".to_string(),
+        legitimate,
+        format!("/srv/{marker}-user"),
+      ]
+    );
   }
 
   #[test]

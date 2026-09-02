@@ -40,6 +40,23 @@ pub async fn backup_excluding(
     .filter(|name| !excluded_collections.contains(&name.as_str()))
     .collect::<Vec<_>>();
 
+  // Stats lives at the backup root so it is shared across dated exports.
+  // Remove a prior export when the source has no Stats collection (or the
+  // caller explicitly excludes it), otherwise a later restore could ingest
+  // stale statistics that were not part of this backup.
+  if !collections.iter().any(|name| name == "Stats") {
+    match tokio::fs::remove_file(backups_folder.join("Stats.gz"))
+      .await
+    {
+      Ok(()) => {}
+      Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+      Err(error) => {
+        return Err(error)
+          .context("Failed to remove stale Stats backup");
+      }
+    }
+  }
+
   let now_backups_folder = backups_folder
     .join(Local::now().format("%Y-%m-%d_%H-%M-%S").to_string());
 

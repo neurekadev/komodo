@@ -114,9 +114,7 @@ export default function ResourceBackups({
     (item) => item.name === snapshot,
   );
   const requiredStackMappings =
-    selectedSnapshot?.source_paths.filter(
-      (path) => !path.includes("komodo-backup-manifest-"),
-    ) ?? [];
+    selectedSnapshot?.restorable_source_paths ?? [];
 
   const crossNode = destinationServerId !== sourceServerId;
   const snapshotSourceServerId = selectedSnapshot?.hostname.startsWith(

@@ -96,6 +96,15 @@ fn operation_cancelled(operation_id: &str) -> bool {
     .is_some_and(|token| token.load(Ordering::SeqCst))
 }
 
+fn request_operation_cancellation(operation_id: &str) -> bool {
+  let tokens = cancellation_tokens().lock().unwrap();
+  let Some(token) = tokens.get(operation_id) else {
+    return false;
+  };
+  token.store(true, Ordering::SeqCst);
+  true
+}
+
 fn backup_operation_lock() -> &'static tokio::sync::Mutex<()> {
   static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
   LOCK.get_or_init(Default::default)
@@ -522,6 +531,25 @@ fn resolve_existing_ancestor(path: &Path) -> anyhow::Result<PathBuf> {
   }
 }
 
+fn validate_backup_source_outside_internal_storage(
+  source: &Path,
+  internal_storage: &Path,
+) -> anyhow::Result<()> {
+  let resolved_source = resolve_existing_ancestor(source)?;
+  let resolved_internal =
+    resolve_existing_ancestor(internal_storage)?;
+  if paths_overlap(source, internal_storage)
+    || paths_overlap(&resolved_source, &resolved_internal)
+  {
+    return Err(anyhow!(
+      "Backup source '{}' overlaps Periphery's internal backup storage '{}'",
+      source.display(),
+      internal_storage.display()
+    ));
+  }
+  Ok(())
+}
+
 fn validate_resolved_restore_destinations(
   publish: &[RestorePublishPath],
 ) -> anyhow::Result<()> {
@@ -700,6 +728,18 @@ async fn discover_source(
             Path::new(&source),
           )?;
         }
+      }
+      let internal_storage =
+        periphery_config().stack_dir().join(".komodo-vykar");
+      validate_backup_source_outside_internal_storage(
+        &run_directory,
+        &internal_storage,
+      )?;
+      for bind_path in &bind_paths {
+        validate_backup_source_outside_internal_storage(
+          bind_path,
+          &internal_storage,
+        )?;
       }
       let mut affected_paths = bind_paths.clone();
       affected_paths.insert(run_directory.clone());
@@ -2046,9 +2086,9 @@ impl Resolve<Args> for CancelVykarOperation {
     self,
     _: &Args,
   ) -> anyhow::Result<CancelVykarOperationResponse> {
-    operation_cancellation_token(&self.operation_id)
-      .store(true, Ordering::SeqCst);
-    Ok(CancelVykarOperationResponse { cancelled: true })
+    Ok(CancelVykarOperationResponse {
+      cancelled: request_operation_cancellation(&self.operation_id),
+    })
   }
 }
 
@@ -2060,10 +2100,37 @@ mod tests {
   fn cancellation_registration_shares_and_cleans_up_token() {
     let id = "cancellable-backup-test";
     let (worker, registration) = register_operation_cancellation(id);
-    operation_cancellation_token(id).store(true, Ordering::SeqCst);
+    assert!(request_operation_cancellation(id));
     assert!(worker.load(Ordering::SeqCst));
     drop(registration);
     assert!(!operation_cancelled(id));
+  }
+
+  #[test]
+  fn cancelling_an_unknown_operation_does_not_register_a_token() {
+    let id = "unknown-cancellable-backup-test";
+    assert!(!request_operation_cancellation(id));
+    assert!(!cancellation_tokens().lock().unwrap().contains_key(id));
+  }
+
+  #[test]
+  fn backup_sources_cannot_capture_internal_backup_storage() {
+    let root = tempfile::tempdir().unwrap();
+    let internal = root.path().join(".komodo-vykar");
+    let stack = root.path().join("stack");
+    std::fs::create_dir_all(&stack).unwrap();
+
+    assert!(
+      validate_backup_source_outside_internal_storage(
+        root.path(),
+        &internal,
+      )
+      .is_err()
+    );
+    validate_backup_source_outside_internal_storage(
+      &stack, &internal,
+    )
+    .unwrap();
   }
 
   fn container(

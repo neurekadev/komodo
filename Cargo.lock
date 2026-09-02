@@ -2020,6 +2020,7 @@ dependencies = [
  "mongo_indexed",
  "mungos",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-util",
  "tracing",

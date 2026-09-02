@@ -13,6 +13,7 @@ import {
   Modal,
   MultiSelect,
   NumberInput,
+  Pagination,
   PasswordInput,
   Select,
   SimpleGrid,
@@ -509,12 +510,18 @@ function BackupSettingsForm({
 
 function CoreRecoverySection() {
   const [snapshot, setSnapshot] = useState<string>();
+  const [snapshotPage, setSnapshotPage] = useState(1);
   const [plan, setPlan] = useState<Types.CoreRecoveryPlan>();
-  const snapshots = useRead("ListBackupSnapshots", {
+  const snapshotResponse = useRead("ListBackupSnapshots", {
     target: { type: "Core" },
-    page: 0,
+    page: snapshotPage - 1,
     limit: 100,
-  }).data?.snapshots ?? [];
+  }).data;
+  const snapshots = snapshotResponse?.snapshots ?? [];
+  const snapshotPages = Math.max(
+    1,
+    Math.ceil((snapshotResponse?.total ?? 0) / 100),
+  );
   const { mutate: planRecovery, isPending: planning } = useWrite(
     "PlanCoreRecovery",
     { onSuccess: setPlan },
@@ -556,6 +563,16 @@ function CoreRecoverySection() {
             Restore and validate
           </Button>
         </Group>
+        {snapshotPages > 1 && (
+          <Pagination
+            total={snapshotPages}
+            value={snapshotPage}
+            onChange={(page) => {
+              setSnapshot(undefined);
+              setSnapshotPage(page);
+            }}
+          />
+        )}
       </Stack>
       <Modal
         opened={!!plan}

@@ -201,10 +201,17 @@ async fn get_restore_files(
       format!("Failed to read restore directory {restore_folder:?}")
     })?;
 
-  let mut restore_files: Vec<(String, PathBuf)> = vec![(
-    String::from("Stats"),
-    backups_folder.join("Stats.gz").components().collect(),
-  )];
+  let stats_file = backups_folder.join("Stats.gz");
+  let mut restore_files: Vec<(String, PathBuf)> = Vec::new();
+  if tokio::fs::try_exists(&stats_file)
+    .await
+    .context("Failed to inspect optional Stats backup")?
+  {
+    restore_files.push((
+      String::from("Stats"),
+      stats_file.components().collect(),
+    ));
+  }
 
   loop {
     match restore_dir
@@ -237,4 +244,38 @@ async fn get_restore_files(
   }
 
   Ok(restore_files)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[tokio::test]
+  async fn stats_backup_is_optional() {
+    let root = tempfile::tempdir().unwrap();
+    let restore_folder = root.path().join("snapshot");
+    tokio::fs::create_dir(&restore_folder).await.unwrap();
+    tokio::fs::write(restore_folder.join("Stack.gz"), b"")
+      .await
+      .unwrap();
+
+    let without_stats =
+      get_restore_files(root.path(), &restore_folder)
+        .await
+        .unwrap();
+    assert_eq!(without_stats.len(), 1);
+    assert_eq!(without_stats[0].0, "Stack");
+
+    tokio::fs::write(root.path().join("Stats.gz"), b"")
+      .await
+      .unwrap();
+    let with_stats = get_restore_files(root.path(), &restore_folder)
+      .await
+      .unwrap();
+    assert!(
+      with_stats
+        .iter()
+        .any(|(collection, _)| collection == "Stats")
+    );
+  }
 }
