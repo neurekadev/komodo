@@ -7,7 +7,7 @@ The `km` CLI executes actions, manages resources, opens terminal sessions, and p
 Run the CLI included in the Core container:
 
 ```sh
-docker exec -it komodo-core km --help
+docker exec -it komodo km --help
 ```
 
 Or run the standalone container image with your configuration directory mounted:

@@ -11,7 +11,7 @@ The Komodo CLI, `km`, can be used to:
   - **Connect to server / container shell** via Komodo Terminals.
 
 The Komodo Core image comes packaged with the Komodo CLI,
-and is available for usage inside running container with `docker exec -it komodo-core km ...`.
+and is available for usage inside running container with `docker exec -it komodo km ...`.
 This way, it inherits the Core database config in order to easily perform backups with `km db backup -y`.
 
 ### Examples
@@ -87,8 +87,8 @@ km attach <container> [options]
 The Core image includes `km`. Use it for database operations or other commands that should inherit Core's configuration:
 
 ```bash
-docker exec -it komodo-core km --help
-docker exec -it komodo-core km db backup -y
+docker exec -it komodo km --help
+docker exec -it komodo km db backup -y
 ```
 
 For a standalone CLI, use the official distroless container image. Mount the directory containing your CLI configuration:

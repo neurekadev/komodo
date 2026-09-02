@@ -7,6 +7,10 @@ Komodo is a self-hosted web application for deploying and monitoring containers,
 
 The recommended installation starts MongoDB, Core, and a local Periphery agent together. The local agent lets Komodo manage the same Docker server immediately, so you do not need to install a second agent before deploying your first Stack.
 
+<Callout title="Independent hard fork" type="warn">
+  Komodo 3.0.0 and later has diverged from upstream Komodo. Start a fresh installation: migrations from upstream are not supported, and its data, configuration, agents, and clients must not be assumed compatible. Cherry-picked upstream fixes do not imply backward compatibility.
+</Callout>
+
 ## What you need
 
 - A Linux server with Docker Engine and the Docker Compose plugin.

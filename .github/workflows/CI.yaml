@@ -58,6 +58,9 @@ jobs:
       - name: Run Unit Tests
         run: cargo test --lib --bins
 
+      - name: Run Compose Defaults Unit Tests
+        run: bash bin/tests/compose-defaults.test.sh
+
   build:
     name: Build
     runs-on: ubuntu-24.04
@@ -89,10 +92,12 @@ jobs:
             cp "compose/$variant.compose.yaml" "$directory/compose.yaml"
             if [[ "$variant" == "periphery" ]]; then
               cp compose/periphery.env "$directory/.env"
+            elif [[ "$variant" == "ferretdb" ]]; then
+              cp compose/ferretdb.env "$directory/.env"
             else
               cp compose/compose.env "$directory/.env"
             fi
-            docker compose --project-directory "$directory" config --quiet
+            docker compose -p komodo --project-directory "$directory" config --quiet
           done
 
   publish-platforms:

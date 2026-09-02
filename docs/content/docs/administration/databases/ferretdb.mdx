@@ -4,38 +4,33 @@ description: Install Komodo with the PostgreSQL-backed FerretDB database option.
 ---
 
 
-<Callout title="Information" type="info">
-
-- If you setup Komodo using **Postgres** or **Sqlite** options prior to [**Komodo v1.18.0**](https://github.com/moghtech/komodo/releases/tag/v1.18.0), you are using **FerretDB v1**.
-- Komodo now uses **FerretDB v2**. For existing users, [**upgrading requires a migration**](https://github.com/moghtech/komodo/blob/main/bin/cli/docs/copy-database.md#ferretdb-v2-update-guide).
-
-</Callout>
-
 [**FerretDB**](https://www.ferretdb.com) is a MongoDB-compatible database backed by [Postgres + DocumentDB extension](https://github.com/microsoft/documentdb).
 Use it when MongoDB cannot run on the host or PostgreSQL is an operational requirement.
 
-1. Create the installation directory and download the FerretDB template as `compose.yaml` and the main environment file as `.env`:
+The template pins FerretDB to major `2` and PostgreSQL/DocumentDB to major `17`. Use fresh volumes for a new fork installation; upstream Komodo migrations are not supported. Do not attach data from a different PostgreSQL major or FerretDB v1.
+
+1. Create the installation directory and download the FerretDB template as `compose.yaml` and its matching environment file as `.env`:
 
 ```bash
 mkdir -p komodo
 cd komodo
 curl -fsSL -o compose.yaml https://raw.githubusercontent.com/neurekadev/komodo/main/compose/ferretdb.compose.yaml
-curl -fsSL -o .env https://raw.githubusercontent.com/neurekadev/komodo/main/compose/compose.env
+curl -fsSL -o .env https://raw.githubusercontent.com/neurekadev/komodo/main/compose/ferretdb.env
 ```
 
-2. Edit `.env`, replacing the example host, credentials, and secrets.
+2. Edit `.env`, replacing every `REPLACE_WITH_*` value. Keep the `${...}` credential references unchanged. Use a URL-safe database password such as `openssl rand -hex 32`, because it is included in a connection URL. Protect `.env` with `chmod 600 .env`.
 3. Review the resolved configuration and deploy:
 
 ```bash
-docker compose config
-docker compose up -d
+docker compose -p komodo config
+docker compose -p komodo up -d
 ```
 
-Docker Compose discovers `compose.yaml` and `.env` automatically. The `.env` file sets `COMPOSE_PROJECT_NAME=komodo`, preserving the established `komodo_*` volume names.
+Docker Compose discovers `compose.yaml` and `.env` automatically. Keep `-p komodo` in subsequent commands to preserve the `komodo_*` volume names. Configuration output includes secrets; do not share it publicly.
 
-The expected result is healthy `komodo-postgres`, `komodo-ferretdb`, `komodo-core`, and `komodo-periphery` containers and a working sign-in page. If startup fails, inspect PostgreSQL and FerretDB logs first, verify their credentials match, and preserve both database volumes while troubleshooting.
+The expected result is running `komodo-postgres`, `komodo-ferretdb`, `komodo`, and `komodo-periphery` containers and a working sign-in page. Open **Servers**, select **Local**, and confirm **OK**. If startup fails, inspect PostgreSQL and FerretDB logs first, verify their credentials match, and preserve both database volumes while troubleshooting.
 
-[View the current FerretDB Compose template](https://github.com/neurekadev/komodo/blob/main/compose/ferretdb.compose.yaml) and [environment example](https://github.com/neurekadev/komodo/blob/main/compose/compose.env).
+[View the current FerretDB Compose template](https://github.com/neurekadev/komodo/blob/main/compose/ferretdb.compose.yaml) and [environment example](https://github.com/neurekadev/komodo/blob/main/compose/ferretdb.env).
 
 <Callout title="Periphery host access" type="warn">
 

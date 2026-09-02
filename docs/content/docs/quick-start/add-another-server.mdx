@@ -28,14 +28,14 @@ The main Komodo installation already includes Periphery for its local Docker hos
    curl -fsSL -o .env https://raw.githubusercontent.com/neurekadev/komodo/main/compose/periphery.env
    ```
 
-2. Edit `.env`. Set `PERIPHERY_CORE_ADDRESS`, `PERIPHERY_CONNECT_AS`, and `PERIPHERY_ONBOARDING_KEY`.
+2. Edit `.env`. Set `PERIPHERY_CORE_ADDRESS`, `PERIPHERY_CONNECT_AS`, and `PERIPHERY_ONBOARDING_KEY`. Protect it with `chmod 600 .env`.
 
 3. Review and start Periphery:
 
    ```bash
-   docker compose config
-   docker compose up -d
-   docker compose logs --tail=100 periphery
+   docker compose -p komodo config
+   docker compose -p komodo up -d
+   docker compose -p komodo logs --tail=100 komodo-periphery
    ```
 
 ## Option 2: Docker run
@@ -66,25 +66,25 @@ The main Komodo installation already includes Periphery for its local Docker hos
      -v /var/run/docker.sock:/var/run/docker.sock \
      -v /var/lib/docker/volumes:/var/lib/docker/volumes \
      -v /proc:/proc \
-     ghcr.io/neurekadev/komodo-periphery:3
+     ghcr.io/neurekadev/komodo-periphery:3 periphery-compose
    ```
 
 3. Inspect startup with `docker logs --tail=100 komodo-periphery`.
 
-The `docker run` command selects its image tag directly; `COMPOSE_KOMODO_IMAGE_TAG` in `.env` applies only to Compose.
+The `docker run` command selects its image tag directly. The `periphery-compose` startup command applies the same persistent identity defaults as the Compose template. Both examples require images built with this startup profile; keep Core and Periphery on the same fork release.
 
 ## Finish onboarding
 
 1. Return to **Servers**, select the name from `PERIPHERY_CONNECT_AS`, and confirm its status is **OK**.
 2. Remove `PERIPHERY_ONBOARDING_KEY` from `.env` after the first successful connection.
 3. Recreate the container so the one-time key is no longer present:
-   - Compose: `docker compose up -d --force-recreate`
+   - Compose: `docker compose -p komodo up -d --force-recreate`
    - Docker run: remove the container and repeat the same `docker run` command. The data volume preserves Periphery's identity.
 4. Disable or delete the onboarding key in Komodo if no other server needs it.
 
 ## Updates and custom Docker roots
 
-For Compose, run `docker compose pull && docker compose up -d`. For `docker run`, pull the selected image, remove the old container, and repeat the command with the same data volume.
+For Compose, run `docker compose -p komodo pull && docker compose -p komodo up -d`. For `docker run`, pull the selected image, remove the old container, and repeat the command with the same data volume.
 
 The examples use `/var/lib/docker/volumes`. Rootless Docker and customized Docker installations use a different directory. Find it with:
 
@@ -92,7 +92,7 @@ The examples use `/var/lib/docker/volumes`. Rootless Docker and customized Docke
 docker info --format '{{.DockerRootDir}}/volumes'
 ```
 
-Set `PERIPHERY_DOCKER_VOLUME_ROOT` for Compose. For `docker run`, replace every `/var/lib/docker/volumes` path in the command with the reported absolute path.
+Add `PERIPHERY_DOCKER_VOLUME_ROOT` to `.env` for Compose. For `docker run`, replace every `/var/lib/docker/volumes` path in the command with the reported absolute path. See [Container Deployment](/administration/container-deployment) for other optional overrides.
 
 Rootless Docker also uses a different socket. Run `docker context inspect --format '{{.Endpoints.docker.Host}}'` to find it. If the result is a `unix://` path, replace the source `/var/run/docker.sock` in the template or command with that host socket path; keep the container target as `/var/run/docker.sock`.
 

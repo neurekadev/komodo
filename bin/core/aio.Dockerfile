@@ -70,7 +70,8 @@ WORKDIR /app
 COPY ./config/core.config.toml /config/.default.config.toml
 COPY --from=ui-builder /builder/ui/dist /app/ui
 COPY --from=core-builder /out/core /usr/local/bin/core
-COPY --from=core-builder /out/km /usr/local/bin/km
+COPY --from=core-builder /out/km /app/bin/km
+COPY --chmod=755 ./bin/core/km.sh /usr/local/bin/km
 COPY --from=denoland/deno:bin /deno /usr/local/bin/deno
 
 # Set $DENO_DIR and preload external Deno deps
@@ -80,6 +81,7 @@ RUN mkdir /action-cache && \
   deno install jsr:@std/yaml jsr:@std/toml
 
 COPY ./bin/entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY ./bin/compose-defaults.sh /app/bin/compose-defaults.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
 ARG GIT_TAG=dev

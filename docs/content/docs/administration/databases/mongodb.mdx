@@ -11,16 +11,18 @@ The official template uses the `mongo:8` major-version tag. This keeps installat
 
 Follow [Install Komodo](/quick-start/install-komodo) for the complete MongoDB, Core, and local Periphery installation.
 
-The expected result is running `komodo-mongo`, `komodo-core`, and `komodo-periphery` containers. Database files persist in `komodo_mongo-data`; MongoDB configuration state persists in `komodo_mongo-config`.
+The expected result is running `komodo-mongo`, `komodo`, and `komodo-periphery` containers. Database files persist in `komodo_mongo-data`; MongoDB configuration state persists in `komodo_mongo-config`.
+
+This template is for a fresh fork installation on MongoDB 8. Do not attach an upstream Komodo database or a volume created by an older MongoDB major. Upstream migrations are not supported.
 
 ## Update MongoDB 8
 
 Back up Komodo before updating the database image, then run:
 
 ```bash
-docker compose pull mongo
-docker compose up -d
-docker compose logs --tail=100 mongo
+docker compose -p komodo pull komodo-mongo
+docker compose -p komodo up -d
+docker compose -p komodo logs --tail=100 komodo-mongo
 ```
 
 Confirm Core can reconnect and existing users and resources remain available. Do not delete the MongoDB volumes during an update.
@@ -30,8 +32,8 @@ Confirm Core can reconnect and existing users and resources remain available. Do
 Start with:
 
 ```bash
-docker compose ps
-docker compose logs --tail=200 mongo
+docker compose -p komodo ps
+docker compose -p komodo logs --tail=200 komodo-mongo
 ```
 
 Verify the database credentials have not changed since the volume was initialized and that `komodo_mongo-data` is writable.
@@ -50,11 +52,11 @@ docker inspect komodo-mongo --format 'status={{.State.Status}} exit={{.State.Exi
 docker logs --tail=200 komodo-mongo
 ```
 
-If the kernel is affected, add this temporary override beneath the MongoDB service's existing `environment` block:
+If the kernel is affected, add this temporary `environment` block to the `komodo-mongo` service in your Compose file. Keep its existing `env_file` entry:
 
 ```yaml
 services:
-  mongo:
+  komodo-mongo:
     environment:
       # Temporary SERVER-121912 workaround: override the image's rseq=0.
       # Remove after upgrading to a fixed kernel and compatible MongoDB release.
@@ -64,8 +66,8 @@ services:
 Recreate only MongoDB and verify that it stays running:
 
 ```bash
-docker compose up -d --force-recreate mongo
-docker compose ps mongo
+docker compose -p komodo up -d --force-recreate komodo-mongo
+docker compose -p komodo ps komodo-mongo
 ```
 
 Check again after at least a minute and confirm Core can reconnect. This override is intentionally absent from the official template. It changes MongoDB's allocator behavior and can reduce performance; use it only for the matching crash signature, then remove it after installing a fixed kernel and compatible MongoDB release.

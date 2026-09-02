@@ -1,36 +1,28 @@
-# Standalone Periphery for an additional Docker server.
-# Use this with periphery.env, not the all-in-one compose.env file.
-
+# Additional server: save periphery.env as .env.
+# Run with -p komodo to retain the established komodo_data volume.
 services:
-  periphery:
+  komodo-periphery:
     image: ghcr.io/neurekadev/komodo-periphery:${COMPOSE_KOMODO_IMAGE_TAG:-3}
     container_name: komodo-periphery
-    init: true
-    restart: unless-stopped
-    env_file: ./.env
-    environment:
-      PERIPHERY_CORE_ADDRESS: ${PERIPHERY_CORE_ADDRESS:?Set PERIPHERY_CORE_ADDRESS in .env}
-      PERIPHERY_CONNECT_AS: ${PERIPHERY_CONNECT_AS:?Set PERIPHERY_CONNECT_AS in .env}
-      PERIPHERY_ONBOARDING_KEY: ${PERIPHERY_ONBOARDING_KEY:-}
-      PERIPHERY_PRIVATE_KEY: ${PERIPHERY_PRIVATE_KEY:-file:/data/keys/periphery.key}
-      PERIPHERY_CORE_PUBLIC_KEYS: ${PERIPHERY_CORE_PUBLIC_KEYS:-file:/data/keys/core.pub}
-      PERIPHERY_ROOT_DIRECTORY: ${PERIPHERY_ROOT_DIRECTORY:-/data}
-      # Docker resolves Stack paths on the host, so use host-visible aliases.
-      PERIPHERY_REPO_DIR: ${PERIPHERY_REPO_DIR:-${PERIPHERY_DOCKER_VOLUME_ROOT:-/var/lib/docker/volumes}/${COMPOSE_PROJECT_NAME:-komodo}_data/_data/repos}
-      PERIPHERY_STACK_DIR: ${PERIPHERY_STACK_DIR:-${PERIPHERY_DOCKER_VOLUME_ROOT:-/var/lib/docker/volumes}/${COMPOSE_PROJECT_NAME:-komodo}_data/_data/stacks}
-      PERIPHERY_BUILD_DIR: ${PERIPHERY_BUILD_DIR:-${PERIPHERY_DOCKER_VOLUME_ROOT:-/var/lib/docker/volumes}/${COMPOSE_PROJECT_NAME:-komodo}_data/_data/builds}
+    env_file: [.env]
+    networks: [komodo-periphery]
     volumes:
+      # Keep the established shared data volume and host-visible Docker paths.
       - data:/data
-      # Periphery controls the host through Docker. Treat it as host trusted.
+      # Docker socket and volume access give Periphery control of this host.
       - /var/run/docker.sock:/var/run/docker.sock
-      # Read/write access to all local named volumes for File Manager.
-      # Restrict Server FileManager permissions to trusted users.
       - ${PERIPHERY_DOCKER_VOLUME_ROOT:-/var/lib/docker/volumes}:${PERIPHERY_DOCKER_VOLUME_ROOT:-/var/lib/docker/volumes}
-      # Required for host process and disk statistics.
       - /proc:/proc
-      # Optional: mount a custom configuration file or trusted root CA.
-      # - /path/to/periphery.config.toml:/config/config.toml
-      # - /path/to/root_ca.crt:/usr/local/share/ca-certificates/root_ca.crt
+      # Optional: mount custom configuration or a trusted root CA.
+      # - /path/to/periphery.config.toml:/config/config.toml:ro
+      # - /path/to/root_ca.crt:/usr/local/share/ca-certificates/root_ca.crt:ro
+    restart: unless-stopped
+    init: true
+    command: [periphery-compose]
+
+networks:
+  komodo-periphery:
+    name: komodo-periphery
 
 volumes:
   data:
