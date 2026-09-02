@@ -174,6 +174,10 @@ pub struct RunVykarBackupBatchResponse {
 pub struct TransactionalVykarRestore {
   pub target: PeripheryBackupTarget,
   pub repository: BackupRepository,
+  /// Core-local repository paths as mounted inside Core. Periphery resolves
+  /// their Docker mount sources and refuses to publish into those sources.
+  #[serde(default)]
+  pub protected_repository_paths: Vec<String>,
   pub advanced: BackupAdvancedSettings,
   pub hostname: String,
   pub snapshot_name: String,
@@ -211,6 +215,10 @@ pub struct RestorePublishPath {
 pub struct PreflightVykarRestore {
   pub target: PeripheryBackupTarget,
   pub repository: BackupRepository,
+  /// Core-local repository paths as mounted inside Core. Periphery resolves
+  /// their Docker mount sources and refuses to publish into those sources.
+  #[serde(default)]
+  pub protected_repository_paths: Vec<String>,
   pub advanced: BackupAdvancedSettings,
   pub hostname: String,
   pub snapshot_name: String,

@@ -679,6 +679,37 @@ fn validate_resolved_restore_destinations_against(
   Ok(())
 }
 
+async fn validate_restore_destinations(
+  publish: &[RestorePublishPath],
+  protected_repository_paths: &[String],
+) -> anyhow::Result<()> {
+  validate_resolved_restore_destinations(publish)?;
+  if protected_repository_paths.is_empty() {
+    return Ok(());
+  }
+  let docker_guard = docker_client().load();
+  let docker = docker_guard
+    .as_ref()
+    .as_ref()
+    .context("Docker is unavailable")?;
+  let containers = docker.list_containers().await?;
+  let protected_repository_sources =
+    resolve_protected_repository_sources(
+      docker,
+      &containers,
+      protected_repository_paths,
+    )
+    .await?;
+  for item in publish {
+    validate_path_outside_protected_repositories(
+      Path::new(&item.destination),
+      &protected_repository_sources,
+      "Restore destination",
+    )?;
+  }
+  Ok(())
+}
+
 fn insert_bind_backup_root(
   bind_paths: &mut BTreeSet<PathBuf>,
   run_directory: &Path,
@@ -1010,6 +1041,7 @@ async fn discover_source(
       validate_path_outside_protected_repositories(
         &run_directory,
         &protected_repository_sources,
+        "Backup source",
       )?;
       for bind_path in &bind_paths {
         validate_path_outside_internal_storage(
@@ -1020,6 +1052,7 @@ async fn discover_source(
         validate_path_outside_protected_repositories(
           bind_path,
           &protected_repository_sources,
+          "Backup source",
         )?;
       }
       let mut affected_paths = bind_paths.clone();
@@ -1084,6 +1117,7 @@ async fn discover_source(
       validate_path_outside_protected_repositories(
         &mountpoint,
         &protected_repository_sources,
+        "Backup source",
       )?;
       Ok(DiscoverBackupSourceResponse {
         paths: vec![mountpoint.to_string_lossy().into_owned()],
@@ -1188,6 +1222,7 @@ async fn resolve_protected_repository_sources(
 fn validate_path_outside_protected_repositories(
   path: &Path,
   protected_repository_sources: &[PathBuf],
+  label: &str,
 ) -> anyhow::Result<()> {
   for repository in protected_repository_sources {
     let resolved_path = resolve_existing_ancestor(path)?;
@@ -1196,7 +1231,7 @@ fn validate_path_outside_protected_repositories(
       || paths_overlap(&resolved_path, &resolved_repository)
     {
       return Err(anyhow!(
-        "Backup source '{}' overlaps a Core-local repository mount '{}'",
+        "{label} '{}' overlaps a Core-local repository mount '{}'",
         path.display(),
         repository.display()
       ));
@@ -1511,7 +1546,11 @@ impl Resolve<Args> for TransactionalVykarRestore {
           self.selected_paths.is_empty(),
         )?;
       }
-      validate_resolved_restore_destinations(&self.publish)?;
+      validate_restore_destinations(
+        &self.publish,
+        &self.protected_repository_paths,
+      )
+      .await?;
       let running_containers =
         discover_running_containers(&self.target, &self.publish)
           .await?;
@@ -1791,7 +1830,11 @@ impl Resolve<Args> for PreflightVykarRestore {
         self.selected_paths.is_empty(),
       )?;
     }
-    validate_resolved_restore_destinations(&self.publish)?;
+    validate_restore_destinations(
+      &self.publish,
+      &self.protected_repository_paths,
+    )
+    .await?;
     let running_containers =
       discover_running_containers(&self.target, &self.publish)
         .await?;
@@ -1958,8 +2001,11 @@ async fn transactional_restore(
       finalization_pending: false,
     };
   }
-  if let Err(error) =
-    validate_resolved_restore_destinations(&request.publish)
+  if let Err(error) = validate_restore_destinations(
+    &request.publish,
+    &request.protected_repository_paths,
+  )
+  .await
   {
     return RestoreTransactionResult::FailedBeforePublication(error);
   }
@@ -3162,6 +3208,7 @@ mod tests {
       validate_path_outside_protected_repositories(
         root.path(),
         std::slice::from_ref(&repository),
+        "Backup source",
       )
       .is_err()
     );
@@ -3169,14 +3216,34 @@ mod tests {
       validate_path_outside_protected_repositories(
         &repository.join("packs"),
         std::slice::from_ref(&repository),
+        "Backup source",
       )
       .is_err()
     );
     validate_path_outside_protected_repositories(
       &application,
       &[repository],
+      "Backup source",
     )
     .unwrap();
+  }
+
+  #[test]
+  fn restore_destinations_cannot_replace_core_repository_mounts() {
+    let root = tempfile::tempdir().unwrap();
+    let repository = root.path().join("core-repository");
+    let alias = root.path().join("repository-alias");
+    std::fs::create_dir_all(&repository).unwrap();
+    std::os::unix::fs::symlink(&repository, &alias).unwrap();
+
+    assert!(
+      validate_path_outside_protected_repositories(
+        &alias.join("packs"),
+        std::slice::from_ref(&repository),
+        "Restore destination",
+      )
+      .is_err()
+    );
   }
 
   #[test]

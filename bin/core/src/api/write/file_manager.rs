@@ -701,6 +701,12 @@ pub fn spawn_managed_transaction_reconciliation_loop() {
         {
           continue;
         }
+        // API-triggered mutations hold the same read side in the write
+        // router. Background reconciliation must do so explicitly, keeping
+        // the resource update and durable intent finalization indivisible
+        // from Core's database export.
+        let _mutation_guard =
+          crate::backup::mutation_barrier().read().await;
         match claim_managed_transaction(&transaction).await {
           Ok(true) => {}
           Ok(false) => continue,
@@ -746,6 +752,8 @@ pub fn spawn_managed_transaction_reconciliation_loop() {
         {
           continue;
         }
+        let _mutation_guard =
+          crate::backup::mutation_barrier().read().await;
         if let Err(error) =
           reconcile_managed_environment_migration(&migration).await
         {

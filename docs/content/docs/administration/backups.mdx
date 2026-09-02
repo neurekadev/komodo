@@ -80,6 +80,8 @@ Open the resource's **Backups** tab, choose a complete snapshot, and select **Re
 
 Before confirmation, Komodo lists paths that will be created, overwritten, and deleted, plus containers that will stop. A Volume restore stops every running container that mounts the destination volume, even when those containers belong to different Stacks. A Stack restore stops every running container in the deployed Compose project. Containers that were already stopped remain stopped. Restore data is written to staging on the destination filesystem, verified with its metadata, and then published using a persisted rollback journal and directory synchronization. Komodo restarts exactly the previously running containers after successful publication or a proven rollback. If state becomes indeterminate, they remain stopped and Komodo raises a critical recovery alert.
 
+Restore preflight and execution both reject any destination that overlaps a configured Core-local repository, including the Docker host source behind a bind mount or named volume attached to Core. This prevents Volume recovery and recovered Stack bind mappings from replacing the active backup repository.
+
 When a restore creates a recovered Stack, Core marks that new resource with the restore-plan identity before it asks Periphery to commit the filesystem publication. Periphery retains the rollback journal and the final commit receipt until Core acknowledges the matching database state. After an interrupted Core or Periphery restart, Komodo reconciles that marker automatically; do not delete or repurpose the recovered Stack while reconciliation is pending.
 
 ### Restore to another Periphery

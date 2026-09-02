@@ -1368,7 +1368,7 @@ pub async fn status() -> anyhow::Result<BackupStatus> {
       return Ok(BackupStatus {
         active_runs,
         recent_runs,
-        critical_alert: critical_alert().read().unwrap().clone(),
+        critical_alert: current_critical_alert(),
         ..Default::default()
       });
     }
@@ -1466,13 +1466,42 @@ pub async fn status() -> anyhow::Result<BackupStatus> {
     mirror_lagging_snapshots,
     last_full_verification_at: previous_primary
       .last_full_verification_at,
-    critical_alert: critical_alert().read().unwrap().clone(),
+    critical_alert: current_critical_alert(),
   })
 }
 
-fn critical_alert() -> &'static RwLock<Option<String>> {
-  static ALERT: OnceLock<RwLock<Option<String>>> = OnceLock::new();
-  ALERT.get_or_init(Default::default)
+#[derive(Default)]
+struct CriticalAlerts {
+  configuration: Option<String>,
+  operational: Option<String>,
+  maintenance: Option<String>,
+}
+
+impl CriticalAlerts {
+  fn current(&self) -> Option<String> {
+    let messages = [
+      self.configuration.as_deref(),
+      self.operational.as_deref(),
+      self.maintenance.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    (!messages.is_empty()).then(|| messages.join("\n"))
+  }
+}
+
+fn critical_alerts() -> &'static RwLock<CriticalAlerts> {
+  static ALERTS: OnceLock<RwLock<CriticalAlerts>> = OnceLock::new();
+  ALERTS.get_or_init(Default::default)
+}
+
+fn current_critical_alert() -> Option<String> {
+  critical_alerts().read().unwrap().current()
+}
+
+fn record_operational_alert(message: String) {
+  critical_alerts().write().unwrap().operational = Some(message);
 }
 
 const CONFIGURATION_ALERT_PREFIX: &str =
@@ -1481,27 +1510,22 @@ const CONFIGURATION_ALERT_PREFIX: &str =
 pub fn record_configuration_alert(error: &anyhow::Error) {
   let message = format!("{CONFIGURATION_ALERT_PREFIX} {error:#}");
   error!("{message}");
-  *critical_alert().write().unwrap() = Some(message);
+  critical_alerts().write().unwrap().configuration = Some(message);
 }
 
 fn clear_configuration_alert() {
-  let mut alert = critical_alert().write().unwrap();
-  if alert.as_deref().is_some_and(|message| {
-    message.starts_with(CONFIGURATION_ALERT_PREFIX)
-  }) {
-    *alert = None;
-  }
+  critical_alerts().write().unwrap().configuration = None;
 }
 
 const MAINTENANCE_ALERT_PREFIX: &str = "Backup maintenance blocked:";
 
 fn clear_maintenance_alert() {
-  let mut alert = critical_alert().write().unwrap();
-  if alert.as_deref().is_some_and(|message| {
-    message.starts_with(MAINTENANCE_ALERT_PREFIX)
-  }) {
-    *alert = None;
-  }
+  critical_alerts().write().unwrap().maintenance = None;
+}
+
+fn record_maintenance_alert(error: &anyhow::Error) {
+  critical_alerts().write().unwrap().maintenance =
+    Some(format!("{MAINTENANCE_ALERT_PREFIX} {error:#}"));
 }
 
 /// Serializes resource mutations with backup discovery/quiescing, restore
@@ -1888,8 +1912,7 @@ fn maintenance_sender() -> &'static tokio::sync::mpsc::Sender<()> {
               error!(
                 "Backup repository maintenance failed: {error:#}"
               );
-              *critical_alert().write().unwrap() =
-                Some(format!("{MAINTENANCE_ALERT_PREFIX} {error:#}"));
+              record_maintenance_alert(&error);
             }
           },
           Err(error) => error!(
@@ -2988,7 +3011,7 @@ async fn run_node_batch(
     }
   };
   if !response.restart_errors.is_empty() {
-    *critical_alert().write().unwrap() = Some(format!(
+    record_operational_alert(format!(
       "Backup restart failed on {}: {}",
       server.name,
       response.restart_errors.join("; ")
@@ -3391,7 +3414,7 @@ async fn backup_stack(
     })
     .await?;
   if !response.restart_errors.is_empty() {
-    *critical_alert().write().unwrap() = Some(format!(
+    record_operational_alert(format!(
       "Containers could not be restarted after stack backup: {}",
       response.restart_errors.join("; ")
     ));
@@ -3453,7 +3476,7 @@ async fn backup_volume(
     })
     .await?;
   if !response.restart_errors.is_empty() {
-    *critical_alert().write().unwrap() = Some(format!(
+    record_operational_alert(format!(
       "Containers could not be restarted after volume backup: {}",
       response.restart_errors.join("; ")
     ));
@@ -3939,6 +3962,9 @@ pub async fn plan_restore(
     .request(PreflightVykarRestore {
       target,
       repository: repository_for_periphery(&settings.primary, false)?,
+      protected_repository_paths: core_local_repository_paths(
+        &settings,
+      ),
       advanced: settings.advanced,
       hostname: format!("komodo-periphery-{}", server.id),
       snapshot_name: snapshot.name.clone(),
@@ -4377,6 +4403,9 @@ pub async fn execute_restore(
     .request(PreflightVykarRestore {
       target: target.clone(),
       repository: repository_for_periphery(&settings.primary, false)?,
+      protected_repository_paths: core_local_repository_paths(
+        &settings,
+      ),
       advanced: settings.advanced.clone(),
       hostname: format!("komodo-periphery-{}", server.id),
       snapshot_name: stored.plan.snapshot.clone(),
@@ -4496,6 +4525,9 @@ pub async fn execute_restore(
             &settings.primary,
             false,
           )?,
+          protected_repository_paths: core_local_repository_paths(
+            &settings,
+          ),
           advanced: settings.advanced,
           hostname: format!("komodo-periphery-{}", server.id),
           snapshot_name: stored.plan.snapshot.clone(),
@@ -4509,7 +4541,7 @@ pub async fn execute_restore(
         })
         .await?;
       if let Some(error) = response.critical_error {
-        *critical_alert().write().unwrap() = Some(error.clone());
+        record_operational_alert(error.clone());
         return finish_run(
           run.clone(),
           BackupRunState::Failed,
@@ -4593,16 +4625,14 @@ pub async fn execute_restore(
               let message = response.critical_error.unwrap_or_else(|| {
                 "Periphery did not confirm restore rollback".into()
               });
-              *critical_alert().write().unwrap() =
-                Some(message.clone());
+              record_operational_alert(message.clone());
               return Err(create_error.context(message));
             }
             Err(rollback_error) => {
               let message = format!(
                 "Recovered Stack creation failed and restore rollback could not be confirmed: {rollback_error:#}"
               );
-              *critical_alert().write().unwrap() =
-                Some(message.clone());
+              record_operational_alert(message.clone());
               return Err(create_error.context(message));
             }
           }
@@ -4631,7 +4661,7 @@ pub async fn execute_restore(
         let message = format!(
           "Recovered Stack finalization requires reconciliation: {error:#}"
         );
-        *critical_alert().write().unwrap() = Some(message.clone());
+        record_operational_alert(message.clone());
         return Err(anyhow!(message));
       }
     }
@@ -4814,7 +4844,7 @@ async fn reconcile_recovered_stack_restores() -> anyhow::Result<()> {
       "Recovered Stack restore reconciliation failed: {}",
       errors.join("; ")
     );
-    *critical_alert().write().unwrap() = Some(message.clone());
+    record_operational_alert(message.clone());
     Err(anyhow!(message))
   }
 }
@@ -5667,6 +5697,24 @@ pub fn spawn_scheduler() {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn maintenance_alerts_do_not_replace_operational_alerts() {
+    let mut alerts = CriticalAlerts {
+      operational: Some("Containers remain stopped".into()),
+      maintenance: Some("Repository prune failed".into()),
+      ..Default::default()
+    };
+    let current = alerts.current().unwrap();
+    assert!(current.contains("Containers remain stopped"));
+    assert!(current.contains("Repository prune failed"));
+
+    alerts.maintenance = None;
+    assert_eq!(
+      alerts.current().as_deref(),
+      Some("Containers remain stopped")
+    );
+  }
 
   #[test]
   fn blank_secret_preserves_sealed_value() {
