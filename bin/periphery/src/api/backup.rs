@@ -729,7 +729,7 @@ fn validate_resolved_restore_destinations_against(
   let destinations = publish
     .iter()
     .map(|item| {
-      validate_selected_destination_ancestors(item)?;
+      validate_restore_destination_ancestors(item)?;
       let destination = Path::new(&item.destination);
       validate_path_outside_internal_storage(
         destination,
@@ -783,26 +783,36 @@ async fn validate_restore_destinations(
   Ok(())
 }
 
-fn validate_selected_destination_ancestors(
+fn validate_restore_destination_ancestors(
   item: &RestorePublishPath,
 ) -> anyhow::Result<()> {
-  let Some(root) = item.destination_root.as_deref().map(Path::new)
-  else {
-    return Ok(());
-  };
   let destination = Path::new(&item.destination);
-  let relative = destination.strip_prefix(root).context(
-    "Selected restore destination is outside its confirmed root",
-  )?;
-  if !root.is_absolute()
-    || relative
+  if !destination.is_absolute()
+    || destination
       .components()
       .any(|part| matches!(part, std::path::Component::ParentDir))
   {
     return Err(anyhow!(
-      "Selected restore boundary is not an absolute normalized path"
+      "Restore destination is not an absolute normalized path"
     ));
   }
+  if let Some(root) = item.destination_root.as_deref().map(Path::new)
+  {
+    if !root.is_absolute()
+      || root
+        .components()
+        .any(|part| matches!(part, std::path::Component::ParentDir))
+      || !destination.starts_with(root)
+    {
+      return Err(anyhow!(
+        "Selected restore destination is outside its confirmed absolute root"
+      ));
+    }
+  }
+  // A full mapped destination has no selection boundary. Both forms still
+  // need every ancestor checked from the filesystem root, not just the leaf.
+  let root = Path::new("/");
+  let relative = destination.strip_prefix(root)?;
   let mut ancestor = root.to_path_buf();
   for part in relative.components() {
     match std::fs::symlink_metadata(&ancestor) {
@@ -811,7 +821,7 @@ fn validate_selected_destination_ancestors(
           || !metadata.is_dir() =>
       {
         return Err(anyhow!(
-          "Selected restore cannot traverse symlink or non-directory ancestor '{}'",
+          "Restore cannot traverse symlink or non-directory ancestor '{}'",
           ancestor.display()
         ));
       }
@@ -2703,6 +2713,7 @@ fn restore_journal_dir() -> anyhow::Result<PathBuf> {
 /// Even a completed deferred receipt remains owned until Core acknowledges it.
 /// Finalize and startup recovery deliberately bypass this gate to repair state.
 pub(crate) fn ensure_no_pending_recovery() -> anyhow::Result<()> {
+  crate::stack::delete::ensure_no_pending_deletions()?;
   ensure_recovery_directories_empty(&[
     restore_journal_dir()?,
     container_quiesce_journal_dir()?,
@@ -2729,8 +2740,8 @@ fn ensure_recovery_directories_empty(
   Ok(())
 }
 
-/// A terminal shell outlives its HTTP/WebSocket connection. Exclude it for the
-/// actual process lifetime, on the node that owns the backup/restore filesystem.
+/// Protect the node's filesystem for real worker/process lifetimes, including
+/// terminals and background mutations that outlive their request connections.
 pub(crate) fn filesystem_barrier()
 -> &'static Arc<tokio::sync::RwLock<()>> {
   static BARRIER: OnceLock<Arc<tokio::sync::RwLock<()>>> =
@@ -2738,10 +2749,19 @@ pub(crate) fn filesystem_barrier()
   BARRIER.get_or_init(|| Arc::new(tokio::sync::RwLock::new(())))
 }
 
+/// Mutating jobs and recovery actions retain this lease for their real
+/// filesystem lifetime, independently of the request that launched them.
+pub(crate) fn filesystem_mutation_guard()
+-> anyhow::Result<tokio::sync::OwnedRwLockReadGuard<()>> {
+  filesystem_barrier().clone().try_read_owned().context(
+    "Filesystem operation blocked by a backup or restore on this Server; retry after it finishes",
+  )
+}
+
 fn protected_filesystem_guard()
 -> anyhow::Result<tokio::sync::OwnedRwLockWriteGuard<()>> {
   filesystem_barrier().clone().try_write_owned().context(
-    "Backup/restore blocked by a running terminal on this Server; exit or delete its terminals, then retry",
+    "Backup/restore blocked by a running terminal, file operation, or Stack deletion on this Server; finish the operation or exit/delete its terminals, then retry",
   )
 }
 
@@ -4158,13 +4178,13 @@ mod tests {
       snapshot_path: "source/link/config".into(),
       destination: link.join("config").to_string_lossy().into_owned(),
     };
-    assert!(validate_selected_destination_ancestors(&item).is_err());
+    assert!(validate_restore_destination_ancestors(&item).is_err());
     item.destination = link.to_string_lossy().into_owned();
-    validate_selected_destination_ancestors(&item).unwrap();
+    validate_restore_destination_ancestors(&item).unwrap();
     item.destination_root = Some(link.to_string_lossy().into_owned());
     item.destination =
       link.join("config").to_string_lossy().into_owned();
-    assert!(validate_selected_destination_ancestors(&item).is_err());
+    assert!(validate_restore_destination_ancestors(&item).is_err());
     item.destination_root =
       Some(root.path().to_string_lossy().into_owned());
     item.destination = root
@@ -4172,10 +4192,59 @@ mod tests {
       .join("missing/child")
       .to_string_lossy()
       .into_owned();
-    validate_selected_destination_ancestors(&item).unwrap();
+    validate_restore_destination_ancestors(&item).unwrap();
     item.destination =
       outside.path().join("config").to_string_lossy().into_owned();
-    assert!(validate_selected_destination_ancestors(&item).is_err());
+    assert!(validate_restore_destination_ancestors(&item).is_err());
+  }
+
+  #[test]
+  fn full_restore_rejects_linked_parents_but_can_replace_the_leaf() {
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let link = root.path().join("link");
+    std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+    let mut item = RestorePublishPath {
+      destination_root: None,
+      snapshot_path: "source/config".into(),
+      destination: link.join("config").to_string_lossy().into_owned(),
+    };
+    assert!(validate_restore_destination_ancestors(&item).is_err());
+    item.destination = link.to_string_lossy().into_owned();
+    validate_restore_destination_ancestors(&item).unwrap();
+    item.destination = root
+      .path()
+      .join("missing/child")
+      .to_string_lossy()
+      .into_owned();
+    validate_restore_destination_ancestors(&item).unwrap();
+    let file = root.path().join("file");
+    std::fs::write(&file, "not a directory").unwrap();
+    item.destination =
+      file.join("child").to_string_lossy().into_owned();
+    assert!(validate_restore_destination_ancestors(&item).is_err());
+    item.destination = "relative/path".into();
+    assert!(validate_restore_destination_ancestors(&item).is_err());
+  }
+
+  #[test]
+  fn selected_restore_also_checks_ancestors_above_its_root() {
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let link = root.path().join("link");
+    std::fs::create_dir(outside.path().join("nested")).unwrap();
+    std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+    let item = RestorePublishPath {
+      destination_root: Some(
+        link.join("nested").to_string_lossy().into_owned(),
+      ),
+      snapshot_path: "source/config".into(),
+      destination: link
+        .join("nested/config")
+        .to_string_lossy()
+        .into_owned(),
+    };
+    assert!(validate_restore_destination_ancestors(&item).is_err());
   }
 
   #[test]

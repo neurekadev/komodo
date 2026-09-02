@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use anyhow::Context;
 use axum::{
   Extension, Router, extract::Path, middleware, routing::post,
@@ -57,11 +59,32 @@ tokio::task_local! {
   /// Set while the write router owns the backup mutation barrier's read side.
   /// Synchronous nested executions reuse that ownership instead of attempting
   /// a recursive Tokio RwLock read after a writer has queued.
-  static WRITE_MUTATION_GUARD_HELD: ();
+  static WRITE_MUTATION_GUARD_HELD: WriteMutationGuard;
 }
+
+type WriteMutationGuard = Arc<tokio::sync::OwnedRwLockReadGuard<()>>;
 
 pub(super) fn mutation_guard_held_by_write_request() -> bool {
   WRITE_MUTATION_GUARD_HELD.try_with(|_| ()).is_ok()
+}
+
+/// Share the current lease instead of recursively reading behind a queued
+/// writer. Direct resolver callers acquire their own lease before mutation.
+pub(super) async fn owned_write_mutation_guard() -> WriteMutationGuard
+{
+  if let Ok(guard) = WRITE_MUTATION_GUARD_HELD.try_with(Arc::clone) {
+    return guard;
+  }
+  Arc::new(
+    crate::backup::mutation_barrier().clone().read_owned().await,
+  )
+}
+
+pub(super) fn spawn_guarded_write_job(
+  guard: WriteMutationGuard,
+  job: impl std::future::Future<Output = ()> + Send + 'static,
+) -> tokio::task::JoinHandle<()> {
+  tokio::spawn(WRITE_MUTATION_GUARD_HELD.scope(guard, job))
 }
 
 #[typeshare]
@@ -315,7 +338,7 @@ async fn task(
   ) {
     None
   } else {
-    Some(crate::backup::mutation_barrier().read().await)
+    Some(crate::backup::mutation_barrier().clone().read_owned().await)
   };
   let task_id = Uuid::new_v4();
   let method: WriteRequestMethod = (&request).into();
@@ -341,7 +364,9 @@ async fn task(
   let args = WriteArgs { user };
   let resolve = request.resolve(&args);
   let res = if let Some(_mutation_guard) = mutation_guard {
-    WRITE_MUTATION_GUARD_HELD.scope((), resolve).await
+    WRITE_MUTATION_GUARD_HELD
+      .scope(Arc::new(_mutation_guard), resolve)
+      .await
   } else {
     resolve.await
   };
@@ -368,8 +393,10 @@ mod tests {
   async fn synchronous_nested_work_reuses_only_the_current_task_guard()
    {
     assert!(!mutation_guard_held_by_write_request());
+    let barrier = Arc::new(tokio::sync::RwLock::new(()));
+    let guard = Arc::new(barrier.read_owned().await);
     WRITE_MUTATION_GUARD_HELD
-      .scope((), async {
+      .scope(guard, async {
         assert!(mutation_guard_held_by_write_request());
         assert!(
           !tokio::spawn(async {
@@ -380,5 +407,43 @@ mod tests {
         );
       })
       .await;
+  }
+
+  #[tokio::test]
+  async fn detached_job_keeps_the_request_lease_until_completion() {
+    let barrier = Arc::new(tokio::sync::RwLock::new(()));
+    let guard = Arc::new(barrier.clone().read_owned().await);
+    let (finish, wait) = tokio::sync::oneshot::channel();
+    let job = WRITE_MUTATION_GUARD_HELD
+      .scope(guard, async {
+        spawn_guarded_write_job(
+          owned_write_mutation_guard().await,
+          async move {
+            assert!(mutation_guard_held_by_write_request());
+            let _ = wait.await;
+          },
+        )
+      })
+      .await;
+    assert!(barrier.try_write().is_err());
+    finish.send(()).unwrap();
+    job.await.unwrap();
+    assert!(barrier.try_write().is_ok());
+  }
+
+  #[tokio::test]
+  async fn detached_job_reuses_lease_even_after_a_writer_queues() {
+    use futures_util::FutureExt;
+    let barrier = Arc::new(tokio::sync::RwLock::new(()));
+    let guard = Arc::new(barrier.clone().read_owned().await);
+    let mut writer = Box::pin(barrier.clone().write_owned());
+    assert!(futures_util::poll!(writer.as_mut()).is_pending());
+    WRITE_MUTATION_GUARD_HELD.scope(guard, async {
+      let shared = owned_write_mutation_guard().now_or_never()
+        .expect("Sharing a live read lease must never queue behind a writer");
+      assert!(Arc::strong_count(&shared) >= 2);
+    }).await;
+    drop(writer.await);
+    assert!(barrier.try_write().is_ok());
   }
 }

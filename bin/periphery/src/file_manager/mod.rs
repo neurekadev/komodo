@@ -215,12 +215,27 @@ where
   T: Send + 'static,
   F: FnOnce() -> anyhow::Result<T> + Send + 'static,
 {
+  let filesystem = crate::api::backup::filesystem_mutation_guard()?;
+  run_heavy_blocking_with_lease(filesystem, task).await
+}
+
+async fn run_heavy_blocking_with_lease<T, F>(
+  filesystem: tokio::sync::OwnedRwLockReadGuard<()>,
+  task: F,
+) -> anyhow::Result<T>
+where
+  T: Send + 'static,
+  F: FnOnce() -> anyhow::Result<T> + Send + 'static,
+{
+  // Keep protection in the blocking closure, not just its awaiting task:
+  // cancelling an RPC does not cancel filesystem work already running.
   let permit = heavy_job_permits()
     .clone()
     .acquire_owned()
     .await
     .context("File Manager job queue is unavailable")?;
   tokio::task::spawn_blocking(move || {
+    let _filesystem = filesystem;
     let _permit = permit;
     task()
   })
@@ -1927,6 +1942,7 @@ pub async fn prepare_managed_environment_migration(
   old_path: &str,
   new_path: &str,
 ) -> anyhow::Result<FileManagerManagedTransactionStatus> {
+  let _filesystem = crate::api::backup::filesystem_mutation_guard()?;
   Uuid::parse_str(operation_id)
     .context("Managed environment migration id is invalid")?;
   relative_path(old_path, false)?;
@@ -2096,6 +2112,7 @@ pub async fn finalize_managed_environment_migration(
   operation_id: &str,
   action: FileManagerManagedTransactionFinalizeAction,
 ) -> anyhow::Result<FileManagerManagedTransactionStatus> {
+  let _filesystem = crate::api::backup::filesystem_mutation_guard()?;
   Uuid::parse_str(operation_id)
     .context("Managed environment migration id is invalid")?;
   let root = resolve_root(target).await?;
@@ -2324,6 +2341,7 @@ pub async fn finalize_managed_transaction(
   operation_id: &str,
   action: FileManagerManagedTransactionFinalizeAction,
 ) -> anyhow::Result<FileManagerManagedTransactionStatus> {
+  let _filesystem = crate::api::backup::filesystem_mutation_guard()?;
   Uuid::parse_str(operation_id)
     .context("Managed transaction id is invalid")?;
   let root = resolve_root(target).await?;
@@ -2621,6 +2639,8 @@ pub async fn commit(
 ) -> anyhow::Result<
   periphery_client::api::file_manager::FileManagerCommitResponse,
 > {
+  let filesystem = crate::api::backup::filesystem_mutation_guard()?;
+  crate::api::backup::ensure_no_pending_recovery()?;
   let root = resolve_root(target).await?;
   if durable_managed {
     match prepare_durable_managed_commit(
@@ -2703,6 +2723,7 @@ pub async fn commit(
           == FileManagerExecutionMode::Recoverable,
     };
   tokio::spawn(async move {
+    let _filesystem = filesystem;
     let _archive_permit = if matches!(
       &plan.operation,
       FileManagerOperation::CreateArchive { .. }
@@ -3239,6 +3260,8 @@ pub async fn undo(
 ) -> anyhow::Result<
   periphery_client::api::file_manager::FileManagerCommitResponse,
 > {
+  let filesystem = crate::api::backup::filesystem_mutation_guard()?;
+  crate::api::backup::ensure_no_pending_recovery()?;
   if !confirmed {
     return Err(anyhow!("Explicit confirmation is required"));
   }
@@ -3301,6 +3324,7 @@ pub async fn undo(
       undoable: !record.recovery,
     };
   tokio::spawn(async move {
+    let _filesystem = filesystem;
     let lock = root_lock(&root_key).await;
     let guard = lock.lock_owned().await;
     let outcome = run_heavy_blocking(move || {
@@ -3430,6 +3454,8 @@ pub async fn redo(
 ) -> anyhow::Result<
   periphery_client::api::file_manager::FileManagerCommitResponse,
 > {
+  let filesystem = crate::api::backup::filesystem_mutation_guard()?;
+  crate::api::backup::ensure_no_pending_recovery()?;
   if !confirmed {
     return Err(anyhow!("Explicit confirmation is required"));
   }
@@ -3483,6 +3509,7 @@ pub async fn redo(
       undoable: true,
     };
   tokio::spawn(async move {
+    let _filesystem = filesystem;
     let lock = root_lock(&root_key).await;
     let guard = lock.lock_owned().await;
     let outcome = run_heavy_blocking(move || {
@@ -3617,6 +3644,8 @@ pub async fn start_upload(
   core: &str,
   request: StartFileManagerUpload,
 ) -> anyhow::Result<Uuid> {
+  let filesystem = crate::api::backup::filesystem_mutation_guard()?;
+  crate::api::backup::ensure_no_pending_recovery()?;
   let StartFileManagerUpload {
     target,
     actor,
@@ -3656,6 +3685,7 @@ pub async fn start_upload(
   let (sender, mut receiver) = tokio::sync::mpsc::channel(32);
   file_transfer_channels().insert(channel, sender).await;
   tokio::spawn(async move {
+    let _filesystem = filesystem;
     let result = async {
       let begin = tokio::time::timeout(
         std::time::Duration::from_secs(30),
@@ -8308,6 +8338,27 @@ fn path_string(path: &Path) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[tokio::test]
+  async fn cancelled_waiter_keeps_running_filesystem_work_guarded() {
+    let barrier = Arc::new(tokio::sync::RwLock::new(()));
+    let guard = barrier.clone().read_owned().await;
+    let (started, ready) = tokio::sync::oneshot::channel();
+    let (finish, wait) = std::sync::mpsc::channel();
+    let job =
+      tokio::spawn(run_heavy_blocking_with_lease(guard, move || {
+        let _ = started.send(());
+        let _ = wait.recv();
+        Ok(())
+      }));
+    ready.await.unwrap();
+    job.abort();
+    assert!(job.await.unwrap_err().is_cancelled());
+    assert!(barrier.try_write().is_err());
+    finish.send(()).unwrap();
+    drop(barrier.write().await);
+    assert!(barrier.try_write().is_ok());
+  }
 
   fn test_journal_record(
     id: &str,

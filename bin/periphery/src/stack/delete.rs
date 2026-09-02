@@ -22,7 +22,7 @@ use shell_escape::unix::escape;
 use uuid::Uuid;
 
 use crate::{
-  api::Args,
+  api::{Args, backup},
   config::periphery_config,
   docker::compose::{docker_compose, list_compose_projects},
   stack::write::resolved_run_directory,
@@ -92,6 +92,7 @@ impl Resolve<Args> for PrepareStackDeletion {
     )
   )]
   async fn resolve(self, args: &Args) -> anyhow::Result<Vec<Log>> {
+    let _filesystem = backup::filesystem_mutation_guard()?;
     let PrepareStackDeletion {
       transaction_id,
       stack,
@@ -106,6 +107,8 @@ impl Resolve<Args> for PrepareStackDeletion {
     {
       return Ok(vec![log]);
     }
+
+    backup::ensure_no_pending_recovery()?;
 
     let mut logs = Vec::new();
     match mode {
@@ -170,6 +173,7 @@ impl Resolve<Args> for RollbackStackDeletion {
     )
   )]
   async fn resolve(self, args: &Args) -> anyhow::Result<Log> {
+    let _filesystem = backup::filesystem_mutation_guard()?;
     rollback_stack_root(&self.transaction_id, &self.stack_name)?;
     Ok(Log::simple(
       "Restore stack files",
@@ -190,10 +194,12 @@ impl Resolve<Args> for CommitStackDeletion {
     )
   )]
   async fn resolve(self, args: &Args) -> anyhow::Result<Log> {
+    let filesystem = backup::filesystem_mutation_guard()?;
     let cleanup =
       commit_stack_root(&self.transaction_id, &self.stack_name)?;
     if let Some(cleanup) = cleanup {
       tokio::spawn(async move {
+        let _filesystem = filesystem;
         if let Err(error) = tokio::fs::remove_dir_all(&cleanup).await
         {
           warn!(
@@ -211,6 +217,39 @@ impl Resolve<Args> for CommitStackDeletion {
         .to_string(),
     ))
   }
+}
+
+pub(crate) fn ensure_no_pending_deletions() -> anyhow::Result<()> {
+  ensure_no_pending_deletions_at(&deletion_base())
+}
+
+fn ensure_no_pending_deletions_at(base: &Path) -> anyhow::Result<()> {
+  let metadata = match fs::symlink_metadata(base) {
+    Ok(metadata) => metadata,
+    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+      return Ok(());
+    }
+    Err(error) => return Err(error.into()),
+  };
+  validate_protected_directory(base, &metadata)?;
+  for entry in fs::read_dir(base)? {
+    let path = entry?.path();
+    validate_protected_directory(
+      &path,
+      &fs::symlink_metadata(&path)?,
+    )?;
+    let state = read_state_at(&path).with_context(|| format!(
+      "Backup/restore blocked by unreadable Stack deletion state at {}",
+      path.display()
+    ))?;
+    if state.phase != DeletionPhase::Committed {
+      return Err(anyhow!(
+        "Backup/restore blocked by pending Stack deletion '{}'; let Core finish deletion reconciliation before retrying",
+        state.transaction_id
+      ));
+    }
+  }
+  Ok(())
 }
 
 pub async fn initialize() -> anyhow::Result<()> {
@@ -932,6 +971,14 @@ fn ensure_protected_directory(
   path: &Path,
   metadata: &fs::Metadata,
 ) -> anyhow::Result<()> {
+  validate_protected_directory(path, metadata)?;
+  set_private_permissions(path)
+}
+
+fn validate_protected_directory(
+  path: &Path,
+  metadata: &fs::Metadata,
+) -> anyhow::Result<()> {
   ensure_real_directory(path, metadata)?;
   #[cfg(unix)]
   {
@@ -942,7 +989,6 @@ fn ensure_protected_directory(
         path.display()
       ));
     }
-    set_private_permissions(path)?;
   }
   Ok(())
 }
@@ -993,6 +1039,45 @@ mod tests {
       root_present: true,
       phase: DeletionPhase::Preparing,
     }
+  }
+
+  #[test]
+  fn pending_deletion_gate_allows_only_committed_or_absent_state() {
+    let root = tempfile::tempdir().unwrap();
+    let base = root.path().join(DELETION_DIRECTORY);
+    ensure_no_pending_deletions_at(&base).unwrap();
+    fs::create_dir(&base).unwrap();
+    ensure_no_pending_deletions_at(&base).unwrap();
+    let transaction = base.join("stack-id");
+    fs::create_dir(&transaction).unwrap();
+    assert!(ensure_no_pending_deletions_at(&base).is_err());
+    let mut state = deletion_state();
+    for phase in [DeletionPhase::Preparing, DeletionPhase::Prepared] {
+      state.phase = phase;
+      write_state_at(&transaction, &state).unwrap();
+      assert!(ensure_no_pending_deletions_at(&base).is_err());
+    }
+    state.phase = DeletionPhase::Committed;
+    write_state_at(&transaction, &state).unwrap();
+    ensure_no_pending_deletions_at(&base).unwrap();
+    fs::write(transaction.join(STATE_FILE), "invalid state").unwrap();
+    assert!(ensure_no_pending_deletions_at(&base).is_err());
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn pending_deletion_gate_rejects_symlinked_transactions() {
+    let root = tempfile::tempdir().unwrap();
+    let base = root.path().join(DELETION_DIRECTORY);
+    let outside = root.path().join("outside");
+    fs::create_dir(&base).unwrap();
+    fs::create_dir(&outside).unwrap();
+    let mut state = deletion_state();
+    state.phase = DeletionPhase::Committed;
+    write_state_at(&outside, &state).unwrap();
+    std::os::unix::fs::symlink(&outside, base.join("stack-id"))
+      .unwrap();
+    assert!(ensure_no_pending_deletions_at(&base).is_err());
   }
 
   #[test]
