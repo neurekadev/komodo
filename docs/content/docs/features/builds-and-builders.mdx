@@ -195,6 +195,7 @@ docker run -d \
   -e PERIPHERY_ROOT_DIRECTORY=/etc/komodo \
   -e PERIPHERY_PRIVATE_KEY=file:/etc/komodo/keys/periphery.key \
   -v /etc/komodo:/etc/komodo \
+  -v /etc/komodo/config:/config:ro \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v /proc:/proc \
   ghcr.io/neurekadev/komodo-periphery:3
@@ -209,7 +210,10 @@ To create the AMI:
    curl -fsSL https://get.docker.com | sh
    systemctl enable docker.service containerd.service
    ```
-2. Create an AMI from the instance in the AWS console.
-3. Create a security group and ensure it allows inbound access on port **8120** from Komodo Core.
+2. If the builder needs custom Periphery configuration, place it at `/etc/komodo/config/periphery.config.toml`. The container mounts that directory read-only at `/config`, where the image loads configuration. An existing `/etc/komodo/periphery.config.toml` must be moved into this directory. Restrict access to the file and any AMI containing credentials; alternatively, provision secrets securely before the container starts.
+3. Create an AMI from the instance in the AWS console.
+4. Create a security group and ensure it allows inbound access on port **8120** from Komodo Core. The container has Docker-host control through its socket mount; allow access only from trusted Core instances.
 
 The instance `user_data` starts the official Periphery container as the instance boots. Komodo Core then connects to port `8120` and runs the build through that container. Keep `use_https` enabled unless you have explicitly configured another protected transport.
+
+Run a test Build before relying on the AMI. If private clones, registry pushes, or configured secrets fail, check the Periphery logs and confirm the configuration file is present at `/config/periphery.config.toml` inside the container.

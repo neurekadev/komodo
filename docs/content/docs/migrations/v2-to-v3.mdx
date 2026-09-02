@@ -93,6 +93,8 @@ curl -fsSL -o compose.yaml https://raw.githubusercontent.com/neurekadev/komodo/m
 
 Keep the existing database credentials, administrator settings, application secrets, authentication providers, and other operator settings in `.env`. Remove `COMPOSE_KOMODO_BACKUPS_PATH`; the v3 template now supplies its internal `/data` key, backup, sync, repository, and Periphery paths directly.
 
+Preserve `KOMODO_FIRST_SERVER_NAME` and any explicit `PERIPHERY_CONNECT_AS` setting. The resolved `PERIPHERY_CONNECT_AS` must match the existing local Server's name in **Servers**. Do not replace it with `Local` unless that is already the Server's name: Core does not rename existing Servers during startup.
+
 Remove old explicit path overrides so the template can use the migrated `/data` layout. This includes `KOMODO_PRIVATE_KEY`, `KOMODO_REPORTING_PRIVATE_KEY`, `KOMODO_PERIPHERY_PUBLIC_KEY`, `KOMODO_CLI_BACKUPS_FOLDER`, `KOMODO_SYNC_DIRECTORY`, `KOMODO_REPO_DIRECTORY`, `PERIPHERY_PRIVATE_KEY`, `PERIPHERY_CORE_PUBLIC_KEYS`, and `PERIPHERY_ROOT_DIRECTORY`. Keep custom overrides only if their mounts have also been migrated deliberately.
 
 Add or replace these deployment settings:
@@ -101,7 +103,6 @@ Add or replace these deployment settings:
 # Keep the established Compose project and named-volume prefix.
 COMPOSE_PROJECT_NAME=komodo
 COMPOSE_KOMODO_IMAGE_TAG=3
-KOMODO_FIRST_SERVER_NAME=Local
 
 # Docker's absolute named-volume storage root on the host.
 PERIPHERY_DOCKER_VOLUME_ROOT=/var/lib/docker/volumes
@@ -144,6 +145,7 @@ docker compose ps
 Before considering the migration complete, verify that:
 
 - Existing users can log in and resources, stacks, repositories, builds, backups, and server connections are present.
+- `docker compose config` shows `PERIPHERY_CONNECT_AS` matching the existing local Server's name, and that Server reports **OK**.
 - `docker compose config` shows `PERIPHERY_ROOT_DIRECTORY: /data` and the repository, stack, and build directories beneath Docker's actual `komodo_data` mountpoint.
 - The Stack File Manager can browse a managed stack.
 - The `komodo_data` Docker Volume remains listed, but its Files tab reports File Manager unavailable.

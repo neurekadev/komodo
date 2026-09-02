@@ -38,7 +38,9 @@ Verify the database credentials have not changed since the volume was initialize
 
 ### MongoDB exits with code 139 on Linux 6.19 or newer
 
-Some MongoDB 8 images can start successfully and then crash about 30 seconds later with exit code `139` (`SIGSEGV`) on Linux kernel 6.19 or newer. This is a known restartable-sequences interaction between the affected kernel and MongoDB's TCMalloc configuration. See the [docker-library investigation](https://github.com/docker-library/mongo/discussions/748) and the [glibc rseq tunable documentation](https://sourceware.org/glibc/manual/latest/html_node/POSIX-Thread-Tunables.html).
+Some MongoDB 8 images can start successfully and then crash about 30–60 seconds later with exit code `139` (`SIGSEGV`) on affected Linux kernels starting with 6.19. This is a known restartable-sequences interaction between the kernel and MongoDB's TCMalloc configuration, tracked in [SERVER-121912](https://jira.mongodb.org/browse/SERVER-121912). Some later MongoDB releases instead refuse to start on affected kernels. Check the [MongoDB kernel compatibility guidance](https://jira.mongodb.org/browse/SERVER-125742) for a fixed kernel and compatible MongoDB release; not every kernel newer than 6.19 is affected.
+
+The affected Docker images explicitly set `GLIBC_TUNABLES=glibc.pthread.rseq=0`. The temporary workaround is **`1`, not `0`**: it overrides the image setting and restores glibc's rseq registration, avoiding the affected TCMalloc path. See the [docker-library investigation](https://github.com/docker-library/mongo/discussions/748) and the [glibc rseq tunable documentation](https://sourceware.org/glibc/manual/latest/html_node/POSIX-Thread-Tunables.html).
 
 Confirm the signature before applying the workaround:
 
@@ -54,8 +56,8 @@ If the kernel is affected, add this temporary override beneath the MongoDB servi
 services:
   mongo:
     environment:
-      # Temporary Linux 6.19+ crash workaround: restore glibc rseq registration.
-      # Remove this after installing a kernel or MongoDB image containing the fix.
+      # Temporary SERVER-121912 workaround: override the image's rseq=0.
+      # Remove after upgrading to a fixed kernel and compatible MongoDB release.
       GLIBC_TUNABLES: glibc.pthread.rseq=1
 ```
 
@@ -66,6 +68,6 @@ docker compose up -d --force-recreate mongo
 docker compose ps mongo
 ```
 
-This override is intentionally absent from the official template. It changes MongoDB's allocator behavior and should be used only for the matching crash signature, then removed after the underlying fix is installed.
+Check again after at least a minute and confirm Core can reconnect. This override is intentionally absent from the official template. It changes MongoDB's allocator behavior and can reduce performance; use it only for the matching crash signature, then remove it after installing a fixed kernel and compatible MongoDB release.
 
 [View the MongoDB Compose template](https://github.com/neurekadev/komodo/blob/main/compose/mongo.compose.yaml) and [environment example](https://github.com/neurekadev/komodo/blob/main/compose/compose.env).
