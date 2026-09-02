@@ -36,6 +36,7 @@ use komodo_client::{
       BackupSnapshot, BackupStatus, BackupTarget, BackupVolumeTarget,
       CoreRecoveryPlan, selection_includes,
     },
+    docker::volume::VolumeScopeEnum,
     komodo_timestamp,
     repo::Repo,
     server::Server,
@@ -243,10 +244,11 @@ async fn save_settings_inner(
     None => None,
   };
   if let Some(existing) = &existing {
-    if !allow_primary_location_change
-      && repository_location(&proposed.primary)
-        != repository_location(&existing.primary)
-    {
+    let primary_location_unchanged = repositories_share_location(
+      &proposed.primary,
+      &existing.primary,
+    )?;
+    if !allow_primary_location_change && !primary_location_unchanged {
       return Err(anyhow!(
         "Primary repository location cannot be changed after initialization; configure a mirror and use verified promotion"
       ));
@@ -254,10 +256,17 @@ async fn save_settings_inner(
     merge_repository_secrets(
       &mut proposed.primary,
       &existing.primary,
+      primary_location_unchanged,
     )?;
     match (&mut proposed.mirror, &existing.mirror) {
       (Some(proposed), Some(existing)) => {
-        merge_repository_secrets(proposed, existing)?
+        let location_unchanged =
+          repositories_share_location(proposed, existing)?;
+        merge_repository_secrets(
+          proposed,
+          existing,
+          location_unchanged,
+        )?
       }
       (Some(proposed), None) => require_repository_secrets(proposed)?,
       _ => {}
@@ -569,7 +578,18 @@ fn normalize_repository_url(value: &str) -> String {
 fn merge_repository_secrets(
   proposed: &mut BackupRepository,
   existing: &BackupRepository,
+  location_unchanged: bool,
 ) -> anyhow::Result<()> {
+  if !location_unchanged {
+    return require_repository_secrets(proposed);
+  }
+  if !proposed.passphrase.value.is_empty()
+    && proposed.passphrase.value != existing.passphrase.value
+  {
+    return Err(anyhow!(
+      "An initialized repository passphrase cannot be changed in place; configure and verify a new mirror repository instead"
+    ));
+  }
   preserve_secret(&mut proposed.passphrase, &existing.passphrase);
   match (&mut proposed.backend, &existing.backend) {
     (
@@ -1666,7 +1686,10 @@ async fn run_fleet(
         .docker
         .into_iter()
         .flat_map(|docker| docker.volumes)
-        .filter(|volume| volume.driver == "local")
+        .filter(|volume| {
+          volume.driver == "local"
+            && volume.scope == VolumeScopeEnum::Local
+        })
       {
         let identity = BackupVolumeTarget {
           server_id: server.id.clone(),
@@ -1847,19 +1870,6 @@ fn spawn_node_retry(
       if *fleet_generation().read().unwrap() != run.id {
         return false;
       }
-      let _server = match Server::coll()
-        .find_one(id_or_name_filter(&server_id))
-        .await
-      {
-        Ok(Some(server)) if server.config.enabled => server,
-        Ok(_) => return false,
-        Err(error) => {
-          warn!(
-            "Backup retry {retry} could not reload node {server_id}: {error:#}"
-          );
-          continue;
-        }
-      };
       if tasks.is_empty() {
         let refreshed = if refresh_targets {
           match refresh_node_targets(
@@ -1913,27 +1923,113 @@ fn spawn_node_retry(
       if *fleet_generation().read().unwrap() != run.id {
         return false;
       }
-      match run_node_batch(&settings, &run, &server_id, tasks.clone())
-        .await
+      let refreshed = match refresh_retry_task_groups(
+        &tasks, &server_id,
+      )
+      .await
       {
-        Ok(outcome) if outcome.retry_blocked => return false,
-        Ok(outcome)
-          if outcome.retry_tasks.is_empty() && targets.is_empty() =>
-        {
-          return !outcome.partial;
-        }
-        Ok(outcome) => {
-          tasks = outcome.retry_tasks;
+        Ok(refreshed) => refreshed,
+        Err(error) => {
           warn!(
-            "Backup retry {retry} for node {server_id} remained partial"
+            "Backup retry {retry} could not refresh current Stack configuration: {error:#}"
           );
+          continue;
         }
-        Err(error) => warn!(
-          "Backup retry {retry} for node {server_id} failed: {error:#}"
-        ),
+      };
+      let mut retry_tasks = Vec::new();
+      let mut all_complete = !refreshed.blocked;
+      for (current_server_id, current_tasks) in refreshed.groups {
+        let attempted = current_tasks.clone();
+        match run_node_batch(
+          &settings,
+          &run,
+          &current_server_id,
+          current_tasks,
+        )
+        .await
+        {
+          Ok(outcome) if outcome.retry_blocked => return false,
+          Ok(outcome) => {
+            all_complete &= !outcome.partial;
+            retry_tasks.extend(outcome.retry_tasks);
+          }
+          Err(error) => {
+            all_complete = false;
+            retry_tasks.extend(attempted);
+            warn!(
+              "Backup retry {retry} for node {current_server_id} failed: {error:#}"
+            );
+          }
+        }
       }
+      tasks = retry_tasks;
+      if tasks.is_empty() && targets.is_empty() {
+        return all_complete;
+      }
+      warn!("Backup retry {retry} remained partial");
     }
   })
+}
+
+struct RefreshedRetryTaskGroups {
+  groups: HashMap<String, Vec<VykarBackupTask>>,
+  blocked: bool,
+}
+
+/// Refresh every serialized Stack target immediately before retry and group
+/// the tasks by its current Server. Repository retry metadata stays attached
+/// to the task, while paths, Repo configuration, and Server placement come
+/// from the mutation-locked current resource state.
+async fn refresh_retry_task_groups(
+  tasks: &[VykarBackupTask],
+  volume_server_id: &str,
+) -> anyhow::Result<RefreshedRetryTaskGroups> {
+  let mut groups: HashMap<String, Vec<VykarBackupTask>> =
+    HashMap::new();
+  let mut blocked = false;
+  for mut task in tasks.iter().cloned() {
+    let current_server_id = match &task.target {
+      PeripheryBackupTarget::Stack { stack, .. } => {
+        let Some(current) = Stack::coll()
+          .find_one(id_or_name_filter(&stack.id))
+          .await?
+        else {
+          // A deleted Stack is no longer part of the fleet selection.
+          continue;
+        };
+        if !current.config.swarm_id.is_empty() {
+          blocked = true;
+          continue;
+        }
+        let repo = if current.config.linked_repo.is_empty() {
+          None
+        } else {
+          Some(
+            resource::get::<Repo>(&current.config.linked_repo)
+              .await?,
+          )
+        };
+        let current_server_id = current.config.server_id.clone();
+        task.target = PeripheryBackupTarget::Stack {
+          stack: Box::new(current),
+          repo: repo.map(Box::new),
+        };
+        current_server_id
+      }
+      PeripheryBackupTarget::Volume { .. } => {
+        volume_server_id.to_string()
+      }
+    };
+    let server = Server::coll()
+      .find_one(id_or_name_filter(&current_server_id))
+      .await?;
+    if !server.is_some_and(|server| server.config.enabled) {
+      blocked = true;
+      continue;
+    }
+    groups.entry(current_server_id).or_default().push(task);
+  }
+  Ok(RefreshedRetryTaskGroups { groups, blocked })
 }
 
 fn spawn_core_retry(
@@ -2021,7 +2117,10 @@ async fn refresh_node_targets(
     .docker
     .into_iter()
     .flat_map(|docker| docker.volumes)
-    .filter(|volume| volume.driver == "local")
+    .filter(|volume| {
+      volume.driver == "local"
+        && volume.scope == VolumeScopeEnum::Local
+    })
   {
     let identity = BackupVolumeTarget {
       server_id: server_id.to_string(),
@@ -2037,21 +2136,6 @@ async fn refresh_node_targets(
         volume_name: identity.volume_name,
       });
     }
-  }
-  if settings.volume_selection.mode
-    == komodo_client::entities::backup::BackupSelectionMode::Include
-  {
-    targets.extend(
-      settings
-        .volume_selection
-        .volumes
-        .iter()
-        .filter(|volume| volume.server_id == server_id)
-        .map(|volume| BackupTarget::Volume {
-          server_id: volume.server_id.clone(),
-          volume_name: volume.volume_name.clone(),
-        }),
-    );
   }
   Ok(targets.into_iter().collect())
 }
@@ -3465,9 +3549,14 @@ pub async fn execute_restore(
     }),
   )
   .await?;
-  let run =
-    new_run(Some(stored.plan.source.clone()), "Restore running")
-      .await?;
+  // Vykar restore does not currently expose cooperative cancellation. Reject
+  // cancellation up front instead of advertising a request that cannot stop
+  // the snapshot download and then blocking behind the operation lock.
+  let run = new_non_cancellable_run(
+    Some(stored.plan.source.clone()),
+    "Restore running",
+  )
+  .await?;
   let operation = async {
     let settings = get_settings().await?;
     let recovered_run_directory =
@@ -4124,7 +4213,7 @@ pub async fn cancel_run(run_id: &str) -> anyhow::Result<BackupRun> {
   }
   if non_cancellable_runs().lock().unwrap().contains(run_id) {
     return Err(anyhow!(
-      "Repository verification cannot be cancelled once it has started"
+      "This backup operation cannot be cancelled once it has started"
     ));
   }
   if let Some(token) = cancellation_token(run_id) {
@@ -4349,6 +4438,30 @@ mod tests {
     };
     preserve_secret(&mut proposed, &existing);
     assert_eq!(proposed.value, "sealed-plaintext");
+  }
+
+  #[test]
+  fn initialized_repository_passphrase_cannot_change_in_place() {
+    let repository = |passphrase: &str| BackupRepository {
+      backend: BackupRepositoryBackend::CoreLocal {
+        path: "/backups/repository".into(),
+      },
+      passphrase: BackupSecret {
+        value: passphrase.into(),
+        configured: false,
+      },
+      ..Default::default()
+    };
+    let existing = repository("original");
+    let mut proposed = repository("replacement");
+    assert!(
+      merge_repository_secrets(&mut proposed, &existing, true)
+        .is_err()
+    );
+
+    let mut redacted = repository("");
+    merge_repository_secrets(&mut redacted, &existing, true).unwrap();
+    assert_eq!(redacted.passphrase.value, "original");
   }
 
   #[test]

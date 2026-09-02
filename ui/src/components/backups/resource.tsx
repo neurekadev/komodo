@@ -30,6 +30,9 @@ type ResourceBackupProps = {
   canExecute: boolean;
 };
 
+const SNAPSHOT_PAGE_LIMIT = 100;
+const PERIPHERY_HOSTNAME_PREFIX = "komodo-periphery-";
+
 const isBelow = (path: string, parent: string) =>
   path !== parent && path.startsWith(parent.endsWith("/") ? parent : `${parent}/`);
 
@@ -47,6 +50,7 @@ export default function ResourceBackups({
 }: ResourceBackupProps) {
   const invalidate = useInvalidate();
   const [snapshot, setSnapshot] = useState<string>();
+  const [snapshotPage, setSnapshotPage] = useState(1);
   const [restoreOpen, setRestoreOpen] = useState(false);
   const [selectedPaths, setSelectedPaths] = useState<string[]>([]);
   const [destinationServerId, setDestinationServerId] =
@@ -59,7 +63,11 @@ export default function ResourceBackups({
 
   const snapshots = useRead(
     "ListBackupSnapshots",
-    { target, page: 0, limit: 100 },
+    {
+      target,
+      page: snapshotPage - 1,
+      limit: SNAPSHOT_PAGE_LIMIT,
+    },
     { refetchInterval: 30_000 },
   );
   const { mutate: runBackup, isPending: backupPending } = useWrite(
@@ -70,7 +78,11 @@ export default function ResourceBackups({
           color: run.state === Types.BackupRunState.Failed ? "red" : "green",
           message: run.message,
         });
-        invalidate(["ListBackupSnapshots", { target, page: 0, limit: 100 }]);
+        setSnapshotPage(1);
+        invalidate([
+          "ListBackupSnapshots",
+          { target, page: 0, limit: SNAPSHOT_PAGE_LIMIT },
+        ]);
       },
     },
   );
@@ -107,6 +119,20 @@ export default function ResourceBackups({
     ) ?? [];
 
   const crossNode = destinationServerId !== sourceServerId;
+  const snapshotSourceServerId = selectedSnapshot?.hostname.startsWith(
+    PERIPHERY_HOSTNAME_PREFIX,
+  )
+    ? selectedSnapshot.hostname.slice(PERIPHERY_HOSTNAME_PREFIX.length)
+    : sourceServerId;
+  const stackRecovery =
+    target.type === "Stack" &&
+    !!selectedSnapshot &&
+    (snapshotSourceServerId !== sourceServerId ||
+      destinationServerId !== snapshotSourceServerId);
+  const snapshotPages = Math.max(
+    1,
+    Math.ceil((snapshots.data?.total ?? 0) / SNAPSHOT_PAGE_LIMIT),
+  );
   const bindings = useMemo(() => {
     const pairs = mappingText
       .split("\n")
@@ -160,6 +186,17 @@ export default function ResourceBackups({
             </>
           )}
         </Group>
+        {snapshotPages > 1 && (
+          <Pagination
+            total={snapshotPages}
+            value={snapshotPage}
+            onChange={(page) => {
+              setSnapshot(undefined);
+              setSelectedPaths([]);
+              setSnapshotPage(page);
+            }}
+          />
+        )}
         {!snapshots.isPending && !options.length && (
           <Text c="dimmed">No snapshots are available for this resource.</Text>
         )}
@@ -191,11 +228,11 @@ export default function ResourceBackups({
             clearable={false}
             wrapperProps={{ label: "Restore destination" }}
           />
-          {crossNode && target.type === "Stack" && (
+          {stackRecovery && (
             <>
               <TextInput
                 label="New recovered Stack name"
-                description="Cross-node recovery creates a new Stack and never retargets the original."
+                description="Recovery from a snapshot-era Server creates a new Stack and never retargets the original."
                 value={recoveredName}
                 onChange={(event) => setRecoveredName(event.currentTarget.value)}
                 required
@@ -261,9 +298,8 @@ export default function ResourceBackups({
               disabled={
                 !snapshot ||
                 !destinationServerId ||
-                (crossNode && target.type === "Stack" && !recoveredName) ||
-                (crossNode &&
-                  target.type === "Stack" &&
+                (stackRecovery && !recoveredName) ||
+                (stackRecovery &&
                   requiredStackMappings.some((path) => !bindings[path])) ||
                 (crossNode && target.type === "Volume" && !destinationVolume)
               }
@@ -274,9 +310,7 @@ export default function ResourceBackups({
                   destination_server_id: destinationServerId,
                   selected_paths: selectedPaths,
                   recovered_stack_name:
-                    crossNode && target.type === "Stack"
-                      ? recoveredName
-                      : undefined,
+                    stackRecovery ? recoveredName : undefined,
                   bind_path_mappings: bindings,
                   destination_volume_name:
                     crossNode && target.type === "Volume"

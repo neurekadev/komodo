@@ -522,6 +522,28 @@ fn resolve_existing_ancestor(path: &Path) -> anyhow::Result<PathBuf> {
   }
 }
 
+fn validate_resolved_restore_destinations(
+  publish: &[RestorePublishPath],
+) -> anyhow::Result<()> {
+  let destinations = publish
+    .iter()
+    .map(|item| {
+      resolve_existing_ancestor(Path::new(&item.destination))
+        .map(|resolved| (item.destination.as_str(), resolved))
+    })
+    .collect::<anyhow::Result<Vec<_>>>()?;
+  for (index, (left_label, left)) in destinations.iter().enumerate() {
+    for (right_label, right) in destinations.iter().skip(index + 1) {
+      if paths_overlap(left, right) {
+        return Err(anyhow!(
+          "Restore destinations overlap after resolving filesystem aliases: '{left_label}' and '{right_label}'"
+        ));
+      }
+    }
+  }
+  Ok(())
+}
+
 fn insert_bind_backup_root(
   bind_paths: &mut BTreeSet<PathBuf>,
   run_directory: &Path,
@@ -958,9 +980,6 @@ impl Resolve<Args> for TransactionalVykarRestore {
         ));
       }
     }
-    let running_containers =
-      discover_running_containers(&self.target, &self.publish)
-        .await?;
     if let PeripheryBackupTarget::Volume { volume_name } =
       &self.target
     {
@@ -977,6 +996,10 @@ impl Resolve<Args> for TransactionalVykarRestore {
         self.selected_paths.is_empty(),
       )?;
     }
+    validate_resolved_restore_destinations(&self.publish)?;
+    let running_containers =
+      discover_running_containers(&self.target, &self.publish)
+        .await?;
     // Persist the complete pre-restore running set before the first stop. If
     // Periphery exits mid-restore, startup recovery can restart every affected
     // container after repairing the filesystem journal.
@@ -1112,9 +1135,6 @@ impl Resolve<Args> for PreflightVykarRestore {
     mut self,
     _: &Args,
   ) -> anyhow::Result<PreflightVykarRestoreResponse> {
-    let running_containers =
-      discover_running_containers(&self.target, &self.publish)
-        .await?;
     let discovered = discover_source(&self.target).await.ok();
     let destination_exists = discovered.is_some();
     if let PeripheryBackupTarget::Volume { volume_name } =
@@ -1129,6 +1149,10 @@ impl Resolve<Args> for PreflightVykarRestore {
         self.selected_paths.is_empty(),
       )?;
     }
+    validate_resolved_restore_destinations(&self.publish)?;
+    let running_containers =
+      discover_running_containers(&self.target, &self.publish)
+        .await?;
     let repository = self.repository.clone();
     let advanced = self.advanced.clone();
     let hostname = self.hostname.clone();
@@ -1285,6 +1309,11 @@ async fn transactional_restore(
   }
   if operation_cancelled(&request.journal_id) {
     return RestoreTransactionResult::Published { rolled_back: true };
+  }
+  if let Err(error) =
+    validate_resolved_restore_destinations(&request.publish)
+  {
+    return RestoreTransactionResult::FailedBeforePublication(error);
   }
   let first_destination =
     PathBuf::from(&request.publish[0].destination);
@@ -1485,6 +1514,7 @@ fn cleanup_restore_staging_journal(
     })?;
   for owned in journal.paths.iter().rev() {
     remove_path(owned)?;
+    fsync_parent(owned)?;
   }
   remove_path(path)?;
   fsync_parent(path)
@@ -1556,8 +1586,10 @@ pub(crate) async fn recover_restore_journals() -> anyhow::Result<()> {
     }
     for entry in &journal.entries {
       remove_path(&entry.source)?;
+      fsync_parent(&entry.source)?;
     }
     remove_path(&journal.staging)?;
+    fsync_parent(&journal.staging)?;
     remove_path(&path)?;
     fsync_parent(&path)?;
     warn!("Recovered interrupted restore journal {}", path.display());
@@ -1656,6 +1688,7 @@ fn publish_restore_in(
   journal_directory: &Path,
   staging_journal_path: Option<&Path>,
 ) -> anyhow::Result<bool> {
+  validate_resolved_restore_destinations(publish)?;
   let mut entries = Vec::new();
   let mut rollback_paths = HashSet::new();
   let mut preparation_cleanup = RemovePathsOnDrop::default();
@@ -1815,9 +1848,10 @@ fn publish_restore_in(
     }
     fsync_parent(&entry.destination)?;
   }
+  remove_path(staging)?;
+  fsync_parent(staging)?;
   std::fs::remove_file(&journal_path)?;
   fsync_parent(&journal_path)?;
-  let _ = std::fs::remove_dir_all(staging);
   Ok(false)
 }
 
@@ -1831,11 +1865,13 @@ fn cleanup_rolled_back_restore(
   journal: &RestoreJournal,
   journal_path: &Path,
 ) -> anyhow::Result<()> {
-  remove_path(journal_path)?;
   for entry in &journal.entries {
     remove_path(&entry.source)?;
+    fsync_parent(&entry.source)?;
   }
   remove_path(&journal.staging)?;
+  fsync_parent(&journal.staging)?;
+  remove_path(journal_path)?;
   fsync_parent(journal_path)
 }
 
@@ -2158,6 +2194,31 @@ mod tests {
     assert_eq!(
       resolve_existing_ancestor(&alias.join("new/child")).unwrap(),
       real.canonicalize().unwrap().join("new/child")
+    );
+  }
+
+  #[test]
+  fn restore_destinations_reject_overlap_through_symlinks() {
+    let root = tempfile::tempdir().unwrap();
+    let real = root.path().join("real");
+    let alias = root.path().join("alias");
+    std::fs::create_dir(&real).unwrap();
+    std::os::unix::fs::symlink(&real, &alias).unwrap();
+    let publish = vec![
+      RestorePublishPath {
+        snapshot_path: "source/one".into(),
+        destination: real.join("app").to_string_lossy().into_owned(),
+      },
+      RestorePublishPath {
+        snapshot_path: "source/two".into(),
+        destination: alias
+          .join("app/data")
+          .to_string_lossy()
+          .into_owned(),
+      },
+    ];
+    assert!(
+      validate_resolved_restore_destinations(&publish).is_err()
     );
   }
 
