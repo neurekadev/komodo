@@ -483,13 +483,8 @@ async fn run_backup_repositories(
   } else {
     run_repository_backup(
       request.primary.clone(),
-      request.advanced.clone(),
-      request.hostname.clone(),
-      request.snapshot_name.clone(),
-      request.source_label.clone(),
+      request,
       paths.clone(),
-      operation_cancellation_token(&request.run_id),
-      !request.filters.include_cross_filesystem_mounts,
     )
     .await
   };
@@ -505,19 +500,7 @@ async fn run_backup_repositories(
         ..Default::default()
       })
   } else if let Some(repository) = request.mirror.clone() {
-    Some(
-      run_repository_backup(
-        repository,
-        request.advanced.clone(),
-        request.hostname.clone(),
-        request.snapshot_name.clone(),
-        request.source_label.clone(),
-        paths,
-        operation_cancellation_token(&request.run_id),
-        !request.filters.include_cross_filesystem_mounts,
-      )
-      .await,
-    )
+    Some(run_repository_backup(repository, request, paths).await)
   } else {
     None
   };
@@ -533,14 +516,16 @@ fn backup_manifest_staging_dir() -> PathBuf {
 
 async fn run_repository_backup(
   repository: komodo_client::entities::backup::BackupRepository,
-  advanced: komodo_client::entities::backup::BackupAdvancedSettings,
-  hostname: String,
-  snapshot_name: String,
-  source_label: String,
+  request: &RunVykarBackup,
   source_paths: Vec<String>,
-  cancellation: Arc<AtomicBool>,
-  one_file_system: bool,
 ) -> VykarBackupRepositoryResult {
+  let advanced = request.advanced.clone();
+  let hostname = request.hostname.clone();
+  let snapshot_name = request.snapshot_name.clone();
+  let source_label = request.source_label.clone();
+  let cancellation = operation_cancellation_token(&request.run_id);
+  let one_file_system =
+    !request.filters.include_cross_filesystem_mounts;
   let result = tokio::task::spawn_blocking(move || {
     let cache = vykar_cache_dir(&hostname)?;
     let repository = VykarRepository::new(
@@ -798,17 +783,15 @@ fn validate_restore_destination_ancestors(
     ));
   }
   if let Some(root) = item.destination_root.as_deref().map(Path::new)
-  {
-    if !root.is_absolute()
+    && (!root.is_absolute()
       || root
         .components()
         .any(|part| matches!(part, std::path::Component::ParentDir))
-      || !destination.starts_with(root)
-    {
-      return Err(anyhow!(
-        "Selected restore destination is outside its confirmed absolute root"
-      ));
-    }
+      || !destination.starts_with(root))
+  {
+    return Err(anyhow!(
+      "Selected restore destination is outside its confirmed absolute root"
+    ));
   }
   // A full mapped destination has no selection boundary. Both forms still
   // need every ancestor checked from the filesystem root, not just the leaf.
@@ -1092,7 +1075,7 @@ fn rewrite_compose_bind_mappings(
   let key = |value: &str| Value::String(value.into());
   let Some(services) = document
     .as_mapping_mut()
-    .and_then(|root| root.get_mut(&key("services")))
+    .and_then(|root| root.get_mut(key("services")))
     .and_then(Value::as_mapping_mut)
   else {
     return 0;
@@ -1101,7 +1084,7 @@ fn rewrite_compose_bind_mappings(
   for service in services.values_mut() {
     let Some(volumes) = service
       .as_mapping_mut()
-      .and_then(|service| service.get_mut(&key("volumes")))
+      .and_then(|service| service.get_mut(key("volumes")))
       .and_then(Value::as_sequence_mut)
     else {
       continue;
@@ -1123,11 +1106,11 @@ fn rewrite_compose_bind_mappings(
         }
         Value::Mapping(long) => {
           let mount_type = long
-            .get(&key("type"))
+            .get(key("type"))
             .and_then(Value::as_str)
             .map(str::to_owned);
           let Some(source) = long
-            .get_mut(&key("source"))
+            .get_mut(key("source"))
             .and_then(|value| value.as_str())
             .map(str::to_owned)
           else {
@@ -1505,10 +1488,10 @@ fn select_bind_backup_roots(
     if exclude.matches(&path, metadata.is_dir()) {
       continue;
     }
-    if !filters.include_cross_filesystem_mounts {
-      if metadata.dev() != run_device {
-        continue;
-      }
+    if !filters.include_cross_filesystem_mounts
+      && metadata.dev() != run_device
+    {
+      continue;
     }
     selected.insert(path);
   }
@@ -3983,8 +3966,10 @@ mod tests {
 
   #[test]
   fn repository_aliases_require_the_actual_core_container_identity() {
-    let mut core = ContainerListItem::default();
-    core.id = Some("a".repeat(64));
+    let core = ContainerListItem {
+      id: Some("a".repeat(64)),
+      ..Default::default()
+    };
     let mut unrelated = core.clone();
     unrelated.id = Some("b".repeat(64));
     unrelated.name = "komodo".into();
