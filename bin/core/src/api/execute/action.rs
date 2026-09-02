@@ -117,6 +117,10 @@ impl Resolve<ExecuteArgs> for RunAction {
     )
     .await?;
 
+    // Protect direct filesystem writes for the entire Action, without holding
+    // the API mutation barrier across nested calls. Conflicts fail immediately.
+    let _backup_activity = crate::backup::activity::begin_action()?;
+
     // get the action state for the action (or insert default).
     let action_state = action_states()
       .action

@@ -61,6 +61,10 @@ Every eligible local Docker named volume is included by default, including volum
 
 Komodo checks the driver and mountpoint again at backup time. Docker mounts that expose a configured Core-local repository are excluded so a repository cannot recursively back up itself. Remote/plugin volume drivers and non-local volume scope are rejected in this version.
 
+Safe container stopping includes containers that bind-mount the Volume's inspected storage path, a parent directory, or a subtree, even when Docker does not list them as named-volume consumers. Restore applies the same overlap check to the actual destination paths. Only containers that were running are stopped and later restarted.
+
+Periphery does not stop its own container when its Docker-volume-root mount overlaps the source. Its filesystem-operation guard prevents other managed mutations while that worker performs the backup or restore.
+
 Use **All**, **Include**, or **Exclude** selection for Stacks and Volumes. Volumes are identified directly by Server and Docker volume name, so unmanaged volumes can be selected without inventing a Stack association. Core has no include/exclude filter.
 
 An explicitly included Stack or Volume that is missing or unsupported makes the fleet run partial rather than silently disappearing from the requested protection set.
@@ -79,7 +83,9 @@ Exit or delete running terminals on the destination Server before a backup or re
 
 Periphery onboarding database writes also wait for Core's export barrier. Server creation, optional Builder creation, permissions, and the onboarding-key record are covered together; network login and success/close handshakes do not hold the barrier.
 
-Actions and Procedures do not hold the backup barrier for their whole runtime. Mutating API calls made by an Action and individual mutating Procedure steps coordinate with backups separately, so backups can run between steps. Action API-key creation and cleanup remain protected. Cancellation requests can still signal running Actions, Procedures, builds, and repository builds while a backup waits; execution audit progress can continue to be recorded. Direct filesystem or Docker commands issued by an Action outside Komodo's API are external writers and must be quiesced by the operator.
+Finish or cancel running Actions before starting backup, restore, restore preview, Core recovery, or repository maintenance/verification work. Actions can write files directly, so their whole managed process lifetime is excluded from that work, including scheduled and webhook Actions. A conflicting backup operation fails immediately with an actionable message; a new Action is also refused while protected backup work is active. An Action therefore cannot launch these backup operations itself: use the Backups UI or its schedule after the Action completes. This does not restrict the Action's filesystem or network permissions.
+
+This process-lifetime guard is separate from the API mutation barrier, so an Action's nested API calls do not deadlock behind a waiting backup writer. Procedures still coordinate their individual mutating steps separately, allowing backups between steps. Action API-key creation and cleanup remain protected. Cancellation requests can still signal running Actions, Procedures, builds, and repository builds; execution audit progress can continue to be recorded. Detached child processes and direct host access remain external writers that the operator must stop.
 
 Backup operations never overlap. If a backup, retry, restore, repository maintenance operation, or another serialized backup operation is still active when a scheduled occurrence arrives, Core skips that occurrence without queuing or cancelling anything. The active work continues and the scheduler waits for the next normal occurrence. Manual backup requests wait for the current operation rather than creating concurrent repository writers.
 
@@ -153,6 +159,8 @@ When recovered-Stack bind mappings require Compose processing, every Compose pat
 
 The original `/core-secrets/backup.key` is required before Komodo can identify or decrypt a Core snapshot. It authenticates snapshot identities and opens the repository credentials stored in the restored database. The official Compose templates keep it in the Core-only `core-secrets` volume rather than the `/data` volume shared with Periphery.
 
+Core never automatically imports a backup key from `/data/keys/backup.key` or `/config/keys/backup.key`. If the private key is absent and either legacy path exists, key initialization fails without reading, copying, or deleting that file. Restore a separately retained, trusted Core-only key; do not promote a key from shared storage merely to clear the error. A key previously exposed to a worker remains compromised even after its shared copy is deleted or a copy is placed in `core-secrets`.
+
 Core also uses this private volume for temporary export, recovery, and manifest staging and for temporary authoritative SFTP key files. Keep enough free space there for a complete logical database export and recovery workspace, and do not share or bind these paths into other containers. Normal completion cleans up temporary files; startup discards abandoned staging, including staging left in the former shared-data locations. This protects direct shared-volume access, not a compromised Docker host.
 
 1. Stop the fresh Core before connecting the old repository.
@@ -165,6 +173,16 @@ Komodo restores the snapshot into a validation database, checks the backup schem
 If the restored database contains a pending Stack recovery record with its matching recovered Stack already inserted, Komodo normalizes it to the idempotent acknowledgement phase. Startup can then clear that historical record even if Periphery already discarded its completed receipt. Unmatched records retain the normal reconciliation checks; a contradictory receipt still blocks completion.
 
 Historical Core-recovery plans are discarded from the validation database during recovery. Expiry cleanup never drops the active database or the previous database retained by the private activation record. A recovery plan from a different active database cannot be activated; create a fresh plan instead.
+
+### Rotate an exposed backup key
+
+Rotation invalidates existing sealed backup settings and the authorization of old snapshots. It does not re-sign or authenticate old backups with the new key. Before proceeding, retain independent offline recovery material and all repository credentials; do not rely on an exposed key as proof that old Core exports are authentic.
+
+1. Disable scheduled backups and Actions, finish active work, and stop Core. Preserve the database, current key, repository configuration and credentials offline for administrator-led recovery.
+2. Remove the old key from Core's private key path and both legacy key paths after preserving the required offline copies. Do not share the replacement `core-secrets` volume with a worker.
+3. Start Core so it generates a fresh random Core-only key. An administrator may instead provision an independently generated 32-byte key as 64 hexadecimal characters in `/core-secrets/backup.key`, readable only by Core, before startup.
+4. In **Backups**, submit a complete replacement configuration, including every repository credential and passphrase. Secrets cannot be inherited from the settings sealed with the old key. Prefer a new empty repository for the newly trusted backup history; retain the old repository separately for offline investigation/recovery.
+5. Initialize and verify the configured repositories, take a new backup, and confirm it appears before re-enabling the schedule. Back up the new private key separately. Old snapshots remain unauthenticated by the new key and cannot be treated as new trusted recovery points.
 
 ### Roll back a Core recovery
 
@@ -207,6 +225,8 @@ Komodo uses Vykar's 20% dead-data compaction threshold. S3 and SFTP repacking is
 Every cycle performs bounded integrity sampling. A full verification is due every 60 days and is mandatory before mirror promotion. Structural failures block pruning and compaction so damaged repository state is never followed by destructive maintenance.
 
 ## Permissions
+
+Core's served TypeScript client at `/client/lib.js` includes the backup request and response types used by the running product, including snapshot browsing, restore plans and cancellation capability. The Action editor loads the matching declarations from `/client`; Actions can read backup status and inventory, but the process-lifetime restriction above prevents starting backup or recovery work from inside an Action.
 
 Backups require both a base resource level and the `Backups` specific permission:
 

@@ -1256,38 +1256,34 @@ fn rewrite_recovered_stack_compose_files(
 async fn affected_running_containers(
   docker: &crate::docker::DockerClient,
   containers: &[ContainerListItem],
-  project_name: Option<&str>,
+  target: &PeripheryBackupTarget,
   paths: &BTreeSet<PathBuf>,
 ) -> anyhow::Result<Vec<String>> {
-  let mut affected = BTreeSet::new();
+  // The worker mounts Docker's volume root to perform this operation. Its own
+  // filesystem gate already excludes other mutations; stopping it would kill
+  // the backup/restore before it can restart application containers.
+  let own_id = komodo_backup::container::current_container_id();
+  let mut affected = running_containers_for_target(
+    containers,
+    target,
+    own_id.as_deref(),
+  )
+  .into_iter()
+  .collect::<BTreeSet<_>>();
   for container in containers.iter().filter(|container| {
-    container.state == ContainerStateStatusEnum::Running
+    container_is_quiesce_candidate(container, own_id.as_deref())
   }) {
-    let same_project = project_name.is_some_and(|project| {
-      container
-        .labels
-        .get(COMPOSE_PROJECT_LABEL)
-        .map(String::as_str)
-        == Some(project)
-    });
-    if same_project {
-      affected.insert(container.name.clone());
+    if affected.contains(&container.name) {
       continue;
     }
     let inspected = docker.inspect_container(&container.name).await?;
-    if inspected
-      .mounts
-      .into_iter()
-      .filter(|mount| mount_type_affects_paths(mount.typ.as_deref()))
-      .filter_map(|mount| mount.source)
-      .map(|source| {
-        let source = PathBuf::from(source);
-        source.canonicalize().unwrap_or(source)
-      })
-      .any(|source| {
-        paths.iter().any(|path| paths_overlap(&source, path))
-      })
-    {
+    if inspected.mounts.into_iter().any(|mount| {
+      mount_affects_paths(
+        mount.typ.as_deref(),
+        mount.source.as_deref(),
+        paths,
+      )
+    }) {
       affected.insert(container.name.clone());
     }
   }
@@ -1296,6 +1292,22 @@ async fn affected_running_containers(
 
 fn mount_type_affects_paths(mount_type: Option<&str>) -> bool {
   matches!(mount_type, Some("bind" | "volume"))
+}
+
+fn mount_affects_paths(
+  mount_type: Option<&str>,
+  source: Option<&str>,
+  paths: &BTreeSet<PathBuf>,
+) -> bool {
+  if !mount_type_affects_paths(mount_type) {
+    return false;
+  }
+  let Some(source) = source else {
+    return false;
+  };
+  let source = PathBuf::from(source);
+  let source = source.canonicalize().unwrap_or(source);
+  paths.iter().any(|path| paths_overlap(&source, path))
 }
 
 async fn discover_source(
@@ -1386,7 +1398,7 @@ async fn discover_source(
       let running = affected_running_containers(
         docker,
         &containers,
-        Some(&project_name),
+        target,
         &affected_paths,
       )
       .await?;
@@ -1425,14 +1437,6 @@ async fn discover_source(
           volume.name
         ));
       }
-      let running_containers = containers
-        .into_iter()
-        .filter(|container| {
-          container.state == ContainerStateStatusEnum::Running
-            && container.volumes.contains(volume_name)
-        })
-        .map(|container| container.name)
-        .collect();
       let mountpoint =
         validate_source_path(Path::new(&volume.mountpoint))?;
       validate_path_outside_internal_storage(
@@ -1445,6 +1449,13 @@ async fn discover_source(
         &protected_repository_sources,
         "Backup source",
       )?;
+      let running_containers = affected_running_containers(
+        docker,
+        &containers,
+        target,
+        &BTreeSet::from([mountpoint.clone()]),
+      )
+      .await?;
       Ok(DiscoverBackupSourceResponse {
         paths: vec![mountpoint.to_string_lossy().into_owned()],
         running_containers,
@@ -1644,32 +1655,20 @@ async fn discover_running_containers(
     .as_ref()
     .context("Docker is unavailable")?;
   let containers = docker.list_containers().await?;
-  match target {
-    PeripheryBackupTarget::Stack { stack, .. } => {
-      let paths = publish
-        .iter()
-        .map(|item| {
-          resolve_existing_ancestor(Path::new(&item.destination))
-        })
-        .collect::<anyhow::Result<BTreeSet<_>>>()?;
-      let project_name = stack.project_name(false);
-      affected_running_containers(
-        docker,
-        &containers,
-        Some(&project_name),
-        &paths,
-      )
-      .await
-    }
-    PeripheryBackupTarget::Volume { .. } => {
-      Ok(running_containers_for_target(&containers, target))
-    }
-  }
+  let paths = publish
+    .iter()
+    .map(|item| {
+      resolve_existing_ancestor(Path::new(&item.destination))
+    })
+    .collect::<anyhow::Result<BTreeSet<_>>>()?;
+  affected_running_containers(docker, &containers, target, &paths)
+    .await
 }
 
 fn running_containers_for_target(
   containers: &[ContainerListItem],
   target: &PeripheryBackupTarget,
+  own_id: Option<&str>,
 ) -> Vec<String> {
   match target {
     PeripheryBackupTarget::Stack { stack, .. } => {
@@ -1677,7 +1676,7 @@ fn running_containers_for_target(
       containers
         .iter()
         .filter(|container| {
-          container.state == ContainerStateStatusEnum::Running
+          container_is_quiesce_candidate(container, own_id)
             && container.labels.get(COMPOSE_PROJECT_LABEL)
               == Some(&project_name)
         })
@@ -1687,12 +1686,20 @@ fn running_containers_for_target(
     PeripheryBackupTarget::Volume { volume_name } => containers
       .iter()
       .filter(|container| {
-        container.state == ContainerStateStatusEnum::Running
+        container_is_quiesce_candidate(container, own_id)
           && container.volumes.contains(volume_name)
       })
       .map(|container| container.name.clone())
       .collect(),
   }
+}
+
+fn container_is_quiesce_candidate(
+  container: &ContainerListItem,
+  own_id: Option<&str>,
+) -> bool {
+  container.state == ContainerStateStatusEnum::Running
+    && !own_id.is_some_and(|id| container_matches_id(container, id))
 }
 
 fn validate_source_path(path: &Path) -> anyhow::Result<PathBuf> {
@@ -4093,7 +4100,7 @@ mod tests {
     ];
 
     assert_eq!(
-      running_containers_for_target(&containers, &target),
+      running_containers_for_target(&containers, &target, None),
       ["web", "worker"]
     );
   }
@@ -4131,7 +4138,7 @@ mod tests {
     ];
 
     assert_eq!(
-      running_containers_for_target(&containers, &target),
+      running_containers_for_target(&containers, &target, None),
       ["stack-a-web", "stack-b-worker"]
     );
   }
@@ -4943,6 +4950,73 @@ mod tests {
     assert!(mount_type_affects_paths(Some("volume")));
     assert!(!mount_type_affects_paths(Some("tmpfs")));
     assert!(!mount_type_affects_paths(None));
+  }
+
+  #[test]
+  fn volume_quiescing_includes_bind_sources_above_at_and_below_storage()
+   {
+    let paths = BTreeSet::from([PathBuf::from(
+      "/docker-data/volumes/data/_data",
+    )]);
+    for source in [
+      "/docker-data/volumes/data/_data",
+      "/docker-data/volumes/data/_data/database",
+      "/docker-data/volumes/data",
+    ] {
+      assert!(mount_affects_paths(
+        Some("bind"),
+        Some(source),
+        &paths
+      ));
+      assert!(mount_affects_paths(
+        Some("volume"),
+        Some(source),
+        &paths
+      ));
+    }
+    for source in [
+      "/docker-data/volumes/other/_data",
+      "/docker-data/volumes/data/_data-other",
+    ] {
+      assert!(!mount_affects_paths(
+        Some("bind"),
+        Some(source),
+        &paths
+      ));
+    }
+    assert!(!mount_affects_paths(
+      Some("tmpfs"),
+      Some("/docker-data"),
+      &paths
+    ));
+    assert!(!mount_affects_paths(Some("bind"), None, &paths));
+  }
+
+  #[test]
+  fn quiescing_excludes_only_the_current_worker_identity() {
+    let worker = ContainerListItem {
+      id: Some("a".repeat(64)),
+      state: ContainerStateStatusEnum::Running,
+      ..Default::default()
+    };
+    assert!(!container_is_quiesce_candidate(
+      &worker,
+      Some(&"a".repeat(64))
+    ));
+    assert!(container_is_quiesce_candidate(
+      &worker,
+      Some(&"b".repeat(64))
+    ));
+    assert!(container_is_quiesce_candidate(&worker, None));
+    assert!(container_is_quiesce_candidate(
+      &worker,
+      Some("periphery")
+    ));
+    let stopped = ContainerListItem {
+      state: ContainerStateStatusEnum::Exited,
+      ..worker
+    };
+    assert!(!container_is_quiesce_candidate(&stopped, None));
   }
 
   #[test]

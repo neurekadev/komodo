@@ -66,6 +66,7 @@ use crate::{
   },
 };
 
+pub(crate) mod activity;
 mod crypto;
 
 const SETTINGS_ID: &str = "singleton";
@@ -1236,6 +1237,7 @@ fn backup_source_filters(
 
 pub async fn initialize_repositories() -> anyhow::Result<BackupRun> {
   let _operation = backup_operation_lock().lock().await;
+  let _actions = activity::quiesce_actions()?;
   let _repository_roles =
     repository_role_barrier().clone().read_owned().await;
   let settings = get_settings().await?;
@@ -2000,6 +2002,7 @@ pub async fn run_backup(
 async fn run_backup_locked(
   target: Option<BackupTarget>,
 ) -> anyhow::Result<BackupRun> {
+  let _actions = activity::quiesce_actions()?;
   let _repository_roles =
     repository_role_barrier().clone().read_owned().await;
   let mut run = new_run(target.clone(), "Backup running").await?;
@@ -2229,6 +2232,7 @@ async fn record_repository_verification(
 
 async fn run_maintenance() -> anyhow::Result<()> {
   let _operation = backup_operation_lock().lock().await;
+  let _actions = activity::quiesce_actions()?;
   let _repository_roles =
     repository_role_barrier().clone().read_owned().await;
   // A settings save can finish while maintenance waits for an active backup.
@@ -2714,6 +2718,13 @@ fn spawn_node_retry(
         )
         .await;
       let _operation = backup_operation_lock().lock().await;
+      let _actions = match activity::quiesce_actions() {
+        Ok(guard) => guard,
+        Err(error) => {
+          warn!("Fleet backup retry {retry} deferred: {error:#}");
+          continue;
+        }
+      };
       if *fleet_generation().read().unwrap() != run.id {
         return false;
       }
@@ -2929,6 +2940,13 @@ fn spawn_core_retry(
       }
       retry = retry.saturating_add(1);
       let _operation = backup_operation_lock().lock().await;
+      let _actions = match activity::quiesce_actions() {
+        Ok(guard) => guard,
+        Err(error) => {
+          warn!("Core backup retry {retry} deferred: {error:#}");
+          continue;
+        }
+      };
       if *fleet_generation().read().unwrap() != run.id {
         discard_core_repository_retry(&run.id).await;
         return false;
@@ -4074,6 +4092,7 @@ pub async fn plan_restore(
   user: &User,
   request: PlanBackupRestore,
 ) -> anyhow::Result<BackupRestorePlan> {
+  let _actions = activity::quiesce_actions()?;
   cleanup_expired_restore_plans().await?;
   let _repository_roles =
     repository_role_barrier().clone().read_owned().await;
@@ -4685,6 +4704,7 @@ pub async fn execute_restore(
   user: &User,
 ) -> anyhow::Result<BackupRun> {
   let _operation = backup_operation_lock().lock().await;
+  let _actions = activity::quiesce_actions()?;
   let _repository_roles =
     repository_role_barrier().clone().read_owned().await;
   let mutation_guard = mutation_barrier().write().await;
@@ -5227,6 +5247,7 @@ async fn cleanup_expired_restore_plans() -> anyhow::Result<()> {
 
 async fn reconcile_recovered_stack_restores() -> anyhow::Result<()> {
   let _operation = backup_operation_lock().lock().await;
+  let _actions = activity::quiesce_actions()?;
   let _mutation = mutation_barrier().write().await;
   let collection = plans_collection();
   let plans = find_collect(
@@ -5519,6 +5540,7 @@ pub async fn plan_core_recovery(
   created_by: String,
 ) -> anyhow::Result<CoreRecoveryPlan> {
   let _operation = core_recovery_operation_lock().lock().await;
+  let _actions = activity::quiesce_actions()?;
   reconcile_core_recovery_state_inner().await?;
   let _repository_roles =
     repository_role_barrier().clone().read_owned().await;
@@ -5722,6 +5744,7 @@ pub async fn execute_core_recovery(
 ) -> anyhow::Result<BackupRun> {
   let _operation = core_recovery_operation_lock().lock().await;
   let backup_operation = backup_operation_lock().lock().await;
+  let actions = activity::quiesce_actions()?;
   let stored = core_recovery_collection()
     .find_one(doc! { "_id": plan_id, "created_by": user_id })
     .await?
@@ -5783,6 +5806,7 @@ pub async fn execute_core_recovery(
   // restore operations blocked until the process restarts into that database.
   std::mem::forget(backup_operation);
   std::mem::forget(mutation);
+  std::mem::forget(actions);
   delete_result?;
   let run = new_non_cancellable_run(
     Some(BackupTarget::Core),
@@ -5861,6 +5885,7 @@ pub async fn verify(
   full: bool,
 ) -> anyhow::Result<BackupRun> {
   let _operation = backup_operation_lock().lock().await;
+  let _actions = activity::quiesce_actions()?;
   let _repository_roles =
     repository_role_barrier().clone().read_owned().await;
   let settings = get_settings().await?;
@@ -5940,6 +5965,7 @@ pub async fn promote_mirror(
   allow_primary_unavailable: bool,
 ) -> anyhow::Result<BackupSettings> {
   let backup_operation = backup_operation_lock().lock().await;
+  let _actions = activity::quiesce_actions()?;
   // Keep the exclusive role barrier from the start of mandatory verification
   // through the settings swap. No unverified mirror write can land in between.
   let repository_roles =

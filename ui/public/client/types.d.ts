@@ -209,7 +209,7 @@ export interface ActionQuerySpecifics {
     scheduled?: boolean;
 }
 export type ActionQuery = ResourceQuery<ActionQuerySpecifics>;
-export type AlerterEndpoint = 
+export type AlerterEndpoint =
 /** Send alert serialized to JSON to an http endpoint. */
 {
     type: "Custom";
@@ -844,7 +844,7 @@ export interface BuildQuerySpecifics {
     states?: BuildState[];
 }
 export type BuildQuery = ResourceQuery<BuildQuerySpecifics>;
-export type BuilderConfig = 
+export type BuilderConfig =
 /** Use a Periphery address as a Builder. */
 {
     type: "Url";
@@ -876,7 +876,7 @@ export interface BuilderQuerySpecifics {
 }
 export type BuilderQuery = ResourceQuery<BuilderQuerySpecifics>;
 /** A wrapper for all Komodo exections. */
-export type Execution = 
+export type Execution =
 /** The "null" execution. Does nothing. */
 {
     type: "None";
@@ -1274,7 +1274,7 @@ export interface ImageRegistryAccount {
     token?: string;
 }
 export type CreateImageRegistryAccountResponse = ImageRegistryAccount;
-export type UserConfig = 
+export type UserConfig =
 /** User that logs in with username / password */
 {
     type: "Local";
@@ -1449,7 +1449,7 @@ export type DeleteOnboardingKeyResponse = OnboardingKey;
 export type DeleteProcedureResponse = Procedure;
 export type DeleteUserResponse = User;
 export type DeleteVariableResponse = Variable;
-export type DeploymentImage = 
+export type DeploymentImage =
 /** Deploy any external image. */
 {
     type: "Image";
@@ -1746,7 +1746,7 @@ export declare enum SeverityLevel {
     Critical = "CRITICAL"
 }
 /** The variants of data related to the alert. */
-export type AlertData = 
+export type AlertData =
 /** A null alert */
 {
     type: "None";
@@ -2390,7 +2390,7 @@ export interface ResourceSyncConfig {
     /** Manage the file contents in the UI. */
     file_contents?: string;
 }
-export type DiffData = 
+export type DiffData =
 /** Resource will be created */
 {
     type: "Create";
@@ -2918,6 +2918,11 @@ export interface StackRemoteFileContents {
     requires?: StackFileRequires;
 }
 export interface StackInfo {
+    /**
+     * Internal marker linking a newly recovered Stack to the durable restore
+     * plan until Core and Periphery acknowledge the same finalization outcome.
+     */
+    recovery_plan_id?: string;
     /**
      * If any of the expected compose / additional files are missing in the repo,
      * they will be stored here.
@@ -5243,7 +5248,7 @@ export interface NetworkListItem {
 }
 export type ListNetworksResponse = NetworkListItem[];
 export type ListOnboardingKeysResponse = OnboardingKey[];
-export type UserTarget = 
+export type UserTarget =
 /** User Id */
 {
     type: "User";
@@ -5808,6 +5813,8 @@ export interface VolumeListItem {
     mountpoint: string;
     created?: string;
     scope: VolumeScopeEnum;
+    /** Whether Docker created the volume without an explicit name. */
+    anonymous?: boolean;
     /** Amount of disk space used by the volume (in bytes). This information is only available for volumes created with the `\"local\"` volume driver. For volumes created with other volume drivers, this field is set to `-1` (\"not available\") */
     size?: I64;
     /** Whether the volume is currently attached to any container */
@@ -6002,6 +6009,21 @@ export interface AwsBuilderConfig {
     /** Which secrets are available on the AMI. */
     secrets?: string[];
 }
+/** Controls bandwidth-aware maintenance and verification. */
+export interface BackupAdvancedSettings {
+    /** Maximum simultaneous node operations. */
+    node_concurrency: U64;
+    /** Optional per-node upload limit in bytes per second. Zero is unlimited. */
+    upload_bytes_per_second: U64;
+    /** Maximum client-side data repacked during one S3/SFTP maintenance cycle. */
+    client_repack_limit_bytes: U64;
+    /** Vykar dead-data ratio that triggers compaction. */
+    compact_threshold_percent: U64;
+    /** Full repository verification interval. */
+    full_verify_every_days: U64;
+    /** Percentage of packs sampled after each cycle. */
+    verify_sample_percent: U64;
+}
 /**
  * **Admin only.** Backs up the Komodo Core database to compressed jsonl files.
  * Response: [Update]. Aliases: `backup-database`, `backup-db`, `backup`.
@@ -6013,6 +6035,230 @@ export interface AwsBuilderConfig {
  * https://komodo.docs.neureka.dev/docs/setup/backup
  */
 export interface BackupCoreDatabase {
+}
+/** A repository supported by Vykar v0.19.1. */
+export type BackupRepositoryBackend =
+/**
+ * Storage local to Core. Core exposes it to Periphery through the
+ * authenticated embedded Vykar REST service.
+ */
+{
+    type: "CoreLocal";
+    params: {
+        path: string;
+    };
+}
+/** S3 or an S3-compatible object store such as Backblaze B2. */
+ | {
+    type: "S3";
+    params: {
+        url: string;
+        region: string;
+        /** Authoritative credentials used only by Core for maintenance. */
+        access_key_id: BackupSecret;
+        secret_access_key: BackupSecret;
+        /**
+         * Distinct worker-scoped credentials. Their storage policy must deny
+         * deletion, compaction, and other maintenance operations.
+         */
+        worker_access_key_id?: BackupSecret;
+        worker_secret_access_key?: BackupSecret;
+        soft_delete?: boolean;
+    };
+}
+/** SFTP storage. The key and known-hosts files must exist on the worker. */
+ | {
+    type: "Sftp";
+    params: {
+        url: string;
+        /** Authoritative key used only by Core for maintenance. */
+        private_key: BackupSecret;
+        /**
+         * Distinct worker-scoped key whose account cannot delete or maintain the
+         * authoritative repository.
+         */
+        worker_private_key?: BackupSecret;
+        known_hosts: string;
+        timeout_seconds: U64;
+    };
+}
+/** A Vykar REST repository. */
+ | {
+    type: "Rest";
+    params: {
+        url: string;
+        /** Authoritative token used only by Core for maintenance. */
+        access_token: BackupSecret;
+        /** Distinct append-only or otherwise maintenance-denied worker token. */
+        worker_access_token?: BackupSecret;
+        allow_insecure_http?: boolean;
+    };
+};
+/** A secret submitted to Core. APIs never return the plaintext value. */
+export interface BackupSecret {
+    /** A new plaintext value. Empty preserves the currently sealed value. */
+    value?: string;
+    /** True when Core has a sealed value. Ignored on writes. */
+    configured?: boolean;
+}
+/** An encrypted Vykar repository definition. */
+export interface BackupRepository {
+    name: string;
+    backend: BackupRepositoryBackend;
+    /** Vykar repository encryption passphrase. Encryption is mandatory. */
+    passphrase?: BackupSecret;
+}
+export type BackupTarget = {
+    type: "Core";
+    params?: undefined;
+} | {
+    type: "Stack";
+    params: {
+        stack_id: string;
+    };
+} | {
+    type: "Volume";
+    params: {
+        server_id: string;
+        volume_name: string;
+    };
+}
+/** A valid Vykar snapshot without a current Komodo source binding. */
+ | {
+    type: "Unbound";
+    params: {
+        source_label: string;
+    };
+};
+export interface BackupRestorePlan {
+    id: string;
+    snapshot: string;
+    source: BackupTarget;
+    destination_server_id?: string;
+    selected_paths: string[];
+    created_paths: string[];
+    overwritten_paths: string[];
+    deleted_paths: string[];
+    containers_to_stop: string[];
+    expires_at: I64;
+}
+export declare enum BackupRunState {
+    Queued = "Queued",
+    Running = "Running",
+    Complete = "Complete",
+    Partial = "Partial",
+    Failed = "Failed",
+    Cancelled = "Cancelled"
+}
+export interface BackupRun {
+    id: string;
+    target?: BackupTarget;
+    state: BackupRunState;
+    /** Whether this operation supports cancellation while it is active. */
+    cancellable?: boolean;
+    message: string;
+    started_at: I64;
+    finished_at: I64;
+    retry_count: U64;
+}
+/** Whether all, only selected, or all except selected resources are backed up. */
+export declare enum BackupSelectionMode {
+    All = "All",
+    Include = "Include",
+    Exclude = "Exclude"
+}
+export interface BackupStackSelection {
+    mode?: BackupSelectionMode;
+    stack_ids?: string[];
+}
+export interface BackupVolumeTarget {
+    server_id: string;
+    volume_name: string;
+}
+export interface BackupVolumeSelection {
+    mode?: BackupSelectionMode;
+    volumes?: BackupVolumeTarget[];
+}
+/** Singleton backup configuration. Core is always the scheduler. */
+export interface BackupSettings {
+    /** Whether the shared backup schedule is active. */
+    enabled: boolean;
+    /** English schedule or five-field cron expression. */
+    schedule: string;
+    /** IANA timezone used to evaluate the schedule. */
+    timezone: string;
+    core_enabled: boolean;
+    stacks_enabled: boolean;
+    volumes_enabled: boolean;
+    core_keep_last: U64;
+    stack_keep_last: U64;
+    volume_keep_last: U64;
+    stack_selection: BackupStackSelection;
+    volume_selection: BackupVolumeSelection;
+    /** Quiesce the affected running containers during backup. */
+    stop_containers: boolean;
+    /** Include Stack bind mounts that live on a different filesystem than the Stack run directory. Disabled by default. */
+    include_cross_filesystem_mounts?: boolean;
+    /** Include anonymous Docker volumes in volume backups. Disabled by default. */
+    include_anonymous_volumes?: boolean;
+    /** Vykar/gitignore-style patterns selecting Stack bind-mount source roots. An empty list includes every eligible root. */
+    bind_mount_include_patterns?: string[];
+    /** Vykar/gitignore-style patterns excluding Stack bind-mount source roots after include matching. */
+    bind_mount_exclude_patterns?: string[];
+    primary: BackupRepository;
+    mirror?: BackupRepository;
+    advanced: BackupAdvancedSettings;
+    /** Changes whenever settings are saved. */
+    updated_at?: I64;
+}
+export interface BackupSnapshot {
+    name: string;
+    source_label: string;
+    hostname: string;
+    target: BackupTarget;
+    /** Absolute source roots recorded by Vykar at backup time. */
+    source_paths: string[];
+    /** Exact user-restorable roots, excluding Komodo's internal manifest. */
+    restorable_source_paths: string[];
+    /** Whether the current Stack still resolves to the snapshot's source roots. Populated by Core when snapshots are listed for a Stack. */
+    source_paths_match_current?: boolean;
+    created_at: I64;
+    original_size: U64;
+    stored_size: U64;
+    file_count: U64;
+    partial: boolean;
+    run_id: string;
+    manifest_checksum: string;
+}
+export interface BackupSnapshotItem {
+    path: string;
+    name: string;
+    directory: boolean;
+    size: U64;
+    modified_at: I64;
+    has_children: boolean;
+}
+export interface BackupSnapshotDirectory {
+    entries: BackupSnapshotItem[];
+    total: U64;
+    page: U64;
+    has_more: boolean;
+}
+export interface BackupSnapshotList {
+    snapshots: BackupSnapshot[];
+    total: U64;
+    /** Any non-zero value means Vykar could not decode part of the inventory. */
+    hidden: U64;
+}
+export interface BackupStatus {
+    active_runs: BackupRun[];
+    recent_runs: BackupRun[];
+    next_run_at: I64;
+    primary_healthy: boolean;
+    mirror_healthy?: boolean;
+    mirror_lagging_snapshots: U64;
+    last_full_verification_at: I64;
+    critical_alert?: string;
 }
 /** Builds multiple Repos in parallel that match pattern. Response: [BatchExecutionResponse]. */
 export interface BatchBuildRepo {
@@ -6382,6 +6628,9 @@ export interface CancelAction {
      * or `update_id`
      */
     update_id?: string;
+}
+export interface CancelBackupRun {
+    run_id: string;
 }
 /**
  * Cancels the target build.
@@ -6900,6 +7149,16 @@ export interface CopySwarm {
     name: string;
     /** The id of the swarm to copy. */
     id: string;
+}
+/** A validated, short-lived plan for replacing the active Core database. */
+export interface CoreRecoveryPlan {
+    id: string;
+    snapshot: string;
+    current_database: string;
+    validation_database: string;
+    backup_schema: string;
+    backup_version: string;
+    expires_at: I64;
 }
 /** Create an action. Response: [Action]. */
 export interface CreateAction {
@@ -7532,6 +7791,14 @@ export interface EnvironmentVar {
     variable: string;
     value: string;
 }
+/** Execute a non-expired, previously confirmed restore plan. */
+export interface ExecuteBackupRestore {
+    plan_id: string;
+}
+/** Admin-only. Persist the validated database pointer and restart Core. */
+export interface ExecuteCoreRecovery {
+    plan_id: string;
+}
 /** Execute a terminal command on the given server. */
 export interface ExecuteTerminalBody {
     /** The target to create terminal for. */
@@ -7952,6 +8219,11 @@ export interface GetAlertersSummary {
 /** Response for [GetAlertersSummary]. */
 export interface GetAlertersSummaryResponse {
     total: number;
+}
+/** Get the singleton configuration. Repository secrets are always redacted. */
+export interface GetBackupSettings {
+}
+export interface GetBackupStatus {
 }
 /** Get a specific build. Response: [Build]. */
 export interface GetBuild {
@@ -8631,6 +8903,9 @@ export interface GlobalAutoUpdate {
      */
     skip_auto_update?: boolean;
 }
+/** Admin-only repository initialization and connectivity check. */
+export interface InitializeBackupRepositories {
+}
 /**
  * Inspect a container on the server. Response: [Container].
  *
@@ -9021,6 +9296,26 @@ export interface ListApiKeys {
 export interface ListApiKeysForServiceUser {
     /** Id or username */
     user: string;
+}
+/**
+ * Lazily load one directory from a snapshot. The picker starts collapsed by
+ * requesting only the root, then loads children as folders are expanded.
+ */
+export interface ListBackupSnapshotDirectory {
+    snapshot: string;
+    parent?: string;
+    search?: string;
+    page?: U64;
+    limit: U64;
+}
+/**
+ * List snapshots from the active primary repository. The target is optional
+ * for administrators and required for resource-scoped users.
+ */
+export interface ListBackupSnapshots {
+    target?: BackupTarget;
+    page?: U64;
+    limit: U64;
 }
 /**
  * Retrieve versions of the build that were built in the past and available for deployment,
@@ -10130,6 +10425,24 @@ export interface PauseStack {
      */
     services?: string[];
 }
+/** Produce an exact-restore preflight. No files or containers are changed. */
+export interface PlanBackupRestore {
+    snapshot: string;
+    destination_server_id?: string;
+    /** Empty selects the full snapshot. */
+    selected_paths?: string[];
+    /** Required for cross-node stack restore. */
+    recovered_stack_name?: string;
+    /** Source absolute bind path to destination absolute bind path. */
+    bind_path_mappings?: Record<string, string>;
+    /** Required for cross-node volume restore. */
+    destination_volume_name?: string;
+    confirm_existing_volume?: boolean;
+}
+/** Admin-only. Restore and validate a Core snapshot without switching databases. */
+export interface PlanCoreRecovery {
+    snapshot: string;
+}
 export type FileManagerOperation = {
     type: "CreateFile";
     params: {
@@ -10209,6 +10522,15 @@ export interface PrepareManagedFileManagerRenderedDownload {
      * compatibility.
      */
     path?: string;
+}
+/** Admin-only. Performs full verification before changing the active primary. */
+export interface PromoteBackupMirror {
+    /**
+     * Explicit disaster-recovery acknowledgement. This permits promotion
+     * after the mirror passes full verification even when the old primary is
+     * unavailable for the final inventory comparison.
+     */
+    allow_primary_unavailable?: boolean;
 }
 /**
  * Prunes the docker buildx cache on the target server. Response: [Update].
@@ -10720,6 +11042,10 @@ export interface RunAction {
      */
     args?: JsonObject;
 }
+/** Start one resource backup, or a full fleet cycle when target is omitted. */
+export interface RunBackup {
+    target?: BackupTarget;
+}
 /**
  * Runs the target build. Response: [Update].
  *
@@ -11189,6 +11515,13 @@ export interface UpdateAlerter {
     config: _PartialAlerterConfig;
 }
 /**
+ * Admin-only settings update. Empty submitted secret values preserve the
+ * existing sealed value.
+ */
+export interface UpdateBackupSettings {
+    settings: BackupSettings;
+}
+/**
  * Update the build at the given id, and return the updated build.
  * Response: [Build].
  *
@@ -11553,6 +11886,10 @@ export interface UrlBuilderConfig {
      * If this is empty, will use passkey in core config.
      */
     passkey?: string;
+}
+export interface VerifyBackupRepository {
+    mirror?: boolean;
+    full?: boolean;
 }
 /** Update dockerfile contents in Files on Server or Git Repo mode. Response: [Update]. */
 export interface WriteBuildFileContents {
@@ -11932,6 +12269,18 @@ export type ReadRequest = {
 } | {
     type: "GetCoreInfo";
     params: GetCoreInfo;
+} | {
+    type: "GetBackupSettings";
+    params: GetBackupSettings;
+} | {
+    type: "GetBackupStatus";
+    params: GetBackupStatus;
+} | {
+    type: "ListBackupSnapshots";
+    params: ListBackupSnapshots;
+} | {
+    type: "ListBackupSnapshotDirectory";
+    params: ListBackupSnapshotDirectory;
 } | {
     type: "ListSecrets";
     params: ListSecrets;
@@ -12377,6 +12726,11 @@ export declare enum RepoWebhookAction {
 export declare enum SpecificPermission {
     /**
      * On **Server / Stack**
+     * - Read backup inventories and execute permitted backup/restore actions.
+     */
+    Backups = "Backups",
+    /**
+     * On **Server / Stack**
      * - Access File Manager APIs for the resource
      */
     FileManager = "FileManager",
@@ -12425,6 +12779,36 @@ export declare enum SyncWebhookAction {
     Sync = "Sync"
 }
 export type WriteRequest = {
+    type: "UpdateBackupSettings";
+    params: UpdateBackupSettings;
+} | {
+    type: "InitializeBackupRepositories";
+    params: InitializeBackupRepositories;
+} | {
+    type: "RunBackup";
+    params: RunBackup;
+} | {
+    type: "PlanBackupRestore";
+    params: PlanBackupRestore;
+} | {
+    type: "ExecuteBackupRestore";
+    params: ExecuteBackupRestore;
+} | {
+    type: "VerifyBackupRepository";
+    params: VerifyBackupRepository;
+} | {
+    type: "PromoteBackupMirror";
+    params: PromoteBackupMirror;
+} | {
+    type: "CancelBackupRun";
+    params: CancelBackupRun;
+} | {
+    type: "PlanCoreRecovery";
+    params: PlanCoreRecovery;
+} | {
+    type: "ExecuteCoreRecovery";
+    params: ExecuteCoreRecovery;
+} | {
     type: "UpdateResourceMeta";
     params: UpdateResourceMeta;
 } | {

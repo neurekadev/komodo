@@ -33,8 +33,8 @@ fn backup_key() -> anyhow::Result<&'static [u8; 32]> {
   let key = load_or_create_key(
     Path::new(BACKUP_KEY_PATH),
     &[
-      (Path::new(LEGACY_SHARED_BACKUP_KEY_PATH), true),
-      (Path::new(LEGACY_CONFIG_BACKUP_KEY_PATH), false),
+      Path::new(LEGACY_SHARED_BACKUP_KEY_PATH),
+      Path::new(LEGACY_CONFIG_BACKUP_KEY_PATH),
     ],
   )?;
   let _ = KEY.set(key);
@@ -43,51 +43,36 @@ fn backup_key() -> anyhow::Result<&'static [u8; 32]> {
 
 fn load_or_create_key(
   path: &Path,
-  legacy_paths: &[(&Path, bool)],
+  legacy_paths: &[&Path],
 ) -> anyhow::Result<[u8; 32]> {
   if let Some(key) = read_key(path)? {
-    // Complete cleanup if a prior migration durably wrote the Core-only key
-    // but exited before deleting a legacy copy from shared storage.
-    for (legacy_path, remove_after_migration) in legacy_paths {
-      if *remove_after_migration {
-        remove_legacy_key(legacy_path)?;
-      }
-    }
     return Ok(key);
   }
-  for (legacy_path, remove_after_migration) in legacy_paths {
-    if let Some(key) = read_key(legacy_path)? {
-      let key = persist_key(path, key)?;
-      if *remove_after_migration {
-        remove_legacy_key(legacy_path)?;
+  for legacy_path in legacy_paths {
+    // Presence is enough to refuse initialization, including dangling symlinks.
+    // Never read or adopt key material from a worker-writable location.
+    match std::fs::symlink_metadata(legacy_path) {
+      Ok(_) => {
+        return Err(anyhow!(
+          "Refusing untrusted legacy backup key at {}; restore a separately retained Core-only key to {} or follow the backup key rotation procedure",
+          legacy_path.display(),
+          path.display()
+        ));
       }
-      return Ok(key);
+      Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+      Err(error) => {
+        return Err(error).with_context(|| {
+          format!(
+            "Failed to inspect legacy backup key location {}",
+            legacy_path.display()
+          )
+        });
+      }
     }
   }
   let mut key = [0_u8; 32];
   rand::rng().fill(&mut key);
   persist_key(path, key)
-}
-
-fn remove_legacy_key(path: &Path) -> anyhow::Result<()> {
-  match std::fs::remove_file(path) {
-    Ok(()) => {}
-    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-      return Ok(());
-    }
-    Err(error) => {
-      return Err(error).with_context(|| {
-        format!(
-          "Failed to remove legacy backup key at {}",
-          path.display()
-        )
-      });
-    }
-  }
-  if let Some(parent) = path.parent() {
-    std::fs::File::open(parent)?.sync_all()?;
-  }
-  Ok(())
 }
 
 fn read_key(path: &Path) -> anyhow::Result<Option<[u8; 32]>> {
@@ -459,7 +444,7 @@ mod tests {
   }
 
   #[test]
-  fn legacy_key_is_migrated_without_rotation() {
+  fn legacy_key_is_rejected_without_import_or_deletion() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("data/backup.key");
     let legacy_path = directory.path().join("config/backup.key");
@@ -467,16 +452,13 @@ mod tests {
     let expected = [19_u8; 32];
     std::fs::write(&legacy_path, hex::encode(expected)).unwrap();
 
-    let actual =
-      load_or_create_key(&path, &[(&legacy_path, true)]).unwrap();
-
-    assert_eq!(actual, expected);
-    assert_eq!(read_key(&path).unwrap(), Some(expected));
-    assert!(!legacy_path.exists());
+    assert!(load_or_create_key(&path, &[&legacy_path]).is_err());
+    assert!(!path.exists());
+    assert_eq!(read_key(&legacy_path).unwrap(), Some(expected));
   }
 
   #[test]
-  fn completed_key_migration_cleans_up_a_shared_legacy_copy() {
+  fn core_only_key_is_not_replaced_by_a_shared_legacy_copy() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("core-only.key");
     let legacy_path = directory.path().join("shared.key");
@@ -484,11 +466,30 @@ mod tests {
     std::fs::write(&path, hex::encode(expected)).unwrap();
     std::fs::write(&legacy_path, hex::encode([31_u8; 32])).unwrap();
 
-    let actual =
-      load_or_create_key(&path, &[(&legacy_path, true)]).unwrap();
+    let actual = load_or_create_key(&path, &[&legacy_path]).unwrap();
 
     assert_eq!(actual, expected);
-    assert!(!legacy_path.exists());
+    assert_eq!(read_key(&legacy_path).unwrap(), Some([31_u8; 32]));
+  }
+
+  #[test]
+  fn dangling_legacy_symlink_cannot_trigger_fresh_key_creation() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("core-only.key");
+    let legacy = directory.path().join("shared.key");
+    std::os::unix::fs::symlink("missing", &legacy).unwrap();
+    assert!(load_or_create_key(&path, &[&legacy]).is_err());
+    assert!(!path.exists());
+  }
+
+  #[test]
+  fn fresh_key_is_persisted_and_reused_without_legacy_material() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("core-only/backup.key");
+    let legacy = directory.path().join("missing.key");
+    let key = load_or_create_key(&path, &[&legacy]).unwrap();
+    assert_eq!(read_key(&path).unwrap(), Some(key));
+    assert_eq!(load_or_create_key(&path, &[&legacy]).unwrap(), key);
   }
 
   #[test]

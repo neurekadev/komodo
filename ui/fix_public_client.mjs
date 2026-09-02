@@ -18,3 +18,11 @@ function fix_mogh_auth_import(path) {
 for (const path of ["lib.d.ts", "lib.js"]) {
   fix_mogh_auth_import(path)
 }
+
+// TypeScript emits a space before the newline in documented union aliases.
+// Normalize the generated declarations here so regeneration stays diff-clean.
+const types_path = __dirname + "/public/client/types.d.ts";
+writeFileSync(
+  types_path,
+  readFileSync(types_path, "utf8").replace(/[ \t]+(?=\r?$)/gm, ""),
+);
