@@ -20,7 +20,7 @@ Komodo documentation is part of the product. Every change that affects a user-vi
 - Put the resource model, CLI, API and client libraries, integrations, and contributor information in **Reference**.
 - Keep product images in **Screenshots** and use the documented filename and metadata convention.
 - Keep actionable upgrade instructions in **Migrations**. Host release notes only in GitHub Releases; do not add release-note or inline-changelog pages.
-- Do not promise migration from upstream Komodo versions newer than `v2.3.2`. Every migration guide must begin with a backup and include verification and rollback steps.
+- Komodo 3.0.0+ is a divergent hard fork. Do not offer upstream migration guides or promise upstream backward compatibility, including from `v2.3.2`. Cherry-picking upstream fixes does not change this policy. Any future fork-to-fork upgrade guide must begin with a backup and include verification and rollback steps.
 
 ## Keep examples synchronized
 

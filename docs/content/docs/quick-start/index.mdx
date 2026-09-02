@@ -1,33 +1,36 @@
 ---
 title: Quick Start
-description: Install Komodo, connect a server, and deploy your first Compose stack.
+description: Install Komodo and deploy your first Compose stack.
 ---
 
-Komodo is a self-hosted web application for deploying and monitoring containers, Compose stacks, builds, and automated workflows across any number of servers.
+Komodo is a self-hosted web application for deploying and monitoring containers, Compose stacks, builds, and automated workflows.
 
-This guide follows the shortest supported path from an empty Docker host to a managed stack.
+The recommended installation starts MongoDB, Core, and a local Periphery agent together. The local agent lets Komodo manage the same Docker server immediately, so you do not need to install a second agent before deploying your first Stack.
+
+<Callout title="Independent hard fork" type="warn">
+  Komodo 3.0.0 and later has diverged from upstream Komodo. Start a fresh installation: migrations from upstream are not supported, and its data, configuration, agents, and clients must not be assumed compatible. Cherry-picked upstream fixes do not imply backward compatibility.
+</Callout>
 
 ## What you need
 
-- A Linux server with a supported Docker Engine and the Docker Compose plugin.
-- A DNS name or private-network address that can reach Komodo Core.
-- Permission to create directories, containers, networks, and named volumes on the Core host.
-- A second Docker server to manage, or permission to use the Core host as your first server.
-
-Podman can work through a `podman` to `docker` alias, but Docker is the recommended path for a first installation.
+- A Linux server with Docker Engine and the Docker Compose plugin.
+- A DNS name or private-network address for Komodo Core.
+- Permission to create directories, containers, networks, and named volumes.
 
 ## Complete the first deployment
 
-1. [Install Core](/quick-start/install-core) with the MongoDB Compose template.
-2. [Connect a server](/quick-start/connect-server) by installing the Periphery agent.
-3. [Deploy your first stack](/quick-start/deploy-first-stack) from the Komodo interface.
+1. [Install Komodo](/quick-start/install-komodo) with the recommended MongoDB Compose template.
+2. Sign in and confirm the local Server reports **OK**.
+3. [Deploy your first Stack](/quick-start/deploy-first-stack).
 
 ## Expected result
 
-You can sign in to Komodo, the connected server reports **OK**, and the first Stack shows its Compose services as running.
+MongoDB, Core, and Periphery run in one Compose project. You can sign in, the local Server reports **OK**, and your first Stack shows its services as running.
 
-## If you need another path
+## Optional next steps
 
-- Use [FerretDB](/administration/databases/ferretdb) when the host cannot run current MongoDB images.
-- Read [Core configuration](/administration/core-configuration) for OAuth/OIDC, private certificate authorities, and mounted configuration files.
-- Review [Security and trust boundaries](/administration/security-and-trust) before exposing Core publicly or granting File Manager access.
+- [Add another Server](/quick-start/add-another-server) when you want Komodo to manage a different Docker host.
+- Use [FerretDB](/administration/databases/ferretdb) when MongoDB cannot run on the host.
+- Review [Security and trust boundaries](/administration/security-and-trust) before exposing Core publicly or giving other users access.
+
+Podman may work through a `podman`-to-`docker` alias, but Docker is the officially supported deployment platform.

@@ -3,6 +3,7 @@
   "pages": [
     "index",
     "databases",
+    "container-deployment",
     "core-configuration",
     "authentication-and-providers",
     "users-groups-permissions",

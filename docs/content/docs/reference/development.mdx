@@ -6,6 +6,10 @@ description: Build, run, and contribute to Komodo.
 
 If you are looking to contribute to Komodo, this page is a launching point for setting up your Komodo development environment.
 
+<Callout title="Self-supported source builds" type="info">
+  Komodo officially distributes and supports container images. The commands on this page are for development and self-compiled builds; the project does not publish native binary releases.
+</Callout>
+
 ## Dependencies
 
 Running Komodo from [source](https://github.com/neurekadev/komodo) requires either [Docker](https://www.docker.com/) (and can use the included [devcontainer](https://code.visualstudio.com/docs/devcontainers/containers)), or can have the development dependencies installed locally:
@@ -98,7 +102,7 @@ docker run -d --name komodo-mongo \
 -v komodo-mongo-config:/data/configdb \
 -e MONGO_INITDB_ROOT_USERNAME=komodo \
 -e MONGO_INITDB_ROOT_PASSWORD=komodo \
-mongo
+mongo:8
 ```
 
 In separate terminals, run Core, Periphery, and UI.

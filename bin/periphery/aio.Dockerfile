@@ -29,6 +29,7 @@ RUN sh ./debian-deps.sh && rm ./debian-deps.sh
 COPY --from=builder /builder/target/release/periphery /usr/local/bin/periphery
 
 COPY ./bin/entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY ./bin/compose-defaults.sh /app/bin/compose-defaults.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
 ARG GIT_TAG=dev
@@ -40,8 +41,8 @@ EXPOSE 8120
 
 # Can mount config file to /config/*config*.toml and it will be picked up.
 ENV PERIPHERY_CONFIG_PATHS="/config"
-# Change the default in container to /config/keys to match Core
-ENV PERIPHERY_PRIVATE_KEY="file:/config/keys/periphery.key"
+# The entrypoint retains /config/keys for ordinary Periphery invocations and
+# selects /data/keys only for the explicit periphery-compose command.
 
 ENTRYPOINT [ "entrypoint.sh" ]
 CMD [ "periphery" ]

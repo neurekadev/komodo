@@ -8,20 +8,19 @@ Additional configuration options for Komodo Core and Periphery, including custom
 
 ## Change Configuration Safely
 
-1. Read the current values from the checked-in [`core.config.toml`](https://github.com/neurekadev/komodo/blob/main/config/core.config.toml), [`periphery.config.toml`](https://github.com/neurekadev/komodo/blob/main/config/periphery.config.toml), and [`compose.env`](https://github.com/neurekadev/komodo/blob/main/compose/compose.env) examples.
+1. Read the current values from the checked-in [`core.config.toml`](https://github.com/neurekadev/komodo/blob/main/config/core.config.toml), [`periphery.config.toml`](https://github.com/neurekadev/komodo/blob/main/config/periphery.config.toml), [`compose.env`](https://github.com/neurekadev/komodo/blob/main/compose/compose.env), and [`periphery.env`](https://github.com/neurekadev/komodo/blob/main/compose/periphery.env) examples.
 2. Back up the active Compose, environment, and mounted configuration files.
 3. Change one concern at a time and keep secrets in protected files or secret-specific environment-file variables.
-4. Run `docker compose config`, restart only the affected service, and inspect its logs.
+4. Run `docker compose -p komodo config`, recreate the affected service with `docker compose -p komodo up -d <service>`, and inspect its logs. A restart alone does not reload `.env`.
 5. Verify sign-in, server connectivity, and one read-only operation before making another change.
 
-The expected result is a healthy Core and connected Periphery agents using the new value. If the service fails, restore the previous file, re-run `docker compose config`, and restart it before continuing.
+The expected result is a healthy Core and connected Periphery agents using the new value. If the service fails, restore the previous file, re-run `docker compose -p komodo config`, and recreate it before continuing. For required environment inputs, image defaults, and storage paths, see [Container Deployment](/administration/container-deployment).
 
 ## First Server and Container Routing
 
-`KOMODO_FIRST_SERVER_ADDRESS` is optional. Core now applies legacy database
-repairs before creating startup resources, so an old deployment can safely
-leave this variable defined while upgrading. After startup, confirm the first
-Server appears once and reports **OK**.
+`KOMODO_FIRST_SERVER_ADDRESS` is optional and selects an inbound connection to
+the first Server. The main Compose installation instead uses an outbound local
+Periphery connection. After startup, confirm the Server reports **OK**.
 
 Set `KOMODO_INTERNET_INTERFACE` only when containerized Core must route outbound
 traffic through a specific interface. Core accepts operational interfaces that
@@ -36,7 +35,7 @@ In order to communicate with companion services on private networks,
 such as OIDC and git providers,
 **Komodo Core and Periphery may both need to trust one or more custom CAs**.
 
-**Starting in V2**, Both the Komodo Core and Periphery images will automatically `update-ca-certificates` on startup,
+Both the Komodo Core and Periphery images automatically run `update-ca-certificates` on startup;
 just mount any required root certificates inside `/usr/local/share/ca-certificates`:
 
 ```yaml
@@ -92,10 +91,10 @@ If using a reverse proxy with Komodo Core, you can limit the IPs which can conne
 komodo.example.com {
 	handle /ws/periphery {
 		import reject-ips
-		reverse_proxy komodo-core:9120
+		reverse_proxy komodo:9120
 	}
 	handle {
-		reverse_proxy komodo-core:9120
+		reverse_proxy komodo:9120
 	}
 }
 ```

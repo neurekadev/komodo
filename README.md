@@ -16,14 +16,17 @@ Komodo is a self-hosted system for building, deploying, and automating software 
 
 > [!NOTE]
 > This repository is a hard fork of [Komodo](https://github.com/moghtech/komodo), initially created to add a File Manager and now maintained to deliver additional features.
+> Version 3.0.0 and later has diverged from upstream. Upstream migrations are not supported, and backward compatibility should not be assumed. Selected upstream fixes may still be cherry-picked.
 
 ## Quick Start
 
-Follow the [Quick Start](https://komodo.docs.neureka.dev/quick-start) to install Core, connect a server, and deploy a first Stack. Download versioned binaries from [Releases](https://github.com/neurekadev/komodo/releases) when you need a non-container installation.
+Follow the [Quick Start](https://komodo.docs.neureka.dev/quick-start) to start MongoDB, Core, and Periphery with Docker Compose, then deploy your first Stack.
+
+Official Komodo releases are distributed as container images. Advanced users may compile the source themselves, but native binary deployments are not an officially supported installation path.
 
 ## Usage
 
-Run Core to host the API and browser interface, then connect Periphery agents on the servers you want to manage.
+The recommended Compose project runs Core, MongoDB, and Periphery for the local Docker host. Add standalone Periphery containers only on other servers you want to manage.
 
 - Read the [documentation](https://komodo.docs.neureka.dev/).
 - Use the [CLI](https://komodo.docs.neureka.dev/reference/cli) and [API clients](https://komodo.docs.neureka.dev/reference/api-and-client-libraries) for automation.
