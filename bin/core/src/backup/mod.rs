@@ -7050,12 +7050,19 @@ mod tests {
 
   #[test]
   fn fleet_retries_have_a_bounded_exponential_window() {
-    assert_eq!(fleet_retry_delay_seconds(0), Some(2));
-    assert_eq!(fleet_retry_delay_seconds(7), Some(256));
+    for (completed_attempts, delay) in
+      [1, 2, 4, 8, 16, 32, 64, 128].into_iter().enumerate()
+    {
+      assert_eq!(
+        fleet_retry_delay_seconds(completed_attempts as u32),
+        Some(delay)
+      );
+    }
     assert_eq!(
       fleet_retry_delay_seconds(MAX_FLEET_RETRY_ATTEMPTS),
       None
     );
+    assert_eq!(fleet_retry_delay_seconds(u32::MAX), None);
   }
 
   #[test]
