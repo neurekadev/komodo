@@ -87,7 +87,11 @@ jobs:
             directory="$RUNNER_TEMP/compose-$variant"
             mkdir -p "$directory"
             cp "compose/$variant.compose.yaml" "$directory/compose.yaml"
-            cp compose/compose.env "$directory/.env"
+            if [[ "$variant" == "periphery" ]]; then
+              cp compose/periphery.env "$directory/.env"
+            else
+              cp compose/compose.env "$directory/.env"
+            fi
             docker compose --project-directory "$directory" config --quiet
           done
 

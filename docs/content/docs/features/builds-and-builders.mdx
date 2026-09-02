@@ -187,9 +187,17 @@ params.use_public_ip = true ## Setting 'false' uses the private IP (when Komodo 
 params.security_group_ids = ["sg-xxxxxxxxxxxxxxxxxx"]
 params.user_data = """
 #!/bin/bash
-curl -sSL \
-   https://raw.githubusercontent.com/neurekadev/komodo/main/scripts/setup-periphery.py | \
-  HOME=/root python3 - --version=v2.X.X
+docker run -d \
+  --name komodo-periphery \
+  --init \
+  --restart unless-stopped \
+  -p 8120:8120 \
+  -e PERIPHERY_ROOT_DIRECTORY=/etc/komodo \
+  -e PERIPHERY_PRIVATE_KEY=file:/etc/komodo/keys/periphery.key \
+  -v /etc/komodo:/etc/komodo \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v /proc:/proc \
+  ghcr.io/neurekadev/komodo-periphery:3
 """
 ```
 
@@ -204,5 +212,4 @@ To create the AMI:
 2. Create an AMI from the instance in the AWS console.
 3. Create a security group and ensure it allows inbound access on port **8120** from Komodo Core.
 
-The instance `user_data` will install the Periphery agent as the instance starts up,
-and Komodo Core will then connect and build the image.
+The instance `user_data` starts the official Periphery container as the instance boots. Komodo Core then connects to port `8120` and runs the build through that container. Keep `use_https` enabled unless you have explicitly configured another protected transport.

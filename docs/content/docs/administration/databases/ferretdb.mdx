@@ -12,9 +12,9 @@ description: Install Komodo with the PostgreSQL-backed FerretDB database option.
 </Callout>
 
 [**FerretDB**](https://www.ferretdb.com) is a MongoDB-compatible database backed by [Postgres + DocumentDB extension](https://github.com/microsoft/documentdb).
-It is a solid option with performance comparable to MongoDB, and can also be run on some systems which [do not support MongoDB](https://github.com/moghtech/komodo/issues/59).
+Use it when MongoDB cannot run on the host or PostgreSQL is an operational requirement.
 
-1. Create the installation directory and download the FerretDB template as `compose.yaml` and the environment file as `.env`:
+1. Create the installation directory and download the FerretDB template as `compose.yaml` and the main environment file as `.env`:
 
 ```bash
 mkdir -p komodo

@@ -8,7 +8,7 @@ Additional configuration options for Komodo Core and Periphery, including custom
 
 ## Change Configuration Safely
 
-1. Read the current values from the checked-in [`core.config.toml`](https://github.com/neurekadev/komodo/blob/main/config/core.config.toml), [`periphery.config.toml`](https://github.com/neurekadev/komodo/blob/main/config/periphery.config.toml), and [`compose.env`](https://github.com/neurekadev/komodo/blob/main/compose/compose.env) examples.
+1. Read the current values from the checked-in [`core.config.toml`](https://github.com/neurekadev/komodo/blob/main/config/core.config.toml), [`periphery.config.toml`](https://github.com/neurekadev/komodo/blob/main/config/periphery.config.toml), [`compose.env`](https://github.com/neurekadev/komodo/blob/main/compose/compose.env), and [`periphery.env`](https://github.com/neurekadev/komodo/blob/main/compose/periphery.env) examples.
 2. Back up the active Compose, environment, and mounted configuration files.
 3. Change one concern at a time and keep secrets in protected files or secret-specific environment-file variables.
 4. Run `docker compose config`, restart only the affected service, and inspect its logs.

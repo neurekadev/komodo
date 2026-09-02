@@ -83,10 +83,6 @@ volumes:
   (...unchanged)
 ```
 
-#### Upgrade Periphery: Systemd
-
-Systemd Periphery users just need to update their Periphery binary version. The keys will be stored in your `root_directory` (default: `/etc/komodo/keys`).
-
 After getting both Core and Periphery running, everything should already work correctly at this point.
 
 ### 2a. Move to public key authentication
@@ -130,7 +126,7 @@ using public key authentication**. Note you must be an Admin user on Komodo.
 core_address = "<YOUR_KOMODO_CORE_ADDRESS>" # Example: demo.komo.do, ws://localhost:9120
 
 ## The Server this Periphery agent should "connect as".
-## Systemd periphery can use the system hostname by setting `connect_as = "$(hostname)"`.
+## Set this to the existing Server name shown in Komodo.
 ## Env: PERIPHERY_CONNECT_AS
 ## Default: None
 connect_as = "<SERVER_NAME>"

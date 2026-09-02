@@ -1,38 +1,71 @@
 ---
 title: MongoDB
-description: Install and operate Komodo with the recommended MongoDB database.
+description: Install and operate Komodo with the recommended MongoDB 8 container.
 ---
 
+[MongoDB](https://www.mongodb.com) is Komodo's recommended database. It stores resource configuration, users, audit logs, and system state.
 
-[**MongoDB**](https://www.mongodb.com) is the recommended database for Komodo. It stores all resource configuration, user accounts, audit logs, and system state. Komodo Core communicates with it directly using the MongoDB driver.
+The official template uses the `mongo:8` major-version tag. This keeps installations on MongoDB 8 while allowing compatible patch updates when you pull the image.
 
-## Quick Start
+## Install with MongoDB
 
-1. Create the installation directory and download the MongoDB template as `compose.yaml` and the environment file as `.env`:
+Follow [Install Komodo](/quick-start/install-komodo) for the complete MongoDB, Core, and local Periphery installation.
 
-```bash
-mkdir -p komodo
-cd komodo
-curl -fsSL -o compose.yaml https://raw.githubusercontent.com/neurekadev/komodo/main/compose/mongo.compose.yaml
-curl -fsSL -o .env https://raw.githubusercontent.com/neurekadev/komodo/main/compose/compose.env
-```
+The expected result is running `komodo-mongo`, `komodo-core`, and `komodo-periphery` containers. Database files persist in `komodo_mongo-data`; MongoDB configuration state persists in `komodo_mongo-config`.
 
-2. Edit `.env`, replacing the example host, credentials, and secrets.
-3. Review the resolved configuration and deploy:
+## Update MongoDB 8
+
+Back up Komodo before updating the database image, then run:
 
 ```bash
-docker compose config
+docker compose pull mongo
 docker compose up -d
+docker compose logs --tail=100 mongo
 ```
 
-Docker Compose discovers `compose.yaml` and `.env` automatically. The `.env` file sets `COMPOSE_PROJECT_NAME=komodo`, preserving the established `komodo_*` volume names.
+Confirm Core can reconnect and existing users and resources remain available. Do not delete the MongoDB volumes during an update.
 
-The expected result is healthy `komodo-mongo`, `komodo-core`, and `komodo-periphery` containers and a working sign-in page. If MongoDB does not become healthy, inspect its logs, verify the host CPU supports the selected image, and confirm the `komodo_mongo-data` volume is writable. Do not remove the volume while troubleshooting.
+## Troubleshooting
 
-[View the current MongoDB Compose template](https://github.com/neurekadev/komodo/blob/main/compose/mongo.compose.yaml) and [environment example](https://github.com/neurekadev/komodo/blob/main/compose/compose.env).
+Start with:
 
-<Callout title="Periphery host access" type="warn">
+```bash
+docker compose ps
+docker compose logs --tail=200 mongo
+```
 
-The template intentionally mounts Docker's named-volume root read/write into Periphery for host-visible workspaces and Docker-volume File Manager access. This makes Periphery Docker-host trusted. File Manager refuses to open `komodo_data` because it contains Periphery's private journal and credentials, but Server-level `FileManager` permission covers every other eligible named volume. Review the [File Manager trust boundary and permission scope](/features/file-manager#containerized-periphery) before deploying.
+Verify the database credentials have not changed since the volume was initialized and that `komodo_mongo-data` is writable.
 
-</Callout>
+### MongoDB exits with code 139 on Linux 6.19 or newer
+
+Some MongoDB 8 images can start successfully and then crash about 30 seconds later with exit code `139` (`SIGSEGV`) on Linux kernel 6.19 or newer. This is a known restartable-sequences interaction between the affected kernel and MongoDB's TCMalloc configuration. See the [docker-library investigation](https://github.com/docker-library/mongo/discussions/748) and the [glibc rseq tunable documentation](https://sourceware.org/glibc/manual/latest/html_node/POSIX-Thread-Tunables.html).
+
+Confirm the signature before applying the workaround:
+
+```bash
+uname -r
+docker inspect komodo-mongo --format 'status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}}'
+docker logs --tail=200 komodo-mongo
+```
+
+If the kernel is affected, add this temporary override beneath the MongoDB service's existing `environment` block:
+
+```yaml
+services:
+  mongo:
+    environment:
+      # Temporary Linux 6.19+ crash workaround: restore glibc rseq registration.
+      # Remove this after installing a kernel or MongoDB image containing the fix.
+      GLIBC_TUNABLES: glibc.pthread.rseq=1
+```
+
+Recreate only MongoDB and verify that it stays running:
+
+```bash
+docker compose up -d --force-recreate mongo
+docker compose ps mongo
+```
+
+This override is intentionally absent from the official template. It changes MongoDB's allocator behavior and should be used only for the matching crash signature, then removed after the underlying fix is installed.
+
+[View the MongoDB Compose template](https://github.com/neurekadev/komodo/blob/main/compose/mongo.compose.yaml) and [environment example](https://github.com/neurekadev/komodo/blob/main/compose/compose.env).

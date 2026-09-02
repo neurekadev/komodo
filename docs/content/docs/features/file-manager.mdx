@@ -120,4 +120,4 @@ Docker reports named-volume mountpoints in the host's path namespace. When Perip
 
 Changing that bind mount to read-only, or mounting only `komodo_data`, disables writable Docker-volume management and breaks the official templates' host-visible workspace paths. This makes the Periphery container part of the Docker host's trusted computing boundary; it already has equivalent host control through the Docker socket. Protect the Core-to-Periphery connection and apply the Server permission warning above.
 
-See [Connect More Servers](/features/servers-and-monitoring#container) for the template and rootless-Docker configuration.
+See [Add Another Server](/quick-start/add-another-server) for the standalone template and rootless-Docker configuration.

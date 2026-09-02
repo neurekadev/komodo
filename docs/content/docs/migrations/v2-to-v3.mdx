@@ -91,55 +91,19 @@ For FerretDB, download `ferretdb.compose.yaml` instead:
 curl -fsSL -o compose.yaml https://raw.githubusercontent.com/neurekadev/komodo/main/compose/ferretdb.compose.yaml
 ```
 
-Keep the existing credentials and other operator settings in `.env`. Apply these storage-contract changes:
+Keep the existing database credentials, administrator settings, application secrets, authentication providers, and other operator settings in `.env`. Remove `COMPOSE_KOMODO_BACKUPS_PATH`; the v3 template now supplies its internal `/data` key, backup, sync, repository, and Periphery paths directly.
 
-| Action | Variables |
-| --- | --- |
-| Remove | `COMPOSE_KOMODO_BACKUPS_PATH` |
-| Change | `COMPOSE_KOMODO_IMAGE_TAG`, `KOMODO_PERIPHERY_PUBLIC_KEY`, `PERIPHERY_CORE_PUBLIC_KEYS`, `PERIPHERY_ROOT_DIRECTORY` |
-| Add | `COMPOSE_PROJECT_NAME`, `KOMODO_PRIVATE_KEY`, `KOMODO_REPORTING_PRIVATE_KEY`, `KOMODO_CLI_BACKUPS_FOLDER`, `KOMODO_SYNC_DIRECTORY`, `KOMODO_REPO_DIRECTORY`, `PERIPHERY_PRIVATE_KEY`, `PERIPHERY_DOCKER_VOLUME_ROOT` |
+Remove old explicit path overrides so the template can use the migrated `/data` layout. This includes `KOMODO_PRIVATE_KEY`, `KOMODO_REPORTING_PRIVATE_KEY`, `KOMODO_PERIPHERY_PUBLIC_KEY`, `KOMODO_CLI_BACKUPS_FOLDER`, `KOMODO_SYNC_DIRECTORY`, `KOMODO_REPO_DIRECTORY`, `PERIPHERY_PRIVATE_KEY`, `PERIPHERY_CORE_PUBLIC_KEYS`, and `PERIPHERY_ROOT_DIRECTORY`. Keep custom overrides only if their mounts have also been migrated deliberately.
 
-Add or replace the settings using this exact block. Its comments and values match the current [`compose.env`](https://github.com/neurekadev/komodo/blob/main/compose/compose.env) example:
+Add or replace these deployment settings:
 
 ```dotenv
-## Keep the established Compose project and named-volume prefix.
+# Keep the established Compose project and named-volume prefix.
 COMPOSE_PROJECT_NAME=komodo
-## Follows "major.minor.patch" semver. Use the v3 major alias by default.
-COMPOSE_KOMODO_IMAGE_TAG="3"
+COMPOSE_KOMODO_IMAGE_TAG=3
+KOMODO_FIRST_SERVER_NAME=Local
 
-## Persist Core identity and reporting keys in the shared data volume.
-KOMODO_PRIVATE_KEY=file:/data/keys/core.key
-KOMODO_REPORTING_PRIVATE_KEY=file:/data/keys/reporting.key
-## Allow Periphery to connect via its generated public key.
-KOMODO_PERIPHERY_PUBLIC_KEY=file:/data/keys/periphery.pub
-
-## Persist backups, sync files, and cloned repositories in the shared data volume.
-KOMODO_CLI_BACKUPS_FOLDER=/data/backups
-KOMODO_SYNC_DIRECTORY=/data/syncs
-KOMODO_REPO_DIRECTORY=/data/repo-cache
-
-## Persist Periphery identity and trust Core's generated public key.
-PERIPHERY_PRIVATE_KEY=file:/data/keys/periphery.key
-PERIPHERY_CORE_PUBLIC_KEYS=file:/data/keys/core.pub
-
-## Specify the root directory used by Periphery agent.
-## All your compose files and repos need to be inside this directory
-## for Periphery to interact with them.
-## - ROOT_DIRECTORY (/data)
-## --- ./stacks
-## ------ ./my_stack_1
-## ------ ./my_stack_2
-## --- ./repos
-## ------ ./my_repo_1
-## --- ./builds
-## --- ./ssl
-## --- ./file-manager-journal
-PERIPHERY_ROOT_DIRECTORY=/data
-
-## Docker's absolute named-volume storage root on the host.
-## It is mounted read/write at the identical path so containerized Periphery
-## can browse and modify local named volumes. Change this for rootless Docker
-## or a nonstandard Docker data root; do not redirect it into /data.
+# Docker's absolute named-volume storage root on the host.
 PERIPHERY_DOCKER_VOLUME_ROOT=/var/lib/docker/volumes
 ```
 
@@ -149,7 +113,7 @@ For rootless Docker or a customized Docker data root, set `PERIPHERY_DOCKER_VOLU
 docker info --format '{{.DockerRootDir}}/volumes'
 ```
 
-The templates keep `PERIPHERY_ROOT_DIRECTORY=/data` for keys, SSL files, and File Manager state. Repositories, stacks, and builds remain in the same `komodo_data` volume, but Periphery accesses them through host-visible aliases beneath `${PERIPHERY_DOCKER_VOLUME_ROOT}/komodo_data/_data`. This keeps relative Compose bind mounts and Docker build contexts in the host daemon's path namespace without changing the named-volume layout.
+The templates set `PERIPHERY_ROOT_DIRECTORY=/data` and the Core and Periphery key paths internally. Repositories, stacks, and builds remain in the same `komodo_data` volume, but Periphery accesses them through host-visible aliases beneath `${PERIPHERY_DOCKER_VOLUME_ROOT}/komodo_data/_data`. This keeps relative Compose bind mounts and Docker build contexts in the host daemon's path namespace without changing the named-volume layout.
 
 With the standard Docker volume root, `docker compose config` resolves the Periphery directories to:
 
