@@ -38,7 +38,7 @@ async fn app() -> anyhow::Result<()> {
   let startup_span = info_span!("CoreStartup");
 
   async {
-    info!("Komodo Core version: v{}", env!("CARGO_PKG_VERSION"));
+    info!("Komodo Core version: {}", komodo_build_info::version());
 
     match (
       config.pretty_startup_config,

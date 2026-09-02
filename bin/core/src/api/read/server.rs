@@ -56,7 +56,7 @@ impl Resolve<ReadArgs> for GetServersSummary {
     )
     .await?;
 
-    let core_version = env!("CARGO_PKG_VERSION");
+    let core_version = komodo_build_info::version();
     let mut res = GetServersSummaryResponse::default();
 
     for server in servers {
@@ -64,7 +64,7 @@ impl Resolve<ReadArgs> for GetServersSummary {
       match server.info.state {
         ServerState::Ok => {
           // Check for version mismatch
-          if matches!(&server.info.version, Some(version) if version != core_version)
+          if matches!(&server.info.version, Some(version) if !komodo_build_info::versions_match(version, core_version))
           {
             res.warning += 1;
           } else {

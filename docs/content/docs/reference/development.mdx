@@ -6,6 +6,10 @@ description: Build, run, and contribute to Komodo.
 
 If you are looking to contribute to Komodo, this page is a launching point for setting up your Komodo development environment.
 
+<Callout title="Self-supported source builds" type="info">
+  Komodo officially distributes and supports container images. The commands on this page are for development and self-compiled builds; the project does not publish native binary releases.
+</Callout>
+
 ## Dependencies
 
 Running Komodo from [source](https://github.com/neurekadev/komodo) requires either [Docker](https://www.docker.com/) (and can use the included [devcontainer](https://code.visualstudio.com/docs/devcontainers/containers)), or can have the development dependencies installed locally:
@@ -98,7 +102,7 @@ docker run -d --name komodo-mongo \
 -v komodo-mongo-config:/data/configdb \
 -e MONGO_INITDB_ROOT_USERNAME=komodo \
 -e MONGO_INITDB_ROOT_PASSWORD=komodo \
-mongo
+mongo:8
 ```
 
 In separate terminals, run Core, Periphery, and UI.
@@ -123,6 +127,24 @@ After API changes, rebuild the client with
 ```bash
 run gen-client  # Rebuild client (after API changes)
 ```
+
+## Build identity
+
+Komodo uses Git metadata as its product version. Release builds report the
+exact bare tag, such as `3.0.0`. Images built from `main` report `edge@<hash>`,
+using the first 12 characters of the commit hash. Local builds without
+complete metadata report `dev`.
+
+The official container workflow passes `GIT_TAG` and `GIT_HASH` as build
+arguments and preserves both values in the final image. The Core version API
+also returns the full tag and hash for diagnostics, while the top bar links a
+release build to its exact release and an edge build to its exact commit.
+
+The unpublished Rust workspace packages and private TypeScript client use the
+sentinel version `0.0.0`. Package metadata is not a Komodo release version and
+does not change for fork releases or upstream synchronization. The UI builds
+the TypeScript client directly from the same repository revision; the fork does
+not publish it to NPM.
 
 ## Docsite Development
 

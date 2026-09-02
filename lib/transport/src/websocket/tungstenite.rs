@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{str::FromStr as _, sync::Arc};
 
 use anyhow::{Context, anyhow};
 use axum::http::{self, HeaderValue};
@@ -246,10 +246,11 @@ fn make_request(url: &str) -> mogh_error::Result<http::Request<()>> {
     url.into_client_request().context("Invalid websocket URL")?;
   request.headers_mut().insert(
     "user-agent",
-    HeaderValue::from_static(concat!(
-      "komodo/",
-      env!("CARGO_PKG_VERSION")
-    )),
+    HeaderValue::from_str(&format!(
+      "komodo/{}",
+      komodo_build_info::version()
+    ))
+    .context("Invalid Komodo build identity")?,
   );
   Ok(request)
 }

@@ -3160,7 +3160,7 @@ async fn run_node_batch(
       advanced: settings.advanced.clone(),
       hostname: format!("komodo-periphery-{}", server.id),
       run_id: run.id.clone(),
-      komodo_version: env!("CARGO_PKG_VERSION").into(),
+      komodo_version: komodo_build_info::version().into(),
       protected_repository_paths: core_local_repository_paths(
         settings,
       ),
@@ -3462,7 +3462,7 @@ async fn backup_core(
     .collect::<Vec<_>>();
   let manifest = serde_json::json!({
     "schema": "komodo.core-export/v1",
-    "version": env!("CARGO_PKG_VERSION"),
+    "version": komodo_build_info::version(),
     "core_instance_id": core_instance_id()?,
     "collections": exported_collections,
     "created_at": komodo_timestamp(),
@@ -3588,7 +3588,7 @@ async fn backup_stack(
       )?,
       snapshot_name,
       run_id: run.id.clone(),
-      komodo_version: env!("CARGO_PKG_VERSION").into(),
+      komodo_version: komodo_build_info::version().into(),
       protected_repository_paths: core_local_repository_paths(
         settings,
       ),
@@ -3650,7 +3650,7 @@ async fn backup_volume(
       )?,
       snapshot_name,
       run_id: run.id.clone(),
-      komodo_version: env!("CARGO_PKG_VERSION").into(),
+      komodo_version: komodo_build_info::version().into(),
       protected_repository_paths: core_local_repository_paths(
         settings,
       ),
@@ -5318,11 +5318,11 @@ pub async fn plan_core_recovery(
     .context("Core snapshot manifest has no Komodo version")?
     .to_string();
   if backup_version.split('.').next()
-    != env!("CARGO_PKG_VERSION").split('.').next()
+    != komodo_build_info::version().split('.').next()
   {
     return Err(anyhow!(
       "Core backup major version {backup_version} is incompatible with {}",
-      env!("CARGO_PKG_VERSION")
+      komodo_build_info::version()
     ));
   }
   let recovered_core_instance_id = manifest

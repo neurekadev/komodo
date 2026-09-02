@@ -1,0 +1,110 @@
+---
+title: Add Another Server
+description: Run standalone Periphery on another Docker server and connect it to Core.
+---
+
+The main Komodo installation already includes Periphery for its local Docker host. Follow this guide only when you want to manage an additional server.
+
+## Prerequisites
+
+- Komodo Core is available at an HTTPS address reachable from the new server.
+- Docker Engine and the Docker Compose plugin are installed on the new server.
+- You are signed in to Komodo as an administrator.
+
+## Create an onboarding key
+
+1. In Komodo, open **Settings → Onboarding**.
+2. Create an onboarding key and copy it. Core shows the secret only once.
+3. Keep the page open until the new Server reports **OK**.
+
+## Option 1: Docker Compose
+
+1. Download the standalone template and its focused environment example:
+
+   ```bash
+   mkdir -p komodo-periphery
+   cd komodo-periphery
+   curl -fsSL -o compose.yaml https://raw.githubusercontent.com/neurekadev/komodo/main/compose/periphery.compose.yaml
+   curl -fsSL -o .env https://raw.githubusercontent.com/neurekadev/komodo/main/compose/periphery.env
+   ```
+
+2. Edit `.env`. Set `PERIPHERY_CORE_ADDRESS`, `PERIPHERY_CONNECT_AS`, and `PERIPHERY_ONBOARDING_KEY`. Protect it with `chmod 600 .env`.
+
+3. Review and start Periphery:
+
+   ```bash
+   docker compose -p komodo config
+   docker compose -p komodo up -d
+   docker compose -p komodo logs --tail=100 komodo-periphery
+   ```
+
+## Option 2: Docker run
+
+1. Download and edit the same focused environment example:
+
+   ```bash
+   mkdir -p komodo-periphery
+   cd komodo-periphery
+   curl -fsSL -o .env https://raw.githubusercontent.com/neurekadev/komodo/main/compose/periphery.env
+   ```
+
+2. Create a persistent data volume and start Periphery:
+
+   ```bash
+   docker volume create komodo-periphery-data
+
+   docker run -d \
+     --name komodo-periphery \
+     --init \
+     --restart unless-stopped \
+     --env-file ./.env \
+     -e PERIPHERY_ROOT_DIRECTORY=/data \
+     -e PERIPHERY_REPO_DIR=/var/lib/docker/volumes/komodo-periphery-data/_data/repos \
+     -e PERIPHERY_STACK_DIR=/var/lib/docker/volumes/komodo-periphery-data/_data/stacks \
+     -e PERIPHERY_BUILD_DIR=/var/lib/docker/volumes/komodo-periphery-data/_data/builds \
+     -v komodo-periphery-data:/data \
+     -v /var/run/docker.sock:/var/run/docker.sock \
+     -v /var/lib/docker/volumes:/var/lib/docker/volumes \
+     -v /proc:/proc \
+     ghcr.io/neurekadev/komodo-periphery:3 periphery-compose
+   ```
+
+3. Inspect startup with `docker logs --tail=100 komodo-periphery`.
+
+The `docker run` command selects its image tag directly. The `periphery-compose` startup command applies the same persistent identity defaults as the Compose template. Both examples require images built with this startup profile; keep Core and Periphery on the same fork release.
+
+## Finish onboarding
+
+1. Return to **Servers**, select the name from `PERIPHERY_CONNECT_AS`, and confirm its status is **OK**.
+2. Remove `PERIPHERY_ONBOARDING_KEY` from `.env` after the first successful connection.
+3. Recreate the container so the one-time key is no longer present:
+   - Compose: `docker compose -p komodo up -d --force-recreate`
+   - Docker run: remove the container and repeat the same `docker run` command. The data volume preserves Periphery's identity.
+4. Disable or delete the onboarding key in Komodo if no other server needs it.
+
+## Updates and custom Docker roots
+
+For Compose, run `docker compose -p komodo pull && docker compose -p komodo up -d`. For `docker run`, pull the selected image, remove the old container, and repeat the command with the same data volume.
+
+The examples use `/var/lib/docker/volumes`. Rootless Docker and customized Docker installations use a different directory. Find it with:
+
+```bash
+docker info --format '{{.DockerRootDir}}/volumes'
+```
+
+Add `PERIPHERY_DOCKER_VOLUME_ROOT` to `.env` for Compose. For `docker run`, replace every `/var/lib/docker/volumes` path in the command with the reported absolute path. See [Container Deployment](/administration/container-deployment) for other optional overrides.
+
+Rootless Docker also uses a different socket. Run `docker context inspect --format '{{.Endpoints.docker.Host}}'` to find it. If the result is a `unix://` path, replace the source `/var/run/docker.sock` in the template or command with that host socket path; keep the container target as `/var/run/docker.sock`.
+
+## Troubleshooting
+
+- Confirm the server can reach `PERIPHERY_CORE_ADDRESS` and trusts its TLS certificate.
+- Confirm `docker ps` succeeds on the server.
+- Check Periphery logs for an onboarding, public-key, or Docker socket error.
+- Keep the persistent data volume when recreating the container; it contains Periphery's identity and managed files.
+
+<Callout title="Docker host trust boundary" type="warn">
+  Periphery controls Docker and mounts the named-volume directory read/write for File Manager and host-visible Stack paths. Anyone who can control Periphery can effectively control the Docker host. Grant Server permissions only to trusted users.
+</Callout>
+
+For monitoring behavior, authentication, and advanced configuration, see [Servers and Monitoring](/features/servers-and-monitoring).

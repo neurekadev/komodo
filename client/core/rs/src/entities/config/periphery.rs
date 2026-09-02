@@ -53,7 +53,12 @@ use super::{
 ///   --log-level info
 /// ```
 #[derive(Parser)]
-#[command(name = "periphery", author, about, version)]
+#[command(
+  name = "periphery",
+  version = komodo_build_info::version(),
+  author,
+  about
+)]
 pub struct CliArgs {
   /// Additional utilities.
   #[command(subcommand)]

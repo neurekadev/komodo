@@ -5,6 +5,9 @@ WORKDIR /app
 COPY package.json yarn.lock ./
 RUN yarn install --frozen-lockfile --non-interactive
 
+ARG GIT_TAG=dev
+ARG GIT_HASH=unknown
+
 COPY . .
 RUN yarn typecheck \
     && yarn lint \
@@ -24,6 +27,11 @@ RUN mkdir -p /config /data /srv \
 COPY --from=caddy-binary /usr/bin/caddy /usr/bin/caddy
 COPY Caddyfile /etc/caddy/Caddyfile
 COPY --from=builder --chown=65532:65532 /app/out /srv
+
+ARG GIT_TAG=dev
+ARG GIT_HASH=unknown
+ENV GIT_TAG=$GIT_TAG \
+    GIT_HASH=$GIT_HASH
 
 EXPOSE 80
 

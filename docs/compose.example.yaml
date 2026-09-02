@@ -1,7 +1,12 @@
 services:
-  docs:
+  komodo-docs:
     image: ghcr.io/neurekadev/komodo-docs:edge
     container_name: komodo-docs
-    restart: unless-stopped
+    networks: [komodo-docs]
     ports:
       - "127.0.0.1:8080:80"
+    restart: unless-stopped
+
+networks:
+  komodo-docs:
+    name: komodo-docs

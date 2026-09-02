@@ -1,7 +1,7 @@
 ## All in one, multi stage compile + runtime Docker build for your architecture.
 
 # Build Core dependencies independently from application source.
-FROM lukemathwalker/cargo-chef:0.1.78-rust-1.97.1-trixie@sha256:6dce65df3d7430c797e94348b4cf36d8d5876b63ca54f35dbfd37a97c42d0add AS chef
+FROM lukemathwalker/cargo-chef:0.1.78-rust-1.98.0-trixie@sha256:d21902576546863995017609e991178939e6f151f6b35fb00f3c0fa97a616ef5 AS chef
 ENV CARGO_HTTP_TIMEOUT=600 \
   CARGO_NET_RETRY=10
 WORKDIR /builder
@@ -17,8 +17,6 @@ COPY ./xtask ./xtask
 RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS core-builder
-ARG GIT_TAG=dev
-ARG GIT_HASH=unknown
 COPY --from=planner /builder/recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json
 
@@ -29,6 +27,9 @@ COPY ./client/periphery/rs ./client/periphery/rs
 COPY ./bin/core ./bin/core
 COPY ./bin/cli ./bin/cli
 COPY ./xtask ./xtask
+
+ARG GIT_TAG=dev
+ARG GIT_HASH=unknown
 
 # Compile app, retain only final binaries in this source-sensitive layer.
 RUN cargo build -p komodo_core --release && \
@@ -57,10 +58,6 @@ RUN cd /builder/client && yarn link && \
 
 # Final Image
 FROM debian:trixie-slim
-ARG GIT_TAG=dev
-ARG GIT_HASH=unknown
-ENV GIT_TAG=$GIT_TAG \
-  GIT_HASH=$GIT_HASH
 
 COPY ./bin/core/starship.toml /starship.toml
 COPY ./bin/core/debian-deps.sh .
@@ -73,7 +70,8 @@ WORKDIR /app
 COPY ./config/core.config.toml /config/.default.config.toml
 COPY --from=ui-builder /builder/ui/dist /app/ui
 COPY --from=core-builder /out/core /usr/local/bin/core
-COPY --from=core-builder /out/km /usr/local/bin/km
+COPY --from=core-builder /out/km /app/bin/km
+COPY --chmod=755 ./bin/core/km.sh /usr/local/bin/km
 COPY --from=denoland/deno:bin /deno /usr/local/bin/deno
 
 # Set $DENO_DIR and preload external Deno deps
@@ -83,7 +81,13 @@ RUN mkdir /action-cache && \
   deno install jsr:@std/yaml jsr:@std/toml
 
 COPY ./bin/entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY ./bin/compose-defaults.sh /app/bin/compose-defaults.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
+
+ARG GIT_TAG=dev
+ARG GIT_HASH=unknown
+ENV GIT_TAG=$GIT_TAG \
+  GIT_HASH=$GIT_HASH
 
 # Hint at the port
 EXPOSE 9120

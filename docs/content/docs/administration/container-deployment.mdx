@@ -1,0 +1,54 @@
+---
+title: Container Deployment
+description: Choose the right environment example and keep container configuration and storage consistent.
+---
+
+Use [Install Komodo](/quick-start/install-komodo) for the main installation or [Add Another Server](/quick-start/add-another-server) for an additional Periphery. This page covers optional settings after the basic deployment works.
+
+## Choose the environment file
+
+Save the matching repository example as `.env` beside `compose.yaml`:
+
+| Deployment | Compose template | Environment example |
+| --- | --- | --- |
+| MongoDB, Core, local Periphery | `mongo.compose.yaml` | `compose.env` |
+| PostgreSQL/DocumentDB, FerretDB, Core, local Periphery | `ferretdb.compose.yaml` | `ferretdb.env` |
+| Additional Periphery | `periphery.compose.yaml` | `periphery.env` |
+
+Replace every `REPLACE_WITH_*` value and keep the `${...}` credential references intact. The database files use native MongoDB or PostgreSQL variables to reuse Core's credentials, so you enter each password only once. Use a URL-safe database password, such as the output of `openssl rand -hex 32`, for FerretDB's connection URL.
+
+Each service loads `.env`. Only use the matching file on a trusted host: the main file contains administrator and database secrets, and all services in that project receive it. Do not reuse it for additional servers; standalone Periphery needs only its Core address, Server name, and temporary onboarding key. Protect `.env` with `chmod 600 .env`. `docker compose config` displays resolved secrets, so do not paste its output into public issues.
+
+## Optional settings
+
+The examples contain required inputs only. Add optional overrides to `.env` when needed:
+
+| Setting | When to use it |
+| --- | --- |
+| `COMPOSE_KOMODO_IMAGE_TAG` | Select a specific fork release or `edge`; the templates default to major tag `3`. Keep Core and Periphery on the same release. |
+| `TZ` | Choose a timezone instead of the container's UTC default. |
+| `KOMODO_FIRST_SERVER_NAME` | Name the main installation's local Server instead of `Local`, before its first start. |
+| `PERIPHERY_CONNECT_AS` | Connect Periphery to an existing Server by its exact name. Changing the default first-server name does not rename a stored Server. |
+| `PERIPHERY_DOCKER_VOLUME_ROOT` | Use a custom Docker volume root or rootless Docker. Run `docker info --format '{{.DockerRootDir}}/volumes'` on the host. |
+
+Other settings remain available in [Advanced Core and Periphery Configuration](/administration/core-configuration) and [Servers and Monitoring](/features/servers-and-monitoring). Recreate affected containers after changing `.env`; a restart alone does not reload it.
+
+## Storage and networking
+
+Always use `docker compose -p komodo ...` with these examples. The project name keeps the established `komodo_data` and database volume names; do not use `down -v` during routine maintenance. If you deliberately use another project name, also set `COMPOSE_PROJECT_NAME` to that exact name in `.env`, and use it consistently with `-p`. Periphery uses that value to locate the volume on the Docker host.
+
+Core and the local Periphery share `data:/data` for communication keys and persistent working data. Existing volume names and directory contents are unchanged. Backups use `/data/backups`; communication keys use `/data/keys`. Core's backup authentication and sealing key is separate at `/core-secrets/backup.key` in the Core-only `core-secrets` volume; preserve it independently for [backup recovery](/administration/backups#recover-core-on-a-fresh-install). Periphery's repositories, stacks, build contexts, and Vykar cache use host-visible paths beneath `/var/lib/docker/volumes/komodo_data/_data` by default, so Docker resolves relative bind mounts correctly and the cache survives container replacement.
+
+Periphery's Docker socket and read/write named-volume-root mounts grant control over the host. Keep that root mounted at the same absolute path inside the container, and restrict Server access to trusted users. See [Security and Trust Boundaries](/administration/security-and-trust).
+
+The main services share the named `komodo` network. Core's service and container name is `komodo`; dependencies use `komodo-mongo`, `komodo-periphery`, `komodo-postgres`, and `komodo-ferretdb` as applicable. Older internal DNS aliases (`core`, `komodo-core`, `periphery`, `mongo`, `postgres`, and `ferretdb`) remain available within that network. Only Core's port `9120` is published; database and local-agent ports stay internal. Standalone Periphery uses the `komodo-periphery` network and connects outbound without a published port.
+
+## Image-owned startup defaults
+
+The templates invoke `core-compose` and `periphery-compose`. These image entrypoint commands supply the shared-volume paths, internal database/Core addresses, and local Server defaults. Explicit environment overrides remain supported. `docker compose config` checks the model and supplied values, but does not display defaults computed inside the image.
+
+The Core image's `km` command uses the same defaults when run with `docker exec komodo km ...`, including the database address and `/data/backups` destination. Ordinary `core` and `periphery` image commands keep their non-Compose behavior, including the AWS Builder's explicit inbound configuration.
+
+Use these templates with images from the same source revision or a release that includes these startup commands. Older images cannot interpret `core-compose` or `periphery-compose`. Existing fork development installations must retain their credentials, Server name, volume project, and path overrides. Changing a Compose service name requires removing its old container first; do not remove its data volumes. Keep backups and the original deployment files before making changes.
+
+Komodo 3.0.0+ is an independent hard fork. Do not attach upstream databases or agent state to these templates. Upstream migrations and backward compatibility are not supported, even when individual upstream changes are cherry-picked.

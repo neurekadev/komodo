@@ -79,6 +79,8 @@ komodo/v1/volume/<server-id>/<volume-name>
 
 Each Periphery also has a stable Vykar hostname so snapshots remain attributable after resource names change.
 
+Backup manifests record the running product's build version, as shown by Core, rather than Cargo's internal `0.0.0` workspace placeholder. Core recovery compares that recorded version with the running build before activating a restored database.
+
 Fleet run status polls every 15 seconds, while repository health and mirror lag share a five-minute cache across browsers. Snapshot inventories are loaded on demand; use **Refresh inventory** or **Refresh snapshots** to fetch new repository contents.
 
 Critical operational alerts survive Core restarts in `/data/backup-operational-alert.json`. They remain latched until an operator confirms that the affected workloads and Periphery restore/quiesce journals have recovered. After that verification, stop Core, archive the alert file, and restart Core to acknowledge it; do not clear it while containers remain stopped or a restore is indeterminate.

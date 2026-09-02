@@ -21,6 +21,8 @@ core = ["mongo", "utoipa", "logger", "svi", "dep:mogh_server"]
 periphery = ["cli", "dep:ipnetwork", "svi", "dep:mogh_server"]
 
 [dependencies]
+# local
+komodo_build_info.workspace = true
 # mogh
 mogh_pki = { workspace = true, optional = true, features = ["cli"] }
 mongo_indexed = { workspace = true, optional = true }

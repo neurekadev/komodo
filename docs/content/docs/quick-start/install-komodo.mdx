@@ -1,0 +1,62 @@
+---
+title: Install Komodo
+description: Start MongoDB, Core, and the local Periphery agent with Docker Compose.
+---
+
+The recommended installation runs the complete first-server setup in one Compose project. MongoDB stores Komodo's state, Core provides the API and browser interface, and Periphery manages Docker on the host.
+
+## Prerequisites
+
+- Docker Engine and the Docker Compose plugin are installed.
+- Port `9120` is reachable by your reverse proxy or private network.
+- You have chosen a durable installation directory.
+- This is a fresh installation, with no upstream Komodo database or agent state attached.
+
+## Install Komodo
+
+1. Download the repository-provided Compose and environment examples:
+
+   ```bash
+   mkdir -p komodo
+   cd komodo
+   curl -fsSL -o compose.yaml https://raw.githubusercontent.com/neurekadev/komodo/main/compose/mongo.compose.yaml
+   curl -fsSL -o .env https://raw.githubusercontent.com/neurekadev/komodo/main/compose/compose.env
+   ```
+
+2. Edit `.env` and replace every `REPLACE_WITH_*` value. Set `KOMODO_HOST` to the address users will open. Generate each password and application secret independently, for example with `openssl rand -hex 32`. Keep the `${...}` credential references unchanged; they give MongoDB the same credentials as Core. Protect the file with `chmod 600 .env`.
+
+3. Review the resolved configuration:
+
+   ```bash
+   docker compose -p komodo config
+   ```
+
+4. Start Komodo:
+
+   ```bash
+   docker compose -p komodo up -d
+   docker compose -p komodo ps
+   ```
+
+5. Put Core behind your HTTPS reverse proxy, open `KOMODO_HOST`, and sign in with `KOMODO_INIT_ADMIN_USERNAME` and `KOMODO_INIT_ADMIN_PASSWORD`.
+
+6. Open **Servers**, select **Local**, and confirm its status is **OK**.
+
+## Expected result
+
+`docker compose -p komodo ps` reports `komodo-mongo`, `komodo`, and `komodo-periphery` as running. The sign-in page loads and the local Server reports live CPU, memory, disk, and Docker information.
+
+Keep `-p komodo` in subsequent commands so Compose uses the same named volumes. For image selection, a custom server name, or a different Docker data root, see [Container Deployment](/administration/container-deployment).
+
+## Troubleshooting
+
+- Run `docker compose -p komodo logs --tail=200 komodo komodo-periphery komodo-mongo` to inspect startup failures.
+- Re-run `docker compose -p komodo config` and look for unchanged `REPLACE_WITH_*` values or missing variables. Its output includes secrets; do not share it publicly.
+- If MongoDB starts and then exits, follow [MongoDB troubleshooting](/administration/databases/mongodb#troubleshooting).
+- Do not delete named volumes while troubleshooting; they contain the database, identities, and Komodo working data.
+
+<Callout title="Docker host access" type="warn">
+  Periphery controls the host through the Docker socket and has read/write access to Docker's named-volume directory. Treat the container as Docker-host trusted. Review [Security and trust boundaries](/administration/security-and-trust) before granting access to other users.
+</Callout>
+
+Continue with [Deploy the First Stack](/quick-start/deploy-first-stack).

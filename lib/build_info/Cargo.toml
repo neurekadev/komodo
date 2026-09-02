@@ -1,0 +1,9 @@
+[package]
+name = "komodo_build_info"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]

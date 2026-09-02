@@ -12,7 +12,12 @@ pub mod terminal;
 pub mod update;
 
 #[derive(Debug, clap::Parser)]
-#[command(name = "komodo-cli", version, about = "", author)]
+#[command(
+  name = "komodo-cli",
+  version = komodo_build_info::version(),
+  about = "",
+  author
+)]
 pub struct CliArgs {
   /// The command to run
   #[command(subcommand)]

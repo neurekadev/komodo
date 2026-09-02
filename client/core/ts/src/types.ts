@@ -9298,8 +9298,12 @@ export interface GetVersion {
 
 /** Response for [GetVersion]. */
 export interface GetVersionResponse {
-	/** The version of the Komodo Core API. */
+	/** Canonical Git-derived product identity for the Komodo Core API. */
 	version: string;
+	/** Exact Git tag supplied when the binary was built, when available. */
+	git_tag?: string;
+	/** Full Git commit hash supplied when the binary was built, when available. */
+	git_hash?: string;
 }
 
 /**

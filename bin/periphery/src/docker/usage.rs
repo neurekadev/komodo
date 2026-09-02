@@ -112,11 +112,7 @@ impl DockerClient {
     let response = tokio::time::timeout(
       DISK_USAGE_TIMEOUT,
       self.docker.df(
-        DataUsageOptionsBuilder::new()
-          ._type(vec!["image".to_string(), "volume".to_string()])
-          .verbose(true)
-          .build()
-          .into(),
+        DataUsageOptionsBuilder::new().verbose(true).build().into(),
       ),
     )
     .await
@@ -321,7 +317,12 @@ pub fn volume_disk_usage(
 
 #[cfg(test)]
 mod tests {
-  use bollard::models::{ImagesDiskUsage, VolumesDiskUsage};
+  use std::sync::Mutex;
+
+  use bollard::{
+    API_DEFAULT_VERSION, BollardRequest, Docker,
+    models::{ImagesDiskUsage, VolumesDiskUsage},
+  };
   use serde_json::json;
 
   use super::*;
@@ -341,6 +342,37 @@ mod tests {
       }),
       ..Default::default()
     }
+  }
+
+  #[tokio::test]
+  async fn requests_verbose_disk_usage_without_a_type_array() {
+    let request_uri = Arc::new(Mutex::new(None));
+    let captured_uri = Arc::clone(&request_uri);
+    let docker = Docker::connect_with_custom_transport(
+      move |request: BollardRequest| {
+        *captured_uri.lock().expect("request URI lock poisoned") =
+          Some(request.uri().to_string());
+        async { Err(bollard::errors::Error::RequestTimeoutError) }
+      },
+      Some("http://localhost"),
+      5,
+      API_DEFAULT_VERSION,
+    )
+    .expect("custom Docker transport should initialize");
+    let client = DockerClient { docker };
+
+    assert!(client.disk_usage_snapshot().await.is_err());
+    let request_uri = request_uri
+      .lock()
+      .expect("request URI lock poisoned")
+      .clone()
+      .expect("disk usage request should reach the Docker transport");
+    assert!(request_uri.contains("/system/df?"));
+    assert_eq!(
+      request_uri.split_once('?').unwrap().1,
+      "verbose=true"
+    );
+    assert!(!request_uri.contains("type="));
   }
 
   #[test]

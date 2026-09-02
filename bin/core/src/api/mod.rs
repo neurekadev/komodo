@@ -61,7 +61,10 @@ pub async fn app() -> anyhow::Result<Router> {
   Ok(
     Router::new()
       .merge(openapi::serve_docs())
-      .route("/version", get(|| async { env!("CARGO_PKG_VERSION") }))
+      .route(
+        "/version",
+        get(|| async { komodo_build_info::version() }),
+      )
       .nest(
         "/auth",
         mogh_auth_server::api::router::<KomodoAuthImpl>().layer(

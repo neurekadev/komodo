@@ -1,111 +1,86 @@
-###################################
-# 🦎 KOMODO COMPOSE - FERRETDB 🦎 #
-###################################
-
-## This compose file will deploy:
-##   1. Postgres + FerretDB Mongo adapter (https://www.ferretdb.com)
-##   2. Komodo Core
-##   3. Komodo Periphery
+# Alternative installation: PostgreSQL/DocumentDB, FerretDB, Core, and Periphery.
+# Save ferretdb.env as .env and run: docker compose -p komodo up -d
+# Back up existing databases and verify the PostgreSQL major before upgrading.
 
 services:
-  postgres:
-    # 🚨 Pin to a specific version. Updates can be breaking.
-    # https://github.com/FerretDB/documentdb/pkgs/container/postgres-documentdb
-    image: ghcr.io/ferretdb/postgres-documentdb
-    container_name: komodo-postgres
-    labels:
-      komodo.skip: # Prevent Komodo from stopping with StopAllContainers
+  komodo:
+    image: ghcr.io/neurekadev/komodo-core:${COMPOSE_KOMODO_IMAGE_TAG:-3}
+    container_name: komodo
+    depends_on: [komodo-ferretdb]
+    env_file: [.env]
+    networks:
+      komodo:
+        aliases: [core, komodo-core]
+    ports:
+      - "9120:9120"
+    volumes:
+      # Keys, backups, syncs, and repository cache stay in the existing volume.
+      - data:/data
+      # Backup authentication and sealing material must remain Core-only.
+      - core-secrets:/core-secrets
+      # Optional: mount custom configuration or a trusted root CA.
+      # - /path/to/core.config.toml:/config/config.toml:ro
+      # - /path/to/root_ca.crt:/usr/local/share/ca-certificates/root_ca.crt:ro
     restart: unless-stopped
-    # ports:
-    #   - 5432:5432
+    init: true
+    command: [core-compose]
+
+  komodo-postgres:
+    image: ghcr.io/ferretdb/postgres-documentdb:17
+    container_name: komodo-postgres
+    env_file: [.env]
+    networks:
+      komodo:
+        aliases: [postgres]
     volumes:
       - postgres-data:/var/lib/postgresql/data
-    environment:
-      POSTGRES_USER: ${KOMODO_DATABASE_USERNAME}
-      POSTGRES_PASSWORD: ${KOMODO_DATABASE_PASSWORD}
-      POSTGRES_DB: postgres
-
-  ferretdb:
-    # 🚨 Pin to a specific version. Updates can be breaking.
-    # https://github.com/FerretDB/FerretDB/pkgs/container/ferretdb
-    image: ghcr.io/ferretdb/ferretdb
-    container_name: komodo-ferretdb
-    labels:
-      komodo.skip: # Prevent Komodo from stopping with StopAllContainers
     restart: unless-stopped
-    depends_on:
-      - postgres
-    # ports:
-    #   - 27017:27017
+    labels:
+      komodo.skip: "true"
+
+  komodo-ferretdb:
+    image: ghcr.io/ferretdb/ferretdb:2
+    container_name: komodo-ferretdb
+    depends_on: [komodo-postgres]
+    env_file: [.env]
+    networks:
+      komodo:
+        aliases: [ferretdb, komodo-database]
     volumes:
       - ferretdb-state:/state
-    environment:
-      FERRETDB_POSTGRESQL_URL: postgres://${KOMODO_DATABASE_USERNAME}:${KOMODO_DATABASE_PASSWORD}@postgres:5432/postgres
-  
-  core:
-    image: ghcr.io/neurekadev/komodo-core:${COMPOSE_KOMODO_IMAGE_TAG:-3}
-    container_name: komodo-core
-    init: true
     restart: unless-stopped
-    depends_on:
-      - ferretdb
-    ports:
-      - 9120:9120
-    env_file: ./.env
-    environment:
-      KOMODO_DATABASE_ADDRESS: ferretdb:27017
-    volumes:
-      ## Share backups, syncs, and repository and Vykar caches with Periphery.
-      - data:/data
-      ## Keep backup sealing and source-authentication material Core-only.
-      - core-secrets:/core-secrets
-      ## Optionally mount a custom core.config.toml
-      # - /path/to/core.config.toml:/config/config.toml
-      ## Optionally mount custom root CA certificate to trust
-      # - /path/to/root_ca.crt:/usr/local/share/ca-certificates/root_ca.crt
+    labels:
+      komodo.skip: "true"
 
-  ## Deploy Periphery container using this block,
-  ## or deploy the Periphery binary with systemd using 
-  ## https://github.com/neurekadev/komodo/tree/main/scripts
-  periphery:
+  komodo-periphery:
     image: ghcr.io/neurekadev/komodo-periphery:${COMPOSE_KOMODO_IMAGE_TAG:-3}
     container_name: komodo-periphery
-    init: true
-    restart: unless-stopped
-    depends_on:
-      - core
-    env_file: ./.env
-    environment:
-      ## Keep Docker-managed workspaces in the host daemon's path namespace.
-      ## These paths are aliases of the same data volume mounted at /data.
-      PERIPHERY_REPO_DIR: ${PERIPHERY_REPO_DIR:-${PERIPHERY_DOCKER_VOLUME_ROOT:-/var/lib/docker/volumes}/${COMPOSE_PROJECT_NAME:-komodo}_data/_data/repos}
-      PERIPHERY_STACK_DIR: ${PERIPHERY_STACK_DIR:-${PERIPHERY_DOCKER_VOLUME_ROOT:-/var/lib/docker/volumes}/${COMPOSE_PROJECT_NAME:-komodo}_data/_data/stacks}
-      PERIPHERY_BUILD_DIR: ${PERIPHERY_BUILD_DIR:-${PERIPHERY_DOCKER_VOLUME_ROOT:-/var/lib/docker/volumes}/${COMPOSE_PROJECT_NAME:-komodo}_data/_data/builds}
+    depends_on: [komodo]
+    env_file: [.env]
+    networks:
+      komodo:
+        aliases: [periphery]
     volumes:
-      ## Share keys and Periphery-managed state, including its Vykar cache, with Core.
+      # Persist Periphery state and its Vykar cache at host-visible Docker paths.
       - data:/data
-      ## Mount external docker socket
+      # Docker socket and volume access give Periphery control of this host.
       - /var/run/docker.sock:/var/run/docker.sock
-      ## Allow the File Manager to access local Docker named volumes.
-      ## Keep Docker's absolute host volume root identical inside the container.
-      ## Set this to Docker's absolute volume root when using a nonstandard data root.
-      ## Security: This intentionally grants Periphery read/write access to every
-      ## local named volume. Restrict Server FileManager permission accordingly;
-      ## the File Manager rejects Periphery's own protected data volume.
       - ${PERIPHERY_DOCKER_VOLUME_ROOT:-/var/lib/docker/volumes}:${PERIPHERY_DOCKER_VOLUME_ROOT:-/var/lib/docker/volumes}
-      ## Allow Periphery to see processes outside of container
       - /proc:/proc
-      ## Optionally mount a custom periphery.config.toml
-      # - /path/to/periphery.config.toml:/config/config.toml
-      ## Optionally mount custom root CA certificate to trust
-      # - /path/to/root_ca.crt:/usr/local/share/ca-certificates/root_ca.crt
+      # Optional: mount custom configuration or a trusted root CA.
+      # - /path/to/periphery.config.toml:/config/config.toml:ro
+      # - /path/to/root_ca.crt:/usr/local/share/ca-certificates/root_ca.crt:ro
+    restart: unless-stopped
+    init: true
+    command: [periphery-compose]
+
+networks:
+  komodo:
+    name: komodo
 
 volumes:
-  # Postgres
   postgres-data:
-  # FerretDB
   ferretdb-state:
-  # Core / Periphery
   data:
   # Core-only backup authentication and sealing key
   core-secrets:

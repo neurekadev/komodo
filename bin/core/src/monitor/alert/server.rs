@@ -149,13 +149,13 @@ pub async fn alert_servers(
     // ========================
     // SERVER VERSION MISMATCH
     // ========================
-    let core_version = env!("CARGO_PKG_VERSION");
+    let core_version = komodo_build_info::version();
     let mismatched_server_version =
       if server_status.state != ServerState::Ok {
         None
       } else if let Some(version) =
         server_status.periphery_info.as_ref().map(|i| &i.version)
-        && version != core_version
+        && !komodo_build_info::versions_match(version, core_version)
       {
         Some(version)
       } else {

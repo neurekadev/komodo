@@ -11,7 +11,7 @@ The Komodo CLI, `km`, can be used to:
   - **Connect to server / container shell** via Komodo Terminals.
 
 The Komodo Core image comes packaged with the Komodo CLI,
-and is available for usage inside running container with `docker exec -it komodo-core km ...`.
+and is available for usage inside running container with `docker exec -it komodo km ...`.
 This way, it inherits the Core database config in order to easily perform backups with `km db backup -y`.
 
 <Callout title="Legacy database format" type="info">
@@ -86,40 +86,25 @@ km attach <container> [options]
 | `-s`, `--server` | Server name — required if multiple servers have a container with the same name |
 | `-r`, `--recreate` | Force a fresh terminal, replacing any existing session |
 
-### Install
+### Run the CLI
 
-There are binaries available for **Linux** (x86_64 / aarch64), **MacOS** (apple silicon), as
-well as a distroless image: **`ghcr.io/neurekadev/komodo-cli`**.
+The Core image includes `km`. Use it for database operations or other commands that should inherit Core's configuration:
 
-#### Linux
-
-You can install the binary using the following command:
-
-System-wide, as root, to `/usr/local/bin/km`:
 ```bash
-curl -sSL https://raw.githubusercontent.com/moghtech/komodo/main/scripts/install-cli.py | python3
+docker exec -it komodo km --help
+docker exec -it komodo km db backup -y
 ```
 
-Or as non-root, to `${HOME}/.local/bin/km`:
+For a standalone CLI, use the official distroless container image. Mount the directory containing your CLI configuration:
+
 ```bash
-curl -sSL https://raw.githubusercontent.com/moghtech/komodo/main/scripts/install-cli.py | python3 - --user
-```
-
-#### MacOS (Homebrew)
-
-Add the `moghtech/komodo` tap, then install `km`:
-```bash
-brew tap moghtech/komodo && \
-  brew install km
-```
-
-#### Container
-
-You can alias a docker run command:
-```bash
-alias km='docker run --rm -v $HOME/.config/komodo:/config ghcr.io/neurekadev/komodo-cli:3 km'
+alias km='docker run --rm -it -v "$HOME/.config/komodo:/config" ghcr.io/neurekadev/komodo-cli:3 km'
 km config
 ```
+
+Keep `-it` for interactive `km connect`, `km exec`, and `km attach` sessions: `-i` keeps standard input open, and `-t` supplies the terminal required for raw mode and resizing. For unattended commands, use `docker run --rm` without `-it`, and pass `-y` where confirmation is required.
+
+Komodo does not publish or support native CLI binaries. Advanced users may compile `km` from the repository source for self-supported use; see [Development](/reference/development).
 
 ### Configure
 

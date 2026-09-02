@@ -2,8 +2,8 @@
   "title": "Quick Start",
   "pages": [
     "index",
-    "install-core",
-    "connect-server",
-    "deploy-first-stack"
+    "install-komodo",
+    "deploy-first-stack",
+    "add-another-server"
   ]
 }

@@ -20,6 +20,8 @@ import TopbarLink from "./link";
 import TopbarAlerts from "./alerts";
 import KeyboardShortcuts from "./keyboard-shortcuts";
 
+const KOMODO_REPOSITORY = "https://github.com/neurekadev/komodo";
+
 const Topbar = ({
   opened,
   toggle,
@@ -27,8 +29,17 @@ const Topbar = ({
   opened: boolean;
   toggle: () => void;
 }) => {
-  const version = useRead("GetVersion", {}, { refetchInterval: 30_000 }).data
-    ?.version;
+  const version = useRead("GetVersion", {}, { refetchInterval: 30_000 }).data;
+  const versionLink = !version
+    ? undefined
+    : version.version.startsWith("edge@") && version.git_hash
+      ? `${KOMODO_REPOSITORY}/commit/${encodeURIComponent(version.git_hash)}`
+      : version.git_tag &&
+          version.git_tag !== "edge" &&
+          version.git_tag !== "dev" &&
+          version.version === version.git_tag
+        ? `${KOMODO_REPOSITORY}/releases/tag/${encodeURIComponent(version.git_tag)}`
+        : `${KOMODO_REPOSITORY}/releases`;
   return (
     <AppShell.Header
       renderRoot={(props) => (
@@ -94,10 +105,8 @@ const Topbar = ({
         <TopbarLink to="https://komodo.docs.neureka.dev/docs/intro">
           Docs
         </TopbarLink>
-        {version && (
-          <TopbarLink to="https://github.com/moghtech/komodo/releases">
-            v{version}
-          </TopbarLink>
+        {versionLink && version && (
+          <TopbarLink to={versionLink}>{version.version}</TopbarLink>
         )}
         <KeyboardShortcuts />
         <WebsocketStatus />

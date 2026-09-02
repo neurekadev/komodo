@@ -16,6 +16,7 @@ path = "src/main.rs"
 # local
 komodo_client = { workspace = true, features = ["core"] }
 periphery_client.workspace = true
+komodo_build_info.workspace = true
 mogh_validations.workspace = true
 interpolate.workspace = true
 mogh_secret_file.workspace = true

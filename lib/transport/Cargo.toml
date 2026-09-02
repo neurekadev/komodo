@@ -8,6 +8,7 @@ homepage.workspace = true
 
 [dependencies]
 periphery_client.workspace = true
+komodo_build_info.workspace = true
 encoding.workspace = true
 mogh_pki.workspace = true
 #

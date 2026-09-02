@@ -1,15 +1,16 @@
-import { UsableResource } from ".";
+import { ResourceComponents, UsableResource } from ".";
 import {
   EntityHeader,
   EntityHeaderProps,
   EntityPageProps,
+  PageBreadcrumbs,
 } from "mogh_ui";
 import { ReactNode } from "react";
 import { Button, Group, Stack, Text } from "@mantine/core";
 import { DividedChildren } from "mogh_ui";
 import ResourceLink from "./link";
 import ResourceDescription from "./description";
-import { usableResourcePath } from "@/lib/utils";
+import { resourceTypeCrumb, usableResourcePath } from "@/lib/utils";
 import ResourceUpdates from "@/components/updates/resource";
 import { usePermissions } from "@/lib/hooks";
 import { Section } from "mogh_ui";
@@ -37,7 +38,8 @@ export default function ResourceSubPage({
   ...headerProps
 }: ResourceSubPageProps) {
   const { canExecute } = usePermissions({ type: parentType, id: parentId });
-  const { backTo, actions, ...stackProps } = pageProps ?? {};
+  const parent = ResourceComponents[parentType].useListItem(parentId);
+  const { backTo, actions, breadcrumbs, ...stackProps } = pageProps ?? {};
   const fallback =
     backTo ?? `/${usableResourcePath(parentType)}/${parentId}`;
   const goBack = useHistoryAwareBack(fallback);
@@ -56,6 +58,18 @@ export default function ResourceSubPage({
   );
   return (
     <Stack mb="50vh" {...stackProps}>
+      {breadcrumbs ?? (
+        <PageBreadcrumbs
+          items={[
+            resourceTypeCrumb(parentType),
+            {
+              label: parent?.name ?? "Unknown",
+              to: `/${usableResourcePath(parentType)}/${parentId}`,
+            },
+            { label: headerProps.name },
+          ]}
+        />
+      )}
       <Group justify="space-between">
         <Button
           leftSection={<ICONS.Back size="1rem" />}
