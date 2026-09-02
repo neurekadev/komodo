@@ -43,6 +43,13 @@ fn load_or_create_key(
   legacy_paths: &[(&Path, bool)],
 ) -> anyhow::Result<[u8; 32]> {
   if let Some(key) = read_key(path)? {
+    // Complete cleanup if a prior migration durably wrote the Core-only key
+    // but exited before deleting a legacy copy from shared storage.
+    for (legacy_path, remove_after_migration) in legacy_paths {
+      if *remove_after_migration {
+        remove_legacy_key(legacy_path)?;
+      }
+    }
     return Ok(key);
   }
   for (legacy_path, remove_after_migration) in legacy_paths {
@@ -335,6 +342,22 @@ mod tests {
 
     assert_eq!(actual, expected);
     assert_eq!(read_key(&path).unwrap(), Some(expected));
+    assert!(!legacy_path.exists());
+  }
+
+  #[test]
+  fn completed_key_migration_cleans_up_a_shared_legacy_copy() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("core-only.key");
+    let legacy_path = directory.path().join("shared.key");
+    let expected = [23_u8; 32];
+    std::fs::write(&path, hex::encode(expected)).unwrap();
+    std::fs::write(&legacy_path, hex::encode([31_u8; 32])).unwrap();
+
+    let actual =
+      load_or_create_key(&path, &[(&legacy_path, true)]).unwrap();
+
+    assert_eq!(actual, expected);
     assert!(!legacy_path.exists());
   }
 

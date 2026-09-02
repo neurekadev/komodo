@@ -69,7 +69,7 @@ export default function ResourceBackups({
       page: snapshotPage - 1,
       limit: SNAPSHOT_PAGE_LIMIT,
     },
-    { refetchInterval: 30_000 },
+    { refetchOnWindowFocus: false },
   );
   const { mutate: runBackup, isPending: backupPending } = useWrite(
     "RunBackup",
@@ -122,6 +122,9 @@ export default function ResourceBackups({
             searchable
             miw={300}
           />
+          <Button variant="subtle" loading={snapshots.isFetching} onClick={() => snapshots.refetch()}>
+            Refresh snapshots
+          </Button>
           {canExecute && (
             <>
               <Button

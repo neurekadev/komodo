@@ -262,7 +262,16 @@ pub fn inner_handler(
     // running after this method returns.
     let task_update = update.clone();
     let handle = tokio::spawn(async move {
-      let _mutation_guard = mutation_guard;
+      // A nested execution reached from a write request cannot acquire a
+      // second read guard synchronously: a queued writer would deadlock it
+      // behind the outer read guard. Acquire in the detached execution task
+      // instead, after inner_handler returns and the outer request can finish.
+      let _mutation_guard = match mutation_guard {
+        Some(guard) => guard,
+        None => {
+          crate::backup::mutation_barrier().clone().read_owned().await
+        }
+      };
       task(task_id, request, user, task_update).await
     });
 

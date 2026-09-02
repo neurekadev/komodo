@@ -26,7 +26,7 @@ Defaults are daily at 01:00 in the Core timezone, 14 complete backups per catego
 
 ### Core
 
-A Core backup is a consistent, versioned export of Komodo's restorable database collections. It is a control-plane backup, not an operating-system image. Secrets used to access repositories, including encryption passphrases, are sealed with a persistent Core key and are never returned by the API or included in Core exports. Back up `/data/keys/backup.key` separately with the deployment configuration; Core snapshots intentionally do not contain that key.
+A Core backup is a consistent, versioned export of Komodo's restorable database collections. It is a control-plane backup, not an operating-system image. Secrets used to access repositories, including encryption passphrases, are sealed with a persistent Core key and are never returned by the API or included in Core exports. Back up `/core-secrets/backup.key` separately with the deployment configuration; Core snapshots intentionally do not contain that key.
 
 ### Stacks
 
@@ -56,6 +56,8 @@ Komodo checks the driver and mountpoint again at backup time. Docker mounts that
 
 Use **All**, **Include**, or **Exclude** selection for Stacks and Volumes. Volumes are identified directly by Server and Docker volume name, so unmanaged volumes can be selected without inventing a Stack association. Core has no include/exclude filter.
 
+An explicitly included Stack or Volume that is missing or unsupported makes the fleet run partial rather than silently disappearing from the requested protection set.
+
 ## Backing up a fleet
 
 At the beginning of every run, Core discovers the currently configured Periphery nodes and resolves live Docker state. New nodes join the next run automatically. A disconnected or failed node makes the fleet run partial or failed, but successful snapshots remain valid while failed work retries with exponential backoff for at most eight attempts. An exhausted run finishes as partial so later scheduled backups can protect healthy targets again; retention, verification, and compaction are still queued for the snapshots that succeeded.
@@ -73,6 +75,10 @@ komodo/v1/volume/<server-id>/<volume-name>
 ```
 
 Each Periphery also has a stable Vykar hostname so snapshots remain attributable after resource names change.
+
+Fleet run status polls every 15 seconds, while repository health and mirror lag share a five-minute cache across browsers. Snapshot inventories are loaded on demand; use **Refresh inventory** or **Refresh snapshots** to fetch new repository contents.
+
+Critical operational alerts survive Core restarts in `/data/backup-operational-alert.json`. They remain latched until an operator confirms that the affected workloads and Periphery restore/quiesce journals have recovered. After that verification, stop Core, archive the alert file, and restart Core to acknowledge it; do not clear it while containers remain stopped or a restore is indeterminate.
 
 ## Restore a Stack or Volume
 
@@ -104,6 +110,18 @@ The original `/core-secrets/backup.key` is required before Komodo can identify o
 4. Connect the existing primary repository in **Administration > Backups**, then select a Core snapshot under **Core recovery**.
 
 Komodo restores the snapshot into a validation database, checks the backup schema/version and confirms that an administrator account remains available. It then switches the persisted active-database pointer and restarts. The fresh pre-restore database is retained for rollback.
+
+### Roll back a Core recovery
+
+If the recovered Core starts but its application data or authentication configuration is unusable, roll back before making further changes:
+
+1. Stop Core and take an independent backup of the database service. Do not run another Core against either database while changing the pointer.
+2. Open `/data/backup-recovery-activation.json` in Core's persistent `data` volume. Confirm that `database` names the recovered database and that `previous_database` names the retained pre-recovery database. Stop if `previous_database` is absent or does not match the database you intend to restore.
+3. Preserve a copy of the activation file. Replace it atomically with valid JSON that moves the current `database` value to `previous_database`, moves the old `previous_database` value to `database`, and leaves `core_instance_id` unchanged. Keep the file owner and mode unchanged.
+4. Start Core. Its startup log must say it is using the retained database named in the updated `database` field.
+5. Sign in with an administrator account, confirm expected Servers and Stacks are present, open **Administration > Backups**, and verify the primary repository before re-enabling scheduled work.
+
+To return to the recovered database after diagnosing the problem, repeat the stopped-Core pointer swap; never edit the activation record while Core is running.
 
 Do not point two active Core instances at the same database. After recovery, reconnect Periphery nodes and verify the repository before allowing scheduled pruning.
 
@@ -146,7 +164,7 @@ Vykar supports [local, S3-compatible, SFTP, and REST backends](https://vykar.bor
 
 - **Core-local:** use a normalized absolute path on persistent Core storage, without surrounding whitespace, `.` or `..` components, duplicate separators, or a trailing separator. This is operationally simple but must be copied or mirrored off the Core host to survive host loss.
 - **S3-compatible:** enter the full bucket/prefix URL, region, Core maintenance credentials, and distinct worker credentials. Backblaze B2 and other compatible providers can be used.
-- **SFTP:** pin known-hosts data and use separate Core and worker keys, each limited to the repository path.
+- **SFTP:** pin known-hosts data and paste complete multiline OpenSSH keys into the Core and worker key editors, preserving their line breaks. Use separate keys, each limited to the repository path. Configured keys remain hidden; an empty editor preserves the saved key.
 - **REST:** use TLS and separate Core and worker access tokens. Plain HTTP requires an explicit opt-in and should only be used on a trusted private network.
 
 For every external backend, the worker identity must be distinct and its storage-side policy must permit the reads and writes needed for backups while denying deletion, compaction, and other maintenance. Only Core receives the authoritative maintenance-capable credentials.

@@ -126,7 +126,7 @@ function SnapshotInventory() {
   const inventory = useRead(
     "ListBackupSnapshots",
     { page: page - 1, limit },
-    { refetchInterval: 30_000 },
+    { refetchOnWindowFocus: false },
   );
   const pages = Math.max(1, Math.ceil((inventory.data?.total ?? 0) / limit));
   return (
@@ -137,6 +137,11 @@ function SnapshotInventory() {
           Administrators can recover complete Stack and Volume snapshots here
           even after the original resource has been deleted.
         </Text>
+        <Group justify="end">
+          <Button variant="subtle" loading={inventory.isFetching} onClick={() => inventory.refetch()}>
+            Refresh inventory
+          </Button>
+        </Group>
         {inventory.data?.snapshots.map((snapshot) => (
           <Group key={snapshot.name} justify="space-between" wrap="nowrap">
             <Stack gap={0} className="overflow-hidden">
@@ -931,8 +936,8 @@ function RepositoryEditor({
         <SimpleGrid cols={{ base: 1, md: 2 }}>
           <TextInput label="SFTP URL" placeholder="sftp://user@host/path" value={backend.params.url} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, url: event.currentTarget.value } })} />
           <NumberInput label="Timeout (seconds)" min={1} value={backend.params.timeout_seconds} onChange={(value) => updateBackend({ ...backend, params: { ...backend.params, timeout_seconds: Number(value) } })} />
-          <PasswordInput label="Private key" description={backend.params.private_key.configured ? "Configured" : "Paste an OpenSSH private key"} value={backend.params.private_key.value ?? ""} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, private_key: { ...backend.params.private_key, value: event.currentTarget.value } } })} />
-          <PasswordInput label="Worker private key" description={backend.params.worker_private_key?.configured ? "Configured" : "Required for a maintenance-denied account"} value={backend.params.worker_private_key?.value ?? ""} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, worker_private_key: { ...backend.params.worker_private_key, value: event.currentTarget.value } } })} />
+          <Textarea autosize minRows={5} autoComplete="off" spellCheck={false} label="Private key" description={backend.params.private_key.configured ? "Configured; paste only to replace it" : "Paste the complete multiline OpenSSH private key"} value={backend.params.private_key.value ?? ""} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, private_key: { ...backend.params.private_key, value: event.currentTarget.value } } })} />
+          <Textarea autosize minRows={5} autoComplete="off" spellCheck={false} label="Worker private key" description={backend.params.worker_private_key?.configured ? "Configured; paste only to replace it" : "Paste the complete multiline key for a maintenance-denied account"} value={backend.params.worker_private_key?.value ?? ""} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, worker_private_key: { ...backend.params.worker_private_key, value: event.currentTarget.value } } })} />
           <TextInput label="Known-hosts entry" value={backend.params.known_hosts} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, known_hosts: event.currentTarget.value } })} />
         </SimpleGrid>
       )}

@@ -36,7 +36,7 @@ use komodo_client::{
       BackupSettings, BackupSnapshot, BackupStatus, BackupTarget,
       BackupVolumeTarget, CoreRecoveryPlan, selection_includes,
     },
-    docker::volume::VolumeScopeEnum,
+    docker::volume::{VolumeListItem, VolumeScopeEnum},
     komodo_timestamp,
     repo::Repo,
     server::Server,
@@ -73,6 +73,8 @@ const RUNS_COLLECTION: &str = "BackupRun";
 const PLANS_COLLECTION: &str = "BackupRestorePlan";
 const CORE_RECOVERY_COLLECTION: &str = "CoreRecoveryPlan";
 const HEALTH_COLLECTION: &str = "BackupRepositoryHealth";
+const OPERATIONAL_ALERT_PATH: &str =
+  "/data/backup-operational-alert.json";
 const CORE_STAGING_PATH: &str = "/data/backups/.komodo-core-staging";
 const CORE_CACHE_PATH: &str = "/data/backups/.komodo-vykar-cache";
 const CORE_RECOVERY_STAGING_PATH: &str =
@@ -178,6 +180,11 @@ struct RepositoryHealthRecord {
   id: String,
   healthy: bool,
   checked_at: i64,
+  /// Full inventory health is shared across polling clients for five minutes.
+  #[serde(default)]
+  inventory_checked_at: i64,
+  #[serde(default)]
+  mirror_lagging_snapshots: u64,
   #[serde(default)]
   last_full_verification_at: i64,
   /// Remains set after an integrity check fails until a full check succeeds.
@@ -1357,6 +1364,9 @@ pub async fn status() -> anyhow::Result<BackupStatus> {
   )
   .await
   .unwrap_or_default();
+  // Coalesce concurrent browser polls before checking the shared persisted
+  // health cache, so only one caller performs an expired inventory refresh.
+  let _health_refresh = repository_health_refresh_lock().lock().await;
   let previous_primary = health_collection()
     .find_one(doc! { "_id": "primary" })
     .await
@@ -1381,6 +1391,31 @@ pub async fn status() -> anyhow::Result<BackupStatus> {
       });
     }
   };
+  if repository_health_cache_is_fresh(
+    previous_primary.inventory_checked_at,
+    settings.updated_at,
+    komodo_timestamp(),
+  ) {
+    return Ok(BackupStatus {
+      active_runs,
+      recent_runs,
+      next_run_at: next_scheduled_run().unwrap_or_default(),
+      primary_healthy: previous_primary.healthy
+        && !previous_primary.verification_failed,
+      mirror_healthy: settings.mirror.as_ref().map(|_| {
+        previous_mirror.healthy
+          && !previous_mirror.verification_failed
+      }),
+      mirror_lagging_snapshots: if settings.mirror.is_some() {
+        previous_primary.mirror_lagging_snapshots
+      } else {
+        0
+      },
+      last_full_verification_at: previous_primary
+        .last_full_verification_at,
+      critical_alert: current_critical_alert(),
+    });
+  }
   let primary_settings = settings.clone();
   let primary_repository = settings.primary.clone();
   let primary = tokio::task::spawn_blocking(move || {
@@ -1449,6 +1484,8 @@ pub async fn status() -> anyhow::Result<BackupStatus> {
       doc! { "$set": {
         "healthy": primary_healthy,
         "checked_at": checked_at,
+        "inventory_checked_at": checked_at,
+        "mirror_lagging_snapshots": mirror_lagging_snapshots as i64,
       } },
     )
     .with_options(UpdateOptions::builder().upsert(true).build())
@@ -1478,11 +1515,33 @@ pub async fn status() -> anyhow::Result<BackupStatus> {
   })
 }
 
+fn repository_health_refresh_lock() -> &'static tokio::sync::Mutex<()>
+{
+  static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+  LOCK.get_or_init(Default::default)
+}
+
+fn repository_health_cache_is_fresh(
+  checked_at: i64,
+  settings_updated_at: i64,
+  now: i64,
+) -> bool {
+  checked_at > 0
+    && checked_at >= settings_updated_at
+    && now >= checked_at
+    && now.saturating_sub(checked_at) < 5 * 60 * 1000
+}
+
 #[derive(Default)]
 struct CriticalAlerts {
   configuration: Option<String>,
   operational: Option<String>,
   maintenance: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedOperationalAlert {
+  message: String,
 }
 
 impl CriticalAlerts {
@@ -1501,7 +1560,20 @@ impl CriticalAlerts {
 
 fn critical_alerts() -> &'static RwLock<CriticalAlerts> {
   static ALERTS: OnceLock<RwLock<CriticalAlerts>> = OnceLock::new();
-  ALERTS.get_or_init(Default::default)
+  ALERTS.get_or_init(|| {
+    let operational = match read_operational_alert(Path::new(
+      OPERATIONAL_ALERT_PATH,
+    )) {
+      Ok(message) => message,
+      Err(error) => Some(format!(
+        "Persisted backup operational alert is unreadable: {error:#}"
+      )),
+    };
+    RwLock::new(CriticalAlerts {
+      operational,
+      ..Default::default()
+    })
+  })
 }
 
 fn current_critical_alert() -> Option<String> {
@@ -1509,7 +1581,62 @@ fn current_critical_alert() -> Option<String> {
 }
 
 fn record_operational_alert(message: String) {
-  critical_alerts().write().unwrap().operational = Some(message);
+  let mut alerts = critical_alerts().write().unwrap();
+  let message = match persist_operational_alert(
+    Path::new(OPERATIONAL_ALERT_PATH),
+    &message,
+  ) {
+    Ok(()) => message,
+    Err(error) => {
+      error!("Failed to persist backup operational alert: {error:#}");
+      format!(
+        "{message}\nThis alert could not be persisted across restart: {error:#}"
+      )
+    }
+  };
+  alerts.operational = Some(message);
+}
+
+fn read_operational_alert(
+  path: &Path,
+) -> anyhow::Result<Option<String>> {
+  let bytes = match std::fs::read(path) {
+    Ok(bytes) => bytes,
+    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+      return Ok(None);
+    }
+    Err(error) => return Err(error.into()),
+  };
+  let alert: PersistedOperationalAlert =
+    serde_json::from_slice(&bytes)?;
+  Ok(Some(alert.message))
+}
+
+fn persist_operational_alert(
+  path: &Path,
+  message: &str,
+) -> anyhow::Result<()> {
+  let parent =
+    path.parent().context("Operational alert has no parent")?;
+  std::fs::create_dir_all(parent)?;
+  let temporary = parent.join(format!(
+    ".backup-operational-alert-{}.tmp",
+    Uuid::new_v4().simple()
+  ));
+  let mut file = OpenOptions::new()
+    .create_new(true)
+    .write(true)
+    .mode(0o600)
+    .open(&temporary)?;
+  file.write_all(&serde_json::to_vec(
+    &PersistedOperationalAlert {
+      message: message.to_string(),
+    },
+  )?)?;
+  file.sync_all()?;
+  std::fs::rename(temporary, path)?;
+  std::fs::File::open(parent)?.sync_all()?;
+  Ok(())
 }
 
 const CONFIGURATION_ALERT_PREFIX: &str =
@@ -2097,6 +2224,15 @@ struct FleetRunOutcome {
   retries: Vec<tokio::task::JoinHandle<bool>>,
 }
 
+fn volume_is_backup_eligible(
+  volume: &VolumeListItem,
+  include_anonymous_volumes: bool,
+) -> bool {
+  volume.driver == "local"
+    && volume.scope == VolumeScopeEnum::Local
+    && (include_anonymous_volumes || !volume.anonymous)
+}
+
 async fn run_fleet(
   settings: &BackupSettings,
   run: &BackupRun,
@@ -2140,6 +2276,7 @@ async fn run_fleet(
     .map(|server| server.id.clone())
     .collect::<HashSet<_>>();
   if settings.stacks_enabled {
+    let mut matched_included_stacks = HashSet::new();
     let stacks =
       find_collect(&db_client().stacks, None, None).await?;
     for stack in stacks {
@@ -2149,6 +2286,10 @@ async fn run_fleet(
         &stack.id,
       ) {
         continue;
+      }
+      if settings.stack_selection.mode == BackupSelectionMode::Include
+      {
+        matched_included_stacks.insert(stack.id.clone());
       }
       if !stack.config.swarm_id.is_empty() {
         // Selecting one unsupported Stack explicitly must be observable. A
@@ -2176,6 +2317,17 @@ async fn run_fleet(
         warn!(
           "Explicitly selected Stack '{}' belongs to a missing or disabled Server",
           stack.name
+        );
+        partial = true;
+      }
+    }
+    if settings.stack_selection.mode == BackupSelectionMode::Include {
+      for selected in &settings.stack_selection.stack_ids {
+        if matched_included_stacks.contains(selected) {
+          continue;
+        }
+        warn!(
+          "Explicitly selected Stack '{selected}' no longer exists"
         );
         partial = true;
       }
@@ -2234,8 +2386,10 @@ async fn run_fleet(
         .into_iter()
         .flat_map(|docker| docker.volumes)
         .filter(|volume| {
-          volume.driver == "local"
-            && volume.scope == VolumeScopeEnum::Local
+          volume_is_backup_eligible(
+            volume,
+            settings.include_anonymous_volumes,
+          )
         })
       {
         let identity = BackupVolumeTarget {
@@ -2713,9 +2867,10 @@ async fn refresh_node_targets(
     .into_iter()
     .flat_map(|docker| docker.volumes)
     .filter(|volume| {
-      volume.driver == "local"
-        && volume.scope == VolumeScopeEnum::Local
-        && (settings.include_anonymous_volumes || !volume.anonymous)
+      volume_is_backup_eligible(
+        volume,
+        settings.include_anonymous_volumes,
+      )
     })
   {
     let identity = BackupVolumeTarget {
@@ -3335,20 +3490,22 @@ async fn backup_core(
   retry.retry_primary =
     !matches!(&primary_result, Ok(result) if !result.partial);
   ensure_not_cancelled(&run.id)?;
-  let Some(mirror) = settings.mirror.clone() else {
-    let _ = tokio::fs::remove_dir_all(&staging).await;
-    return primary_result.map(|result| result.partial);
+  let mirror_result = if let Some(mirror) = settings.mirror.clone() {
+    let result = write_core_repository_snapshot(
+      mirror,
+      settings,
+      &retry,
+      cancellation,
+      false,
+    )
+    .await;
+    retry.retry_mirror =
+      !matches!(&result, Ok(result) if !result.partial);
+    Some(result)
+  } else {
+    retry.retry_mirror = false;
+    None
   };
-  let mirror_result = write_core_repository_snapshot(
-    mirror,
-    settings,
-    &retry,
-    cancellation,
-    false,
-  )
-  .await;
-  retry.retry_mirror =
-    !matches!(&mirror_result, Ok(result) if !result.partial);
   ensure_not_cancelled(&run.id)?;
   if !retry.retry_primary && !retry.retry_mirror {
     let _ = tokio::fs::remove_dir_all(&staging).await;
@@ -3370,10 +3527,11 @@ async fn backup_core(
   let _ = tokio::fs::remove_dir_all(&staging).await;
   match (primary_result, mirror_result) {
     (Err(error), _) => Err(error),
-    (_, Err(error)) => Err(error),
-    (Ok(primary), Ok(mirror)) => {
+    (_, Some(Err(error))) => Err(error),
+    (Ok(primary), Some(Ok(mirror))) => {
       Ok(primary.partial || mirror.partial)
     }
+    (Ok(primary), None) => Ok(primary.partial),
   }
 }
 
@@ -5748,6 +5906,50 @@ pub fn spawn_scheduler() {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn operational_alerts_survive_a_fresh_read() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("operational-alert.json");
+    assert_eq!(read_operational_alert(&path).unwrap(), None);
+    persist_operational_alert(&path, "Containers remain stopped")
+      .unwrap();
+    assert_eq!(
+      read_operational_alert(&path).unwrap().as_deref(),
+      Some("Containers remain stopped")
+    );
+    persist_operational_alert(&path, "Restore needs reconciliation")
+      .unwrap();
+    assert_eq!(
+      read_operational_alert(&path).unwrap().as_deref(),
+      Some("Restore needs reconciliation")
+    );
+  }
+
+  #[test]
+  fn repository_health_cache_expires_and_tracks_settings_changes() {
+    assert!(repository_health_cache_is_fresh(1_000, 500, 2_000));
+    assert!(!repository_health_cache_is_fresh(1_000, 1_001, 2_000));
+    assert!(!repository_health_cache_is_fresh(1_000, 500, 301_000));
+    assert!(!repository_health_cache_is_fresh(0, 0, 1_000));
+    assert!(!repository_health_cache_is_fresh(2_000, 500, 1_000));
+  }
+
+  #[test]
+  fn anonymous_volume_eligibility_requires_explicit_opt_in() {
+    let mut volume = VolumeListItem {
+      driver: "local".into(),
+      scope: VolumeScopeEnum::Local,
+      anonymous: true,
+      ..Default::default()
+    };
+    assert!(!volume_is_backup_eligible(&volume, false));
+    assert!(volume_is_backup_eligible(&volume, true));
+    volume.anonymous = false;
+    assert!(volume_is_backup_eligible(&volume, false));
+    volume.driver = "remote-plugin".into();
+    assert!(!volume_is_backup_eligible(&volume, true));
+  }
 
   #[test]
   fn maintenance_alerts_do_not_replace_operational_alerts() {
