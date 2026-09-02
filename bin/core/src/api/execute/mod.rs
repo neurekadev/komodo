@@ -241,8 +241,11 @@ pub fn inner_handler(
     // and in their case will spawn tasks, so that isn't necessary
     // here either.
     if update.operation == Operation::None {
-      let response = task(task_id, request, user, update).await?;
+      // Each nested batch member acquires its own read guard. Keeping this
+      // outer guard while a writer is queued would make the recursive read
+      // acquisition wait behind a writer that is itself waiting on us.
       drop(mutation_guard);
+      let response = task(task_id, request, user, update).await?;
       return Ok(ExecutionResult::Batch(response));
     }
 

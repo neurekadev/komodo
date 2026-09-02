@@ -379,8 +379,18 @@ async fn run_backup_repositories(
       "Repository-specific retry requested without a configured mirror"
     ));
   }
-  let manifest_dir = std::env::temp_dir()
+  let manifest_staging = backup_manifest_staging_dir();
+  std::fs::create_dir_all(&manifest_staging).with_context(|| {
+    format!(
+      "Failed to create backup manifest staging root {}",
+      manifest_staging.display()
+    )
+  })?;
+  let manifest_dir = manifest_staging
     .join(backup_manifest_source_name(&request.snapshot_name));
+  // Operations are serialized. Removing a same-snapshot directory here
+  // recovers staging left by a process exit before the drop guard ran.
+  remove_path(&manifest_dir)?;
   std::fs::create_dir(&manifest_dir).with_context(|| {
     format!(
       "Failed to create backup manifest staging directory {}",
@@ -438,6 +448,13 @@ async fn run_backup_repositories(
     None
   };
   Ok((primary, mirror))
+}
+
+fn backup_manifest_staging_dir() -> PathBuf {
+  periphery_config()
+    .stack_dir()
+    .join(".komodo-vykar")
+    .join("backup-manifests")
 }
 
 async fn run_repository_backup(
@@ -2150,6 +2167,9 @@ async fn restart_container_quiesce_journal(
 /// recovered-Stack publications remain intact for Core reconciliation. This
 /// runs before Periphery accepts requests.
 pub(crate) async fn recover_restore_journals() -> anyhow::Result<()> {
+  let manifest_staging = backup_manifest_staging_dir();
+  remove_path(&manifest_staging)?;
+  std::fs::create_dir_all(&manifest_staging)?;
   let directory = restore_journal_dir()?;
   let mut deferred_journal_ids = HashSet::new();
   for entry in std::fs::read_dir(&directory)? {

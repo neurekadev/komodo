@@ -30,6 +30,15 @@ type ResourceBackupProps = {
   canExecute: boolean;
 };
 
+type RestoreSnapshotButtonProps = {
+  target: Types.BackupTarget;
+  sourceServerId: string;
+  snapshot?: Types.BackupSnapshot;
+  forceStackRecovery?: boolean;
+  compact?: boolean;
+  children?: ReactNode;
+};
+
 const SNAPSHOT_PAGE_LIMIT = 100;
 const PERIPHERY_HOSTNAME_PREFIX = "komodo-periphery-";
 
@@ -51,15 +60,6 @@ export default function ResourceBackups({
   const invalidate = useInvalidate();
   const [snapshot, setSnapshot] = useState<string>();
   const [snapshotPage, setSnapshotPage] = useState(1);
-  const [restoreOpen, setRestoreOpen] = useState(false);
-  const [selectedPaths, setSelectedPaths] = useState<string[]>([]);
-  const [destinationServerId, setDestinationServerId] =
-    useState(sourceServerId);
-  const [recoveredName, setRecoveredName] = useState("");
-  const [destinationVolume, setDestinationVolume] = useState("");
-  const [confirmExistingVolume, setConfirmExistingVolume] = useState(false);
-  const [mappingText, setMappingText] = useState("");
-  const [plan, setPlan] = useState<Types.BackupRestorePlan>();
 
   const snapshots = useRead(
     "ListBackupSnapshots",
@@ -86,24 +86,6 @@ export default function ResourceBackups({
       },
     },
   );
-  const { mutate: createPlan, isPending: planPending } = useWrite(
-    "PlanBackupRestore",
-    { onSuccess: setPlan },
-  );
-  const { mutate: executeRestore, isPending: restorePending } = useWrite(
-    "ExecuteBackupRestore",
-    {
-      onSuccess: (run) => {
-        setPlan(undefined);
-        setRestoreOpen(false);
-        notifications.show({
-          color: run.state === Types.BackupRunState.Complete ? "green" : "red",
-          message: run.message,
-        });
-      },
-    },
-  );
-
   const options =
     snapshots.data?.snapshots.map((item) => ({
       value: item.name,
@@ -113,32 +95,10 @@ export default function ResourceBackups({
   const selectedSnapshot = snapshots.data?.snapshots.find(
     (item) => item.name === snapshot,
   );
-  const requiredStackMappings =
-    selectedSnapshot?.restorable_source_paths ?? [];
-
-  const crossNode = destinationServerId !== sourceServerId;
-  const snapshotSourceServerId = selectedSnapshot?.hostname.startsWith(
-    PERIPHERY_HOSTNAME_PREFIX,
-  )
-    ? selectedSnapshot.hostname.slice(PERIPHERY_HOSTNAME_PREFIX.length)
-    : sourceServerId;
-  const stackRecovery =
-    target.type === "Stack" &&
-    !!selectedSnapshot &&
-    (snapshotSourceServerId !== sourceServerId ||
-      destinationServerId !== snapshotSourceServerId ||
-      selectedSnapshot.source_paths_match_current === false);
   const snapshotPages = Math.max(
     1,
     Math.ceil((snapshots.data?.total ?? 0) / SNAPSHOT_PAGE_LIMIT),
   );
-  const bindings = useMemo(() => {
-    const pairs = mappingText
-      .split("\n")
-      .map((line) => line.split("=").map((part) => part.trim()))
-      .filter((pair) => pair.length === 2 && pair[0] && pair[1]);
-    return Object.fromEntries(pairs as [string, string][]);
-  }, [mappingText]);
 
   return (
     <Section
@@ -170,18 +130,11 @@ export default function ResourceBackups({
               >
                 Back up now
               </Button>
-              <Button
-                variant="light"
-                leftSection={<ICONS.Restart size="1rem" />}
-                disabled={!snapshot}
-                onClick={() => {
-                  setSelectedPaths([]);
-                  setDestinationServerId(sourceServerId);
-                  setRestoreOpen(true);
-                }}
-              >
-                Restore
-              </Button>
+              <RestoreSnapshotButton
+                target={target}
+                sourceServerId={sourceServerId}
+                snapshot={selectedSnapshot}
+              />
             </>
           )}
         </Group>
@@ -191,7 +144,6 @@ export default function ResourceBackups({
             value={snapshotPage}
             onChange={(page) => {
               setSnapshot(undefined);
-              setSelectedPaths([]);
               setSnapshotPage(page);
             }}
           />
@@ -200,6 +152,85 @@ export default function ResourceBackups({
           <Text c="dimmed">No snapshots are available for this resource.</Text>
         )}
       </Stack>
+    </Section>
+  );
+}
+
+export function RestoreSnapshotButton({
+  target,
+  sourceServerId,
+  snapshot,
+  forceStackRecovery = false,
+  compact = false,
+  children = "Restore",
+}: RestoreSnapshotButtonProps) {
+  const [restoreOpen, setRestoreOpen] = useState(false);
+  const [selectedPaths, setSelectedPaths] = useState<string[]>([]);
+  const [destinationServerId, setDestinationServerId] = useState(sourceServerId);
+  const [recoveredName, setRecoveredName] = useState("");
+  const [destinationVolume, setDestinationVolume] = useState("");
+  const [confirmExistingVolume, setConfirmExistingVolume] = useState(false);
+  const [mappingText, setMappingText] = useState("");
+  const [plan, setPlan] = useState<Types.BackupRestorePlan>();
+  const { mutate: createPlan, isPending: planPending } = useWrite(
+    "PlanBackupRestore",
+    { onSuccess: setPlan },
+  );
+  const { mutate: executeRestore, isPending: restorePending } = useWrite(
+    "ExecuteBackupRestore",
+    {
+      onSuccess: (run) => {
+        setPlan(undefined);
+        setRestoreOpen(false);
+        notifications.show({
+          color: run.state === Types.BackupRunState.Complete ? "green" : "red",
+          message: run.message,
+        });
+      },
+    },
+  );
+  const requiredStackMappings = snapshot?.restorable_source_paths ?? [];
+  const crossNode = destinationServerId !== sourceServerId;
+  const snapshotSourceServerId = snapshot?.hostname.startsWith(
+    PERIPHERY_HOSTNAME_PREFIX,
+  )
+    ? snapshot.hostname.slice(PERIPHERY_HOSTNAME_PREFIX.length)
+    : sourceServerId;
+  const stackRecovery =
+    target.type === "Stack" &&
+    !!snapshot &&
+    (forceStackRecovery ||
+      snapshotSourceServerId !== sourceServerId ||
+      destinationServerId !== snapshotSourceServerId ||
+      snapshot.source_paths_match_current === false);
+  const bindings = useMemo(() => {
+    const pairs = mappingText
+      .split("\n")
+      .map((line) => line.split("=").map((part) => part.trim()))
+      .filter((pair) => pair.length === 2 && pair[0] && pair[1]);
+    return Object.fromEntries(pairs as [string, string][]);
+  }, [mappingText]);
+
+  return (
+    <>
+      <Button
+        variant="light"
+        size={compact ? "compact-sm" : undefined}
+        leftSection={<ICONS.Restart size="1rem" />}
+        disabled={!snapshot || snapshot.partial}
+        onClick={() => {
+          setSelectedPaths([]);
+          setDestinationServerId(sourceServerId);
+          setRecoveredName("");
+          setDestinationVolume("");
+          setConfirmExistingVolume(false);
+          setMappingText("");
+          setPlan(undefined);
+          setRestoreOpen(true);
+        }}
+      >
+        {children}
+      </Button>
 
       <Modal
         opened={restoreOpen}
@@ -278,7 +309,7 @@ export default function ResourceBackups({
           )}
           {snapshot && (
             <SnapshotPicker
-              snapshot={snapshot}
+              snapshot={snapshot.name}
               selected={selectedPaths}
               onChange={setSelectedPaths}
             />
@@ -305,7 +336,7 @@ export default function ResourceBackups({
               onClick={() =>
                 snapshot &&
                 createPlan({
-                  snapshot,
+                  snapshot: snapshot.name,
                   destination_server_id: destinationServerId,
                   selected_paths: selectedPaths,
                   recovered_stack_name:
@@ -360,7 +391,7 @@ export default function ResourceBackups({
           </Stack>
         )}
       </Modal>
-    </Section>
+    </>
   );
 }
 

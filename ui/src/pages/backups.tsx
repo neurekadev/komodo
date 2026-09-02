@@ -1,3 +1,4 @@
+import { RestoreSnapshotButton } from "@/components/backups/resource";
 import { useInvalidate, useRead, useSetTitle, useUser, useWrite } from "@/lib/hooks";
 import { ICONS } from "@/lib/icons";
 import {
@@ -112,19 +113,23 @@ export default function Backups() {
 }
 
 function SnapshotInventory() {
+  const [page, setPage] = useState(1);
+  const limit = 20;
   const inventory = useRead(
     "ListBackupSnapshots",
-    { page: 0, limit: 100 },
+    { page: page - 1, limit },
     { refetchInterval: 30_000 },
   );
+  const pages = Math.max(1, Math.ceil((inventory.data?.total ?? 0) / limit));
   return (
     <Section title="Primary snapshots" icon={<ICONS.Backup size="1.3rem" />}>
       <Stack gap="xs">
         <Text size="sm" c="dimmed">
           This inventory is read directly from the active primary repository.
-          Resource restore controls appear on each Stack or Volume.
+          Administrators can recover complete Stack and Volume snapshots here
+          even after the original resource has been deleted.
         </Text>
-        {inventory.data?.snapshots.slice(0, 20).map((snapshot) => (
+        {inventory.data?.snapshots.map((snapshot) => (
           <Group key={snapshot.name} justify="space-between" wrap="nowrap">
             <Stack gap={0} className="overflow-hidden">
               <Text size="sm" fw={500} truncate>
@@ -134,22 +139,45 @@ function SnapshotInventory() {
                 {snapshot.name} · {snapshot.hostname}
               </Text>
             </Stack>
-            <Badge color={snapshot.partial ? "orange" : "green"}>
-              {snapshot.partial ? "Partial" : "Complete"}
-            </Badge>
+            <Group gap="xs" wrap="nowrap">
+              <Badge color={snapshot.partial ? "orange" : "green"}>
+                {snapshot.partial ? "Partial" : "Complete"}
+              </Badge>
+              {!snapshot.partial &&
+                (snapshot.target.type === "Stack" ||
+                  snapshot.target.type === "Volume") && (
+                  <RestoreSnapshotButton
+                    target={snapshot.target}
+                    sourceServerId={snapshotSourceServerId(snapshot)}
+                    snapshot={snapshot}
+                    forceStackRecovery={snapshot.target.type === "Stack"}
+                    compact
+                  >
+                    Recover
+                  </RestoreSnapshotButton>
+                )}
+            </Group>
           </Group>
         ))}
         {!inventory.isPending && !inventory.data?.snapshots.length && (
           <Text c="dimmed">No snapshots in the primary repository.</Text>
         )}
-        {(inventory.data?.total ?? 0) > 20 && (
-          <Text size="xs" c="dimmed">
-            Showing 20 of {inventory.data?.total} snapshots.
-          </Text>
+        {pages > 1 && (
+          <Pagination total={pages} value={page} onChange={setPage} />
         )}
       </Stack>
     </Section>
   );
+}
+
+function snapshotSourceServerId(snapshot: Types.BackupSnapshot) {
+  if (snapshot.target.type === "Volume") {
+    return snapshot.target.params.server_id;
+  }
+  const prefix = "komodo-periphery-";
+  return snapshot.hostname.startsWith(prefix)
+    ? snapshot.hostname.slice(prefix.length)
+    : "";
 }
 
 function snapshotTargetLabel(target: Types.BackupTarget) {
