@@ -80,24 +80,35 @@ impl Resolve<WriteArgs> for PlanBackupRestore {
       PermissionLevel::Execute,
     )
     .await?;
-    if let Some(destination) = &self.destination_server_id {
-      let source_server = match &snapshot.target {
-        komodo_client::entities::backup::BackupTarget::Volume {
-          server_id,
-          ..
-        } => Some(server_id.clone()),
-        komodo_client::entities::backup::BackupTarget::Stack {
-          stack_id,
-        } => crate::resource::get::<Stack>(stack_id)
-          .await
-          .ok()
-          .map(|stack| stack.config.server_id),
-        _ => None,
-      };
+    let current_stack_server = match &snapshot.target {
+      komodo_client::entities::backup::BackupTarget::Stack {
+        stack_id,
+      } => crate::resource::get::<Stack>(stack_id)
+        .await
+        .ok()
+        .map(|stack| stack.config.server_id),
+      _ => None,
+    };
+    let source_server = match &snapshot.target {
+      komodo_client::entities::backup::BackupTarget::Volume {
+        server_id,
+        ..
+      } => Some(server_id.clone()),
+      komodo_client::entities::backup::BackupTarget::Stack {
+        ..
+      } => crate::backup::snapshot_server_id(&snapshot)
+        .map(str::to_string),
+      _ => None,
+    };
+    let destination_server =
+      self.destination_server_id.clone().or_else(|| {
+        current_stack_server.or_else(|| source_server.clone())
+      });
+    if let Some(destination) = destination_server {
       if source_server.as_deref() != Some(destination.as_str()) {
         crate::backup::authorize_target(
           &komodo_client::entities::backup::BackupTarget::Volume {
-            server_id: destination.clone(),
+            server_id: destination,
             volume_name: String::new(),
           },
           user,

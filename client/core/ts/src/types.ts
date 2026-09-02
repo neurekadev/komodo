@@ -6414,7 +6414,7 @@ export interface BackupSnapshotList {
 }
 
 export interface BackupStatus {
-	active_run?: BackupRun;
+	active_runs: BackupRun[];
 	recent_runs: BackupRun[];
 	next_run_at: I64;
 	primary_healthy: boolean;

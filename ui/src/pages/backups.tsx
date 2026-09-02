@@ -201,20 +201,22 @@ function StatusSection({ status }: { status?: Types.BackupStatus }) {
           {status.critical_alert}
         </Alert>
       )}
-      {admin && status?.active_run && (
-        <Group mt="md" justify="space-between">
-          <Text size="sm">
-            Active: {status.active_run.message}
-          </Text>
-          <Button
-            color="red"
-            variant="light"
-            loading={cancelling}
-            onClick={() => cancel({ run_id: status.active_run!.id })}
-          >
-            Cancel run
-          </Button>
-        </Group>
+      {admin && !!status?.active_runs.length && (
+        <Stack mt="md" gap="xs">
+          {status.active_runs.map((run) => (
+            <Group key={run.id} justify="space-between">
+              <Text size="sm">Active: {run.message}</Text>
+              <Button
+                color="red"
+                variant="light"
+                loading={cancelling}
+                onClick={() => cancel({ run_id: run.id })}
+              >
+                Cancel run
+              </Button>
+            </Group>
+          ))}
+        </Stack>
       )}
       {!!status?.recent_runs.length && (
         <Stack mt="md" gap="xs">
@@ -709,7 +711,12 @@ function VolumeServerChoices({
   selected: Types.BackupVolumeTarget[];
   toggle: (target: Types.BackupVolumeTarget) => void;
 }) {
-  const volumes = useRead("ListVolumes", { server: serverId }).data ?? [];
+  const volumes = (useRead("ListVolumes", { server: serverId }).data ?? [])
+    .filter(
+      (volume) =>
+        volume.driver === "local" &&
+        volume.scope === Types.VolumeScopeEnum.Local,
+    );
   return (
     <Accordion.Item value={serverId}>
       <Accordion.Control>{serverName}</Accordion.Control>

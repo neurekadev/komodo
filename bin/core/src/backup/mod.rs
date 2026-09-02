@@ -81,6 +81,7 @@ const STACK_MANIFEST_STAGING_PATH: &str =
 const CORE_INSTANCE_ID_PATH: &str = "/data/keys/backup-instance-id";
 const LEGACY_CORE_INSTANCE_ID_PATH: &str =
   "/config/keys/backup-instance-id";
+const PERIPHERY_HOSTNAME_PREFIX: &str = "komodo-periphery-";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SealedBackupSettings {
@@ -250,11 +251,17 @@ async fn save_settings_inner(
     }
     None => (None, false),
   };
+  let primary_location_unchanged = existing
+    .as_ref()
+    .map(|existing| {
+      repositories_share_location(
+        &proposed.primary,
+        &existing.primary,
+      )
+    })
+    .transpose()?
+    .unwrap_or(true);
   if let Some(existing) = &existing {
-    let primary_location_unchanged = repositories_share_location(
-      &proposed.primary,
-      &existing.primary,
-    )?;
     if primary_initialized
       && !allow_primary_location_change
       && !primary_location_unchanged
@@ -267,6 +274,7 @@ async fn save_settings_inner(
       &mut proposed.primary,
       &existing.primary,
       primary_location_unchanged,
+      primary_initialized,
     )?;
     match (&mut proposed.mirror, &existing.mirror) {
       (Some(proposed), Some(existing)) => {
@@ -276,6 +284,7 @@ async fn save_settings_inner(
           proposed,
           existing,
           location_unchanged,
+          true,
         )?
       }
       (Some(proposed), None) => require_repository_secrets(proposed)?,
@@ -286,6 +295,13 @@ async fn save_settings_inner(
     if let Some(mirror) = &proposed.mirror {
       require_repository_secrets(mirror)?;
     }
+  }
+  if !primary_location_unchanged {
+    // Health is keyed by role. A corrected pre-initialization location must
+    // not inherit verification evidence from the replaced repository.
+    health_collection()
+      .delete_one(doc! { "_id": "primary" })
+      .await?;
   }
   let mirror_changed = match (
     existing
@@ -627,11 +643,13 @@ fn merge_repository_secrets(
   proposed: &mut BackupRepository,
   existing: &BackupRepository,
   location_unchanged: bool,
+  initialized: bool,
 ) -> anyhow::Result<()> {
   if !location_unchanged {
     return require_repository_secrets(proposed);
   }
-  if !proposed.passphrase.value.is_empty()
+  if initialized
+    && !proposed.passphrase.value.is_empty()
     && proposed.passphrase.value != existing.passphrase.value
   {
     return Err(anyhow!(
@@ -1075,7 +1093,7 @@ pub async fn status() -> anyhow::Result<BackupStatus> {
   )
   .await
   .unwrap_or_default();
-  let active_run = find_collect(
+  let active_runs = find_collect(
     &runs_collection(),
     doc! {
       "state": {
@@ -1087,13 +1105,10 @@ pub async fn status() -> anyhow::Result<BackupStatus> {
     },
     FindOptions::builder()
       .sort(doc! { "started_at": -1 })
-      .limit(1)
       .build(),
   )
   .await
-  .unwrap_or_default()
-  .into_iter()
-  .next();
+  .unwrap_or_default();
   let previous_primary = health_collection()
     .find_one(doc! { "_id": "primary" })
     .await
@@ -1192,7 +1207,7 @@ pub async fn status() -> anyhow::Result<BackupStatus> {
       .await;
   }
   Ok(BackupStatus {
-    active_run,
+    active_runs,
     recent_runs,
     next_run_at: next_scheduled_run().unwrap_or_default(),
     primary_healthy,
@@ -1581,7 +1596,8 @@ async fn run_maintenance(
     }
     record_repository_verification(health_id, true, full_due).await?;
     let settings_for_worker = settings.clone();
-    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+    let maintenance = tokio::task::spawn_blocking(
+      move || -> anyhow::Result<()> {
       let vykar = core_repository(&repository, &settings_for_worker)?;
       let inventory = vykar.list_snapshots()?;
       if inventory.hidden > 0 {
@@ -1617,9 +1633,17 @@ async fn run_maintenance(
         max_repack,
       )?;
       Ok(())
-    })
+    },
+    )
     .await
-    .context("Vykar maintenance worker failed")??;
+    .context("Vykar maintenance worker failed")
+    .and_then(|result| result);
+    if let Err(error) = maintenance {
+      // Any failure after verification makes the preceding evidence unsafe to
+      // reuse. Force a full verification before another destructive cycle.
+      record_repository_verification(health_id, false, false).await?;
+      return Err(error);
+    }
   }
   Ok(())
 }
@@ -2977,6 +3001,10 @@ pub async fn authorize_snapshot(
   Ok(snapshot)
 }
 
+pub fn snapshot_server_id(snapshot: &BackupSnapshot) -> Option<&str> {
+  snapshot.hostname.strip_prefix(PERIPHERY_HOSTNAME_PREFIX)
+}
+
 async fn snapshot_stack_source(
   snapshot: &BackupSnapshot,
 ) -> anyhow::Result<(Stack, Option<Stack>)> {
@@ -3746,19 +3774,28 @@ impl Drop for RemoveDirectoryOnDrop {
 }
 
 fn purge_abandoned_core_staging() -> anyhow::Result<()> {
-  let path = Path::new(CORE_STAGING_PATH);
-  match std::fs::remove_dir_all(path) {
-    Ok(()) => {}
-    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-    Err(error) => {
-      return Err(
-        anyhow::Error::new(error)
-          .context("Failed to purge abandoned Core staging"),
-      );
+  for path in [
+    CORE_STAGING_PATH,
+    CORE_RECOVERY_STAGING_PATH,
+    STACK_MANIFEST_STAGING_PATH,
+  ] {
+    let path = Path::new(path);
+    match std::fs::remove_dir_all(path) {
+      Ok(()) => {}
+      Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+      Err(error) => {
+        return Err(anyhow::Error::new(error).with_context(|| {
+          format!(
+            "Failed to purge abandoned Core staging at {}",
+            path.display()
+          )
+        }));
+      }
     }
+    std::fs::create_dir_all(path).with_context(|| {
+      format!("Failed to create Core staging at {}", path.display())
+    })?;
   }
-  std::fs::create_dir_all(path)
-    .context("Failed to create Core staging directory")?;
   Ok(())
 }
 
@@ -3771,8 +3808,20 @@ async fn cleanup_expired_restore_plans() -> anyhow::Result<()> {
   Ok(())
 }
 
-async fn cleanup_expired_core_recovery_plans() -> anyhow::Result<()> {
-  let _operation = core_recovery_operation_lock().lock().await;
+fn is_managed_core_recovery_database(
+  current_database: &str,
+  candidate: &str,
+) -> bool {
+  let prefix = format!("{current_database}_recovery_");
+  candidate.strip_prefix(&prefix).is_some_and(|suffix| {
+    suffix.len() == 12
+      && suffix
+        .chars()
+        .all(|character| character.is_ascii_hexdigit())
+  })
+}
+
+async fn reconcile_core_recovery_state_inner() -> anyhow::Result<()> {
   let expired = find_collect(
     &core_recovery_collection(),
     doc! { "plan.expires_at": { "$lt": komodo_timestamp() } },
@@ -3796,14 +3845,45 @@ async fn cleanup_expired_core_recovery_plans() -> anyhow::Result<()> {
       .delete_one(doc! { "_id": &stored.id })
       .await?;
   }
+  let active_databases =
+    find_collect(&core_recovery_collection(), None, None)
+      .await?
+      .into_iter()
+      .map(|stored| stored.plan.validation_database)
+      .collect::<HashSet<_>>();
+  let client = db_client().db.client();
+  let current_database = db_client().db.name();
+  for database_name in client.list_database_names().await? {
+    if is_managed_core_recovery_database(
+      current_database,
+      &database_name,
+    ) && !active_databases.contains(&database_name)
+    {
+      client
+        .database(&database_name)
+        .drop()
+        .await
+        .with_context(|| {
+          format!(
+            "Failed to drop orphaned Core recovery database '{database_name}'"
+          )
+        })?;
+    }
+  }
   Ok(())
+}
+
+async fn reconcile_core_recovery_state() -> anyhow::Result<()> {
+  let _operation = core_recovery_operation_lock().lock().await;
+  reconcile_core_recovery_state_inner().await
 }
 
 pub async fn plan_core_recovery(
   snapshot_name: &str,
   created_by: String,
 ) -> anyhow::Result<CoreRecoveryPlan> {
-  cleanup_expired_core_recovery_plans().await?;
+  let _operation = core_recovery_operation_lock().lock().await;
+  reconcile_core_recovery_state_inner().await?;
   let _repository_roles =
     repository_role_barrier().clone().read_owned().await;
   let snapshot = list_snapshots()
@@ -4403,8 +4483,7 @@ pub fn spawn_scheduler() {
       if let Err(error) = cleanup_expired_restore_plans().await {
         error!("Failed to clean expired restore plans: {error:#}");
       }
-      if let Err(error) = cleanup_expired_core_recovery_plans().await
-      {
+      if let Err(error) = reconcile_core_recovery_state().await {
         error!(
           "Failed to clean expired Core recovery plans: {error:#}"
         );
@@ -4507,13 +4586,33 @@ mod tests {
     let existing = repository("original");
     let mut proposed = repository("replacement");
     assert!(
-      merge_repository_secrets(&mut proposed, &existing, true)
+      merge_repository_secrets(&mut proposed, &existing, true, true)
         .is_err()
     );
 
     let mut redacted = repository("");
-    merge_repository_secrets(&mut redacted, &existing, true).unwrap();
+    merge_repository_secrets(&mut redacted, &existing, true, true)
+      .unwrap();
     assert_eq!(redacted.passphrase.value, "original");
+  }
+
+  #[test]
+  fn uninitialized_repository_passphrase_can_be_corrected() {
+    let repository = |passphrase: &str| BackupRepository {
+      backend: BackupRepositoryBackend::CoreLocal {
+        path: "/backups/repository".into(),
+      },
+      passphrase: BackupSecret {
+        value: passphrase.into(),
+        configured: false,
+      },
+      ..Default::default()
+    };
+    let existing = repository("mistyped");
+    let mut proposed = repository("corrected");
+    merge_repository_secrets(&mut proposed, &existing, true, false)
+      .unwrap();
+    assert_eq!(proposed.passphrase.value, "corrected");
   }
 
   #[test]
@@ -4661,6 +4760,35 @@ mod tests {
     assert!(!is_backup_manifest_source(
       "stack-20260902T010001Z-run-other-id",
       &format!("/tmp/{marker}")
+    ));
+  }
+
+  #[test]
+  fn snapshot_server_comes_from_snapshot_hostname() {
+    let snapshot = BackupSnapshot {
+      hostname: "komodo-periphery-snapshot-server".into(),
+      ..Default::default()
+    };
+    assert_eq!(
+      snapshot_server_id(&snapshot),
+      Some("snapshot-server")
+    );
+  }
+
+  #[test]
+  fn managed_recovery_database_names_require_exact_generated_suffix()
+  {
+    assert!(is_managed_core_recovery_database(
+      "komodo",
+      "komodo_recovery_0123abcdef45"
+    ));
+    assert!(!is_managed_core_recovery_database(
+      "komodo",
+      "komodo_recovery_customer"
+    ));
+    assert!(!is_managed_core_recovery_database(
+      "komodo",
+      "other_recovery_0123abcdef45"
     ));
   }
 

@@ -339,7 +339,8 @@ pub struct BackupRun {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 pub struct BackupStatus {
-  pub active_run: Option<BackupRun>,
+  #[serde(default)]
+  pub active_runs: Vec<BackupRun>,
   pub recent_runs: Vec<BackupRun>,
   pub next_run_at: I64,
   pub primary_healthy: bool,

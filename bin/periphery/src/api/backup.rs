@@ -8,6 +8,7 @@ use std::{
     Arc, Mutex, OnceLock,
     atomic::{AtomicBool, Ordering},
   },
+  time::{Duration, Instant},
 };
 
 use anyhow::{Context, anyhow};
@@ -29,6 +30,8 @@ use super::Args;
 
 const COMPOSE_PROJECT_LABEL: &str = "com.docker.compose.project";
 const RESTORE_PLAN_VOLUME_LABEL: &str = "komodo.restore-plan";
+const PENDING_CANCELLATION_TTL: Duration = Duration::from_secs(60);
+const MAX_PENDING_CANCELLATIONS: usize = 1_024;
 
 #[derive(Deserialize)]
 struct BackupComposeConfig {
@@ -53,21 +56,34 @@ enum BackupComposeMount {
   },
 }
 
-fn cancellation_tokens()
--> &'static Mutex<HashMap<String, Arc<AtomicBool>>> {
-  static TOKENS: OnceLock<Mutex<HashMap<String, Arc<AtomicBool>>>> =
+#[derive(Default)]
+struct OperationCancellationRegistry {
+  active: HashMap<String, Arc<AtomicBool>>,
+  pending: HashMap<String, Instant>,
+}
+
+impl OperationCancellationRegistry {
+  fn prune_pending(&mut self, now: Instant) {
+    self.pending.retain(|_, expires_at| *expires_at > now);
+  }
+}
+
+fn cancellation_registry()
+-> &'static Mutex<OperationCancellationRegistry> {
+  static REGISTRY: OnceLock<Mutex<OperationCancellationRegistry>> =
     OnceLock::new();
-  TOKENS.get_or_init(Default::default)
+  REGISTRY.get_or_init(Default::default)
 }
 
 fn operation_cancellation_token(
   operation_id: &str,
 ) -> Arc<AtomicBool> {
-  cancellation_tokens()
+  cancellation_registry()
     .lock()
     .unwrap()
-    .entry(operation_id.to_string())
-    .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+    .active
+    .get(operation_id)
+    .expect("backup operation cancellation was not registered")
     .clone()
 }
 
@@ -75,33 +91,64 @@ struct OperationCancellationRegistration(String);
 
 impl Drop for OperationCancellationRegistration {
   fn drop(&mut self) {
-    cancellation_tokens().lock().unwrap().remove(&self.0);
+    cancellation_registry()
+      .lock()
+      .unwrap()
+      .active
+      .remove(&self.0);
   }
 }
 
 fn register_operation_cancellation(
   operation_id: &str,
 ) -> (Arc<AtomicBool>, OperationCancellationRegistration) {
+  let mut registry = cancellation_registry().lock().unwrap();
+  let now = Instant::now();
+  registry.prune_pending(now);
+  let cancelled = registry.pending.remove(operation_id).is_some();
+  let token = Arc::new(AtomicBool::new(cancelled));
+  registry
+    .active
+    .insert(operation_id.to_string(), token.clone());
   (
-    operation_cancellation_token(operation_id),
+    token,
     OperationCancellationRegistration(operation_id.to_string()),
   )
 }
 
 fn operation_cancelled(operation_id: &str) -> bool {
-  cancellation_tokens()
+  cancellation_registry()
     .lock()
     .unwrap()
+    .active
     .get(operation_id)
     .is_some_and(|token| token.load(Ordering::SeqCst))
 }
 
 fn request_operation_cancellation(operation_id: &str) -> bool {
-  let tokens = cancellation_tokens().lock().unwrap();
-  let Some(token) = tokens.get(operation_id) else {
-    return false;
-  };
-  token.store(true, Ordering::SeqCst);
+  let mut registry = cancellation_registry().lock().unwrap();
+  if let Some(token) = registry.active.get(operation_id) {
+    token.store(true, Ordering::SeqCst);
+    return true;
+  }
+
+  // Cancellation and backup requests use separate HTTP connections, so the
+  // cancellation can arrive first. Retain only a short-lived, size-bounded
+  // marker; registration consumes it atomically under this same lock.
+  let now = Instant::now();
+  registry.prune_pending(now);
+  if registry.pending.len() >= MAX_PENDING_CANCELLATIONS
+    && let Some(oldest) = registry
+      .pending
+      .iter()
+      .min_by_key(|(_, expires_at)| **expires_at)
+      .map(|(operation_id, _)| operation_id.clone())
+  {
+    registry.pending.remove(&oldest);
+  }
+  registry
+    .pending
+    .insert(operation_id.to_string(), now + PENDING_CANCELLATION_TTL);
   true
 }
 
@@ -531,19 +578,20 @@ fn resolve_existing_ancestor(path: &Path) -> anyhow::Result<PathBuf> {
   }
 }
 
-fn validate_backup_source_outside_internal_storage(
-  source: &Path,
+fn validate_path_outside_internal_storage(
+  path: &Path,
   internal_storage: &Path,
+  label: &str,
 ) -> anyhow::Result<()> {
-  let resolved_source = resolve_existing_ancestor(source)?;
+  let resolved_path = resolve_existing_ancestor(path)?;
   let resolved_internal =
     resolve_existing_ancestor(internal_storage)?;
-  if paths_overlap(source, internal_storage)
-    || paths_overlap(&resolved_source, &resolved_internal)
+  if paths_overlap(path, internal_storage)
+    || paths_overlap(&resolved_path, &resolved_internal)
   {
     return Err(anyhow!(
-      "Backup source '{}' overlaps Periphery's internal backup storage '{}'",
-      source.display(),
+      "{label} '{}' overlaps Periphery's internal backup storage '{}'",
+      path.display(),
       internal_storage.display()
     ));
   }
@@ -553,10 +601,26 @@ fn validate_backup_source_outside_internal_storage(
 fn validate_resolved_restore_destinations(
   publish: &[RestorePublishPath],
 ) -> anyhow::Result<()> {
+  validate_resolved_restore_destinations_against(
+    publish,
+    &periphery_config().stack_dir().join(".komodo-vykar"),
+  )
+}
+
+fn validate_resolved_restore_destinations_against(
+  publish: &[RestorePublishPath],
+  internal_storage: &Path,
+) -> anyhow::Result<()> {
   let destinations = publish
     .iter()
     .map(|item| {
-      resolve_existing_ancestor(Path::new(&item.destination))
+      let destination = Path::new(&item.destination);
+      validate_path_outside_internal_storage(
+        destination,
+        internal_storage,
+        "Restore destination",
+      )?;
+      resolve_existing_ancestor(destination)
         .map(|resolved| (item.destination.as_str(), resolved))
     })
     .collect::<anyhow::Result<Vec<_>>>()?;
@@ -731,14 +795,16 @@ async fn discover_source(
       }
       let internal_storage =
         periphery_config().stack_dir().join(".komodo-vykar");
-      validate_backup_source_outside_internal_storage(
+      validate_path_outside_internal_storage(
         &run_directory,
         &internal_storage,
+        "Backup source",
       )?;
       for bind_path in &bind_paths {
-        validate_backup_source_outside_internal_storage(
+        validate_path_outside_internal_storage(
           bind_path,
           &internal_storage,
+          "Backup source",
         )?;
       }
       let mut affected_paths = bind_paths.clone();
@@ -2107,10 +2173,25 @@ mod tests {
   }
 
   #[test]
-  fn cancelling_an_unknown_operation_does_not_register_a_token() {
-    let id = "unknown-cancellable-backup-test";
-    assert!(!request_operation_cancellation(id));
-    assert!(!cancellation_tokens().lock().unwrap().contains_key(id));
+  fn cancellation_before_registration_is_bounded_and_consumed() {
+    let id = "early-cancellable-backup-test";
+    assert!(request_operation_cancellation(id));
+    {
+      let registry = cancellation_registry().lock().unwrap();
+      assert!(!registry.active.contains_key(id));
+      assert!(registry.pending.contains_key(id));
+      assert!(registry.pending.len() <= MAX_PENDING_CANCELLATIONS);
+    }
+    let (worker, registration) = register_operation_cancellation(id);
+    assert!(worker.load(Ordering::SeqCst));
+    assert!(
+      !cancellation_registry()
+        .lock()
+        .unwrap()
+        .pending
+        .contains_key(id)
+    );
+    drop(registration);
   }
 
   #[test]
@@ -2121,14 +2202,17 @@ mod tests {
     std::fs::create_dir_all(&stack).unwrap();
 
     assert!(
-      validate_backup_source_outside_internal_storage(
+      validate_path_outside_internal_storage(
         root.path(),
         &internal,
+        "Backup source",
       )
       .is_err()
     );
-    validate_backup_source_outside_internal_storage(
-      &stack, &internal,
+    validate_path_outside_internal_storage(
+      &stack,
+      &internal,
+      "Backup source",
     )
     .unwrap();
   }
@@ -2286,6 +2370,22 @@ mod tests {
     ];
     assert!(
       validate_resolved_restore_destinations(&publish).is_err()
+    );
+  }
+
+  #[test]
+  fn restore_destinations_cannot_replace_internal_backup_storage() {
+    let root = tempfile::tempdir().unwrap();
+    let internal = root.path().join(".komodo-vykar");
+    let publish = vec![RestorePublishPath {
+      snapshot_path: "source/root".into(),
+      destination: root.path().to_string_lossy().into_owned(),
+    }];
+    assert!(
+      validate_resolved_restore_destinations_against(
+        &publish, &internal,
+      )
+      .is_err()
     );
   }
 

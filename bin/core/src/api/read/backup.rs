@@ -38,6 +38,22 @@ impl Resolve<ReadArgs> for GetBackupStatus {
   ) -> mogh_error::Result<BackupStatus> {
     let mut status = crate::backup::status().await?;
     if !user.admin {
+      let mut authorized_active = Vec::new();
+      for run in status.active_runs {
+        let Some(target) = &run.target else {
+          continue;
+        };
+        if crate::backup::authorize_target(
+          target,
+          user,
+          PermissionLevel::Read,
+        )
+        .await
+        .is_ok()
+        {
+          authorized_active.push(run);
+        }
+      }
       let mut authorized = Vec::new();
       for run in status.recent_runs {
         let Some(target) = &run.target else {
@@ -54,9 +70,7 @@ impl Resolve<ReadArgs> for GetBackupStatus {
           authorized.push(run);
         }
       }
-      status.active_run = status.active_run.filter(|run| {
-        authorized.iter().any(|candidate| candidate.id == run.id)
-      });
+      status.active_runs = authorized_active;
       status.recent_runs = authorized;
       status.critical_alert = None;
     }
