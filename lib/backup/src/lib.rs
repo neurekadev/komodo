@@ -84,6 +84,7 @@ impl VykarRepository {
         access_key_id,
         secret_access_key,
         soft_delete,
+        ..
       } => {
         config.repository.url = url.clone();
         config.repository.region = Some(region.clone());
@@ -100,6 +101,7 @@ impl VykarRepository {
         private_key,
         known_hosts,
         timeout_seconds,
+        ..
       } => {
         config.repository.url = url.clone();
         let mut key = NamedTempFile::new_in(cache_dir)
@@ -123,6 +125,7 @@ impl VykarRepository {
         url,
         access_token,
         allow_insecure_http,
+        ..
       } => {
         config.repository.url = url.clone();
         config.repository.access_token =
@@ -1050,6 +1053,7 @@ mod tests {
           value: token.into(),
           configured: false,
         },
+        worker_access_token: BackupSecret::default(),
         allow_insecure_http: true,
       },
       passphrase: BackupSecret {

@@ -1894,6 +1894,11 @@ struct RestoreJournal {
   entries: Vec<RestoreJournalEntry>,
   #[serde(default)]
   committed: bool,
+  /// Filesystem commit/rollback completed, but the journal remains durable
+  /// until every quiesced container has restarted. This makes finalization
+  /// idempotent across transient Docker failures.
+  #[serde(default)]
+  finalized: bool,
   /// A Volume created specifically for this restore. The same durable
   /// journal owns both filesystem rollback and removal of the side effect
   /// until publication is committed.
@@ -1958,6 +1963,7 @@ fn persist_restore_volume_journal(
       staging: PathBuf::new(),
       entries: Vec::new(),
       committed: false,
+      finalized: false,
       owned_volume: Some(RestoreOwnedVolume {
         volume_name: volume_name.to_string(),
         restore_plan_id: restore_plan_id.to_string(),
@@ -2366,6 +2372,7 @@ fn publish_restore_in(
     staging: staging.to_path_buf(),
     entries,
     committed: false,
+    finalized: false,
     owned_volume,
   };
   persist_journal(&journal_path, &journal)?;
@@ -2467,6 +2474,7 @@ fn cleanup_rolled_back_restore(
         staging: PathBuf::new(),
         entries: Vec::new(),
         committed: false,
+        finalized: false,
         owned_volume: journal.owned_volume.clone(),
       },
     )
@@ -2661,13 +2669,13 @@ async fn finalize_restore_publication(
         journal_path.display()
       )
     })?;
-  if journal.committed {
-    return Err(anyhow!(
-      "Restore publication was already committed but not cleaned up"
-    ));
-  }
-
-  if commit {
+  if journal.finalized {
+    if journal.committed != commit {
+      return Err(anyhow!(
+        "Restore was already finalized with the opposite decision"
+      ));
+    }
+  } else if commit {
     // Make the decision durable before discarding rollback data. Startup
     // recovery will finish a committed cleanup after a power loss.
     journal.committed = true;
@@ -2682,7 +2690,14 @@ async fn finalize_restore_publication(
       remove_path(&journal.staging)?;
       fsync_parent(&journal.staging)?;
     }
+    journal.finalized = true;
+    persist_journal(&journal_path, &journal)?;
   } else {
+    if journal.committed {
+      return Err(anyhow!(
+        "Restore commit is already durable and cannot be rolled back"
+      ));
+    }
     rollback_published(&mut journal, &journal_path)?;
     for entry in &journal.entries {
       remove_path(&entry.source)?;
@@ -2695,9 +2710,9 @@ async fn finalize_restore_publication(
     if let Some(owned) = &journal.owned_volume {
       remove_owned_restore_volume(owned).await?;
     }
+    journal.finalized = true;
+    persist_journal(&journal_path, &journal)?;
   }
-  remove_path(&journal_path)?;
-  fsync_parent(&journal_path)?;
 
   let container_journal_path = container_quiesce_journal_dir()?
     .join(format!("{journal_id}.json"));
@@ -2726,6 +2741,10 @@ async fn finalize_restore_publication(
     path_lexists(&container_journal_path)
       .then_some(container_journal_path.as_path()),
   )?;
+  // Retain the finalized publication journal until restart succeeds. A
+  // retry can now load the decision and retry only container recovery.
+  remove_path(&journal_path)?;
+  fsync_parent(&journal_path)?;
   Ok(FinalizeVykarRestoreResponse {
     complete: true,
     rolled_back: !commit,
@@ -3201,6 +3220,7 @@ mod tests {
         published: true,
       }],
       committed: false,
+      finalized: false,
       owned_volume: None,
     };
     rollback_published(&mut journal, &journal_path).unwrap();
@@ -3216,6 +3236,7 @@ mod tests {
       staging: root.path().join("staging"),
       entries: Vec::new(),
       committed: false,
+      finalized: false,
       owned_volume: Some(RestoreOwnedVolume {
         volume_name: "recovered-data".into(),
         restore_plan_id: "plan-id".into(),

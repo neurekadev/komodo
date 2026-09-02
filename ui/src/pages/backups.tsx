@@ -39,6 +39,8 @@ const backendDefaults = (
           region: "auto",
           access_key_id: {},
           secret_access_key: {},
+          worker_access_key_id: {},
+          worker_secret_access_key: {},
           soft_delete: true,
         },
       };
@@ -48,6 +50,7 @@ const backendDefaults = (
         params: {
           url: "",
           private_key: {},
+          worker_private_key: {},
           known_hosts: "",
           timeout_seconds: 30,
         },
@@ -55,7 +58,7 @@ const backendDefaults = (
     case "Rest":
       return {
         type,
-        params: { url: "", access_token: {}, allow_insecure_http: false },
+        params: { url: "", access_token: {}, worker_access_token: {}, allow_insecure_http: false },
       };
     default:
       return { type: "CoreLocal", params: { path: "/data/backups/vykar" } };
@@ -787,12 +790,19 @@ function RepositoryEditor({
           onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, path: event.currentTarget.value } })}
         />
       )}
+      {backend.type !== "CoreLocal" && (
+        <Alert color="blue">
+          Core maintenance credentials stay on Core. Configure distinct worker credentials whose backend policy permits required backup reads and writes but denies deletion and maintenance.
+        </Alert>
+      )}
       {backend.type === "S3" && (
         <SimpleGrid cols={{ base: 1, md: 2 }}>
           <TextInput label="S3 URL" placeholder="s3://bucket/prefix" value={backend.params.url} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, url: event.currentTarget.value } })} />
           <TextInput label="Region" value={backend.params.region} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, region: event.currentTarget.value } })} />
           <PasswordInput label="Access key ID" description={backend.params.access_key_id.configured ? "Configured" : undefined} value={backend.params.access_key_id.value ?? ""} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, access_key_id: { ...backend.params.access_key_id, value: event.currentTarget.value } } })} />
           <PasswordInput label="Secret access key" description={backend.params.secret_access_key.configured ? "Configured" : undefined} value={backend.params.secret_access_key.value ?? ""} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, secret_access_key: { ...backend.params.secret_access_key, value: event.currentTarget.value } } })} />
+          <PasswordInput label="Worker access key ID" description={backend.params.worker_access_key_id?.configured ? "Configured" : "Required; must be maintenance-denied"} value={backend.params.worker_access_key_id?.value ?? ""} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, worker_access_key_id: { ...backend.params.worker_access_key_id, value: event.currentTarget.value } } })} />
+          <PasswordInput label="Worker secret access key" description={backend.params.worker_secret_access_key?.configured ? "Configured" : "Required; must be maintenance-denied"} value={backend.params.worker_secret_access_key?.value ?? ""} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, worker_secret_access_key: { ...backend.params.worker_secret_access_key, value: event.currentTarget.value } } })} />
         </SimpleGrid>
       )}
       {backend.type === "Sftp" && (
@@ -800,6 +810,7 @@ function RepositoryEditor({
           <TextInput label="SFTP URL" placeholder="sftp://user@host/path" value={backend.params.url} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, url: event.currentTarget.value } })} />
           <NumberInput label="Timeout (seconds)" min={1} value={backend.params.timeout_seconds} onChange={(value) => updateBackend({ ...backend, params: { ...backend.params, timeout_seconds: Number(value) } })} />
           <PasswordInput label="Private key" description={backend.params.private_key.configured ? "Configured" : "Paste an OpenSSH private key"} value={backend.params.private_key.value ?? ""} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, private_key: { ...backend.params.private_key, value: event.currentTarget.value } } })} />
+          <PasswordInput label="Worker private key" description={backend.params.worker_private_key?.configured ? "Configured" : "Required for a maintenance-denied account"} value={backend.params.worker_private_key?.value ?? ""} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, worker_private_key: { ...backend.params.worker_private_key, value: event.currentTarget.value } } })} />
           <TextInput label="Known-hosts entry" value={backend.params.known_hosts} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, known_hosts: event.currentTarget.value } })} />
         </SimpleGrid>
       )}
@@ -807,6 +818,7 @@ function RepositoryEditor({
         <SimpleGrid cols={{ base: 1, md: 2 }}>
           <TextInput label="REST repository URL" value={backend.params.url} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, url: event.currentTarget.value } })} />
           <PasswordInput label="Access token" description={backend.params.access_token.configured ? "Configured" : undefined} value={backend.params.access_token.value ?? ""} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, access_token: { ...backend.params.access_token, value: event.currentTarget.value } } })} />
+          <PasswordInput label="Worker access token" description={backend.params.worker_access_token?.configured ? "Configured" : "Required; must deny deletion and maintenance"} value={backend.params.worker_access_token?.value ?? ""} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, worker_access_token: { ...backend.params.worker_access_token, value: event.currentTarget.value } } })} />
           <Checkbox label="Allow insecure HTTP" checked={backend.params.allow_insecure_http ?? false} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, allow_insecure_http: event.currentTarget.checked } })} />
         </SimpleGrid>
       )}

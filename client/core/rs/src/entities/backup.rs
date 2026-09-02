@@ -53,15 +53,27 @@ pub enum BackupRepositoryBackend {
   S3 {
     url: String,
     region: String,
+    /// Authoritative credentials used only by Core for maintenance.
     access_key_id: BackupSecret,
     secret_access_key: BackupSecret,
+    /// Distinct worker-scoped credentials. Their storage policy must deny
+    /// deletion, compaction, and other maintenance operations.
+    #[serde(default)]
+    worker_access_key_id: BackupSecret,
+    #[serde(default)]
+    worker_secret_access_key: BackupSecret,
     #[serde(default)]
     soft_delete: bool,
   },
   /// SFTP storage. The key and known-hosts files must exist on the worker.
   Sftp {
     url: String,
+    /// Authoritative key used only by Core for maintenance.
     private_key: BackupSecret,
+    /// Distinct worker-scoped key whose account cannot delete or maintain the
+    /// authoritative repository.
+    #[serde(default)]
+    worker_private_key: BackupSecret,
     known_hosts: String,
     #[serde(default = "default_sftp_timeout_seconds")]
     timeout_seconds: U64,
@@ -69,7 +81,11 @@ pub enum BackupRepositoryBackend {
   /// A Vykar REST repository.
   Rest {
     url: String,
+    /// Authoritative token used only by Core for maintenance.
     access_token: BackupSecret,
+    /// Distinct append-only or otherwise maintenance-denied worker token.
+    #[serde(default)]
+    worker_access_token: BackupSecret,
     #[serde(default)]
     allow_insecure_http: bool,
   },
@@ -94,13 +110,31 @@ impl BackupRepositoryBackend {
       Self::S3 {
         access_key_id,
         secret_access_key,
+        worker_access_key_id,
+        worker_secret_access_key,
         ..
       } => {
         access_key_id.redact();
         secret_access_key.redact();
+        worker_access_key_id.redact();
+        worker_secret_access_key.redact();
       }
-      Self::Sftp { private_key, .. } => private_key.redact(),
-      Self::Rest { access_token, .. } => access_token.redact(),
+      Self::Sftp {
+        private_key,
+        worker_private_key,
+        ..
+      } => {
+        private_key.redact();
+        worker_private_key.redact();
+      }
+      Self::Rest {
+        access_token,
+        worker_access_token,
+        ..
+      } => {
+        access_token.redact();
+        worker_access_token.redact();
+      }
     }
   }
 }
@@ -498,6 +532,10 @@ mod tests {
           value: "secret".into(),
           configured: false,
         },
+        worker_access_token: BackupSecret {
+          value: "worker-secret".into(),
+          configured: false,
+        },
         allow_insecure_http: false,
       },
       passphrase: BackupSecret {
@@ -508,12 +546,17 @@ mod tests {
     repo.redact();
     assert!(repo.passphrase.value.is_empty());
     assert!(repo.passphrase.configured);
-    let BackupRepositoryBackend::Rest { access_token, .. } =
-      repo.backend
+    let BackupRepositoryBackend::Rest {
+      access_token,
+      worker_access_token,
+      ..
+    } = repo.backend
     else {
       panic!("wrong backend")
     };
     assert!(access_token.value.is_empty());
     assert!(access_token.configured);
+    assert!(worker_access_token.value.is_empty());
+    assert!(worker_access_token.configured);
   }
 }

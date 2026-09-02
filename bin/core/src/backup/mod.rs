@@ -218,7 +218,20 @@ pub async fn get_settings() -> anyhow::Result<BackupSettings> {
 
 pub async fn get_redacted_settings() -> anyhow::Result<BackupSettings>
 {
-  let mut settings = get_settings().await?;
+  let mut settings = match get_settings().await {
+    Ok(settings) => settings,
+    Err(error) => {
+      record_configuration_alert(&error);
+      BackupSettings {
+        timezone: if core_config().timezone.is_empty() {
+          "UTC".into()
+        } else {
+          core_config().timezone.clone()
+        },
+        ..Default::default()
+      }
+    }
+  };
   settings.redact();
   Ok(settings)
 }
@@ -257,15 +270,25 @@ async fn save_settings_inner(
     {
       Some(record) => {
         let primary_initialized = record.primary_initialized;
-        let bytes = crypto::open(&record.sealed)?;
-        (
-          Some(
-            serde_json::from_slice::<BackupSettings>(&bytes)
-              .context("Failed to decode sealed backup settings")?,
+        match crypto::open(&record.sealed).and_then(|bytes| {
+          serde_json::from_slice::<BackupSettings>(&bytes)
+            .context("Failed to decode sealed backup settings")
+        }) {
+          Ok(settings) => (
+            Some(settings),
+            primary_initialized,
+            record.mirror_initialized,
           ),
-          primary_initialized,
-          record.mirror_initialized,
-        )
+          Err(error) => {
+            // An administrator can repair an unreadable sealed record by
+            // submitting a complete replacement. No unavailable secret or
+            // initialization state is inherited from the damaged record.
+            warn!(
+              "Replacing unreadable sealed backup settings: {error:#}"
+            );
+            (None, false, false)
+          }
+        }
       }
       None => (None, false, false),
     };
@@ -365,6 +388,7 @@ async fn save_settings_inner(
     .with_options(UpdateOptions::builder().upsert(true).build())
     .await
     .context("Failed to persist sealed backup settings")?;
+  clear_configuration_alert();
   invalidate_fleet_retries();
   notify_scheduler();
   let mut redacted = proposed;
@@ -703,31 +727,53 @@ fn merge_repository_secrets(
       BackupRepositoryBackend::S3 {
         access_key_id,
         secret_access_key,
+        worker_access_key_id,
+        worker_secret_access_key,
         ..
       },
       BackupRepositoryBackend::S3 {
         access_key_id: old_access,
         secret_access_key: old_secret,
+        worker_access_key_id: old_worker_access,
+        worker_secret_access_key: old_worker_secret,
         ..
       },
     ) => {
       preserve_secret(access_key_id, old_access);
       preserve_secret(secret_access_key, old_secret);
+      preserve_secret(worker_access_key_id, old_worker_access);
+      preserve_secret(worker_secret_access_key, old_worker_secret);
     }
     (
-      BackupRepositoryBackend::Sftp { private_key, .. },
+      BackupRepositoryBackend::Sftp {
+        private_key,
+        worker_private_key,
+        ..
+      },
       BackupRepositoryBackend::Sftp {
         private_key: old_key,
+        worker_private_key: old_worker_key,
         ..
       },
-    ) => preserve_secret(private_key, old_key),
+    ) => {
+      preserve_secret(private_key, old_key);
+      preserve_secret(worker_private_key, old_worker_key);
+    }
     (
-      BackupRepositoryBackend::Rest { access_token, .. },
+      BackupRepositoryBackend::Rest {
+        access_token,
+        worker_access_token,
+        ..
+      },
       BackupRepositoryBackend::Rest {
         access_token: old_token,
+        worker_access_token: old_worker_token,
         ..
       },
-    ) => preserve_secret(access_token, old_token),
+    ) => {
+      preserve_secret(access_token, old_token);
+      preserve_secret(worker_access_token, old_worker_token);
+    }
     (BackupRepositoryBackend::CoreLocal { .. }, _) => {}
     _ => require_repository_secrets(proposed)?,
   }
@@ -752,7 +798,7 @@ fn require_repository_secrets(
       "Repository encryption passphrase is required"
     ));
   }
-  let valid = match &repository.backend {
+  let authoritative_valid = match &repository.backend {
     BackupRepositoryBackend::CoreLocal { .. } => true,
     BackupRepositoryBackend::S3 {
       access_key_id,
@@ -769,10 +815,55 @@ fn require_repository_secrets(
       !access_token.value.is_empty()
     }
   };
-  if valid {
+  if !authoritative_valid {
+    return Err(anyhow!(
+      "Authoritative repository credentials are required"
+    ));
+  }
+  require_worker_credentials(repository)
+}
+
+fn require_worker_credentials(
+  repository: &BackupRepository,
+) -> anyhow::Result<()> {
+  let valid_and_distinct = match &repository.backend {
+    BackupRepositoryBackend::CoreLocal { .. } => true,
+    BackupRepositoryBackend::S3 {
+      access_key_id,
+      secret_access_key,
+      worker_access_key_id,
+      worker_secret_access_key,
+      ..
+    } => {
+      !worker_access_key_id.value.is_empty()
+        && !worker_secret_access_key.value.is_empty()
+        && (worker_access_key_id.value != access_key_id.value
+          || worker_secret_access_key.value
+            != secret_access_key.value)
+    }
+    BackupRepositoryBackend::Sftp {
+      private_key,
+      worker_private_key,
+      ..
+    } => {
+      !worker_private_key.value.is_empty()
+        && worker_private_key.value != private_key.value
+    }
+    BackupRepositoryBackend::Rest {
+      access_token,
+      worker_access_token,
+      ..
+    } => {
+      !worker_access_token.value.is_empty()
+        && worker_access_token.value != access_token.value
+    }
+  };
+  if valid_and_distinct {
     Ok(())
   } else {
-    Err(anyhow!("Repository credentials are required"))
+    Err(anyhow!(
+      "External repositories require distinct worker-scoped credentials whose policy denies deletion and maintenance"
+    ))
   }
 }
 
@@ -953,8 +1044,10 @@ fn core_repository(
   )
 }
 
-/// Convert Core-local storage to the embedded authenticated REST endpoint for
-/// Periphery. Other backends are used directly on the worker.
+/// Convert Core-local storage to the embedded authenticated REST endpoint, or
+/// substitute distinct maintenance-denied credentials for an external
+/// backend. Authoritative credentials never cross the Core/Periphery trust
+/// boundary.
 fn repository_for_periphery(
   repository: &BackupRepository,
   mirror: bool,
@@ -962,7 +1055,36 @@ fn repository_for_periphery(
   let BackupRepositoryBackend::CoreLocal { path } =
     &repository.backend
   else {
-    return Ok(repository.clone());
+    require_worker_credentials(repository)?;
+    let mut worker = repository.clone();
+    match &mut worker.backend {
+      BackupRepositoryBackend::S3 {
+        access_key_id,
+        secret_access_key,
+        worker_access_key_id,
+        worker_secret_access_key,
+        ..
+      } => {
+        *access_key_id = std::mem::take(worker_access_key_id);
+        *secret_access_key = std::mem::take(worker_secret_access_key);
+      }
+      BackupRepositoryBackend::Sftp {
+        private_key,
+        worker_private_key,
+        ..
+      } => {
+        *private_key = std::mem::take(worker_private_key);
+      }
+      BackupRepositoryBackend::Rest {
+        access_token,
+        worker_access_token,
+        ..
+      } => {
+        *access_token = std::mem::take(worker_access_token);
+      }
+      BackupRepositoryBackend::CoreLocal { .. } => unreachable!(),
+    }
+    return Ok(worker);
   };
   let registered = embedded_repository_paths()
     .read()
@@ -990,6 +1112,7 @@ fn repository_for_periphery(
         value: crypto::embedded_server_token()?,
         configured: false,
       },
+      worker_access_token: BackupSecret::default(),
       allow_insecure_http: core_config().host.starts_with("http://"),
     },
     passphrase: repository.passphrase.clone(),
@@ -1172,7 +1295,18 @@ pub async fn status() -> anyhow::Result<BackupStatus> {
     .ok()
     .flatten()
     .unwrap_or_default();
-  let settings = get_settings().await?;
+  let settings = match get_settings().await {
+    Ok(settings) => settings,
+    Err(error) => {
+      record_configuration_alert(&error);
+      return Ok(BackupStatus {
+        active_runs,
+        recent_runs,
+        critical_alert: critical_alert().read().unwrap().clone(),
+        ..Default::default()
+      });
+    }
+  };
   let primary_settings = settings.clone();
   let primary_repository = settings.primary.clone();
   let primary = tokio::task::spawn_blocking(move || {
@@ -1273,6 +1407,24 @@ pub async fn status() -> anyhow::Result<BackupStatus> {
 fn critical_alert() -> &'static RwLock<Option<String>> {
   static ALERT: OnceLock<RwLock<Option<String>>> = OnceLock::new();
   ALERT.get_or_init(Default::default)
+}
+
+const CONFIGURATION_ALERT_PREFIX: &str =
+  "Backup configuration unavailable:";
+
+pub fn record_configuration_alert(error: &anyhow::Error) {
+  let message = format!("{CONFIGURATION_ALERT_PREFIX} {error:#}");
+  error!("{message}");
+  *critical_alert().write().unwrap() = Some(message);
+}
+
+fn clear_configuration_alert() {
+  let mut alert = critical_alert().write().unwrap();
+  if alert.as_deref().is_some_and(|message| {
+    message.starts_with(CONFIGURATION_ALERT_PREFIX)
+  }) {
+    *alert = None;
+  }
 }
 
 const MAINTENANCE_ALERT_PREFIX: &str = "Backup maintenance blocked:";
@@ -5164,6 +5316,54 @@ mod tests {
   }
 
   #[test]
+  fn external_worker_receives_only_distinct_scoped_credentials() {
+    let repository = BackupRepository {
+      backend: BackupRepositoryBackend::Rest {
+        url: "https://backup.example".into(),
+        access_token: BackupSecret {
+          value: "authoritative-token".into(),
+          configured: false,
+        },
+        worker_access_token: BackupSecret {
+          value: "append-only-worker-token".into(),
+          configured: false,
+        },
+        allow_insecure_http: false,
+      },
+      passphrase: BackupSecret {
+        value: "repository-passphrase".into(),
+        configured: false,
+      },
+      ..Default::default()
+    };
+    let worker =
+      repository_for_periphery(&repository, false).unwrap();
+    let BackupRepositoryBackend::Rest {
+      access_token,
+      worker_access_token,
+      ..
+    } = worker.backend
+    else {
+      panic!("wrong backend")
+    };
+    assert_eq!(access_token.value, "append-only-worker-token");
+    assert!(worker_access_token.value.is_empty());
+
+    let mut unsafe_repository = repository;
+    let BackupRepositoryBackend::Rest {
+      worker_access_token,
+      ..
+    } = &mut unsafe_repository.backend
+    else {
+      unreachable!()
+    };
+    worker_access_token.value = "authoritative-token".into();
+    assert!(
+      repository_for_periphery(&unsafe_repository, false).is_err()
+    );
+  }
+
+  #[test]
   fn repository_locations_normalize_equivalent_paths_and_urls() {
     let local = |path: &str| BackupRepository {
       backend: BackupRepositoryBackend::CoreLocal {
@@ -5180,6 +5380,7 @@ mod tests {
       backend: BackupRepositoryBackend::Rest {
         url: url.into(),
         access_token: Default::default(),
+        worker_access_token: Default::default(),
         allow_insecure_http: false,
       },
       ..Default::default()

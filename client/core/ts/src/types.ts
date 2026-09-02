@@ -6245,21 +6245,37 @@ export type BackupRepositoryBackend =
 	| { type: "S3", params: {
 	url: string;
 	region: string;
+	/** Authoritative credentials used only by Core for maintenance. */
 	access_key_id: BackupSecret;
 	secret_access_key: BackupSecret;
+	/**
+	 * Distinct worker-scoped credentials. Their storage policy must deny
+	 * deletion, compaction, and other maintenance operations.
+	 */
+	worker_access_key_id?: BackupSecret;
+	worker_secret_access_key?: BackupSecret;
 	soft_delete?: boolean;
 }}
 	/** SFTP storage. The key and known-hosts files must exist on the worker. */
 	| { type: "Sftp", params: {
 	url: string;
+	/** Authoritative key used only by Core for maintenance. */
 	private_key: BackupSecret;
+	/**
+	 * Distinct worker-scoped key whose account cannot delete or maintain the
+	 * authoritative repository.
+	 */
+	worker_private_key?: BackupSecret;
 	known_hosts: string;
 	timeout_seconds: U64;
 }}
 	/** A Vykar REST repository. */
 	| { type: "Rest", params: {
 	url: string;
+	/** Authoritative token used only by Core for maintenance. */
 	access_token: BackupSecret;
+	/** Distinct append-only or otherwise maintenance-denied worker token. */
+	worker_access_token?: BackupSecret;
 	allow_insecure_http?: boolean;
 }};
 

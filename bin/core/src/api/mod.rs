@@ -27,32 +27,36 @@ struct Variant {
 
 pub async fn app() -> anyhow::Result<Router> {
   let config = core_config();
-  let settings = crate::backup::get_settings().await?;
   let mut vykar_router = Router::new();
-  if let komodo_client::entities::backup::BackupRepositoryBackend::CoreLocal {
-    path,
-  } = &settings.primary.backend
-  {
-    vykar_router = vykar_router.nest(
-      "/vykar/primary",
-      crate::backup::embedded_vykar_router(
-        std::path::Path::new(path),
-        false,
-      )?,
-    );
-  }
-  if let Some(mirror) = &settings.mirror
-    && let komodo_client::entities::backup::BackupRepositoryBackend::CoreLocal {
-      path,
-    } = &mirror.backend
-  {
-    vykar_router = vykar_router.nest(
-      "/vykar/mirror",
-      crate::backup::embedded_vykar_router(
-        std::path::Path::new(path),
-        true,
-      )?,
-    );
+  match crate::backup::get_settings().await {
+    Ok(settings) => {
+      if let komodo_client::entities::backup::BackupRepositoryBackend::CoreLocal {
+        path,
+      } = &settings.primary.backend
+      {
+        vykar_router = vykar_router.nest(
+          "/vykar/primary",
+          crate::backup::embedded_vykar_router(
+            std::path::Path::new(path),
+            false,
+          )?,
+        );
+      }
+      if let Some(mirror) = &settings.mirror
+        && let komodo_client::entities::backup::BackupRepositoryBackend::CoreLocal {
+          path,
+        } = &mirror.backend
+      {
+        vykar_router = vykar_router.nest(
+          "/vykar/mirror",
+          crate::backup::embedded_vykar_router(
+            std::path::Path::new(path),
+            true,
+          )?,
+        );
+      }
+    }
+    Err(error) => crate::backup::record_configuration_alert(&error),
   }
   Ok(
     Router::new()
