@@ -16,6 +16,7 @@ use komodo_client::entities::backup::{
   BackupAdvancedSettings, BackupRepository, BackupRepositoryBackend,
   BackupSnapshot, BackupSnapshotItem, BackupTarget,
 };
+use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 use vykar_core::{
   commands,
@@ -273,21 +274,13 @@ impl VykarRepository {
         Some(&self.passphrase),
         snapshot_name,
       )?;
+    let manifest_source_name =
+      backup_manifest_source_name(snapshot_name);
     let manifest_roots = source_paths
       .into_iter()
       .filter(|path| {
-        Path::new(path)
-          .file_name()
-          .and_then(|name| name.to_str())
-          .and_then(|name| {
-            name.strip_prefix("komodo-backup-manifest-")
-          })
-          .is_some_and(|suffix| {
-            suffix.len() == 6
-              && suffix
-                .chars()
-                .all(|character| character.is_ascii_alphanumeric())
-          })
+        Path::new(path).file_name().and_then(|name| name.to_str())
+          == Some(manifest_source_name.as_str())
       })
       .map(|path| path.trim_matches('/').to_string())
       .collect::<HashSet<_>>();
@@ -720,6 +713,17 @@ pub fn snapshot_name(prefix: &str, run_id: &str) -> String {
   )
 }
 
+/// Exact internal source-root name for the manifest bundled with a snapshot.
+/// The fresh snapshot name contains a UUID, and hashing it gives Core and
+/// Periphery the same unambiguous marker without classifying user paths by a
+/// broad basename pattern.
+pub fn backup_manifest_source_name(snapshot_name: &str) -> String {
+  format!(
+    "komodo-backup-manifest-{}",
+    hex::encode(Sha256::digest(snapshot_name.as_bytes()))
+  )
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -744,6 +748,14 @@ mod tests {
       },
       ..Default::default()
     }
+  }
+
+  #[test]
+  fn manifest_source_name_is_bound_to_the_snapshot() {
+    let first = backup_manifest_source_name("snapshot-one");
+    assert_eq!(first, backup_manifest_source_name("snapshot-one"));
+    assert_ne!(first, backup_manifest_source_name("snapshot-two"));
+    assert_eq!(first.len(), "komodo-backup-manifest-".len() + 64);
   }
 
   #[test]

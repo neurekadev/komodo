@@ -12,7 +12,7 @@ use std::{
 
 use anyhow::{Context, anyhow};
 use command::{CommandOptions, run_komodo_standard_command};
-use komodo_backup::VykarRepository;
+use komodo_backup::{VykarRepository, backup_manifest_source_name};
 use komodo_client::entities::docker::{
   container::{ContainerListItem, ContainerStateStatusEnum},
   volume::VolumeScopeEnum,
@@ -323,13 +323,19 @@ async fn run_backup_repositories(
       "Repository-specific retry requested without a configured mirror"
     ));
   }
-  let manifest_dir = tempfile::Builder::new()
-    .prefix("komodo-backup-manifest-")
-    .tempdir()
-    .context("Failed to create backup manifest staging directory")?;
-  write_manifest(request, source_paths, manifest_dir.path())?;
+  let manifest_dir = std::env::temp_dir()
+    .join(backup_manifest_source_name(&request.snapshot_name));
+  std::fs::create_dir(&manifest_dir).with_context(|| {
+    format!(
+      "Failed to create backup manifest staging directory {}",
+      manifest_dir.display()
+    )
+  })?;
+  let _manifest_cleanup =
+    RemovePathsOnDrop(vec![manifest_dir.clone()]);
+  write_manifest(request, source_paths, &manifest_dir)?;
   let mut paths = source_paths.to_vec();
-  paths.push(manifest_dir.path().to_string_lossy().into_owned());
+  paths.push(manifest_dir.to_string_lossy().into_owned());
 
   let primary = if request.mirror_only {
     VykarBackupRepositoryResult {
