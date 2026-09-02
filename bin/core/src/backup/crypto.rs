@@ -19,6 +19,9 @@ const LEGACY_CONFIG_BACKUP_KEY_PATH: &str = "/config/keys/backup.key";
 const AAD: &[u8] = b"komodo-backup-settings/v1";
 const SOURCE_AUTH_PREFIX: &str = "komodo-auth/v1";
 const SOURCE_AUTH_CONTEXT: &[u8] = b"komodo-backup-source/v1";
+const CORE_SOURCE_AUTH_PREFIX: &str = "komodo-core-auth/v2";
+const CORE_SOURCE_AUTH_CONTEXT: &[u8] =
+  b"komodo-core-export-content/v2";
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -236,12 +239,123 @@ pub fn authenticate_source_label(
   hostname: &str,
   snapshot_name: &str,
 ) -> anyhow::Result<String> {
+  if authorized_label
+    .starts_with(&format!("{CORE_SOURCE_AUTH_PREFIX}/"))
+  {
+    return authenticate_core_source_label(
+      authorized_label,
+      hostname,
+      snapshot_name,
+    )
+    .map(|(source, _)| source);
+  }
   authenticate_source_label_with_key(
     authorized_label,
     hostname,
     snapshot_name,
     backup_key()?,
   )
+}
+
+pub fn authorize_core_source_label(
+  source: &str,
+  hostname: &str,
+  name: &str,
+  digest: &str,
+) -> anyhow::Result<String> {
+  authorize_core_source_label_with_key(
+    source,
+    hostname,
+    name,
+    digest,
+    backup_key()?,
+  )
+}
+
+fn authorize_core_source_label_with_key(
+  source: &str,
+  hostname: &str,
+  name: &str,
+  digest: &str,
+  key: &[u8; 32],
+) -> anyhow::Result<String> {
+  let encoded = BASE64URL_NOPAD.encode(source.as_bytes());
+  let signature =
+    core_source_mac(&encoded, hostname, name, digest, key)?
+      .finalize()
+      .into_bytes();
+  Ok(format!(
+    "{CORE_SOURCE_AUTH_PREFIX}/{encoded}/{digest}/{}",
+    hex::encode(signature)
+  ))
+}
+
+pub fn authenticate_core_source_label(
+  label: &str,
+  hostname: &str,
+  name: &str,
+) -> anyhow::Result<(String, String)> {
+  authenticate_core_source_label_with_key(
+    label,
+    hostname,
+    name,
+    backup_key()?,
+  )
+}
+
+fn authenticate_core_source_label_with_key(
+  label: &str,
+  hostname: &str,
+  name: &str,
+  key: &[u8; 32],
+) -> anyhow::Result<(String, String)> {
+  let rest = label
+    .strip_prefix(&format!("{CORE_SOURCE_AUTH_PREFIX}/"))
+    .context(
+      "Core snapshot has no immutable-content authorization",
+    )?;
+  let parts = rest.split('/').collect::<Vec<_>>();
+  if parts.len() != 3
+    || parts[1].len() != 64
+    || !parts[1].bytes().all(|byte| byte.is_ascii_hexdigit())
+  {
+    return Err(anyhow!(
+      "Core snapshot content authorization is malformed"
+    ));
+  }
+  let signature = hex::decode(parts[2])?;
+  core_source_mac(parts[0], hostname, name, parts[1], key)?
+    .verify_slice(&signature)
+    .map_err(|_| {
+      anyhow!("Core snapshot content authorization is invalid")
+    })?;
+  let source =
+    String::from_utf8(BASE64URL_NOPAD.decode(parts[0].as_bytes())?)?;
+  if !source.starts_with("komodo/v1/core/") {
+    return Err(anyhow!(
+      "Core content authorization has a non-Core identity"
+    ));
+  }
+  Ok((source, parts[1].to_string()))
+}
+
+fn core_source_mac(
+  encoded: &str,
+  hostname: &str,
+  name: &str,
+  digest: &str,
+  key: &[u8; 32],
+) -> anyhow::Result<HmacSha256> {
+  let mut mac = <HmacSha256 as HmacKeyInit>::new_from_slice(key)
+    .map_err(|_| {
+      anyhow!("Failed to initialize Core content authorization")
+    })?;
+  mac.update(CORE_SOURCE_AUTH_CONTEXT);
+  for value in [encoded, hostname, name, digest] {
+    mac.update(&(value.len() as u64).to_be_bytes());
+    mac.update(value.as_bytes());
+  }
+  Ok(mac)
 }
 
 fn authenticate_source_label_with_key(
@@ -396,6 +510,64 @@ mod tests {
         &authorized,
         "komodo-periphery-server-a",
         "volume-snapshot-b",
+        &key,
+      )
+      .is_err()
+    );
+  }
+
+  #[test]
+  fn core_authorization_cannot_be_reused_for_replacement_contents() {
+    let key = [13_u8; 32];
+    let original = "a".repeat(64);
+    let replacement = "b".repeat(64);
+    let label = authorize_core_source_label_with_key(
+      "komodo/v1/core/instance",
+      "komodo-core-instance",
+      "reused-name",
+      &original,
+      &key,
+    )
+    .unwrap();
+    let (_, digest) = authenticate_core_source_label_with_key(
+      &label,
+      "komodo-core-instance",
+      "reused-name",
+      &key,
+    )
+    .unwrap();
+    assert_eq!(digest, original);
+    assert_ne!(digest, replacement);
+    assert!(
+      authenticate_core_source_label_with_key(
+        &label.replace(&original, &replacement),
+        "komodo-core-instance",
+        "reused-name",
+        &key,
+      )
+      .is_err()
+    );
+    assert!(
+      authenticate_core_source_label_with_key(
+        &label,
+        "komodo-core-instance",
+        "different-name",
+        &key,
+      )
+      .is_err()
+    );
+    let legacy = authorize_source_label_with_key(
+      "komodo/v1/core/instance",
+      "komodo-core-instance",
+      "reused-name",
+      &key,
+    )
+    .unwrap();
+    assert!(
+      authenticate_core_source_label_with_key(
+        &legacy,
+        "komodo-core-instance",
+        "reused-name",
         &key,
       )
       .is_err()

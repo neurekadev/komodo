@@ -83,6 +83,8 @@ Each Periphery also has a stable Vykar hostname so snapshots remain attributable
 
 Backup manifests record the running product's build version, as shown by Core, rather than Cargo's internal `0.0.0` workspace placeholder. Core recovery compares that recorded version with the running build before activating a restored database.
 
+Core snapshot authorization also binds the snapshot identity to a digest of the exact export file names and contents, including its manifest. Recovery verifies that digest before importing any database records; reusing an older authorized snapshot name cannot authorize replacement contents. Legacy Core snapshots without this content-bound authorization remain visible as unbound snapshots and are not eligible for automatic Core recovery. Create a fresh Core snapshot with this version before relying on the recovery workflow.
+
 Fleet run status polls every 15 seconds, while repository health and mirror lag share a five-minute cache across browsers. Snapshot inventories are loaded on demand; use **Refresh inventory** or **Refresh snapshots** to fetch new repository contents.
 
 Critical operational alerts survive Core restarts in `/data/backup-operational-alert.json`. They remain latched until an operator confirms that the affected workloads and Periphery restore/quiesce journals have recovered. After that verification, stop Core, archive the alert file, and restart Core to acknowledge it; do not clear it while containers remain stopped or a restore is indeterminate.
@@ -96,6 +98,8 @@ Before confirmation, Komodo lists paths that will be created, overwritten, and d
 Restore preflight and execution both reject any destination that overlaps a configured Core-local repository, including the matching repository subtree in a bind mount or named volume attached to Core. Repository aliases are resolved only from the Docker container identity reported by Core, then translated through Periphery's own mounts where necessary. A remote application's unrelated `/data` mount is not treated as Core storage. Keep Docker's `/etc/hostname` mount or its default container-ID hostname available; if Komodo cannot identify its container safely, protection fails with an explicit error. Other directories in the same shared volume remain available as backup and restore roots. This prevents Volume recovery and recovered Stack bind mappings from replacing the active backup repository.
 
 The preview treats destination symlinks as entries to replace, not directories to traverse. Files behind those links are neither listed as deleted nor changed by replacing the link.
+
+For selected files or folders, Komodo retains the original confirmed destination root and rejects any symlink ancestor between that root and the selection. The selected entry itself may be a symlink that will be replaced. This is checked during preflight and again before publication; old selection plans without the root boundary require a fresh preview.
 
 When a restore creates a recovered Stack, Core marks that new resource with the restore-plan identity before it asks Periphery to commit the filesystem publication. Periphery retains the rollback journal and the final commit receipt until Core acknowledges the matching database state. After an interrupted Core or Periphery restart, Komodo reconciles that marker automatically; do not delete or repurpose the recovered Stack while reconciliation is pending.
 
@@ -122,6 +126,8 @@ The original `/core-secrets/backup.key` is required before Komodo can identify o
 
 Komodo restores the snapshot into a validation database, checks the backup schema/version and confirms that an administrator account remains available. It then switches the persisted active-database pointer and restarts. The fresh pre-restore database is retained for rollback.
 
+If the restored database contains a pending Stack recovery record with its matching recovered Stack already inserted, Komodo normalizes it to the idempotent acknowledgement phase. Startup can then clear that historical record even if Periphery already discarded its completed receipt. Unmatched records retain the normal reconciliation checks; a contradictory receipt still blocks completion.
+
 ### Roll back a Core recovery
 
 If the recovered Core starts but its application data or authentication configuration is unusable, roll back before making further changes:
@@ -140,6 +146,8 @@ Do not point two active Core instances at the same database. After recovery, rec
 
 The primary repository is authoritative. Snapshot lists, manifests, file trees, and restores always come from the active primary backend. The mirror receives the same logical sources while data is quiesced, but it is not an automatic read fallback. Promotion is administrator-only and requires a successful full verification, making an incomplete mirror unable to silently become authoritative.
 
+After initialization, a Core-local repository is the same location only when its resolved path is equal. Moving to a parent or child directory is a location change and requires verified promotion; overlapping primary and mirror paths remain forbidden.
+
 <Callout title="Periphery backup-read trust" type="warn">
 Vykar encrypts and deduplicates on the client, so every Periphery that writes to a shared repository receives its encryption passphrase and the worker-scoped storage access needed to read repository metadata and packs. The passphrase protects backups from the storage provider; it does not isolate one participating Periphery from another or from Core snapshots in the same repository. Treat every participating Server as backup-read trusted. If hosts must not share that trust, manage them with separate Komodo deployments and separate repositories.
 </Callout>
@@ -151,6 +159,8 @@ For an off-site mirror, use a different provider or failure domain. Core-local s
 ## Retention, compaction, and verification
 
 Retention is evaluated independently for Core, each Stack, and each Server/Volume pair in both repositories. Komodo batches all snapshot deletions first and compacts once per repository, rather than downloading and repacking separately for every volume. Manual backups and fleet retries that finish complete or partial feed a debounced maintenance queue for the same reason.
+
+Queued maintenance loads the current repository and retention settings only after acquiring its operation and repository-role locks. Settings saved while it waits are used by that cycle; settings cannot change during its verification and deletion work.
 
 Komodo uses Vykar's 20% dead-data compaction threshold. S3 and SFTP repacking is client-side and defaults to a 5 GiB per-cycle cap to control download cost; Core-local and REST repositories can use [server-side encrypted passthrough](https://vykar.borgbase.com/server-setup). See Vykar's [compaction architecture](https://vykar.borgbase.com/architecture#compact) for the storage model.
 

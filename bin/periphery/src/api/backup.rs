@@ -678,6 +678,7 @@ fn validate_resolved_restore_destinations_against(
   let destinations = publish
     .iter()
     .map(|item| {
+      validate_selected_destination_ancestors(item)?;
       let destination = Path::new(&item.destination);
       validate_path_outside_internal_storage(
         destination,
@@ -728,6 +729,50 @@ async fn validate_restore_destinations(
       "Restore destination",
     )?;
   }
+  Ok(())
+}
+
+fn validate_selected_destination_ancestors(
+  item: &RestorePublishPath,
+) -> anyhow::Result<()> {
+  let Some(root) = item.destination_root.as_deref().map(Path::new)
+  else {
+    return Ok(());
+  };
+  let destination = Path::new(&item.destination);
+  let relative = destination.strip_prefix(root).context(
+    "Selected restore destination is outside its confirmed root",
+  )?;
+  if !root.is_absolute()
+    || relative
+      .components()
+      .any(|part| matches!(part, std::path::Component::ParentDir))
+  {
+    return Err(anyhow!(
+      "Selected restore boundary is not an absolute normalized path"
+    ));
+  }
+  let mut ancestor = root.to_path_buf();
+  for part in relative.components() {
+    match std::fs::symlink_metadata(&ancestor) {
+      Ok(metadata)
+        if metadata.file_type().is_symlink()
+          || !metadata.is_dir() =>
+      {
+        return Err(anyhow!(
+          "Selected restore cannot traverse symlink or non-directory ancestor '{}'",
+          ancestor.display()
+        ));
+      }
+      Ok(_) => {}
+      Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        return Ok(());
+      }
+      Err(error) => return Err(error.into()),
+    }
+    ancestor.push(part.as_os_str());
+  }
+  // The leaf itself may be a symlink: publication replaces that entry.
   Ok(())
 }
 
@@ -1760,6 +1805,10 @@ fn resolve_volume_publish_destinations(
       mountpoint.join(relative)
     };
     item.destination = destination.to_string_lossy().into_owned();
+    if !full_restore {
+      item.destination_root =
+        Some(mountpoint.to_string_lossy().into_owned());
+    }
   }
   Ok(())
 }
@@ -3788,10 +3837,12 @@ mod tests {
     std::os::unix::fs::symlink(&real, &alias).unwrap();
     let publish = vec![
       RestorePublishPath {
+        destination_root: None,
         snapshot_path: "source/one".into(),
         destination: real.join("app").to_string_lossy().into_owned(),
       },
       RestorePublishPath {
+        destination_root: None,
         snapshot_path: "source/two".into(),
         destination: alias
           .join("app/data")
@@ -3809,6 +3860,7 @@ mod tests {
     let root = tempfile::tempdir().unwrap();
     let internal = root.path().join(".komodo-vykar");
     let publish = vec![RestorePublishPath {
+      destination_root: None,
       snapshot_path: "source/root".into(),
       destination: root.path().to_string_lossy().into_owned(),
     }];
@@ -3821,8 +3873,43 @@ mod tests {
   }
 
   #[test]
+  fn selected_restore_rejects_symlink_ancestors_but_can_replace_the_leaf()
+   {
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let link = root.path().join("link");
+    std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+    let mut item = RestorePublishPath {
+      destination_root: Some(
+        root.path().to_string_lossy().into_owned(),
+      ),
+      snapshot_path: "source/link/config".into(),
+      destination: link.join("config").to_string_lossy().into_owned(),
+    };
+    assert!(validate_selected_destination_ancestors(&item).is_err());
+    item.destination = link.to_string_lossy().into_owned();
+    validate_selected_destination_ancestors(&item).unwrap();
+    item.destination_root = Some(link.to_string_lossy().into_owned());
+    item.destination =
+      link.join("config").to_string_lossy().into_owned();
+    assert!(validate_selected_destination_ancestors(&item).is_err());
+    item.destination_root =
+      Some(root.path().to_string_lossy().into_owned());
+    item.destination = root
+      .path()
+      .join("missing/child")
+      .to_string_lossy()
+      .into_owned();
+    validate_selected_destination_ancestors(&item).unwrap();
+    item.destination =
+      outside.path().join("config").to_string_lossy().into_owned();
+    assert!(validate_selected_destination_ancestors(&item).is_err());
+  }
+
+  #[test]
   fn selected_volume_destinations_use_the_inspected_mountpoint() {
     let mut publish = vec![RestorePublishPath {
+      destination_root: None,
       snapshot_path: "source/_data/config/app.toml".into(),
       destination:
         "/var/lib/docker/volumes/app-data/_data/config/app.toml"
@@ -3838,6 +3925,10 @@ mod tests {
     assert_eq!(
       publish[0].destination,
       "/custom/docker/volumes/app-data/data/config/app.toml"
+    );
+    assert_eq!(
+      publish[0].destination_root.as_deref(),
+      Some("/custom/docker/volumes/app-data/data")
     );
   }
 
@@ -4012,6 +4103,7 @@ mod tests {
       },
     ];
     let publish = vec![RestorePublishPath {
+      destination_root: None,
       snapshot_path: root.into(),
       destination: destination.path().to_string_lossy().into_owned(),
     }];
@@ -4066,6 +4158,7 @@ mod tests {
         });
       }
       let publish = vec![RestorePublishPath {
+        destination_root: None,
         snapshot_path: "source/root".into(),
         destination: publish_root.to_string_lossy().into_owned(),
       }];
@@ -4097,10 +4190,12 @@ mod tests {
     std::fs::write(first.join("original.txt"), b"original").unwrap();
     let publish = vec![
       RestorePublishPath {
+        destination_root: None,
         snapshot_path: "one".into(),
         destination: first.to_string_lossy().into_owned(),
       },
       RestorePublishPath {
+        destination_root: None,
         snapshot_path: "two.txt".into(),
         destination: first
           .join("child.txt")
@@ -4136,6 +4231,7 @@ mod tests {
     let destination = root.path().join("destination.txt");
     std::fs::write(&destination, b"original").unwrap();
     let publish = [RestorePublishPath {
+      destination_root: None,
       snapshot_path: "new.txt".into(),
       destination: destination.to_string_lossy().into_owned(),
     }];
@@ -4244,10 +4340,12 @@ mod tests {
     std::fs::write(&yaml, b"old-yaml").unwrap();
     let publish = vec![
       RestorePublishPath {
+        destination_root: None,
         snapshot_path: "new-json".into(),
         destination: json.to_string_lossy().into_owned(),
       },
       RestorePublishPath {
+        destination_root: None,
         snapshot_path: "new-yaml".into(),
         destination: yaml.to_string_lossy().into_owned(),
       },
@@ -4276,6 +4374,7 @@ mod tests {
     std::fs::write(download.join("present"), b"present").unwrap();
     let publish = vec![
       RestorePublishPath {
+        destination_root: None,
         snapshot_path: "present".into(),
         destination: root
           .path()
@@ -4284,6 +4383,7 @@ mod tests {
           .into_owned(),
       },
       RestorePublishPath {
+        destination_root: None,
         snapshot_path: "missing".into(),
         destination: root
           .path()

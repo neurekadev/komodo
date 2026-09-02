@@ -1,7 +1,7 @@
 use std::{
   collections::{BTreeMap, HashMap, HashSet},
   fs::OpenOptions,
-  io::Write,
+  io::{Read, Write},
   os::unix::fs::OpenOptionsExt,
   path::{Path, PathBuf},
   sync::{
@@ -549,7 +549,7 @@ fn validate_settings(
   validate_repository_definition(&settings.primary)?;
   if let Some(mirror) = &settings.mirror {
     validate_repository_definition(mirror)?;
-    if repositories_share_location(&settings.primary, mirror)? {
+    if repositories_overlap(&settings.primary, mirror)? {
       return Err(anyhow!(
         "Primary and mirror must use different repository locations"
       ));
@@ -663,11 +663,31 @@ fn repositories_share_location(
       let mirror = resolve_existing_path_ancestor(
         &normalize_core_local_path(mirror),
       )?;
-      Ok(paths_overlap(&primary, &mirror))
+      Ok(primary == mirror)
     }
     _ => {
       Ok(repository_location(primary) == repository_location(mirror))
     }
+  }
+}
+
+fn repositories_overlap(
+  primary: &BackupRepository,
+  mirror: &BackupRepository,
+) -> anyhow::Result<bool> {
+  match (&primary.backend, &mirror.backend) {
+    (
+      BackupRepositoryBackend::CoreLocal { path: primary },
+      BackupRepositoryBackend::CoreLocal { path: mirror },
+    ) => Ok(paths_overlap(
+      &resolve_existing_path_ancestor(&normalize_core_local_path(
+        primary,
+      ))?,
+      &resolve_existing_path_ancestor(&normalize_core_local_path(
+        mirror,
+      ))?,
+    )),
+    _ => repositories_share_location(primary, mirror),
   }
 }
 
@@ -1801,10 +1821,18 @@ fn authenticated_snapshot_source(
   let valid =
     authenticated.as_ref().is_some_and(
       |(target, raw)| match target {
-        BackupTarget::Core => raw
-          .strip_prefix("komodo/v1/core/")
-          .zip(snapshot.hostname.strip_prefix("komodo-core-"))
-          .is_some_and(|(identity, writer)| identity == writer),
+        BackupTarget::Core => {
+          crypto::authenticate_core_source_label(
+            &snapshot.source_label,
+            &snapshot.hostname,
+            &snapshot.name,
+          )
+          .is_ok()
+            && raw
+              .strip_prefix("komodo/v1/core/")
+              .zip(snapshot.hostname.strip_prefix("komodo-core-"))
+              .is_some_and(|(identity, writer)| identity == writer)
+        }
         BackupTarget::Stack { .. } => {
           snapshot.hostname.starts_with(PERIPHERY_HOSTNAME_PREFIX)
         }
@@ -2060,19 +2088,12 @@ fn maintenance_sender() -> &'static tokio::sync::mpsc::Sender<()> {
         // Manual backups close together share one prune/check/compact cycle.
         tokio::time::sleep(std::time::Duration::from_secs(30)).await;
         while receiver.try_recv().is_ok() {}
-        match get_settings().await {
-          Ok(settings) => match run_maintenance(settings).await {
-            Ok(()) => clear_maintenance_alert(),
-            Err(error) => {
-              error!(
-                "Backup repository maintenance failed: {error:#}"
-              );
-              record_maintenance_alert(&error);
-            }
-          },
-          Err(error) => error!(
-            "Failed to load backup maintenance settings: {error:#}"
-          ),
+        match run_maintenance().await {
+          Ok(()) => clear_maintenance_alert(),
+          Err(error) => {
+            error!("Backup repository maintenance failed: {error:#}");
+            record_maintenance_alert(&error);
+          }
         }
       }
     });
@@ -2122,12 +2143,13 @@ async fn record_repository_verification(
   Ok(())
 }
 
-async fn run_maintenance(
-  settings: BackupSettings,
-) -> anyhow::Result<()> {
+async fn run_maintenance() -> anyhow::Result<()> {
   let _operation = backup_operation_lock().lock().await;
   let _repository_roles =
     repository_role_barrier().clone().read_owned().await;
+  // A settings save can finish while maintenance waits for an active backup.
+  // Read policy only after both guards and retain the role guard through deletion.
+  let settings = get_settings().await?;
   let repositories =
     std::iter::once(("primary", settings.primary.clone()))
       .chain(settings.mirror.clone().map(|mirror| ("mirror", mirror)))
@@ -3373,6 +3395,55 @@ async fn write_core_repository_snapshot(
   .context("Core repository backup worker failed")?
 }
 
+/// Hash the exact relative file set and file bytes, including the manifest.
+/// No worker-visible label can authorize a replacement export with new contents.
+fn core_export_digest(root: &Path) -> anyhow::Result<String> {
+  fn collect(
+    root: &Path,
+    directory: &Path,
+    files: &mut BTreeMap<String, String>,
+  ) -> anyhow::Result<()> {
+    if !std::fs::symlink_metadata(directory)?.is_dir() {
+      return Err(anyhow!(
+        "Core export contains a non-directory or symlink ancestor"
+      ));
+    }
+    for entry in std::fs::read_dir(directory)? {
+      let entry = entry?;
+      let path = entry.path();
+      let kind = entry.file_type()?;
+      if kind.is_dir() {
+        collect(root, &path, files)?;
+      } else if kind.is_file() {
+        let mut file = std::fs::File::open(&path)?;
+        let mut hasher = Sha256::new();
+        let mut buffer = [0_u8; 65536];
+        loop {
+          let read = file.read(&mut buffer)?;
+          if read == 0 {
+            break;
+          }
+          hasher.update(&buffer[..read]);
+        }
+        let relative = path
+          .strip_prefix(root)?
+          .to_str()
+          .context("Core export path is not valid UTF-8")?
+          .to_string();
+        files.insert(relative, hex::encode(hasher.finalize()));
+      } else {
+        return Err(anyhow!(
+          "Core export contains a symlink or special file"
+        ));
+      }
+    }
+    Ok(())
+  }
+  let mut files = BTreeMap::new();
+  collect(root, root, &mut files)?;
+  Ok(hex::encode(Sha256::digest(serde_json::to_vec(&files)?)))
+}
+
 async fn retry_core_repositories(
   settings: &BackupSettings,
   run: &BackupRun,
@@ -3480,8 +3551,18 @@ async fn backup_core(
   .await?;
   let name = snapshot_name("core", &run.id);
   let hostname = format!("komodo-core-{}", core_instance_id()?);
-  let label =
-    authorized_source_label(&BackupTarget::Core, &hostname, &name)?;
+  let digest_root = staging.clone();
+  let digest = tokio::task::spawn_blocking(move || {
+    core_export_digest(&digest_root)
+  })
+  .await
+  .context("Core export digest worker failed")??;
+  let label = crypto::authorize_core_source_label(
+    &BackupTarget::Core.source_label(core_instance_id()?),
+    &hostname,
+    &name,
+    &digest,
+  )?;
   let path = staging.to_string_lossy().into_owned();
   let mut retry = CoreRepositoryRetry {
     snapshot_name: name,
@@ -4082,6 +4163,7 @@ pub async fn plan_restore(
         }
         publish.push(
           periphery_client::api::backup::RestorePublishPath {
+            destination_root: None,
             snapshot_path: source.trim_start_matches('/').into(),
             destination: destination_path,
           },
@@ -4132,6 +4214,7 @@ pub async fn plan_restore(
         .context("Snapshot does not contain a volume source path")?;
       publish.push(
         periphery_client::api::backup::RestorePublishPath {
+          destination_root: None,
           snapshot_path: source_path.trim_start_matches('/').into(),
           destination: format!(
             "/var/lib/docker/volumes/{destination_name}/_data"
@@ -4272,6 +4355,12 @@ fn selected_publish_paths(
     };
     let destination = Path::new(&root.destination).join(relative);
     publish.push(periphery_client::api::backup::RestorePublishPath {
+      destination_root: Some(
+        root
+          .destination_root
+          .clone()
+          .unwrap_or_else(|| root.destination.clone()),
+      ),
       snapshot_path: selected.clone(),
       destination: destination.to_string_lossy().into_owned(),
     });
@@ -4511,6 +4600,16 @@ pub async fn execute_restore(
     .find_one(doc! { "_id": plan_id, "created_by": &user.id })
     .await?
     .context("Restore plan does not exist")?;
+  if !stored.plan.selected_paths.is_empty()
+    && stored
+      .publish
+      .iter()
+      .any(|path| path.destination_root.is_none())
+  {
+    return Err(anyhow!(
+      "Selected restore plan has no original destination boundary; create a fresh preview"
+    ));
+  }
   if stored.plan.expires_at < komodo_timestamp()
     && (stored.recovered_stack_name.is_none()
       || !stored.recovered_stack_execution_started)
@@ -5259,6 +5358,46 @@ async fn reconcile_core_recovery_state() -> anyhow::Result<()> {
   reconcile_core_recovery_state_inner().await
 }
 
+fn historical_restore_finalization_update(
+  plan_id: &str,
+  stack: &Stack,
+) -> Option<database::bson::Document> {
+  // The marked Stack is inserted only after Periphery publishes every root.
+  // In a restored Core database it may outlive an already acknowledged receipt.
+  (stack.info.recovery_plan_id.as_deref() == Some(plan_id)).then(
+    || {
+      doc! { "$set": {
+        "recovered_stack_execution_started": true,
+        "recovered_stack_finalized": true,
+        "recovered_stack_id": &stack.id,
+      } }
+    },
+  )
+}
+
+async fn normalize_historical_restore_sagas(
+  validation: &database::mungos::mongodb::Database,
+) -> anyhow::Result<()> {
+  let plans =
+    validation.collection::<StoredRestorePlan>(PLANS_COLLECTION);
+  for stored in find_collect(&plans, None, None).await? {
+    if stored.recovered_stack_name.is_none() {
+      continue;
+    }
+    let stack = validation
+      .collection::<Stack>("Stack")
+      .find_one(doc! { "info.recovery_plan_id": &stored.id })
+      .await?;
+    if let Some(stack) = stack
+      && let Some(update) =
+        historical_restore_finalization_update(&stored.id, &stack)
+    {
+      plans.update_one(doc! { "_id": &stored.id }, update).await?;
+    }
+  }
+  Ok(())
+}
+
 pub async fn plan_core_recovery(
   snapshot_name: &str,
   created_by: String,
@@ -5306,6 +5445,26 @@ pub async fn plan_core_recovery(
   let manifest_path =
     find_file_named(&staging, "komodo-core-manifest.json")
       .context("Core snapshot manifest is missing")?;
+  let authenticated_root = manifest_path
+    .parent()
+    .context("Core manifest has no export root")?
+    .to_path_buf();
+  let (_, expected_digest) = crypto::authenticate_core_source_label(
+    &snapshot.source_label,
+    &snapshot.hostname,
+    &snapshot.name,
+  )?;
+  let digest_root = authenticated_root.clone();
+  let actual_digest = tokio::task::spawn_blocking(move || {
+    core_export_digest(&digest_root)
+  })
+  .await
+  .context("Core recovery digest worker failed")??;
+  if actual_digest != expected_digest {
+    return Err(anyhow!(
+      "Core snapshot contents do not match their Core-authorized digest; recovery blocked"
+    ));
+  }
   let manifest: serde_json::Value =
     serde_json::from_slice(&tokio::fs::read(&manifest_path).await?)?;
   let backup_schema = manifest
@@ -5347,7 +5506,7 @@ pub async fn plan_core_recovery(
   }
 
   let (backup_root, restore_folder) =
-    find_core_restore_layout(&staging)?;
+    find_core_restore_layout(&authenticated_root)?;
   let current_database = db_client().db.name().to_string();
   let validation_database =
     core_recovery_database_name(&current_database);
@@ -5361,6 +5520,8 @@ pub async fn plan_core_recovery(
     )
     .await
     .context("Failed to restore the Core validation database")?;
+    normalize_historical_restore_sagas(&validation).await
+      .context("Failed to normalize historical recovered-Stack receipts")?;
     // Repository credentials are deliberately excluded from Core snapshots.
     // Carry forward the freshly configured, locally sealed repository settings
     // so recovery can still access its primary after the database switch.
@@ -6180,9 +6341,23 @@ mod tests {
       .unwrap()
     );
     assert!(
-      repositories_share_location(
+      repositories_overlap(
         &local(&actual.to_string_lossy()),
         &local(&actual.join("nested").to_string_lossy())
+      )
+      .unwrap()
+    );
+    assert!(
+      !repositories_share_location(
+        &local(&actual.to_string_lossy()),
+        &local(&actual.join("nested").to_string_lossy()),
+      )
+      .unwrap()
+    );
+    assert!(
+      !repositories_share_location(
+        &local(&actual.join("nested").to_string_lossy()),
+        &local(&actual.to_string_lossy()),
       )
       .unwrap()
     );
@@ -6253,6 +6428,7 @@ mod tests {
   fn selected_restore_publishes_only_selected_subtrees() {
     let roots =
       vec![periphery_client::api::backup::RestorePublishPath {
+        destination_root: None,
         snapshot_path: "srv/app".into(),
         destination: "/restore/app".into(),
       }];
@@ -6264,16 +6440,22 @@ mod tests {
     assert_eq!(publish.len(), 2);
     assert_eq!(publish[0].destination, "/restore/app/config");
     assert_eq!(publish[1].destination, "/restore/app/data/file.db");
+    assert!(
+      publish.iter().all(|item| item.destination_root.as_deref()
+        == Some("/restore/app"))
+    );
   }
 
   #[test]
   fn restore_destinations_must_not_overlap() {
     let publish = vec![
       periphery_client::api::backup::RestorePublishPath {
+        destination_root: None,
         snapshot_path: "source/one".into(),
         destination: "/restore/app".into(),
       },
       periphery_client::api::backup::RestorePublishPath {
+        destination_root: None,
         snapshot_path: "source/two".into(),
         destination: "/restore/app/data".into(),
       },
@@ -6386,6 +6568,63 @@ mod tests {
       find_core_restore_layout(root.path()).unwrap();
     assert_eq!(backup_root, dated.parent().unwrap());
     assert_eq!(restore_folder, "2026-01-01_01-00-00");
+  }
+
+  #[test]
+  fn core_export_digest_covers_contents_and_exact_file_names() {
+    let root = tempfile::tempdir().unwrap();
+    let export = root.path().join("dated");
+    std::fs::create_dir(&export).unwrap();
+    std::fs::write(
+      root.path().join("komodo-core-manifest.json"),
+      b"manifest",
+    )
+    .unwrap();
+    let file = export.join("User.gz");
+    std::fs::write(&file, b"original-admin").unwrap();
+    let expected = core_export_digest(root.path()).unwrap();
+    assert_eq!(core_export_digest(root.path()).unwrap(), expected);
+    std::fs::write(&file, b"replacement-admin").unwrap();
+    assert_ne!(core_export_digest(root.path()).unwrap(), expected);
+    std::fs::write(&file, b"original-admin").unwrap();
+    std::fs::rename(&file, export.join("Other.gz")).unwrap();
+    assert_ne!(core_export_digest(root.path()).unwrap(), expected);
+    std::fs::rename(export.join("Other.gz"), &file).unwrap();
+    std::fs::write(export.join("Injected.gz"), b"injected").unwrap();
+    assert_ne!(core_export_digest(root.path()).unwrap(), expected);
+    std::os::unix::fs::symlink(&file, export.join("alias.gz"))
+      .unwrap();
+    assert!(core_export_digest(root.path()).is_err());
+  }
+
+  #[test]
+  fn historical_restore_normalization_requires_the_exact_stack_marker()
+   {
+    let mut stack = Stack::default();
+    stack.id = "recovered-stack".into();
+    assert!(
+      historical_restore_finalization_update("plan", &stack)
+        .is_none()
+    );
+    stack.info.recovery_plan_id = Some("unrelated-plan".into());
+    assert!(
+      historical_restore_finalization_update("plan", &stack)
+        .is_none()
+    );
+    stack.info.recovery_plan_id = Some("plan".into());
+    let update =
+      historical_restore_finalization_update("plan", &stack).unwrap();
+    let fields = update.get_document("$set").unwrap();
+    assert!(fields.get_bool("recovered_stack_finalized").unwrap());
+    assert!(
+      fields
+        .get_bool("recovered_stack_execution_started")
+        .unwrap()
+    );
+    assert_eq!(
+      fields.get_str("recovered_stack_id").unwrap(),
+      "recovered-stack"
+    );
   }
 
   #[test]

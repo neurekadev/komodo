@@ -216,6 +216,10 @@ pub struct TransactionalVykarRestore {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct RestorePublishPath {
+  /// Original confirmed root for a selected child. Ancestors beneath this
+  /// boundary must not be followed through symlinks during publication.
+  #[serde(default)]
+  pub destination_root: Option<String>,
   pub snapshot_path: String,
   pub destination: String,
 }
