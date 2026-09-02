@@ -4668,7 +4668,67 @@ mod tests {
     let first = root.path().join("destination");
     std::fs::create_dir_all(&first).unwrap();
     std::fs::write(first.join("original.txt"), b"original").unwrap();
+    // The first publication creates this previously absent sibling as its
+    // rollback copy. The second entry must then fail its existence recheck,
+    // after the first destination has actually been replaced.
+    let second =
+      restore_rollback_path(&first, "rollback-test").unwrap();
     let publish = vec![
+      RestorePublishPath {
+        destination_root: None,
+        snapshot_path: "one".into(),
+        destination: first.to_string_lossy().into_owned(),
+      },
+      RestorePublishPath {
+        destination_root: None,
+        snapshot_path: "two.txt".into(),
+        destination: second.to_string_lossy().into_owned(),
+      },
+    ];
+    let publication_started = AtomicBool::new(false);
+    let journals = root.path().join("journals");
+    assert!(
+      publish_restore_in(
+        &download,
+        &publish,
+        "rollback-test",
+        &publication_started,
+        &journals,
+        None,
+        false,
+      )
+      .unwrap()
+    );
+    assert!(publication_started.load(Ordering::SeqCst));
+    assert_eq!(
+      std::fs::read(first.join("original.txt")).unwrap(),
+      b"original"
+    );
+    assert!(!first.join("new.txt").exists());
+    assert!(!second.exists());
+    assert!(!download.exists());
+    assert!(!journals.join("rollback-test.json").exists());
+    for index in 0..publish.len() {
+      assert!(
+        !root
+          .path()
+          .join(format!(".komodo-restore-rollback-test-{index}"))
+          .exists()
+      );
+    }
+  }
+
+  #[test]
+  fn overlapping_destinations_fail_before_publication() {
+    let root = tempfile::tempdir().unwrap();
+    let download = root.path().join("download");
+    std::fs::create_dir_all(download.join("one")).unwrap();
+    std::fs::write(download.join("one/new.txt"), b"new").unwrap();
+    std::fs::write(download.join("two.txt"), b"two").unwrap();
+    let first = root.path().join("destination");
+    std::fs::create_dir(&first).unwrap();
+    std::fs::write(first.join("original.txt"), b"original").unwrap();
+    let publish = [
       RestorePublishPath {
         destination_root: None,
         snapshot_path: "one".into(),
@@ -4683,23 +4743,37 @@ mod tests {
           .into_owned(),
       },
     ];
+    let publication_started = AtomicBool::new(false);
+    let journals = root.path().join("journals");
+    let error = publish_restore_in(
+      &download,
+      &publish,
+      "overlap-test",
+      &publication_started,
+      &journals,
+      None,
+      false,
+    )
+    .unwrap_err();
     assert!(
-      publish_restore_in(
-        &download,
-        &publish,
-        "rollback-test",
-        &AtomicBool::new(false),
-        &root.path().join("journals"),
-        None,
-        false,
-      )
-      .unwrap()
+      error.to_string().contains("Restore destinations overlap")
     );
+    assert!(!publication_started.load(Ordering::SeqCst));
     assert_eq!(
       std::fs::read(first.join("original.txt")).unwrap(),
       b"original"
     );
     assert!(!first.join("new.txt").exists());
+    assert!(!first.join("child.txt").exists());
+    assert!(download.join("one/new.txt").exists());
+    assert!(!journals.exists());
+    assert!(root.path().read_dir().unwrap().all(|entry| {
+      !entry
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .starts_with(".komodo-restore-")
+    }));
   }
 
   #[test]
