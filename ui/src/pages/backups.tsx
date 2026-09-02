@@ -269,14 +269,16 @@ function StatusSection({ status }: { status?: Types.BackupStatus }) {
           {status.active_runs.map((run) => (
             <Group key={run.id} justify="space-between">
               <Text size="sm">Active: {run.message}</Text>
-              <Button
-                color="red"
-                variant="light"
-                loading={cancelling}
-                onClick={() => cancel({ run_id: run.id })}
-              >
-                Cancel run
-              </Button>
+              {run.cancellable && (
+                <Button
+                  color="red"
+                  variant="light"
+                  loading={cancelling}
+                  onClick={() => cancel({ run_id: run.id })}
+                >
+                  Cancel run
+                </Button>
+              )}
             </Group>
           ))}
         </Stack>

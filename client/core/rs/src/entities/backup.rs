@@ -383,6 +383,9 @@ pub struct BackupRun {
   pub id: String,
   pub target: Option<BackupTarget>,
   pub state: BackupRunState,
+  /// Whether this operation supports cancellation while it is active.
+  #[serde(default)]
+  pub cancellable: bool,
   pub message: String,
   pub started_at: I64,
   pub finished_at: I64,
@@ -488,6 +491,28 @@ pub fn selection_includes<T: PartialEq>(
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn backup_run_cancellation_is_explicit_and_defaults_to_disabled() {
+    let run = BackupRun {
+      state: BackupRunState::Running,
+      cancellable: true,
+      ..Default::default()
+    };
+    let mut value = serde_json::to_value(run).unwrap();
+    assert!(
+      serde_json::from_value::<BackupRun>(value.clone())
+        .unwrap()
+        .cancellable
+    );
+    value.as_object_mut().unwrap().remove("cancellable");
+    assert!(
+      !serde_json::from_value::<BackupRun>(value)
+        .unwrap()
+        .cancellable
+    );
+    assert!(!BackupRun::default().cancellable);
+  }
 
   #[test]
   fn selection_modes_are_unambiguous() {

@@ -6342,6 +6342,8 @@ export interface BackupRun {
 	id: string;
 	target?: BackupTarget;
 	state: BackupRunState;
+	/** Whether this operation supports cancellation while it is active. */
+	cancellable?: boolean;
 	message: string;
 	started_at: I64;
 	finished_at: I64;

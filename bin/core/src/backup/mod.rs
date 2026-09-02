@@ -1289,6 +1289,7 @@ pub async fn finalize_interrupted_runs() -> anyhow::Result<u64> {
           "state": to_bson(&BackupRunState::Failed)?,
           "message": "Core restarted before the backup operation completed",
           "finished_at": komodo_timestamp(),
+          "cancellable": false,
         }
       },
     )
@@ -1320,6 +1321,7 @@ async fn create_run(
     id: Uuid::new_v4().to_string(),
     target,
     state: BackupRunState::Running,
+    cancellable,
     message: message.into(),
     started_at: komodo_timestamp(),
     ..Default::default()
@@ -1348,6 +1350,7 @@ async fn finish_run(
   run.state = state;
   run.message = message.into();
   run.finished_at = komodo_timestamp();
+  run.cancellable = false;
   let filter = if state == BackupRunState::Cancelled {
     doc! { "id": &run.id }
   } else {
@@ -3720,6 +3723,7 @@ async fn backup_stack(
 ) -> anyhow::Result<bool> {
   let _mutation = mutation_barrier().write().await;
   let stack = resource::get::<Stack>(stack_id).await?;
+  let resolved_stack_id = stack.id.clone();
   if !stack.config.swarm_id.is_empty() {
     return Err(anyhow!(
       "Swarm stacks are not supported by backup v1"
@@ -3751,7 +3755,7 @@ async fn backup_stack(
       hostname: hostname.clone(),
       source_label: authorized_source_label(
         &BackupTarget::Stack {
-          stack_id: stack_id.into(),
+          stack_id: resolved_stack_id,
         },
         &hostname,
         &snapshot_name,
@@ -3814,7 +3818,7 @@ async fn backup_volume(
       hostname: hostname.clone(),
       source_label: authorized_source_label(
         &BackupTarget::Volume {
-          server_id: server_id.into(),
+          server_id: server.id.clone(),
           volume_name: volume_name.into(),
         },
         &hostname,
@@ -6052,7 +6056,9 @@ pub async fn cancel_run(run_id: &str) -> anyhow::Result<BackupRun> {
       "Only an active backup run can be cancelled"
     ));
   }
-  if non_cancellable_runs().lock().unwrap().contains(run_id) {
+  if !run.cancellable
+    || non_cancellable_runs().lock().unwrap().contains(run_id)
+  {
     return Err(anyhow!(
       "This backup operation cannot be cancelled once it has started"
     ));

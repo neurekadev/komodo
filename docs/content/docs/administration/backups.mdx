@@ -93,6 +93,10 @@ komodo/v1/volume/<server-id>/<volume-name>
 
 Each Periphery also has a stable Vykar hostname so snapshots remain attributable after resource names change.
 
+When an API backup request identifies a Stack or Server by name, Core resolves it and signs the snapshot with the resource's stable ID. The snapshot remains bound to that resource for browsing and recovery.
+
+**Cancel run** appears only for active backup operations that support cooperative cancellation. Repository initialization, verification, Stack/Volume restore, and Core recovery cannot be cancelled after starting; their active status remains visible without a Cancel button.
+
 Backup manifests record the running product's build version, as shown by Core, rather than Cargo's internal `0.0.0` workspace placeholder. Core recovery compares that recorded version with the running build before activating a restored database.
 
 Core snapshot authorization binds the snapshot identity to the export's creation time and a digest of its exact file names and contents, including its manifest. Recovery verifies that digest and the manifest's creation time before importing any database records; reusing an older authorized snapshot name cannot authorize replacement contents. Core inventory and retention use the signed export time, not the repository upload time, so uploading an exact copy of an old export cannot make it a newer recovery point or displace newer backups. Snapshots without the required content-and-time authorization remain visible as unbound snapshots and are not eligible for automatic Core recovery or managed retention.
