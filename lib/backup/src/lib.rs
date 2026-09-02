@@ -246,6 +246,7 @@ impl VykarRepository {
           target,
           source_paths: entry.source_paths,
           restorable_source_paths,
+          source_paths_match_current: None,
           created_at: entry.time.timestamp_millis(),
           original_size: stats.original_size,
           stored_size: stats.deduplicated_size,

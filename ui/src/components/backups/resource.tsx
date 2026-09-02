@@ -126,7 +126,8 @@ export default function ResourceBackups({
     target.type === "Stack" &&
     !!selectedSnapshot &&
     (snapshotSourceServerId !== sourceServerId ||
-      destinationServerId !== snapshotSourceServerId);
+      destinationServerId !== snapshotSourceServerId ||
+      selectedSnapshot.source_paths_match_current === false);
   const snapshotPages = Math.max(
     1,
     Math.ceil((snapshots.data?.total ?? 0) / SNAPSHOT_PAGE_LIMIT),
@@ -230,7 +231,7 @@ export default function ResourceBackups({
             <>
               <TextInput
                 label="New recovered Stack name"
-                description="Recovery from a snapshot-era Server creates a new Stack and never retargets the original."
+                description="Recovery from snapshot-era paths or a different Server creates a new Stack and never retargets the original."
                 value={recoveredName}
                 onChange={(event) => setRecoveredName(event.currentTarget.value)}
                 required

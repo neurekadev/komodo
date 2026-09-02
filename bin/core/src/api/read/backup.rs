@@ -100,6 +100,27 @@ impl Resolve<ReadArgs> for ListBackupSnapshots {
       crate::backup::list_snapshots().await?;
     if let Some(target) = self.target {
       snapshots.retain(|snapshot| snapshot.target == target);
+      if let komodo_client::entities::backup::BackupTarget::Stack {
+        stack_id,
+      } = target
+      {
+        let current =
+          crate::backup::current_stack_backup_source(&stack_id)
+            .await
+            .ok();
+        for snapshot in &mut snapshots {
+          snapshot.source_paths_match_current = Some(
+            current.as_ref().is_some_and(|(server_id, paths)| {
+              crate::backup::snapshot_server_id(snapshot)
+                == Some(server_id.as_str())
+                && crate::backup::backup_source_paths_match(
+                  &snapshot.restorable_source_paths,
+                  paths,
+                )
+            }),
+          );
+        }
+      }
     }
     snapshots
       .sort_by_key(|snapshot| std::cmp::Reverse(snapshot.created_at));

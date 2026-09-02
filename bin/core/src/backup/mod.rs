@@ -45,7 +45,8 @@ use komodo_client::{
   },
 };
 use periphery_client::api::backup::{
-  CancelVykarOperation, PeripheryBackupTarget, PreflightVykarRestore,
+  CancelVykarOperation, DiscoverBackupSource, PeripheryBackupTarget,
+  PreflightVykarRestore, PreflightVykarRestoreResponse,
   RunVykarBackup, RunVykarBackupBatch, TransactionalVykarRestore,
   VykarBackupTask, VykarRetainedSnapshot,
 };
@@ -82,6 +83,7 @@ const CORE_INSTANCE_ID_PATH: &str = "/data/keys/backup-instance-id";
 const LEGACY_CORE_INSTANCE_ID_PATH: &str =
   "/config/keys/backup-instance-id";
 const PERIPHERY_HOSTNAME_PREFIX: &str = "komodo-periphery-";
+const CORE_RECOVERY_DATABASE_PREFIX: &str = "komodo_recovery_";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SealedBackupSettings {
@@ -92,6 +94,9 @@ struct SealedBackupSettings {
   /// Set only after the primary repository has initialized successfully.
   #[serde(default)]
   primary_initialized: bool,
+  /// Set only after the mirror repository has initialized successfully.
+  #[serde(default)]
+  mirror_initialized: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,6 +116,8 @@ struct StoredRestorePlan {
   destination_volume_name: Option<String>,
   #[serde(default)]
   create_volume_if_missing: bool,
+  #[serde(default)]
+  destination_exists: bool,
   /// Immutable source metadata used when this plan creates a recovered Stack.
   #[serde(default)]
   recovered_stack_source: Option<Stack>,
@@ -233,24 +240,26 @@ async fn save_settings_inner(
   allow_primary_location_change: bool,
 ) -> anyhow::Result<BackupSettings> {
   validate_settings(&proposed)?;
-  let (existing, primary_initialized) = match settings_collection()
-    .find_one(doc! { "_id": SETTINGS_ID })
-    .await
-    .context("Failed to load existing backup settings")?
-  {
-    Some(record) => {
-      let primary_initialized = record.primary_initialized;
-      let bytes = crypto::open(&record.sealed)?;
-      (
-        Some(
-          serde_json::from_slice::<BackupSettings>(&bytes)
-            .context("Failed to decode sealed backup settings")?,
-        ),
-        primary_initialized,
-      )
-    }
-    None => (None, false),
-  };
+  let (existing, primary_initialized, mirror_initialized) =
+    match settings_collection()
+      .find_one(doc! { "_id": SETTINGS_ID })
+      .await
+      .context("Failed to load existing backup settings")?
+    {
+      Some(record) => {
+        let primary_initialized = record.primary_initialized;
+        let bytes = crypto::open(&record.sealed)?;
+        (
+          Some(
+            serde_json::from_slice::<BackupSettings>(&bytes)
+              .context("Failed to decode sealed backup settings")?,
+          ),
+          primary_initialized,
+          record.mirror_initialized,
+        )
+      }
+      None => (None, false, false),
+    };
   let primary_location_unchanged = existing
     .as_ref()
     .map(|existing| {
@@ -284,7 +293,7 @@ async fn save_settings_inner(
           proposed,
           existing,
           location_unchanged,
-          true,
+          mirror_initialized,
         )?
       }
       (Some(proposed), None) => require_repository_secrets(proposed)?,
@@ -331,6 +340,13 @@ async fn save_settings_inner(
     updated_at: proposed.updated_at,
     primary_initialized: primary_initialized
       || allow_primary_location_change,
+    mirror_initialized: if allow_primary_location_change {
+      proposed.mirror.is_some()
+    } else if mirror_changed {
+      false
+    } else {
+      mirror_initialized
+    },
   };
   settings_collection()
     .update_one(
@@ -347,30 +363,41 @@ async fn save_settings_inner(
   Ok(redacted)
 }
 
-async fn mark_primary_initialized(
+async fn mark_repository_initialized(
   mut settings: BackupSettings,
+  mirror: bool,
 ) -> anyhow::Result<()> {
+  let field = if mirror {
+    "mirror_initialized"
+  } else {
+    "primary_initialized"
+  };
+  let update = if mirror {
+    doc! { "$set": { "mirror_initialized": true } }
+  } else {
+    doc! { "$set": { "primary_initialized": true } }
+  };
   let updated = settings_collection()
-    .update_one(
-      doc! { "_id": SETTINGS_ID },
-      doc! { "$set": { "primary_initialized": true } },
-    )
+    .update_one(doc! { "_id": SETTINGS_ID }, update)
     .await
-    .context("Failed to record primary repository initialization")?;
+    .with_context(|| {
+      format!("Failed to record {field} repository state")
+    })?;
   if updated.matched_count > 0 {
     return Ok(());
   }
 
   // Initialization is also available before the first explicit settings save.
-  // Persist the effective defaults so the successful primary cannot later be
-  // silently replaced by editing a newly-created settings record.
+  // Persist the effective defaults so a successfully initialized repository
+  // cannot later be silently replaced by editing a new settings record.
   settings.updated_at = komodo_timestamp();
   let bytes = serde_json::to_vec(&settings)?;
   let record = SealedBackupSettings {
     id: SETTINGS_ID.into(),
     sealed: crypto::seal(&bytes)?,
     updated_at: settings.updated_at,
-    primary_initialized: true,
+    primary_initialized: !mirror,
+    mirror_initialized: mirror,
   };
   settings_collection()
     .update_one(
@@ -967,9 +994,8 @@ pub async fn initialize_repositories() -> anyhow::Result<BackupRun> {
       })
       .await
       .context("Vykar initialization worker failed")??;
-      if index == 0 {
-        mark_primary_initialized(settings.clone()).await?;
-      }
+      mark_repository_initialized(settings.clone(), index == 1)
+        .await?;
     }
     anyhow::Ok(())
   }
@@ -1038,13 +1064,16 @@ async fn create_run(
     started_at: komodo_timestamp(),
     ..Default::default()
   };
-  if !cancellable {
+  if cancellable {
+    register_cancellation_token(&run.id);
+  } else {
     non_cancellable_runs()
       .lock()
       .unwrap()
       .insert(run.id.clone());
   }
   if let Err(error) = runs_collection().insert_one(&run).await {
+    cancellation_tokens().lock().unwrap().remove(&run.id);
     non_cancellable_runs().lock().unwrap().remove(&run.id);
     return Err(error.into());
   }
@@ -1343,7 +1372,6 @@ pub async fn run_backup(
     repository_role_barrier().clone().read_owned().await;
   let mut run = new_run(target.clone(), "Backup running").await?;
   let run_id = run.id.clone();
-  let _cancellation = register_cancellation_token(&run_id);
   let settings = match get_settings().await {
     Ok(settings) => settings,
     Err(error) => {
@@ -3007,7 +3035,7 @@ pub fn snapshot_server_id(snapshot: &BackupSnapshot) -> Option<&str> {
 
 async fn snapshot_stack_source(
   snapshot: &BackupSnapshot,
-) -> anyhow::Result<(Stack, Option<Stack>)> {
+) -> anyhow::Result<(Stack, Option<Stack>, Vec<String>)> {
   let BackupTarget::Stack { stack_id } = &snapshot.target else {
     return Err(anyhow!("Snapshot is not a Stack backup"));
   };
@@ -3078,7 +3106,41 @@ async fn snapshot_stack_source(
       "Stack snapshot recovery manifest does not match its source label"
     ));
   }
-  Ok((*stack, current))
+  Ok((*stack, current, manifest.paths))
+}
+
+pub async fn current_stack_backup_source(
+  stack_id: &str,
+) -> anyhow::Result<(String, Vec<String>)> {
+  let stack = resource::get::<Stack>(stack_id).await?;
+  let server =
+    resource::get::<Server>(&stack.config.server_id).await?;
+  let repo = if stack.config.linked_repo.is_empty() {
+    None
+  } else {
+    Some(resource::get::<Repo>(&stack.config.linked_repo).await?)
+  };
+  let source = periphery_client(&server)
+    .await?
+    .request(DiscoverBackupSource {
+      target: PeripheryBackupTarget::Stack {
+        stack: Box::new(stack),
+        repo: repo.map(Box::new),
+      },
+    })
+    .await?;
+  Ok((server.id, source.paths))
+}
+
+pub fn backup_source_paths_match(
+  left: &[String],
+  right: &[String],
+) -> bool {
+  let mut left = left.to_vec();
+  let mut right = right.to_vec();
+  left.sort();
+  right.sort();
+  left == right
 }
 
 fn stack_restore_requires_recovery(
@@ -3113,13 +3175,13 @@ pub async fn plan_restore(
     ));
   }
   let selected_paths = normalize_selected_paths(&selected_paths)?;
-  let (snapshot_stack, current_stack) =
+  let (snapshot_stack, current_stack, snapshot_stack_paths) =
     if matches!(&snapshot.target, BackupTarget::Stack { .. }) {
-      let (snapshot_stack, current_stack) =
+      let (snapshot_stack, current_stack, source_paths) =
         snapshot_stack_source(&snapshot).await?;
-      (Some(snapshot_stack), current_stack)
+      (Some(snapshot_stack), current_stack, source_paths)
     } else {
-      (None, None)
+      (None, None, Vec::new())
     };
   let source_stack_missing = current_stack.is_none()
     && matches!(&snapshot.target, BackupTarget::Stack { .. });
@@ -3161,11 +3223,31 @@ pub async fn plan_restore(
       let current_server_id = current_stack
         .as_ref()
         .map(|stack| stack.config.server_id.as_str());
-      let recovering_stack = stack_restore_requires_recovery(
-        &snapshot_stack.config.server_id,
-        current_server_id,
-        &destination,
-      );
+      let explicitly_recovering = recovered_stack_name
+        .as_deref()
+        .is_some_and(|name| !name.trim().is_empty());
+      let mut recovering_stack = explicitly_recovering
+        || stack_restore_requires_recovery(
+          &snapshot_stack.config.server_id,
+          current_server_id,
+          &destination,
+        );
+      if !recovering_stack {
+        let (_, current_paths) = current_stack_backup_source(
+          &current_stack
+            .as_ref()
+            .context("Current Stack is missing")?
+            .id,
+        )
+        .await
+        .context(
+          "Failed to discover the current Stack backup roots",
+        )?;
+        recovering_stack = !backup_source_paths_match(
+          &snapshot_stack_paths,
+          &current_paths,
+        );
+      }
       let stack = if recovering_stack {
         snapshot_stack
       } else {
@@ -3198,11 +3280,9 @@ pub async fn plan_restore(
         recovered_stack_name = Some(recovered_name);
         recovered_stack_source = Some(stack.clone());
       }
-      if destination != stack.config.server_id
-        && bind_path_mappings.is_empty()
-      {
+      if recovering_stack && bind_path_mappings.is_empty() {
         return Err(anyhow!(
-          "Cross-node stack restore requires explicit bind path mappings"
+          "Recovered Stack restore requires explicit source-path mappings"
         ));
       }
       if recovering_stack && !selected_paths.is_empty() {
@@ -3210,30 +3290,21 @@ pub async fn plan_restore(
           "Recovered Stack creation requires the complete snapshot"
         ));
       }
-      let source_paths = snapshot
-        .source_paths
-        .iter()
-        .filter(|path| {
-          !is_backup_manifest_source(&snapshot.name, path)
-        })
-        .cloned()
-        .collect::<Vec<_>>();
+      let source_paths = snapshot_stack_paths;
       if source_paths.is_empty() {
         return Err(anyhow!(
           "Snapshot does not contain a Stack run directory"
         ));
       }
       for source in source_paths {
-        let destination_path = if destination
-          == stack.config.server_id
-        {
+        let destination_path = if !recovering_stack {
           source.clone()
         } else {
           bind_path_mappings
             .get(&source)
             .with_context(|| {
               format!(
-                "Cross-node Stack restore is missing a destination mapping for '{source}'"
+                "Recovered Stack restore is missing a destination mapping for '{source}'"
               )
             })?
             .clone()
@@ -3379,6 +3450,7 @@ pub async fn plan_restore(
       recovered_stack_run_directory,
       destination_volume_name: destination_volume_name.clone(),
       create_volume_if_missing,
+      destination_exists: preflight.destination_exists,
       recovered_stack_source,
       source_stack_missing,
     })
@@ -3460,6 +3532,37 @@ fn validate_non_overlapping_destinations(
     }
   }
   Ok(())
+}
+
+fn same_restore_preview(
+  stored: &StoredRestorePlan,
+  current: &PreflightVykarRestoreResponse,
+) -> bool {
+  fn same_strings(left: &[String], right: &[String]) -> bool {
+    let mut left = left.to_vec();
+    let mut right = right.to_vec();
+    left.sort();
+    right.sort();
+    left == right
+  }
+
+  stored.destination_exists == current.destination_exists
+    && same_strings(
+      &stored.plan.created_paths,
+      &current.created_paths,
+    )
+    && same_strings(
+      &stored.plan.overwritten_paths,
+      &current.overwritten_paths,
+    )
+    && same_strings(
+      &stored.plan.deleted_paths,
+      &current.deleted_paths,
+    )
+    && same_strings(
+      &stored.plan.containers_to_stop,
+      &current.containers_to_stop,
+    )
 }
 
 async fn restore_periphery_target(
@@ -3627,6 +3730,24 @@ pub async fn execute_restore(
     }),
   )
   .await?;
+  let settings = get_settings().await?;
+  let refreshed_preview = periphery_client(&server)
+    .await?
+    .request(PreflightVykarRestore {
+      target: target.clone(),
+      repository: repository_for_periphery(&settings.primary, false)?,
+      advanced: settings.advanced.clone(),
+      hostname: format!("komodo-periphery-{}", server.id),
+      snapshot_name: stored.plan.snapshot.clone(),
+      selected_paths: stored.plan.selected_paths.clone(),
+      publish: stored.publish.clone(),
+    })
+    .await?;
+  if !same_restore_preview(&stored, &refreshed_preview) {
+    return Err(anyhow!(
+      "Restore preview changed after confirmation; create and review a new preflight"
+    ));
+  }
   // Vykar restore does not currently expose cooperative cancellation. Reject
   // cancellation up front instead of advertising a request that cannot stop
   // the snapshot download and then blocking behind the operation lock.
@@ -3636,7 +3757,6 @@ pub async fn execute_restore(
   )
   .await?;
   let operation = async {
-    let settings = get_settings().await?;
     let recovered_run_directory =
       stored.recovered_stack_run_directory.clone().or_else(|| {
         stored.publish.first().map(|path| path.destination.clone())
@@ -3808,17 +3928,46 @@ async fn cleanup_expired_restore_plans() -> anyhow::Result<()> {
   Ok(())
 }
 
+fn parse_core_recovery_database(database: &str) -> Option<&str> {
+  let generated =
+    database.strip_prefix(CORE_RECOVERY_DATABASE_PREFIX)?;
+  let (namespace, recovery_id) = generated.split_once('_')?;
+  (namespace.len() == 16
+    && namespace
+      .chars()
+      .all(|character| character.is_ascii_hexdigit())
+    && recovery_id.len() == 12
+    && recovery_id
+      .chars()
+      .all(|character| character.is_ascii_hexdigit()))
+  .then_some(namespace)
+}
+
+fn core_recovery_database_namespace(database: &str) -> String {
+  parse_core_recovery_database(database)
+    .map(str::to_string)
+    .unwrap_or_else(|| {
+      hex::encode(Sha256::digest(database.as_bytes()))[..16]
+        .to_string()
+    })
+}
+
+fn core_recovery_database_name(current_database: &str) -> String {
+  format!(
+    "{CORE_RECOVERY_DATABASE_PREFIX}{}_{}",
+    core_recovery_database_namespace(current_database),
+    &Uuid::new_v4().simple().to_string()[..12]
+  )
+}
+
 fn is_managed_core_recovery_database(
   current_database: &str,
   candidate: &str,
 ) -> bool {
-  let prefix = format!("{current_database}_recovery_");
-  candidate.strip_prefix(&prefix).is_some_and(|suffix| {
-    suffix.len() == 12
-      && suffix
-        .chars()
-        .all(|character| character.is_ascii_hexdigit())
-  })
+  let current_namespace =
+    core_recovery_database_namespace(current_database);
+  parse_core_recovery_database(candidate)
+    .is_some_and(|namespace| namespace == current_namespace.as_str())
 }
 
 async fn reconcile_core_recovery_state_inner() -> anyhow::Result<()> {
@@ -3968,11 +4117,8 @@ pub async fn plan_core_recovery(
   let (backup_root, restore_folder) =
     find_core_restore_layout(&staging)?;
   let current_database = db_client().db.name().to_string();
-  let validation_database = format!(
-    "{}_recovery_{}",
-    current_database,
-    &Uuid::new_v4().simple().to_string()[..12]
-  );
+  let validation_database =
+    core_recovery_database_name(&current_database);
   let validation =
     db_client().db.client().database(&validation_database);
   let result = async {
@@ -4094,9 +4240,11 @@ pub async fn execute_core_recovery(
   // restore operations blocked until the process restarts into that database.
   std::mem::forget(backup_operation);
   delete_result?;
-  let run =
-    new_run(Some(BackupTarget::Core), "Core recovery activating")
-      .await?;
+  let run = new_non_cancellable_run(
+    Some(BackupTarget::Core),
+    "Core recovery activating",
+  )
+  .await?;
   let run = finish_run(
     run,
     BackupRunState::Complete,
@@ -4410,7 +4558,9 @@ pub fn embedded_vykar_router(
     listen: String::new(),
     data_dir: path.to_string_lossy().into_owned(),
     token: crypto::embedded_server_token()?,
-    append_only: false,
+    // Periphery only needs to append backup data. Retention, pruning, and
+    // deletion stay on Core so a compromised worker cannot destroy history.
+    append_only: true,
     log_format: "json".into(),
   };
   Ok(vykar_server::handlers::router(
@@ -4725,6 +4875,36 @@ mod tests {
   }
 
   #[test]
+  fn restore_preview_must_still_match_at_execution() {
+    let stored = StoredRestorePlan {
+      id: "plan".into(),
+      created_by: "user".into(),
+      plan: BackupRestorePlan {
+        created_paths: vec!["/new/b".into(), "/new/a".into()],
+        overwritten_paths: vec!["/existing".into()],
+        ..Default::default()
+      },
+      publish: Vec::new(),
+      recovered_stack_name: None,
+      recovered_stack_run_directory: None,
+      destination_volume_name: None,
+      create_volume_if_missing: false,
+      destination_exists: true,
+      recovered_stack_source: None,
+      source_stack_missing: false,
+    };
+    let mut current = PreflightVykarRestoreResponse {
+      destination_exists: true,
+      created_paths: vec!["/new/a".into(), "/new/b".into()],
+      overwritten_paths: vec!["/existing".into()],
+      ..Default::default()
+    };
+    assert!(same_restore_preview(&stored, &current));
+    current.deleted_paths.push("/unexpected".into());
+    assert!(!same_restore_preview(&stored, &current));
+  }
+
+  #[test]
   fn core_recovery_layout_requires_a_database_export() {
     let root = tempfile::tempdir().unwrap();
     assert!(find_core_restore_layout(root.path()).is_err());
@@ -4778,10 +4958,13 @@ mod tests {
   #[test]
   fn managed_recovery_database_names_require_exact_generated_suffix()
   {
-    assert!(is_managed_core_recovery_database(
-      "komodo",
-      "komodo_recovery_0123abcdef45"
-    ));
+    let first = core_recovery_database_name("komodo");
+    let second = core_recovery_database_name(&first);
+    assert!(is_managed_core_recovery_database("komodo", &first));
+    assert!(is_managed_core_recovery_database(&first, &second));
+    assert!(first.len() <= 63);
+    assert!(second.len() <= 63);
+    assert!(!second.contains(first.as_str()));
     assert!(!is_managed_core_recovery_database(
       "komodo",
       "komodo_recovery_customer"
@@ -4789,6 +4972,18 @@ mod tests {
     assert!(!is_managed_core_recovery_database(
       "komodo",
       "other_recovery_0123abcdef45"
+    ));
+  }
+
+  #[test]
+  fn stack_source_path_drift_ignores_only_order() {
+    assert!(backup_source_paths_match(
+      &["/srv/app".into(), "/srv/data".into()],
+      &["/srv/data".into(), "/srv/app".into()],
+    ));
+    assert!(!backup_source_paths_match(
+      &["/srv/app".into(), "/srv/data".into()],
+      &["/srv/app-new".into(), "/srv/data".into()],
     ));
   }
 

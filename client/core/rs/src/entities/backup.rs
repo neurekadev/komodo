@@ -363,6 +363,10 @@ pub struct BackupSnapshot {
   /// Exact user-restorable roots, excluding Komodo's internal manifest.
   #[serde(default)]
   pub restorable_source_paths: Vec<String>,
+  /// Whether the current Stack still resolves to the snapshot's source roots.
+  /// Populated by Core when snapshots are listed for a Stack.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub source_paths_match_current: Option<bool>,
   pub created_at: I64,
   pub original_size: U64,
   pub stored_size: U64,

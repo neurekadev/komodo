@@ -6381,6 +6381,8 @@ export interface BackupSnapshot {
 	source_paths: string[];
 	/** Exact user-restorable roots, excluding Komodo's internal manifest. */
 	restorable_source_paths: string[];
+	/** Whether the current Stack still resolves to the snapshot's source roots. Populated by Core when snapshots are listed for a Stack. */
+	source_paths_match_current?: boolean;
 	created_at: I64;
 	original_size: U64;
 	stored_size: U64;
