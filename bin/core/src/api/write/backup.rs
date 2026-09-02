@@ -173,45 +173,6 @@ impl Resolve<WriteArgs> for PlanBackupRestore {
   }
 }
 
-#[cfg(test)]
-mod tests {
-  use super::*;
-
-  #[test]
-  fn moved_stack_recovery_requires_destination_authorization() {
-    let recovering = stack_recovery_requested(
-      true,
-      false,
-      Some("snapshot-server"),
-      Some("current-server"),
-      Some("snapshot-server"),
-    );
-    assert!(recovering);
-    assert!(destination_backup_permission_required(
-      Some("snapshot-server"),
-      "snapshot-server",
-      recovering,
-    ));
-  }
-
-  #[test]
-  fn in_place_stack_restore_does_not_add_server_authorization() {
-    let recovering = stack_recovery_requested(
-      true,
-      false,
-      Some("server"),
-      Some("server"),
-      Some("server"),
-    );
-    assert!(!recovering);
-    assert!(!destination_backup_permission_required(
-      Some("server"),
-      "server",
-      recovering,
-    ));
-  }
-}
-
 impl Resolve<WriteArgs> for ExecuteBackupRestore {
   async fn resolve(
     self,
@@ -290,5 +251,44 @@ impl Resolve<WriteArgs> for ExecuteCoreRecovery {
       crate::backup::execute_core_recovery(&self.plan_id, &user.id)
         .await?,
     )
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn moved_stack_recovery_requires_destination_authorization() {
+    let recovering = stack_recovery_requested(
+      true,
+      false,
+      Some("snapshot-server"),
+      Some("current-server"),
+      Some("snapshot-server"),
+    );
+    assert!(recovering);
+    assert!(destination_backup_permission_required(
+      Some("snapshot-server"),
+      "snapshot-server",
+      recovering,
+    ));
+  }
+
+  #[test]
+  fn in_place_stack_restore_does_not_add_server_authorization() {
+    let recovering = stack_recovery_requested(
+      true,
+      false,
+      Some("server"),
+      Some("server"),
+      Some("server"),
+    );
+    assert!(!recovering);
+    assert!(!destination_backup_permission_required(
+      Some("server"),
+      "server",
+      recovering,
+    ));
   }
 }

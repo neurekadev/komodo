@@ -414,15 +414,16 @@ mod tests {
     let barrier = Arc::new(tokio::sync::RwLock::new(()));
     let guard = Arc::new(barrier.clone().read_owned().await);
     let (finish, wait) = tokio::sync::oneshot::channel();
-    let job = WRITE_MUTATION_GUARD_HELD
+    let (job,) = WRITE_MUTATION_GUARD_HELD
       .scope(guard, async {
-        spawn_guarded_write_job(
+        // Return the detached handle without awaiting its completion here.
+        (spawn_guarded_write_job(
           owned_write_mutation_guard().await,
           async move {
             assert!(mutation_guard_held_by_write_request());
             let _ = wait.await;
           },
-        )
+        ),)
       })
       .await;
     assert!(barrier.try_write().is_err());

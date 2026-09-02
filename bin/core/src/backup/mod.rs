@@ -1882,10 +1882,9 @@ fn authenticated_retention_deletions(
   snapshots: &[BackupSnapshot],
   settings: &BackupSettings,
 ) -> Vec<String> {
-  let mut by_source: HashMap<
-    String,
-    (u64, Vec<(&BackupSnapshot, i64)>),
-  > = HashMap::new();
+  type RetentionGroup<'a> = (u64, Vec<(&'a BackupSnapshot, i64)>);
+  let mut by_source: HashMap<String, RetentionGroup<'_>> =
+    HashMap::new();
   for snapshot in snapshots {
     let Some((target, raw_source)) =
       authenticated_snapshot_source(snapshot)
@@ -6858,8 +6857,10 @@ mod tests {
   #[test]
   fn historical_restore_normalization_requires_the_exact_stack_marker()
    {
-    let mut stack = Stack::default();
-    stack.id = "recovered-stack".into();
+    let mut stack = Stack {
+      id: "recovered-stack".into(),
+      ..Default::default()
+    };
     assert!(
       historical_restore_finalization_update("plan", &stack)
         .is_none()
