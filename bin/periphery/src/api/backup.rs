@@ -1204,19 +1204,38 @@ async fn resolve_protected_repository_sources(
       else {
         continue;
       };
-      if !protected
-        .iter()
-        .any(|path| paths_overlap(&destination, path))
-      {
-        continue;
-      }
       let Some(source) = mount.source.map(PathBuf::from) else {
         continue;
       };
-      sources.insert(source.canonicalize().unwrap_or(source));
+      for repository in &protected {
+        let Some(mapped) =
+          map_path_through_mount(repository, &destination, &source)
+        else {
+          continue;
+        };
+        sources.insert(mapped.canonicalize().unwrap_or(mapped));
+      }
     }
   }
   Ok(sources.into_iter().collect())
+}
+
+fn map_path_through_mount(
+  repository: &Path,
+  mount_destination: &Path,
+  mount_source: &Path,
+) -> Option<PathBuf> {
+  if let Ok(relative) = repository.strip_prefix(mount_destination) {
+    // The mount contains the repository. Protect only the corresponding
+    // subtree on the host so siblings in the same shared volume remain
+    // eligible backup and restore roots.
+    Some(mount_source.join(relative))
+  } else if mount_destination.starts_with(repository) {
+    // The entire mounted source is nested beneath the repository.
+    Some(mount_source.to_path_buf())
+  } else {
+    None
+  }
 }
 
 fn validate_path_outside_protected_repositories(
@@ -3244,6 +3263,35 @@ mod tests {
       )
       .is_err()
     );
+  }
+
+  #[test]
+  fn protected_repository_mapping_preserves_the_mount_subpath() {
+    assert_eq!(
+      map_path_through_mount(
+        Path::new("/data/backups/vykar"),
+        Path::new("/data"),
+        Path::new("/var/lib/docker/volumes/komodo_data/_data"),
+      ),
+      Some(PathBuf::from(
+        "/var/lib/docker/volumes/komodo_data/_data/backups/vykar"
+      ))
+    );
+    assert_eq!(
+      map_path_through_mount(
+        Path::new("/data/backups"),
+        Path::new("/data/backups/vykar"),
+        Path::new("/repository-volume"),
+      ),
+      Some(PathBuf::from("/repository-volume"))
+    );
+    let mapped = map_path_through_mount(
+      Path::new("/data/backups/vykar"),
+      Path::new("/data"),
+      Path::new("/host/data"),
+    )
+    .unwrap();
+    assert!(!paths_overlap(Path::new("/host/data/stacks"), &mapped));
   }
 
   #[test]

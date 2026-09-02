@@ -45,7 +45,8 @@ Some features are additionally gated behind a specific permission for that featu
 - **`Backups`**: User can access encrypted snapshots for the associated Stack or Server-backed Volume.
   - Read permits listing snapshots and browsing their file trees. Execute or Write permits manual backup and same-target restore.
   - A Stack accepts `Backups` directly or inherits it from its attached Server. A Volume uses the Server grant.
-  - Cross-node restore also requires Execute plus `Backups` on the destination Server. A recovered cross-node Stack requires the existing Stack-create permission.
+  - New Server and Stack creators receive `Backups` with their creator permissions. Existing grants are unchanged and must be updated explicitly.
+  - Cross-node restore also requires Execute plus `Backups` on the destination Server. Any recovered Stack requires that destination Server permission—even on its historical Server—plus the existing Stack-create permission.
   - Fleet schedule, repositories, retention, Core recovery, mirror promotion, unbound snapshots, and maintenance remain admin-only. See [Backups](/administration/backups#permissions).
 - **`FileManager`**: User can access the [File Manager](/features/file-manager) on the associated resource.
   - Valid on `Server` and `Stack`.

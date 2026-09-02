@@ -84,6 +84,7 @@ const LEGACY_CORE_INSTANCE_ID_PATH: &str =
   "/config/keys/backup-instance-id";
 const PERIPHERY_HOSTNAME_PREFIX: &str = "komodo-periphery-";
 const CORE_RECOVERY_DATABASE_PREFIX: &str = "komodo_recovery_";
+const MAX_FLEET_RETRY_ATTEMPTS: u32 = 8;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SealedBackupSettings {
@@ -2388,6 +2389,11 @@ fn fleet_generation() -> &'static RwLock<String> {
   GENERATION.get_or_init(Default::default)
 }
 
+fn fleet_retry_delay_seconds(completed_attempts: u32) -> Option<u64> {
+  (completed_attempts < MAX_FLEET_RETRY_ATTEMPTS)
+    .then(|| 2_u64.saturating_pow(completed_attempts.min(8)).min(300))
+}
+
 fn spawn_node_retry(
   settings: BackupSettings,
   run: BackupRun,
@@ -2397,13 +2403,17 @@ fn spawn_node_retry(
   mut refresh_targets: bool,
 ) -> tokio::task::JoinHandle<bool> {
   tokio::spawn(async move {
-    let mut retry = 0_u64;
+    let mut retry = 0_u32;
     loop {
       if *fleet_generation().read().unwrap() != run.id {
         return false;
       }
-      let seconds =
-        2_u64.saturating_pow(retry.min(8) as u32).min(300);
+      let Some(seconds) = fleet_retry_delay_seconds(retry) else {
+        warn!(
+          "Backup retries for node {server_id} exhausted after {retry} attempts"
+        );
+        return false;
+      };
       tokio::time::sleep(std::time::Duration::from_secs(seconds))
         .await;
       if *fleet_generation().read().unwrap() != run.id {
@@ -2616,42 +2626,30 @@ fn spawn_core_retry(
     let mut retry = 0_u32;
     loop {
       if *fleet_generation().read().unwrap() != run.id {
-        let retry =
-          core_repository_retries().lock().unwrap().remove(&run.id);
-        if let Some(retry) = retry {
-          let _ = tokio::fs::remove_dir_all(retry.staging).await;
-        }
+        discard_core_repository_retry(&run.id).await;
         return false;
       }
-      let seconds = 2_u64.saturating_pow(retry.min(8)).min(300);
+      let Some(seconds) = fleet_retry_delay_seconds(retry) else {
+        warn!("Core backup retries exhausted after {retry} attempts");
+        discard_core_repository_retry(&run.id).await;
+        return false;
+      };
       tokio::time::sleep(std::time::Duration::from_secs(seconds))
         .await;
       if *fleet_generation().read().unwrap() != run.id {
-        let retry =
-          core_repository_retries().lock().unwrap().remove(&run.id);
-        if let Some(retry) = retry {
-          let _ = tokio::fs::remove_dir_all(retry.staging).await;
-        }
+        discard_core_repository_retry(&run.id).await;
         return false;
       }
       retry = retry.saturating_add(1);
       let _operation = backup_operation_lock().lock().await;
       if *fleet_generation().read().unwrap() != run.id {
-        let retry =
-          core_repository_retries().lock().unwrap().remove(&run.id);
-        if let Some(retry) = retry {
-          let _ = tokio::fs::remove_dir_all(retry.staging).await;
-        }
+        discard_core_repository_retry(&run.id).await;
         return false;
       }
       let _repository_roles =
         repository_role_barrier().clone().read_owned().await;
       if *fleet_generation().read().unwrap() != run.id {
-        let retry =
-          core_repository_retries().lock().unwrap().remove(&run.id);
-        if let Some(retry) = retry {
-          let _ = tokio::fs::remove_dir_all(retry.staging).await;
-        }
+        discard_core_repository_retry(&run.id).await;
         return false;
       }
       match backup_core(&settings, &run).await {
@@ -2667,6 +2665,14 @@ fn spawn_core_retry(
       }
     }
   })
+}
+
+async fn discard_core_repository_retry(run_id: &str) {
+  let retry =
+    core_repository_retries().lock().unwrap().remove(run_id);
+  if let Some(retry) = retry {
+    let _ = tokio::fs::remove_dir_all(retry.staging).await;
+  }
 }
 
 async fn refresh_node_targets(
@@ -4320,6 +4326,7 @@ pub async fn execute_restore(
     })
     .context("Restore destination server is missing")?;
   let server = resource::get::<Server>(&server_id).await?;
+  let recovering_stack = stored.recovered_stack_name.is_some();
   let source_server_id = match &stored.plan.source {
     BackupTarget::Stack { stack_id } => Some(
       if let Some(stack) = stored.recovered_stack_source.as_ref() {
@@ -4331,7 +4338,9 @@ pub async fn execute_restore(
     BackupTarget::Volume { server_id, .. } => Some(server_id.clone()),
     BackupTarget::Core | BackupTarget::Unbound { .. } => None,
   };
-  if source_server_id.as_deref() != Some(server_id.as_str()) {
+  if recovering_stack
+    || source_server_id.as_deref() != Some(server_id.as_str())
+  {
     authorize_target(
       &BackupTarget::Volume {
         server_id: server_id.clone(),
@@ -6137,6 +6146,16 @@ mod tests {
     assert_eq!(
       fleet_retry_completion(true, true).0,
       BackupRunState::Cancelled
+    );
+  }
+
+  #[test]
+  fn fleet_retries_have_a_bounded_exponential_window() {
+    assert_eq!(fleet_retry_delay_seconds(0), Some(2));
+    assert_eq!(fleet_retry_delay_seconds(7), Some(256));
+    assert_eq!(
+      fleet_retry_delay_seconds(MAX_FLEET_RETRY_ATTEMPTS),
+      None
     );
   }
 

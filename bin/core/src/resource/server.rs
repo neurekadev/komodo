@@ -49,6 +49,7 @@ impl super::KomodoResource for Server {
 
   fn creator_specific_permissions() -> IndexSet<SpecificPermission> {
     [
+      SpecificPermission::Backups,
       SpecificPermission::Terminal,
       SpecificPermission::FileManager,
       SpecificPermission::Inspect,
@@ -316,4 +317,17 @@ pub async fn rotate_server_keys(
     .public_key;
   update_server_public_key(&server.id, &public_key).await?;
   Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn server_creators_receive_backup_access() {
+    assert!(
+      <Server as crate::resource::KomodoResource>::creator_specific_permissions()
+        .contains(&SpecificPermission::Backups)
+    );
+  }
 }

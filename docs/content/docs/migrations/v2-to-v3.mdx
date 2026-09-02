@@ -23,6 +23,8 @@ Komodo v3 adds a [File Manager](/features/file-manager) for Stack directories an
 
 Non-admin users need the new `FileManager` specific permission in addition to their base resource level. Read or Execute allows browsing, while Write allows changes on writable targets. Existing grants do not gain `FileManager` automatically; update the relevant users or groups. New Server and Stack creators receive it with their creator permissions.
 
+The encrypted backup feature likewise requires the new `Backups` specific permission on Servers and Stacks. Existing grants are not broadened automatically; update users and groups that should browse or operate backups. New Server and Stack creators receive `Backups` with their creator permissions.
+
 ## Migrate to Komodo v3
 
 The v3 templates share the Compose volume `komodo_data` between Core and Periphery at `/data`. Existing MongoDB or FerretDB database volumes keep their v2 names.

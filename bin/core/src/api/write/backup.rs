@@ -30,6 +30,29 @@ fn require_admin(
   }
 }
 
+fn stack_recovery_requested(
+  stack_snapshot: bool,
+  explicit_recovery: bool,
+  snapshot_server: Option<&str>,
+  current_server: Option<&str>,
+  destination_server: Option<&str>,
+) -> bool {
+  stack_snapshot
+    && (explicit_recovery
+      || current_server != snapshot_server
+      || destination_server.is_some_and(|destination| {
+        Some(destination) != snapshot_server
+      }))
+}
+
+fn destination_backup_permission_required(
+  source_server: Option<&str>,
+  destination_server: &str,
+  recovering_stack: bool,
+) -> bool {
+  recovering_stack || source_server != Some(destination_server)
+}
+
 impl Resolve<WriteArgs> for UpdateBackupSettings {
   async fn resolve(
     self,
@@ -102,32 +125,90 @@ impl Resolve<WriteArgs> for PlanBackupRestore {
     };
     let destination_server =
       self.destination_server_id.clone().or_else(|| {
-        current_stack_server.or_else(|| source_server.clone())
+        current_stack_server
+          .clone()
+          .or_else(|| source_server.clone())
       });
-    if let Some(destination) = destination_server {
-      if source_server.as_deref() != Some(destination.as_str()) {
-        crate::backup::authorize_target(
-          &komodo_client::entities::backup::BackupTarget::Volume {
-            server_id: destination,
-            volume_name: String::new(),
-          },
-          user,
-          PermissionLevel::Execute,
+    let recovering_stack = stack_recovery_requested(
+      matches!(
+        &snapshot.target,
+        komodo_client::entities::backup::BackupTarget::Stack { .. }
+      ),
+      self
+        .recovered_stack_name
+        .as_deref()
+        .is_some_and(|name| !name.trim().is_empty()),
+      source_server.as_deref(),
+      current_stack_server.as_deref(),
+      destination_server.as_deref(),
+    );
+    if let Some(destination) = destination_server
+      && destination_backup_permission_required(
+        source_server.as_deref(),
+        &destination,
+        recovering_stack,
+      )
+    {
+      crate::backup::authorize_target(
+        &komodo_client::entities::backup::BackupTarget::Volume {
+          server_id: destination,
+          volume_name: String::new(),
+        },
+        user,
+        PermissionLevel::Execute,
+      )
+      .await?;
+    }
+    if recovering_stack
+      && !<Stack as KomodoResource>::user_can_create(user)
+    {
+      return Err(
+        anyhow!(
+          "Recovered Stack creation requires Stack-create permission"
         )
-        .await?;
-        if matches!(
-          snapshot.target,
-          komodo_client::entities::backup::BackupTarget::Stack { .. }
-        ) && !<Stack as KomodoResource>::user_can_create(user)
-        {
-          return Err(anyhow!(
-            "Cross-node stack restore requires Stack-create permission"
-          )
-          .status_code(StatusCode::FORBIDDEN));
-        }
-      }
+        .status_code(StatusCode::FORBIDDEN),
+      );
     }
     Ok(crate::backup::plan_restore(snapshot, user, self).await?)
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn moved_stack_recovery_requires_destination_authorization() {
+    let recovering = stack_recovery_requested(
+      true,
+      false,
+      Some("snapshot-server"),
+      Some("current-server"),
+      Some("snapshot-server"),
+    );
+    assert!(recovering);
+    assert!(destination_backup_permission_required(
+      Some("snapshot-server"),
+      "snapshot-server",
+      recovering,
+    ));
+  }
+
+  #[test]
+  fn in_place_stack_restore_does_not_add_server_authorization() {
+    let recovering = stack_recovery_requested(
+      true,
+      false,
+      Some("server"),
+      Some("server"),
+      Some("server"),
+    );
+    assert!(!recovering);
+    assert!(!destination_backup_permission_required(
+      Some("server"),
+      "server",
+      recovering,
+    ));
   }
 }
 
