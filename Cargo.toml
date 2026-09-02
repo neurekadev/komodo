@@ -1,14 +1,14 @@
 [workspace]
 resolver = "2"
 members = [
-	"bin/cli",
-	"bin/core",
-	"bin/periphery",
+	"bin/*",
 	"lib/*",
 	"xtask",
 	"client/core/rs",
 	"client/periphery/rs",
 ]
+# Shell tests are not Cargo workspace members.
+exclude = ["bin/tests"]
 
 [workspace.package]
 version = "0.0.0"

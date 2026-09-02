@@ -2,6 +2,11 @@ name: CI
 
 on:
   workflow_dispatch:
+    inputs:
+      build-images:
+        description: Build all container images without publishing.
+        type: boolean
+        default: false
   push:
     branches: [main]
     tags: ["[0-9]*.[0-9]*.[0-9]*"]
@@ -100,6 +105,120 @@ jobs:
             fi
             docker compose -p komodo --project-directory "$directory" config --quiet
           done
+
+  verify-platforms:
+    name: Build ${{ matrix.name }}
+    if: github.event_name == 'workflow_dispatch' && inputs.build-images
+    needs:
+      - lint
+      - unit-tests
+      - build
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Core AMD64
+            component: core
+            cache: true
+            description: Komodo Core
+            context: .
+            dockerfile: bin/core/aio.Dockerfile
+            arch: amd64
+            runner: ubuntu-24.04
+            platform: linux/amd64
+          - name: Core ARM64
+            component: core
+            cache: true
+            description: Komodo Core
+            context: .
+            dockerfile: bin/core/aio.Dockerfile
+            arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+          - name: Periphery AMD64
+            component: periphery
+            cache: false
+            description: Komodo Periphery
+            context: .
+            dockerfile: bin/periphery/aio.Dockerfile
+            arch: amd64
+            runner: ubuntu-24.04
+            platform: linux/amd64
+          - name: Periphery ARM64
+            component: periphery
+            cache: false
+            description: Komodo Periphery
+            context: .
+            dockerfile: bin/periphery/aio.Dockerfile
+            arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+          - name: CLI AMD64
+            component: cli
+            cache: false
+            description: Komodo CLI
+            context: .
+            dockerfile: bin/cli/aio.Dockerfile
+            arch: amd64
+            runner: ubuntu-24.04
+            platform: linux/amd64
+          - name: CLI ARM64
+            component: cli
+            cache: false
+            description: Komodo CLI
+            context: .
+            dockerfile: bin/cli/aio.Dockerfile
+            arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+          - name: Docs AMD64
+            component: docs
+            cache: false
+            description: Komodo Documentation
+            context: docs
+            dockerfile: docs/Dockerfile
+            arch: amd64
+            runner: ubuntu-24.04
+            platform: linux/amd64
+          - name: Docs ARM64
+            component: docs
+            cache: false
+            description: Komodo Documentation
+            context: docs
+            dockerfile: docs/Dockerfile
+            arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+
+    steps:
+      - name: Check Out Repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set Up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build Platform Image
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          build-args: |
+            GIT_TAG=dev
+            GIT_HASH=${{ github.sha }}
+          platforms: ${{ matrix.platform }}
+          push: false
+          provenance: false
+          sbom: false
+          cache-from: |
+            ${{ matrix.cache && format('type=gha,scope=ci-{0}-{1}', matrix.component, matrix.arch) || '' }}
+            ${{ matrix.cache && format('type=gha,scope={0}-{1}', matrix.component, matrix.arch) || '' }}
+          cache-to: ${{ matrix.cache && format('type=gha,scope=ci-{0}-{1},mode=max,ignore-error=true', matrix.component, matrix.arch) || '' }}
 
   publish-platforms:
     name: Publish ${{ matrix.name }}
