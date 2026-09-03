@@ -49,10 +49,12 @@ use komodo_client::{
 };
 use periphery_client::api::backup::{
   BackupSourceFilters, CancelVykarOperation, DiscoverBackupSource,
-  FinalizeVykarRestore, PeripheryBackupTarget, PreflightVykarRestore,
+  FinalizeVykarRestore, GetBackupVolumeInventory,
+  PeripheryBackupTarget, PreflightVykarRestore,
   PreflightVykarRestoreResponse, ProtectedRepositoryPath,
   RunVykarBackup, RunVykarBackupBatch, TransactionalVykarRestore,
-  VykarBackupTask, VykarRetainedSnapshot,
+  VykarBackupRepositoryResult, VykarBackupTask,
+  VykarRetainedSnapshot,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -2225,9 +2227,58 @@ fn snapshot_tree_slots() -> &'static Arc<tokio::sync::Semaphore> {
 
 pub async fn run_backup(
   target: Option<BackupTarget>,
+  user: &User,
 ) -> anyhow::Result<BackupRun> {
-  let _operation = backup_operation_lock().lock().await;
+  // Write requests are detached from their HTTP connection. Never let manual
+  // requests accumulate invisible work before a run ID can be cancelled.
+  let _operation = admit_manual_backup(backup_operation_lock())?;
+  let user = crate::helpers::query::get_user(&user.id).await?;
+  authorize_manual_backup(target.as_ref(), &user).await?;
+  if active_backup_run().await?.is_some() {
+    return Err(anyhow!(
+      "A backup run or its retries are still active; retry after it finishes"
+    ));
+  }
   run_backup_locked(target).await
+}
+
+fn admit_manual_backup(
+  operation: &tokio::sync::Mutex<()>,
+) -> anyhow::Result<tokio::sync::MutexGuard<'_, ()>> {
+  operation.try_lock().context(
+    "Another backup operation is active; this manual request was not queued. Retry after it finishes",
+  )
+}
+
+async fn authorize_manual_backup(
+  target: Option<&BackupTarget>,
+  user: &User,
+) -> anyhow::Result<()> {
+  if !user.enabled {
+    return Err(anyhow!("User is no longer enabled"));
+  }
+  if let Some(target) = target {
+    authorize_target(target, user, PermissionLevel::Execute).await
+  } else if user.admin {
+    Ok(())
+  } else {
+    Err(anyhow!("Fleet backup operations are admin only"))
+  }
+}
+
+async fn active_backup_run() -> anyhow::Result<Option<BackupRun>> {
+  Ok(
+    runs_collection()
+      .find_one(doc! {
+        "state": {
+          "$in": [
+            to_bson(&BackupRunState::Queued)?,
+            to_bson(&BackupRunState::Running)?,
+          ]
+        }
+      })
+      .await?,
+  )
 }
 
 async fn run_backup_locked(
@@ -2319,17 +2370,7 @@ async fn run_scheduled_backup() -> anyhow::Result<Option<BackupRun>> {
     );
     return Ok(None);
   };
-  let active = runs_collection()
-    .find_one(doc! {
-      "state": {
-        "$in": [
-          to_bson(&BackupRunState::Queued)?,
-          to_bson(&BackupRunState::Running)?,
-        ]
-      }
-    })
-    .await?;
-  if let Some(active) = active {
+  if let Some(active) = active_backup_run().await? {
     tracing::info!(
       run_id = active.id,
       "Skipping scheduled fleet backup because an earlier run is still active"
@@ -2588,6 +2629,23 @@ fn volume_is_backup_eligible(
     && (include_anonymous_volumes || !volume.anonymous)
 }
 
+async fn backup_volume_inventory(
+  server: &Server,
+) -> anyhow::Result<Vec<VolumeListItem>> {
+  let client = tokio::time::timeout(
+    std::time::Duration::from_secs(10),
+    periphery_client(server),
+  )
+  .await
+  .context("Backup discovery connection exceeded 10 seconds")??;
+  client
+    .request_with_timeout(
+      GetBackupVolumeInventory {},
+      std::time::Duration::from_secs(65),
+    )
+    .await
+}
+
 async fn run_fleet(
   settings: &BackupSettings,
   run: &BackupRun,
@@ -2696,57 +2754,43 @@ async fn run_fleet(
       if !server.config.enabled {
         continue;
       }
-      let client = match periphery_client(&server).await {
-        Ok(client) => client,
+      ensure_not_cancelled(&run.id)?;
+      let volumes = backup_volume_inventory(&server).await;
+      let volumes = match volumes {
+        Ok(volumes) => volumes,
         Err(error) => {
           warn!(
-            "Backup discovery could not connect to {}: {error:#}",
+            "Backup discovery failed on {}: {error:#}",
             server.name
           );
           partial = true;
           discovery_retry_servers.insert(server.id.clone());
+          targets.extend(
+            settings
+              .volume_selection
+              .volumes
+              .iter()
+              .filter(|volume| volume.server_id == server.id)
+              .cloned()
+              .map(
+                |BackupVolumeTarget {
+                   server_id,
+                   volume_name,
+                 }| BackupTarget::Volume {
+                  server_id,
+                  volume_name,
+                },
+              ),
+          );
           continue;
         }
       };
-      let poll = client
-        .request(periphery_client::api::poll::PollStatus {
-          include_stats: false,
-          include_docker: true,
-        })
-        .await;
-      let Ok(poll) = poll else {
-        partial = true;
-        discovery_retry_servers.insert(server.id.clone());
-        targets.extend(
-          settings
-            .volume_selection
-            .volumes
-            .iter()
-            .filter(|volume| volume.server_id == server.id)
-            .cloned()
-            .map(
-              |BackupVolumeTarget {
-                 server_id,
-                 volume_name,
-               }| BackupTarget::Volume {
-                server_id,
-                volume_name,
-              },
-            ),
-        );
-        continue;
-      };
-      for volume in poll
-        .docker
-        .into_iter()
-        .flat_map(|docker| docker.volumes)
-        .filter(|volume| {
-          volume_is_backup_eligible(
-            volume,
-            settings.include_anonymous_volumes,
-          )
-        })
-      {
+      for volume in volumes.into_iter().filter(|volume| {
+        volume_is_backup_eligible(
+          volume,
+          settings.include_anonymous_volumes,
+        )
+      }) {
         let identity = BackupVolumeTarget {
           server_id: server.id.clone(),
           volume_name: volume.name,
@@ -3224,24 +3268,13 @@ async fn refresh_node_targets(
     return Ok(targets.into_iter().collect());
   }
   let server = resource::get::<Server>(server_id).await?;
-  let poll = periphery_client(&server)
-    .await?
-    .request(periphery_client::api::poll::PollStatus {
-      include_stats: false,
-      include_docker: true,
-    })
-    .await?;
-  for volume in poll
-    .docker
-    .into_iter()
-    .flat_map(|docker| docker.volumes)
-    .filter(|volume| {
-      volume_is_backup_eligible(
-        volume,
-        settings.include_anonymous_volumes,
-      )
-    })
-  {
+  let volumes = backup_volume_inventory(&server).await?;
+  for volume in volumes.into_iter().filter(|volume| {
+    volume_is_backup_eligible(
+      volume,
+      settings.include_anonymous_volumes,
+    )
+  }) {
     let identity = BackupVolumeTarget {
       server_id: server_id.to_string(),
       volume_name: volume.name,
@@ -3597,6 +3630,13 @@ async fn run_node_batch(
       || result.mirror.as_ref().is_some_and(|mirror| {
         mirror.complete && mirror.error.is_none()
       });
+    let retain_primary =
+      repository_attempt_is_retained(&result.primary);
+    let retain_mirror = mirror_configured
+      && result
+        .mirror
+        .as_ref()
+        .is_some_and(repository_attempt_is_retained);
     migrate_legacy_retained_snapshots(&mut task, mirror_configured);
     if primary_complete {
       retire_retained_repository_copies(
@@ -3605,7 +3645,7 @@ async fn run_node_batch(
         true,
       )
       .await;
-    } else {
+    } else if !retain_primary {
       delete_node_snapshot_copies(
         settings,
         task.snapshot_name.clone(),
@@ -3622,7 +3662,7 @@ async fn run_node_batch(
           false,
         )
         .await;
-      } else {
+      } else if !retain_mirror {
         delete_node_snapshot_copies(
           settings,
           task.snapshot_name.clone(),
@@ -3632,11 +3672,11 @@ async fn run_node_batch(
         .await;
       }
     }
-    if primary_complete || mirror_configured && mirror_complete {
+    if retain_primary || retain_mirror {
       task.retained_snapshots.push(VykarRetainedSnapshot {
         snapshot_name: task.snapshot_name.clone(),
-        retain_primary: primary_complete,
-        retain_mirror: mirror_configured && mirror_complete,
+        retain_primary,
+        retain_mirror,
       });
     }
     if !(primary_complete && mirror_complete) {
@@ -3666,6 +3706,15 @@ async fn run_node_batch(
     retry_tasks,
     retry_blocked: !response.restart_errors.is_empty(),
   })
+}
+
+fn repository_attempt_is_retained(
+  result: &VykarBackupRepositoryResult,
+) -> bool {
+  // A committed partial snapshot is diagnostic evidence, not an absent/failed
+  // write. Keep it (and any older complete copy) until complete replacement or
+  // normal retention. Partial data must never count as a complete backup.
+  result.partial || result.complete && result.error.is_none()
 }
 
 async fn run_target(
@@ -6614,6 +6663,68 @@ pub fn spawn_scheduler() {
 mod tests {
   use super::*;
 
+  #[test]
+  fn manual_backup_admission_rejects_busy_requests_without_queueing()
+  {
+    let operation = tokio::sync::Mutex::new(());
+    let running = admit_manual_backup(&operation).unwrap();
+    for _ in 0..64 {
+      let error = admit_manual_backup(&operation).unwrap_err();
+      assert!(error.to_string().contains("not queued"));
+    }
+    drop(running);
+    assert!(admit_manual_backup(&operation).is_ok());
+  }
+
+  #[tokio::test]
+  async fn manual_backups_do_not_jump_a_waiting_serialized_operation()
+  {
+    use futures_util::FutureExt;
+
+    let operation = tokio::sync::Mutex::new(());
+    let running = operation.lock().await;
+    let next_operation = operation.lock();
+    tokio::pin!(next_operation);
+    assert!(next_operation.as_mut().now_or_never().is_none());
+    drop(running);
+    assert!(admit_manual_backup(&operation).is_err());
+    let next_operation = next_operation.await;
+    assert!(admit_manual_backup(&operation).is_err());
+    drop(next_operation);
+    assert!(admit_manual_backup(&operation).is_ok());
+  }
+
+  #[tokio::test]
+  async fn manual_backup_authorization_rejects_disabled_or_demoted_admins()
+   {
+    let mut user = User {
+      enabled: true,
+      admin: true,
+      ..Default::default()
+    };
+    assert!(authorize_manual_backup(None, &user).await.is_ok());
+    assert!(
+      authorize_manual_backup(Some(&BackupTarget::Core), &user)
+        .await
+        .is_ok()
+    );
+    user.enabled = false;
+    assert!(authorize_manual_backup(None, &user).await.is_err());
+    assert!(
+      authorize_manual_backup(Some(&BackupTarget::Core), &user)
+        .await
+        .is_err()
+    );
+    user.enabled = true;
+    user.admin = false;
+    assert!(authorize_manual_backup(None, &user).await.is_err());
+    assert!(
+      authorize_manual_backup(Some(&BackupTarget::Core), &user)
+        .await
+        .is_err()
+    );
+  }
+
   #[tokio::test]
   async fn committed_recovery_remains_complete_when_audit_steps_fail()
   {
@@ -7851,5 +7962,48 @@ mod tests {
     );
     assert_eq!(retained.len(), 1);
     assert_eq!(retained[0].snapshot_name, "attempt-b");
+  }
+
+  #[test]
+  fn committed_partial_attempts_are_preserved_without_becoming_complete()
+   {
+    let partial = VykarBackupRepositoryResult {
+      partial: true,
+      ..Default::default()
+    };
+    assert!(!partial.complete);
+    assert!(repository_attempt_is_retained(&partial));
+    assert!(!repository_attempt_is_retained(
+      &VykarBackupRepositoryResult::default()
+    ));
+    assert!(!repository_attempt_is_retained(
+      &VykarBackupRepositoryResult {
+        complete: true,
+        error: Some("failed write".into()),
+        ..Default::default()
+      }
+    ));
+    assert!(repository_attempt_is_retained(
+      &VykarBackupRepositoryResult {
+        complete: true,
+        ..Default::default()
+      }
+    ));
+    let mut retained = vec![VykarRetainedSnapshot {
+      snapshot_name: "diagnostic-partial".into(),
+      retain_primary: repository_attempt_is_retained(&partial),
+      retain_mirror: true,
+    }];
+    assert_eq!(
+      take_retained_repository_copies(&mut retained, true),
+      vec!["diagnostic-partial".to_string()]
+    );
+    assert_eq!(retained.len(), 1);
+    assert!(retained[0].retain_mirror);
+    assert_eq!(
+      take_retained_repository_copies(&mut retained, false),
+      vec!["diagnostic-partial".to_string()]
+    );
+    assert!(retained.is_empty());
   }
 }

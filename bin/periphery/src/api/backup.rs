@@ -20,7 +20,7 @@ use komodo_client::entities::{
   backup::BackupRestorePathSummary,
   docker::{
     container::{ContainerListItem, ContainerStateStatusEnum},
-    volume::{VolumeScopeEnum, is_anonymous_volume},
+    volume::{VolumeListItem, VolumeScopeEnum, is_anonymous_volume},
   },
 };
 use mogh_resolver::Resolve;
@@ -42,6 +42,55 @@ const MAX_RESTORE_PREVIEW_ROWS: usize = 10_000;
 const MAX_RESTORE_PREVIEW_BYTES: usize = 1024 * 1024;
 const MAX_RESTORE_PREVIEW_DEPTH: usize =
   komodo_backup::MAX_RESTORE_PATH_DEPTH;
+
+fn backup_inventory_slots() -> &'static Arc<tokio::sync::Semaphore> {
+  static SLOTS: OnceLock<Arc<tokio::sync::Semaphore>> =
+    OnceLock::new();
+  SLOTS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
+}
+
+async fn bounded_backup_inventory<T>(
+  slots: &Arc<tokio::sync::Semaphore>,
+  timeout: Duration,
+  work: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+  let _permit = slots.clone().try_acquire_owned().context(
+    "Backup Docker inventory is already running; retry after it finishes",
+  )?;
+  // These are read-only async Docker queries, with no spawned filesystem work.
+  // Dropping the future on expiry cancels the queries before releasing the slot.
+  tokio::time::timeout(timeout, work)
+    .await
+    .context("Backup Docker inventory exceeded its deadline")?
+}
+
+impl Resolve<Args> for GetBackupVolumeInventory {
+  async fn resolve(
+    self,
+    _: &Args,
+  ) -> anyhow::Result<Vec<VolumeListItem>> {
+    bounded_backup_inventory(
+      backup_inventory_slots(),
+      Duration::from_secs(60),
+      async {
+        let docker_guard = docker_client().load();
+        let client = docker_guard
+          .as_ref()
+          .as_ref()
+          .context("Docker is not connected")?;
+        let containers = client
+          .list_containers()
+          .await
+          .context("Backup container inventory failed")?;
+        client
+          .list_volumes(&containers)
+          .await
+          .context("Backup volume inventory failed")
+      },
+    )
+    .await
+  }
+}
 
 fn preflight_slots() -> &'static Arc<tokio::sync::Semaphore> {
   static SLOTS: OnceLock<Arc<tokio::sync::Semaphore>> =
@@ -3995,6 +4044,72 @@ impl Resolve<Args> for CancelVykarOperation {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[tokio::test]
+  async fn backup_inventory_distinguishes_empty_success_from_docker_errors()
+   {
+    let slots = Arc::new(tokio::sync::Semaphore::new(1));
+    let empty = bounded_backup_inventory(
+      &slots,
+      Duration::from_secs(60),
+      async { Ok(Vec::<VolumeListItem>::new()) },
+    )
+    .await
+    .unwrap();
+    assert!(empty.is_empty());
+    for message in [
+      "Docker is not connected",
+      "Backup container inventory failed",
+      "Backup volume inventory failed",
+    ] {
+      let error = bounded_backup_inventory::<Vec<VolumeListItem>>(
+        &slots,
+        Duration::from_secs(60),
+        async { Err(anyhow!(message)) },
+      )
+      .await
+      .unwrap_err();
+      assert_eq!(error.to_string(), message);
+      assert_eq!(slots.available_permits(), 1);
+    }
+  }
+
+  #[tokio::test]
+  async fn backup_inventory_refuses_overlaps_and_releases_expired_work()
+   {
+    use futures_util::FutureExt;
+
+    let slots = Arc::new(tokio::sync::Semaphore::new(1));
+    let work = bounded_backup_inventory(
+      &slots,
+      Duration::from_secs(60),
+      std::future::pending::<anyhow::Result<()>>(),
+    );
+    tokio::pin!(work);
+    assert!(work.as_mut().now_or_never().is_none());
+    assert_eq!(slots.available_permits(), 0);
+    let polled = AtomicBool::new(false);
+    let refused =
+      bounded_backup_inventory(&slots, Duration::ZERO, async {
+        polled.store(true, Ordering::SeqCst);
+        Ok(())
+      })
+      .await;
+    assert!(
+      refused.unwrap_err().to_string().contains("already running")
+    );
+    assert!(!polled.load(Ordering::SeqCst));
+
+    let slots = Arc::new(tokio::sync::Semaphore::new(1));
+    let expired = bounded_backup_inventory(
+      &slots,
+      Duration::ZERO,
+      std::future::pending::<anyhow::Result<()>>(),
+    )
+    .await;
+    assert!(expired.unwrap_err().to_string().contains("deadline"));
+    assert_eq!(slots.available_permits(), 1);
+  }
 
   #[test]
   fn pending_journals_gate_new_work_until_recovery_removes_them() {

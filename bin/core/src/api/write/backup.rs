@@ -78,17 +78,7 @@ impl Resolve<WriteArgs> for RunBackup {
     self,
     WriteArgs { user }: &WriteArgs,
   ) -> mogh_error::Result<BackupRun> {
-    if let Some(target) = &self.target {
-      crate::backup::authorize_target(
-        target,
-        user,
-        PermissionLevel::Execute,
-      )
-      .await?;
-    } else {
-      require_admin(user)?;
-    }
-    Ok(crate::backup::run_backup(self.target).await?)
+    Ok(crate::backup::run_backup(self.target, user).await?)
   }
 }
 

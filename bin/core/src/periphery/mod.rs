@@ -95,7 +95,27 @@ impl PeripheryClient {
         || format!("No connection found for server {}", self.id),
       )?;
 
-    self.request_on_connection(connection, request).await
+    self.request_on_connection(connection, request, None).await
+  }
+
+  /// Bound read-only requests even while the worker continues sending pings.
+  /// Timed-out mutating requests need a separate worker-lifetime protocol.
+  pub async fn request_with_timeout<T>(
+    &self,
+    request: T,
+    timeout: Duration,
+  ) -> anyhow::Result<T::Response>
+  where
+    T: std::fmt::Debug + Serialize + HasResponse,
+    T::Response: DeserializeOwned,
+  {
+    let connection =
+      periphery_connections().get(&self.id).await.with_context(
+        || format!("No connection found for server {}", self.id),
+      )?;
+    self
+      .request_on_connection(connection, request, Some(timeout))
+      .await
   }
 
   /// Validate and retain the exact connection used to send capabilities.
@@ -118,21 +138,19 @@ impl PeripheryClient {
         "Backup worker connection changed; verify its enrolled identity and retry"
       ));
     }
-    self.request_on_connection(connection, request).await
+    self.request_on_connection(connection, request, None).await
   }
 
   async fn request_on_connection<T>(
     &self,
     connection: Arc<PeripheryConnection>,
     request: T,
+    timeout: Option<Duration>,
   ) -> anyhow::Result<T::Response>
   where
     T: std::fmt::Debug + Serialize + HasResponse,
     T::Response: DeserializeOwned,
   {
-    // Polls connected 3 times before bailing
-    connection.bail_if_not_connected().await?;
-
     let channel_id = Uuid::new_v4();
     let (response_sender, mut response_receiever) = channel();
     connection
@@ -140,23 +158,21 @@ impl PeripheryClient {
       .insert(channel_id, response_sender)
       .await;
 
-    if let Err(e) = connection
-      .sender
-      .send_request(
-        channel_id,
-        &json!({
-          "type": T::req_type(),
-          "params": request
-        }),
-      )
-      .await
-      .context("Failed to send request over channel")
-    {
-      connection.responses.remove(&channel_id).await;
-      return Err(e);
-    }
+    let work = async {
+      // Include connection readiness and the send in the total deadline.
+      connection.bail_if_not_connected().await?;
+      connection
+        .sender
+        .send_request(
+          channel_id,
+          &json!({
+            "type": T::req_type(),
+            "params": request
+          }),
+        )
+        .await
+        .context("Failed to send request over channel")?;
 
-    let res = async {
       // Poll for the associated response
       loop {
         let message = response_receiever
@@ -175,9 +191,18 @@ impl PeripheryClient {
 
         return message.decode();
       }
-    }
-    .await;
+    };
+    let res = if let Some(timeout) = timeout {
+      tokio::time::timeout(timeout, work)
+        .await
+        .context("Periphery request exceeded its total deadline")
+        .and_then(|result| result)
+    } else {
+      work.await
+    };
 
+    // Also remove timed-out registrations instead of abandoning a response
+    // sender each time a read-only discovery deadline expires.
     connection.responses.remove(&channel_id).await;
 
     res
@@ -188,6 +213,49 @@ impl PeripheryClient {
 mod tests {
   use super::*;
   use komodo_client::entities::server::Server;
+
+  #[tokio::test]
+  async fn read_only_request_deadline_removes_its_response_registration()
+   {
+    use encoding::WithChannel;
+    use periphery_client::transport::TransportMessage;
+
+    let mut server = Server::default();
+    server.id = "inventory-test".into();
+    let (connection, mut outgoing) = PeripheryConnection::new(
+      PeripheryConnectionArgs::from_server(&server),
+    );
+    connection.set_connected(true);
+    let client = PeripheryClient {
+      id: server.id.clone(),
+      responses: connection.responses.clone(),
+    };
+    let error = client
+      .request_on_connection(
+        connection.clone(),
+        api::backup::GetBackupVolumeInventory {},
+        Some(Duration::ZERO),
+      )
+      .await
+      .unwrap_err();
+    assert!(error.to_string().contains("total deadline"));
+    let message = outgoing
+      .recv()
+      .with_timeout(Duration::from_secs(1))
+      .await
+      .unwrap();
+    let TransportMessage::Request(message) =
+      message.decode().unwrap()
+    else {
+      panic!("expected an inventory request")
+    };
+    let WithChannel { channel, .. } = message
+      .decode()
+      .unwrap()
+      .map_decode::<serde_json::Value>()
+      .unwrap();
+    assert!(connection.responses.get(&channel).await.is_none());
+  }
 
   #[test]
   fn pinned_connection_identity_does_not_follow_server_replacement() {

@@ -3,12 +3,20 @@ use komodo_client::entities::{
     BackupAdvancedSettings, BackupRepository,
     BackupRestorePathSummary,
   },
+  docker::volume::VolumeListItem,
   repo::Repo,
   stack::Stack,
 };
 use mogh_resolver::Resolve;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+/// Strict, read-only Docker inventory for backups. Unlike dashboard polling,
+/// missing Docker or failed container/volume lists are errors, never empty lists.
+#[derive(Serialize, Deserialize, Debug, Clone, Resolve)]
+#[response(Vec<VolumeListItem>)]
+#[error(anyhow::Error)]
+pub struct GetBackupVolumeInventory {}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ProtectedRepositoryPath {
@@ -132,9 +140,9 @@ pub struct VykarBackupTask {
   /// replaces once at least one repository commits the new snapshot.
   #[serde(default)]
   pub superseded_snapshot_names: Vec<String>,
-  /// Prior attempts that may still be the newest complete copy for an
-  /// individual repository. Copies are retired independently as that role
-  /// commits a newer attempt.
+  /// Prior attempts that may still be the newest complete or diagnostic partial
+  /// copy for a repository. Copies are retired independently once that role
+  /// commits a complete replacement, or by normal retention after retries end.
   #[serde(default)]
   pub retained_snapshots: Vec<VykarRetainedSnapshot>,
 }

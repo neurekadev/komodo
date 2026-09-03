@@ -61,6 +61,7 @@ pub enum PeripheryRequest {
   ListSecrets(ListSecrets),
 
   // Backup and transactional restore
+  GetBackupVolumeInventory(GetBackupVolumeInventory),
   DiscoverBackupSource(DiscoverBackupSource),
   RunVykarBackup(RunVykarBackup),
   RunVykarBackupBatch(RunVykarBackupBatch),
