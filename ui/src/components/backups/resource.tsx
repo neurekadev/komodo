@@ -169,6 +169,7 @@ export function RestoreSnapshotButton({
   children = "Restore",
 }: RestoreSnapshotButtonProps) {
   const [restoreOpen, setRestoreOpen] = useState(false);
+  const [fullSnapshot, setFullSnapshot] = useState(true);
   const [selectedPaths, setSelectedPaths] = useState<string[]>([]);
   const [destinationServerId, setDestinationServerId] = useState(sourceServerId);
   const [recoveredName, setRecoveredName] = useState("");
@@ -218,6 +219,7 @@ export function RestoreSnapshotButton({
         leftSection={<ICONS.Restart size="1rem" />}
         disabled={!snapshot || snapshot.partial}
         onClick={() => {
+          setFullSnapshot(true);
           setSelectedPaths([]);
           setDestinationServerId(sourceServerId);
           setRecoveredName("");
@@ -312,7 +314,15 @@ export function RestoreSnapshotButton({
               />
             </>
           )}
-          {snapshot && (
+          <Checkbox
+            label="Restore entire snapshot"
+            checked={fullSnapshot}
+            onChange={(event) => {
+              setFullSnapshot(event.currentTarget.checked);
+              setSelectedPaths([]);
+            }}
+          />
+          {snapshot && !fullSnapshot && (
             <SnapshotPicker
               snapshot={snapshot.name}
               selected={selectedPaths}
@@ -320,8 +330,9 @@ export function RestoreSnapshotButton({
             />
           )}
           <Text size="sm" c="dimmed">
-            Select nothing to restore the full snapshot. Selecting folders or
-            files performs an exact restore of only those subtrees.
+            Uncheck Restore entire snapshot to select specific files or folders.
+            Select at least one path. Children of a selected folder are included;
+            deselect that folder first to choose individual children.
           </Text>
           <Group justify="end">
             <Button variant="default" onClick={() => setRestoreOpen(false)}>
@@ -333,6 +344,7 @@ export function RestoreSnapshotButton({
               disabled={
                 !snapshot ||
                 !destinationServerId ||
+                (!fullSnapshot && selectedPaths.length === 0) ||
                 (stackRecovery && !recoveredName) ||
                 (stackRecovery &&
                   requiredStackMappings.some((path) => !bindings[path])) ||
@@ -340,10 +352,11 @@ export function RestoreSnapshotButton({
               }
               onClick={() =>
                 snapshot &&
+                (fullSnapshot || selectedPaths.length > 0) &&
                 createPlan({
                   snapshot: snapshot.name,
                   destination_server_id: destinationServerId,
-                  selected_paths: selectedPaths,
+                  selected_paths: fullSnapshot ? [] : selectedPaths,
                   recovered_stack_name:
                     stackRecovery ? recoveredName : undefined,
                   bind_path_mappings: bindings,
@@ -533,12 +546,9 @@ function SnapshotEntry({
   const descendants = selected.some((path) => isBelow(path, entry.path));
   const checked = exact || ancestor;
   const toggle = () => {
+    if (ancestor) return;
     if (exact) {
       onChange(selected.filter((path) => path !== entry.path && !isBelow(path, entry.path)));
-    } else if (ancestor) {
-      // A parent selection represents the whole subtree. Remove that covering
-      // selection before allowing finer-grained child choices.
-      onChange(selected.filter((path) => !isBelow(entry.path, path)));
     } else {
       onChange([
         ...selected.filter((path) => !isBelow(path, entry.path)),
@@ -563,6 +573,8 @@ function SnapshotEntry({
         )}
         <Checkbox
           checked={checked}
+          disabled={ancestor}
+          title={ancestor ? "Included by a selected parent; deselect the parent first" : undefined}
           indeterminate={!checked && descendants}
           onChange={toggle}
           aria-label={`Select ${entry.path}`}

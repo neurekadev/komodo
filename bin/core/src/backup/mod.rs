@@ -12,7 +12,7 @@ use std::{
 
 use anyhow::{Context, anyhow};
 use database::{
-  bson::{Bson, doc, to_bson, to_document},
+  bson::{Bson, Document, doc, to_bson, to_document},
   mungos::{
     find::find_collect,
     mongodb::{
@@ -40,6 +40,7 @@ use komodo_client::{
     },
     docker::volume::{VolumeListItem, VolumeScopeEnum},
     komodo_timestamp,
+    permission::PermissionLevel,
     repo::Repo,
     server::Server,
     stack::{Stack, StackConfig},
@@ -60,7 +61,7 @@ use uuid::Uuid;
 use crate::{
   config::core_config,
   helpers::{periphery_client, query::id_or_name_filter},
-  permission::get_check_permissions,
+  permission::{get_check_permissions, load_list_permits},
   resource::{self, KomodoResource},
   state::{
     CORE_RECOVERY_ACTIVATION_PATH, db_client,
@@ -1398,52 +1399,66 @@ async fn finish_run(
   Ok(run)
 }
 
-async fn collect_recent_runs<S, F, A>(
-  mut runs: S,
-  mut authorized: F,
-) -> anyhow::Result<Vec<BackupRun>>
-where
-  S: futures_util::Stream<Item = anyhow::Result<BackupRun>> + Unpin,
-  F: FnMut(Option<BackupTarget>) -> A,
-  A: std::future::Future<Output = bool>,
-{
-  let mut recent = Vec::new();
-  while let Some(run) = runs.try_next().await? {
-    if authorized(run.target.clone()).await {
-      recent.push(run);
-      if recent.len() == 20 {
-        break;
-      }
+fn append_backup_history_keys(
+  keys: &mut Vec<String>,
+  id: String,
+  name: String,
+) {
+  keys.push(id);
+  // API requests may store names, but ObjectId-shaped names resolve as IDs.
+  // Including those aliases could disclose another resource's history.
+  if id_or_name_filter(&name).contains_key("name") {
+    keys.push(name);
+  }
+}
+
+async fn readable_backup_history_keys<T: KomodoResource>(
+  user: &User,
+) -> anyhow::Result<Vec<String>> {
+  let mut permits =
+    load_list_permits::<T>(user, PermissionLevel::Read.backups())
+      .await?;
+  let mut resources = T::coll().find(doc! {}).batch_size(100).await?;
+  let mut keys = Vec::new();
+  // Check each current resource once, not once per historical backup run.
+  while let Some(resource) = resources.try_next().await? {
+    if permits.permitted::<T>(&resource).await.unwrap_or(false) {
+      append_backup_history_keys(
+        &mut keys,
+        resource.id,
+        resource.name,
+      );
     }
   }
-  Ok(recent)
+  Ok(keys)
+}
+
+fn backup_history_filter(
+  stack_keys: Vec<String>,
+  server_keys: Vec<String>,
+) -> Document {
+  doc! { "$or": [
+    { "target.type": "Stack", "target.params.stack_id": { "$in": stack_keys } },
+    { "target.type": "Volume", "target.params.server_id": { "$in": server_keys } },
+  ] }
 }
 
 pub async fn status(user: &User) -> anyhow::Result<BackupStatus> {
-  let cursor = runs_collection()
-    .find(doc! {})
+  let history_filter = if user.admin {
+    doc! {}
+  } else {
+    backup_history_filter(
+      readable_backup_history_keys::<Stack>(user).await?,
+      readable_backup_history_keys::<Server>(user).await?,
+    )
+  };
+  let recent_runs = runs_collection()
+    .find(history_filter)
     .sort(doc! { "started_at": -1, "id": -1 })
-    // Non-admins must keep scanning until 20 authorized runs are found.
-    .limit(if user.admin { 20 } else { 0 })
-    .batch_size(100)
+    .limit(20)
+    .await?
+    .try_collect()
     .await?;
-  let recent_runs = collect_recent_runs(
-    cursor.map_err(anyhow::Error::from),
-    |target| async move {
-      if user.admin {
-        return true;
-      }
-      let Some(target) = target else { return false };
-      authorize_target(
-        &target,
-        user,
-        komodo_client::entities::permission::PermissionLevel::Read,
-      )
-      .await
-      .is_ok()
-    },
-  )
-  .await?;
   let active_runs = find_collect(
     &runs_collection(),
     doc! {
@@ -7393,42 +7408,65 @@ mod tests {
     ));
   }
 
-  #[tokio::test]
-  async fn recent_history_limits_authorized_runs_not_global_runs() {
-    let runs = (0..65).map(|index| {
-      Ok(BackupRun {
-        id: index.to_string(),
-        target: if index < 25 {
-          None
-        } else {
-          Some(BackupTarget::Stack {
-            stack_id: if index < 30 { "other" } else { "mine" }
-              .into(),
-          })
-        },
-        ..Default::default()
-      })
-    });
-    let recent = collect_recent_runs(futures_util::stream::iter(runs), |target| async move {
-      matches!(target, Some(BackupTarget::Stack { stack_id }) if stack_id == "mine")
-    }).await.unwrap();
-    assert_eq!(recent.len(), 20);
-    assert_eq!(recent.first().unwrap().id, "30");
-    assert_eq!(recent.last().unwrap().id, "49");
-    let admin = collect_recent_runs(
-      futures_util::stream::iter((0..30).map(|index| {
-        Ok(BackupRun {
-          id: index.to_string(),
-          ..Default::default()
-        })
-      })),
-      |_| async { true },
-    )
-    .await
+  #[test]
+  fn backup_history_query_scopes_targets_before_limiting() {
+    let filter = backup_history_filter(
+      vec!["stack".into()],
+      vec!["server".into()],
+    );
+    assert_eq!(
+      filter,
+      doc! { "$or": [
+        { "target.type": "Stack", "target.params.stack_id": { "$in": ["stack"] } },
+        { "target.type": "Volume", "target.params.server_id": { "$in": ["server"] } },
+      ] }
+    );
+    let empty = backup_history_filter(Vec::new(), Vec::new());
+    for arm in empty.get_array("$or").unwrap() {
+      let arm = arm.as_document().unwrap();
+      let field = if arm.get_str("target.type").unwrap() == "Stack" {
+        "target.params.stack_id"
+      } else {
+        "target.params.server_id"
+      };
+      assert!(
+        arm
+          .get_document(field)
+          .unwrap()
+          .get_array("$in")
+          .unwrap()
+          .is_empty()
+      );
+    }
+    let target = to_document(&BackupTarget::Stack {
+      stack_id: "stack".into(),
+    })
     .unwrap();
-    assert_eq!(admin.len(), 20);
-    assert_eq!(admin.first().unwrap().id, "0");
-    assert_eq!(admin.last().unwrap().id, "19");
+    assert_eq!(target.get_str("type").unwrap(), "Stack");
+    assert_eq!(
+      target
+        .get_document("params")
+        .unwrap()
+        .get_str("stack_id")
+        .unwrap(),
+      "stack"
+    );
+  }
+
+  #[test]
+  fn backup_history_names_cannot_alias_another_resource_id() {
+    let mut keys = Vec::new();
+    append_backup_history_keys(
+      &mut keys,
+      "mine".into(),
+      "my-stack".into(),
+    );
+    append_backup_history_keys(
+      &mut keys,
+      "also-mine".into(),
+      "0123456789abcdef01234567".into(),
+    );
+    assert_eq!(keys, ["mine", "my-stack", "also-mine"]);
   }
 
   #[tokio::test]
