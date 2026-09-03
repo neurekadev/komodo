@@ -445,6 +445,20 @@ pub struct BackupSnapshotItem {
   pub has_children: bool,
 }
 
+/// Counts and digest of every changed path, including rows omitted from display.
+#[typeshare]
+#[derive(
+  Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize,
+)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+pub struct BackupRestorePathSummary {
+  pub created: u32,
+  pub overwritten: u32,
+  pub deleted: u32,
+  /// SHA-256 of the complete, sorted path sets and their change categories.
+  pub sha256: String,
+}
+
 #[typeshare]
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
@@ -457,6 +471,9 @@ pub struct BackupRestorePlan {
   pub created_paths: Vec<String>,
   pub overwritten_paths: Vec<String>,
   pub deleted_paths: Vec<String>,
+  /// Complete change-set confirmation; the path lists are bounded samples.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub path_summary: Option<BackupRestorePathSummary>,
   pub containers_to_stop: Vec<String>,
   pub expires_at: I64,
 }

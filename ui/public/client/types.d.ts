@@ -6130,6 +6130,14 @@ export type BackupTarget = {
         source_label: string;
     };
 };
+/** Counts and digest of every changed path, including rows omitted from display. */
+export interface BackupRestorePathSummary {
+    created: number;
+    overwritten: number;
+    deleted: number;
+    /** SHA-256 of the complete, sorted path sets and their change categories. */
+    sha256: string;
+}
 export interface BackupRestorePlan {
     id: string;
     snapshot: string;
@@ -6139,6 +6147,8 @@ export interface BackupRestorePlan {
     created_paths: string[];
     overwritten_paths: string[];
     deleted_paths: string[];
+    /** Complete change-set confirmation; the path lists are bounded samples. */
+    path_summary?: BackupRestorePathSummary;
     containers_to_stop: string[];
     expires_at: I64;
 }

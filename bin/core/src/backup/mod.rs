@@ -4514,6 +4514,7 @@ pub async fn plan_restore(
     created_paths: preflight.created_paths,
     overwritten_paths: preflight.overwritten_paths,
     deleted_paths: preflight.deleted_paths,
+    path_summary: preflight.path_summary,
     containers_to_stop: preflight.containers_to_stop,
     expires_at: komodo_timestamp() + 15 * 60 * 1000,
   };
@@ -4648,6 +4649,7 @@ fn same_restore_preview(
   }
 
   stored.destination_exists == current.destination_exists
+    && stored.plan.path_summary == current.path_summary
     && same_strings(
       &stored.plan.created_paths,
       &current.created_paths,
@@ -7149,6 +7151,16 @@ mod tests {
       ..Default::default()
     };
     assert!(same_restore_preview(&stored, &current));
+    // Older plans without a complete digest cannot approve sampled previews.
+    current.path_summary = Some(Default::default());
+    assert!(!same_restore_preview(&stored, &current));
+    let mut summarized = stored.clone();
+    summarized.plan.path_summary = current.path_summary.clone();
+    assert!(same_restore_preview(&summarized, &current));
+    current.path_summary.as_mut().unwrap().sha256 =
+      "changed-unlisted-path".into();
+    assert!(!same_restore_preview(&summarized, &current));
+    current.path_summary = None;
     current.deleted_paths.push("/unexpected".into());
     assert!(!same_restore_preview(&stored, &current));
   }

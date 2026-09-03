@@ -1,5 +1,8 @@
 use komodo_client::entities::{
-  backup::{BackupAdvancedSettings, BackupRepository},
+  backup::{
+    BackupAdvancedSettings, BackupRepository,
+    BackupRestorePathSummary,
+  },
   repo::Repo,
   stack::Stack,
 };
@@ -256,6 +259,9 @@ pub struct PreflightVykarRestoreResponse {
   pub created_paths: Vec<String>,
   pub overwritten_paths: Vec<String>,
   pub deleted_paths: Vec<String>,
+  /// Complete change-set confirmation; the path lists are bounded samples.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub path_summary: Option<BackupRestorePathSummary>,
   pub containers_to_stop: Vec<String>,
 }
 
@@ -269,6 +275,7 @@ impl PreflightVykarRestoreResponse {
       left == right
     }
     self.destination_exists == other.destination_exists
+      && self.path_summary == other.path_summary
       && same(&self.created_paths, &other.created_paths)
       && same(&self.overwritten_paths, &other.overwritten_paths)
       && same(&self.deleted_paths, &other.deleted_paths)

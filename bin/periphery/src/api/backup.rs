@@ -16,9 +16,12 @@ use command::{CommandOptions, run_komodo_standard_command};
 use komodo_backup::{
   VykarPatternMatcher, VykarRepository, backup_manifest_source_name,
 };
-use komodo_client::entities::docker::{
-  container::{ContainerListItem, ContainerStateStatusEnum},
-  volume::{VolumeScopeEnum, is_anonymous_volume},
+use komodo_client::entities::{
+  backup::BackupRestorePathSummary,
+  docker::{
+    container::{ContainerListItem, ContainerStateStatusEnum},
+    volume::{VolumeScopeEnum, is_anonymous_volume},
+  },
 };
 use mogh_resolver::Resolve;
 use periphery_client::api::backup::*;
@@ -46,39 +49,63 @@ fn preflight_slots() -> &'static Arc<tokio::sync::Semaphore> {
   SLOTS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
 }
 
-struct RestorePreviewBudget {
-  inventory: komodo_backup::RestoreInventoryBudget,
-  rows: usize,
-  path_bytes: usize,
-}
-
-impl RestorePreviewBudget {
-  fn new(deadline: Instant) -> Self {
-    Self {
-      inventory: komodo_backup::RestoreInventoryBudget::new(deadline),
-      rows: 0,
-      path_bytes: 0,
+/// Inventory collection is bounded separately. Hash every classified path
+/// before limiting the display, so a full recovered Stack can be confirmed
+/// without losing changes beyond the first page from execution revalidation.
+fn bounded_restore_preview(
+  mut created_paths: Vec<String>,
+  mut overwritten_paths: Vec<String>,
+  mut deleted_paths: Vec<String>,
+) -> PreflightVykarRestoreResponse {
+  let mut digest = Sha256::new();
+  digest.update(b"komodo-restore-paths-v1");
+  for (category, paths) in [
+    (b'c', &mut created_paths),
+    (b'o', &mut overwritten_paths),
+    (b'd', &mut deleted_paths),
+  ] {
+    paths.sort();
+    paths.dedup();
+    digest.update([category]);
+    digest.update((paths.len() as u64).to_le_bytes());
+    for path in paths.iter() {
+      digest.update((path.len() as u64).to_le_bytes());
+      digest.update(path.as_bytes());
     }
   }
-
-  fn push(
-    &mut self,
-    output: &mut Vec<String>,
-    path: &Path,
-  ) -> anyhow::Result<()> {
-    let path = path.to_string_lossy();
-    if self.rows >= MAX_RESTORE_PREVIEW_ROWS
-      || path.len()
-        > MAX_RESTORE_PREVIEW_BYTES.saturating_sub(self.path_bytes)
-    {
-      return Err(anyhow!(
-        "Restore preview exceeds 10,000 changed paths or 1 MiB of path text; select a smaller subtree before confirming"
-      ));
-    }
-    self.rows += 1;
-    self.path_bytes += path.len();
-    output.push(path.into_owned());
-    Ok(())
+  let summary = BackupRestorePathSummary {
+    // The complete inventory is capped at 100,000 entries before this call.
+    created: created_paths.len() as u32,
+    overwritten: overwritten_paths.len() as u32,
+    deleted: deleted_paths.len() as u32,
+    sha256: hex::encode(digest.finalize()),
+  };
+  let mut remaining_rows = MAX_RESTORE_PREVIEW_ROWS;
+  let mut remaining_bytes = MAX_RESTORE_PREVIEW_BYTES;
+  for paths in [
+    &mut created_paths,
+    &mut overwritten_paths,
+    &mut deleted_paths,
+  ] {
+    let keep = paths
+      .iter()
+      .take_while(|path| {
+        if remaining_rows == 0 || path.len() > remaining_bytes {
+          return false;
+        }
+        remaining_rows -= 1;
+        remaining_bytes -= path.len();
+        true
+      })
+      .count();
+    paths.truncate(keep);
+  }
+  PreflightVykarRestoreResponse {
+    created_paths,
+    overwritten_paths,
+    deleted_paths,
+    path_summary: Some(summary),
+    ..Default::default()
   }
 }
 
@@ -2409,31 +2436,29 @@ impl Resolve<Args> for PreflightVykarRestore {
         &advanced,
       )?
       .snapshot_paths(&snapshot, &selected, deadline)?;
-      if let Some(volume_name) = missing_volume {
-        return compare_missing_volume_paths(
+      let (created, overwritten, deleted) = if let Some(volume_name) = missing_volume {
+        compare_missing_volume_paths(
           &snapshot_paths,
           &publish,
           &volume_name,
           deadline,
-        );
-      }
-      compare_restore_paths(
-        &snapshot_paths,
-        &publish,
-        &selected,
-        deadline,
-      )
+        )?
+      } else {
+        compare_restore_paths(
+          &snapshot_paths,
+          &publish,
+          &selected,
+          deadline,
+        )?
+      };
+      Ok::<_, anyhow::Error>(bounded_restore_preview(created, overwritten, deleted))
     });
-    let (created_paths, overwritten_paths, deleted_paths) = worker
+    let mut preview = worker
       .await
       .context("Restore preflight worker failed")??;
-    Ok(PreflightVykarRestoreResponse {
-      destination_exists,
-      created_paths,
-      overwritten_paths,
-      deleted_paths,
-      containers_to_stop: running_containers,
-    })
+    preview.destination_exists = destination_exists;
+    preview.containers_to_stop = running_containers;
+    Ok(preview)
     }).await
   }
 }
@@ -2459,7 +2484,8 @@ fn compare_missing_volume_paths(
   let logical_root = Path::new("/var/lib/docker/volumes")
     .join(volume_name)
     .join("_data");
-  let mut budget = RestorePreviewBudget::new(deadline);
+  let mut budget =
+    komodo_backup::RestoreInventoryBudget::new(deadline);
   let mut created = Vec::new();
   for item in snapshot_paths {
     let Some((mapping, relative)) =
@@ -2483,8 +2509,8 @@ fn compare_missing_volume_paths(
       "volume://{volume_name}/{}",
       relative.to_string_lossy()
     ));
-    budget.inventory.consume(&display.to_string_lossy())?;
-    budget.push(&mut created, &display)?;
+    budget.consume(&display.to_string_lossy())?;
+    created.push(display.to_string_lossy().into_owned());
   }
   created.sort();
   created.dedup();
@@ -2497,7 +2523,8 @@ fn compare_restore_paths(
   selected: &[String],
   deadline: Instant,
 ) -> anyhow::Result<(Vec<String>, Vec<String>, Vec<String>)> {
-  let mut budget = RestorePreviewBudget::new(deadline);
+  let mut budget =
+    komodo_backup::RestoreInventoryBudget::new(deadline);
   let mut expected = HashSet::<PathBuf>::new();
   let mut created = Vec::new();
   let mut overwritten = Vec::new();
@@ -2517,17 +2544,17 @@ fn compare_restore_paths(
     } else {
       Path::new(&mapping.destination).join(relative)
     };
-    budget.inventory.consume(&destination.to_string_lossy())?;
+    budget.consume(&destination.to_string_lossy())?;
     expected.insert(destination.clone());
     match restore_preview_metadata(
       Path::new(&mapping.destination),
       &destination,
     )? {
       None => {
-        budget.push(&mut created, &destination)?;
+        created.push(destination.to_string_lossy().into_owned());
       }
       Some(metadata) if !item.directory || !metadata.is_dir() => {
-        budget.push(&mut overwritten, &destination)?;
+        overwritten.push(destination.to_string_lossy().into_owned());
       }
       Some(_) => {}
     }
@@ -2625,9 +2652,9 @@ fn collect_unexpected_paths(
   root: &Path,
   expected: &HashSet<PathBuf>,
   deleted: &mut Vec<String>,
-  budget: &mut RestorePreviewBudget,
+  budget: &mut komodo_backup::RestoreInventoryBudget,
 ) -> anyhow::Result<()> {
-  budget.inventory.consume(&root.to_string_lossy())?;
+  budget.consume(&root.to_string_lossy())?;
   let metadata = match std::fs::symlink_metadata(root) {
     Ok(metadata) => metadata,
     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -2636,7 +2663,7 @@ fn collect_unexpected_paths(
     Err(error) => return Err(error.into()),
   };
   if !expected.contains(root) {
-    budget.push(deleted, root)?;
+    deleted.push(root.to_string_lossy().into_owned());
   }
   if !metadata.is_dir() {
     return Ok(());
@@ -2651,9 +2678,9 @@ fn collect_unexpected_paths(
     };
     let entry = entry?;
     let path = entry.path();
-    budget.inventory.consume(&path.to_string_lossy())?;
+    budget.consume(&path.to_string_lossy())?;
     if !expected.contains(&path) {
-      budget.push(deleted, &path)?;
+      deleted.push(path.to_string_lossy().into_owned());
     }
     if entry.file_type()?.is_dir() {
       if directories.len() >= MAX_RESTORE_PREVIEW_DEPTH {
@@ -4807,20 +4834,123 @@ mod tests {
   }
 
   #[test]
-  fn preview_rows_and_bytes_are_bounded_across_all_change_lists() {
-    let mut budget = RestorePreviewBudget::new(
-      Instant::now() + RESTORE_PREFLIGHT_TIMEOUT,
+  fn large_previews_keep_complete_counts_and_hash_omitted_changes() {
+    let created = (0..MAX_RESTORE_PREVIEW_ROWS + 1)
+      .map(|index| format!("/root/{index:06}"))
+      .collect::<Vec<_>>();
+    let preview = bounded_restore_preview(
+      created.clone(),
+      vec!["/overwrite".into()],
+      vec!["/delete".into()],
     );
-    budget.rows = MAX_RESTORE_PREVIEW_ROWS - 1;
-    let mut created = Vec::new();
-    let mut deleted = Vec::new();
-    budget.push(&mut created, Path::new("a")).unwrap();
-    assert!(budget.push(&mut deleted, Path::new("b")).is_err());
-    assert!(deleted.is_empty());
-    budget.rows = 0;
-    budget.path_bytes = MAX_RESTORE_PREVIEW_BYTES - 1;
-    budget.push(&mut created, Path::new("c")).unwrap();
-    assert!(budget.push(&mut deleted, Path::new("d")).is_err());
+    let summary = preview.path_summary.as_ref().unwrap();
+    assert_eq!(
+      summary.created,
+      (MAX_RESTORE_PREVIEW_ROWS + 1) as u32
+    );
+    assert_eq!(summary.overwritten, 1);
+    assert_eq!(summary.deleted, 1);
+    assert_eq!(preview.created_paths.len(), MAX_RESTORE_PREVIEW_ROWS);
+    assert!(preview.overwritten_paths.is_empty());
+    assert!(preview.deleted_paths.is_empty());
+    let mut changed = created;
+    *changed.last_mut().unwrap() = "/root/999999".into();
+    let changed = bounded_restore_preview(
+      changed,
+      vec!["/overwrite".into()],
+      vec!["/delete".into()],
+    );
+    assert_eq!(preview.created_paths, changed.created_paths);
+    assert!(!preview.matches(&changed));
+    let reclassified = bounded_restore_preview(
+      Vec::new(),
+      preview.created_paths.clone(),
+      Vec::new(),
+    );
+    assert_ne!(
+      summary.sha256,
+      reclassified.path_summary.unwrap().sha256
+    );
+  }
+
+  #[test]
+  fn preview_digest_is_order_independent_but_category_sensitive() {
+    let expected = bounded_restore_preview(
+      vec!["a".into(), "b".into()],
+      Vec::new(),
+      Vec::new(),
+    );
+    let reordered = bounded_restore_preview(
+      vec!["b".into(), "a".into(), "a".into()],
+      Vec::new(),
+      Vec::new(),
+    );
+    assert!(expected.matches(&reordered));
+    let reclassified = bounded_restore_preview(
+      vec!["a".into()],
+      vec!["b".into()],
+      Vec::new(),
+    );
+    assert_ne!(
+      expected.path_summary.unwrap().sha256,
+      reclassified.path_summary.unwrap().sha256
+    );
+  }
+
+  #[test]
+  fn preview_text_limit_only_bounds_display_not_confirmation() {
+    let paths = (0..600)
+      .map(|index| format!("/{index:04}/{}", "x".repeat(2048)))
+      .collect::<Vec<_>>();
+    let preview = bounded_restore_preview(
+      paths,
+      vec!["/overwrite".into()],
+      vec!["/delete".into()],
+    );
+    let summary = preview.path_summary.as_ref().unwrap();
+    assert_eq!(summary.created, 600);
+    assert!(preview.created_paths.len() < 600);
+    let displayed_bytes: usize = preview
+      .created_paths
+      .iter()
+      .chain(&preview.overwritten_paths)
+      .chain(&preview.deleted_paths)
+      .map(String::len)
+      .sum();
+    assert!(displayed_bytes <= MAX_RESTORE_PREVIEW_BYTES);
+    assert_eq!(summary.overwritten, 1);
+    assert_eq!(summary.deleted, 1);
+  }
+
+  #[test]
+  fn complete_recovered_stack_can_exceed_display_row_limit() {
+    let parent = tempfile::tempdir().unwrap();
+    let destination = parent.path().join("recovered");
+    let paths = (0..MAX_RESTORE_PREVIEW_ROWS + 1)
+      .map(|index| komodo_backup::SnapshotPath {
+        path: format!("root/{index:06}"),
+        directory: false,
+      })
+      .collect::<Vec<_>>();
+    let (created, overwritten, deleted) = compare_restore_paths(
+      &paths,
+      &[RestorePublishPath {
+        destination_root: None,
+        snapshot_path: "root".into(),
+        destination: destination.to_string_lossy().into_owned(),
+      }],
+      &[],
+      Instant::now() + RESTORE_PREFLIGHT_TIMEOUT,
+    )
+    .unwrap();
+    let preview =
+      bounded_restore_preview(created, overwritten, deleted);
+    assert_eq!(
+      preview.path_summary.unwrap().created,
+      (MAX_RESTORE_PREVIEW_ROWS + 1) as u32
+    );
+    assert_eq!(preview.created_paths.len(), MAX_RESTORE_PREVIEW_ROWS);
+    assert!(!destination.exists());
   }
 
   #[test]
@@ -4929,14 +5059,13 @@ mod tests {
   }
 
   #[test]
-  fn destination_inventory_stops_when_preview_is_full() {
+  fn destination_inventory_still_fails_closed_when_deadline_expires()
+  {
     let destination = tempfile::tempdir().unwrap();
     std::fs::write(destination.path().join("extra"), b"extra")
       .unwrap();
-    let mut budget = RestorePreviewBudget::new(
-      Instant::now() + RESTORE_PREFLIGHT_TIMEOUT,
-    );
-    budget.rows = MAX_RESTORE_PREVIEW_ROWS;
+    let mut budget =
+      komodo_backup::RestoreInventoryBudget::new(Instant::now());
     let mut deleted = Vec::new();
     assert!(
       collect_unexpected_paths(

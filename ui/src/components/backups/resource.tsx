@@ -369,13 +369,42 @@ export function RestoreSnapshotButton({
       >
         {plan && (
           <Stack>
-            <PreflightList label="Create" paths={plan.created_paths} />
-            <PreflightList label="Overwrite" paths={plan.overwritten_paths} />
-            <PreflightList label="Delete" paths={plan.deleted_paths} />
+            {plan.path_summary &&
+              (plan.path_summary.created > plan.created_paths.length ||
+                plan.path_summary.overwritten > plan.overwritten_paths.length ||
+                plan.path_summary.deleted > plan.deleted_paths.length) && (
+              <Alert color="yellow">
+                Only a bounded sample of paths is displayed. The counts below
+                include every change, including any omitted overwrites and
+                deletions. Confirm restore approves the complete change set,
+                not just the displayed paths. Komodo checks its full digest
+                again before publication.
+              </Alert>
+            )}
+            <PreflightList
+              label="Create"
+              paths={plan.created_paths}
+              total={plan.path_summary?.created}
+            />
+            <PreflightList
+              label="Overwrite"
+              paths={plan.overwritten_paths}
+              total={plan.path_summary?.overwritten}
+            />
+            <PreflightList
+              label="Delete"
+              paths={plan.deleted_paths}
+              total={plan.path_summary?.deleted}
+            />
             <PreflightList
               label="Stop containers"
               paths={plan.containers_to_stop}
             />
+            {plan.path_summary && (
+              <Text size="xs" c="dimmed" style={{ overflowWrap: "anywhere" }}>
+                Complete path-set SHA-256: {plan.path_summary.sha256}
+              </Text>
+            )}
             <Alert color="red">
               This plan expires at {new Date(plan.expires_at).toLocaleString()}.
               Komodo stages and verifies data before publishing it with a
@@ -400,11 +429,28 @@ export function RestoreSnapshotButton({
   );
 }
 
-function PreflightList({ label, paths }: { label: string; paths: string[] }) {
+function PreflightList({
+  label,
+  paths,
+  total = paths.length,
+}: {
+  label: string;
+  paths: string[];
+  total?: number;
+}) {
   return (
     <Stack gap={4}>
-      <Text fw={600}>{label} ({paths.length})</Text>
-      {paths.length ? paths.map((path) => <Code key={path}>{path}</Code>) : <Text c="dimmed">None</Text>}
+      <Text fw={600}>{label} ({total})</Text>
+      {total > paths.length && (
+        <Text size="sm" c="dimmed">
+          Showing {paths.length} of {total} paths; all are included in confirmation.
+        </Text>
+      )}
+      {paths.length ? (
+        paths.map((path) => <Code key={path}>{path}</Code>)
+      ) : total === 0 ? (
+        <Text c="dimmed">None</Text>
+      ) : null}
     </Stack>
   );
 }

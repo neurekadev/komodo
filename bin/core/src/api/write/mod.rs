@@ -330,12 +330,16 @@ async fn handler(
   res?
 }
 
-async fn task(
-  request: WriteRequest,
-  user: User,
-) -> mogh_error::Result<axum::response::Response> {
-  let mutation_guard = if matches!(
-    &request,
+async fn request_mutation_guard(
+  request: &WriteRequest,
+  barrier: &Arc<tokio::sync::RwLock<()>>,
+) -> Option<tokio::sync::OwnedRwLockReadGuard<()>> {
+  // These File Manager controls only signal an ownership-checked operation.
+  // Its original worker keeps the mutation lease until it actually exits.
+  // A new read lease here would queue behind a backup writer that is itself
+  // waiting for that worker to accept a conflict decision or cancellation.
+  if matches!(
+    request,
     WriteRequest::UpdateBackupSettings(_)
       | WriteRequest::InitializeBackupRepositories(_)
       | WriteRequest::RunBackup(_)
@@ -346,11 +350,24 @@ async fn task(
       | WriteRequest::CancelBackupRun(_)
       | WriteRequest::PlanCoreRecovery(_)
       | WriteRequest::ExecuteCoreRecovery(_)
+      | WriteRequest::ResolveFileManagerOperationConflict(_)
+      | WriteRequest::CancelFileManagerOperation(_)
   ) {
     None
   } else {
-    Some(crate::backup::mutation_barrier().clone().read_owned().await)
-  };
+    Some(barrier.clone().read_owned().await)
+  }
+}
+
+async fn task(
+  request: WriteRequest,
+  user: User,
+) -> mogh_error::Result<axum::response::Response> {
+  let mutation_guard = request_mutation_guard(
+    &request,
+    crate::backup::mutation_barrier(),
+  )
+  .await;
   let task_id = Uuid::new_v4();
   let method: WriteRequestMethod = (&request).into();
 
@@ -399,6 +416,66 @@ async fn task(
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[tokio::test]
+  async fn file_manager_controls_remain_reachable_behind_a_backup_writer()
+   {
+    use futures_util::FutureExt;
+    use komodo_client::entities::file_manager::{
+      FileManagerConflictAction, FileManagerTarget,
+    };
+
+    let target = FileManagerTarget::Stack {
+      stack: "stack".into(),
+    };
+    let barrier = Arc::new(tokio::sync::RwLock::new(()));
+    let worker = barrier.clone().read_owned().await;
+    let mut writer = Box::pin(barrier.clone().write_owned());
+    assert!(futures_util::poll!(writer.as_mut()).is_pending());
+    let controls = [
+      WriteRequest::CancelFileManagerOperation(
+        CancelFileManagerOperation {
+          target: target.clone(),
+          operation_id: "operation".into(),
+        },
+      ),
+      WriteRequest::ResolveFileManagerOperationConflict(
+        ResolveFileManagerOperationConflict {
+          target: target.clone(),
+          operation_id: "operation".into(),
+          decision_id: "decision".into(),
+          action: FileManagerConflictAction::Skip,
+          apply_to_all: false,
+        },
+      ),
+    ];
+    for control in controls {
+      assert!(
+        request_mutation_guard(&control, &barrier)
+          .now_or_never()
+          .expect("Control signals must not queue behind a backup")
+          .is_none()
+      );
+      assert!(futures_util::poll!(writer.as_mut()).is_pending());
+    }
+    let commit = WriteRequest::CommitFileManagerOperation(
+      CommitFileManagerOperation {
+        target,
+        plan_id: "plan".into(),
+        decisions: Vec::new(),
+        confirmed: true,
+      },
+    );
+    let mut new_operation =
+      Box::pin(request_mutation_guard(&commit, &barrier));
+    assert!(futures_util::poll!(new_operation.as_mut()).is_pending());
+    // Signalling cancellation does not release the existing worker's lease.
+    drop(worker);
+    let backup = writer.await;
+    assert!(futures_util::poll!(new_operation.as_mut()).is_pending());
+    drop(backup);
+    assert!(new_operation.await.is_some());
+  }
 
   #[tokio::test]
   async fn synchronous_nested_work_reuses_only_the_current_task_guard()

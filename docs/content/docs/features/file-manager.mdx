@@ -65,6 +65,8 @@ Depending on the target and permission level, File Manager supports:
 - Conflict review with an explicit choice to overwrite or skip each collision.
 - Progress reporting and cancellation for long-running operations.
 
+Conflict decisions and **Cancel** remain available when a backup or restore is waiting for your operation. They still check the operation's owner and target. The active worker keeps its backup-protection lease until it actually finishes or cancels; submitting a control request does not allow a backup to overlap unfinished filesystem work.
+
 Create, create-folder, rename, move, copy, and delete operations have per-user, per-target undo and redo history when Safe mode is enabled. Recovery manifests and any retained data expire after 24 hours. Text edits, uploads, and archive operations are not added to the undo history.
 
 ### Safe Mode and Permanent Operations
