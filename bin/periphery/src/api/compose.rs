@@ -1,5 +1,8 @@
 use std::{
-  borrow::Cow, fmt::Write, path::PathBuf, sync::LazyLock,
+  borrow::Cow,
+  fmt::Write,
+  path::{Path, PathBuf},
+  sync::LazyLock,
   time::Duration,
 };
 
@@ -22,7 +25,9 @@ use komodo_client::{
   parsers::parse_multiline_command,
 };
 use mogh_resolver::Resolve;
-use periphery_client::api::{DeployStackResponse, compose::*};
+use periphery_client::api::{
+  DeployStackResponse, backup::ProtectedRepositoryPath, compose::*,
+};
 use shell_escape::unix::escape;
 use tracing::Instrument;
 
@@ -110,6 +115,46 @@ impl Resolve<crate::api::Args> for GetComposeLogSearch {
 
 //
 
+async fn protected_compose_sources(
+  protected_paths: &[ProtectedRepositoryPath],
+) -> anyhow::Result<Vec<PathBuf>> {
+  let docker = crate::state::docker_client().load();
+  let docker = docker.as_ref().as_ref().context(
+    "Could not connect to Docker to validate protected Stack storage",
+  )?;
+  super::backup::file_manager_protected_sources(
+    docker,
+    protected_paths,
+  )
+  .await
+}
+
+async fn read_compose_file(
+  path: &Path,
+  protected: &[PathBuf],
+) -> anyhow::Result<String> {
+  super::backup::validate_path_outside_protected_repositories(
+    path,
+    protected,
+    "Stack file",
+  )?;
+  Ok(tokio::fs::read_to_string(path).await?)
+}
+
+async fn write_compose_file(
+  path: &Path,
+  contents: String,
+  protected: &[PathBuf],
+) -> anyhow::Result<()> {
+  super::backup::validate_path_outside_protected_repositories(
+    path,
+    protected,
+    "Stack file",
+  )?;
+  mogh_secret_file::write_async(path, contents).await?;
+  Ok(())
+}
+
 impl Resolve<crate::api::Args> for GetComposeContentsOnHost {
   async fn resolve(
     self,
@@ -119,7 +164,10 @@ impl Resolve<crate::api::Args> for GetComposeContentsOnHost {
       name,
       run_directory,
       file_paths,
+      protected_paths,
     } = self;
+    let protected =
+      protected_compose_sources(&protected_paths).await?;
     let root = periphery_config()
       .stack_dir()
       .join(to_path_compatible_name(&name));
@@ -133,13 +181,13 @@ impl Resolve<crate::api::Args> for GetComposeContentsOnHost {
         .join(&file.path)
         .components()
         .collect::<PathBuf>();
-      match tokio::fs::read_to_string(&full_path).await.with_context(
-        || {
+      match read_compose_file(&full_path, &protected)
+        .await
+        .with_context(|| {
           format!(
             "Failed to read compose file contents at {full_path:?}"
           )
-        },
-      ) {
+        }) {
         Ok(contents) => {
           // The path we store here has to be the same as incoming file path in the array,
           // in order for WriteComposeContentsToHost to write to the correct path.
@@ -186,7 +234,10 @@ impl Resolve<crate::api::Args> for WriteComposeContentsToHost {
       run_directory,
       file_path,
       contents,
+      protected_paths,
     } = self;
+    let protected =
+      protected_compose_sources(&protected_paths).await?;
     let file_path = periphery_config()
       .stack_dir()
       .join(to_path_compatible_name(&name))
@@ -194,7 +245,7 @@ impl Resolve<crate::api::Args> for WriteComposeContentsToHost {
       .join(file_path)
       .components()
       .collect::<PathBuf>();
-    mogh_secret_file::write_async(&file_path, contents)
+    write_compose_file(&file_path, contents, &protected)
       .await
       .with_context(|| {
         format!(
@@ -233,7 +284,10 @@ impl Resolve<crate::api::Args> for WriteCommitComposeContents {
       file_path,
       contents,
       git_token,
+      protected_paths,
     } = self;
+    let protected =
+      protected_compose_sources(&protected_paths).await?;
 
     let root =
       pull_or_clone_stack(&stack, repo.as_ref(), git_token, args)
@@ -252,6 +306,11 @@ impl Resolve<crate::api::Args> for WriteCommitComposeContents {
       "Write Compose File".to_string()
     };
 
+    super::backup::validate_path_outside_protected_repositories(
+      &root.join(&file_path),
+      &protected,
+      "Stack file",
+    )?;
     write_commit_file(
       &msg,
       &root,
@@ -1112,4 +1171,55 @@ async fn compose_down(
   }
 
   Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[tokio::test]
+  async fn host_file_access_rejects_protected_paths_without_changing_secrets()
+   {
+    let directory = tempfile::tempdir().unwrap();
+    let private = directory.path().join("core-secrets");
+    let stack = directory.path().join("stack");
+    std::fs::create_dir_all(&private).unwrap();
+    std::fs::create_dir_all(&stack).unwrap();
+    let state = private.join("state.json");
+    std::fs::write(&state, "original identity").unwrap();
+    let alias = stack.join("alias");
+    std::os::unix::fs::symlink(&private, &alias).unwrap();
+    let protected = vec![private.clone()];
+
+    for path in [
+      state.clone(),
+      stack.join("../core-secrets/state.json"),
+      alias.join("state.json"),
+      private.join("new-state.json"),
+      alias.join("new-state.json"),
+    ] {
+      let read_error =
+        read_compose_file(&path, &protected).await.unwrap_err();
+      assert!(read_error.to_string().contains("protected Core"));
+      let write_error =
+        write_compose_file(&path, "replacement".into(), &protected)
+          .await
+          .unwrap_err();
+      assert!(write_error.to_string().contains("protected Core"));
+    }
+    assert_eq!(
+      std::fs::read_to_string(&state).unwrap(),
+      "original identity"
+    );
+    assert!(!private.join("new-state.json").exists());
+
+    let compose = stack.join("compose.yaml");
+    write_compose_file(&compose, "services: {}".into(), &protected)
+      .await
+      .unwrap();
+    assert_eq!(
+      read_compose_file(&compose, &protected).await.unwrap(),
+      "services: {}"
+    );
+  }
 }

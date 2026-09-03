@@ -54,6 +54,8 @@ Stacks support three ways to provide compose files:
 2. **Files on the host** — Point to existing files on the server.
 3. **Git repo** — Komodo clones the repo onto the host to deploy. Changes are tracked in git and you can use [webhooks](/features/webhooks) to auto-redeploy on push.
 
+Host-file reads and Stack file writes exclude `/data/core-secrets`, including paths that point there through another mount or a symbolic link. Keep application files in a separate directory within the shared data volume.
+
 The Stack **Files** tab opens the directory containing the primary Compose file. UI-managed and host-file Stacks can be changed by users with Write and `FileManager` permission; repository-backed Stacks are read-only, and Swarm Stacks do not expose File Manager. See [File Manager](/features/file-manager) for supported operations and permissions.
 
 ## Importing Existing Projects

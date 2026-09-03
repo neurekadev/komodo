@@ -127,6 +127,7 @@ async fn legacy_managed_download_bytes(
     .request(GetComposeContentsOnHost {
       name: stack.name.clone(),
       run_directory: String::new(),
+      protected_paths: crate::backup::file_manager_protected_paths()?,
       file_paths: vec![StackFileDependency::full_redeploy(
         compose_path.clone(),
       )],

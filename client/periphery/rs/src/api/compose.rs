@@ -23,6 +23,8 @@ pub struct GetComposeContentsOnHost {
   pub run_directory: String,
   /// Both compose files and env / additional files, all relative to run directory.
   pub file_paths: Vec<StackFileDependency>,
+  /// Core-owned storage excluded from generic file access.
+  pub protected_paths: Vec<super::backup::ProtectedRepositoryPath>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -100,6 +102,8 @@ pub struct WriteComposeContentsToHost {
   pub file_path: String,
   /// The contents to write.
   pub contents: String,
+  /// Core-owned storage excluded from generic file access.
+  pub protected_paths: Vec<super::backup::ProtectedRepositoryPath>,
 }
 
 //
@@ -122,6 +126,8 @@ pub struct WriteCommitComposeContents {
   pub contents: String,
   /// If provided, use it to login in. Otherwise check periphery local git providers.
   pub git_token: Option<String>,
+  /// Core-owned storage excluded from generic file access.
+  pub protected_paths: Vec<super::backup::ProtectedRepositoryPath>,
 }
 
 //

@@ -1104,6 +1104,20 @@ fn repository_for_periphery(
   })
 }
 
+pub(crate) fn ensure_outside_core_storage(
+  path: &Path,
+) -> anyhow::Result<()> {
+  if komodo_backup::filesystem::paths_overlap(
+    path,
+    Path::new(CORE_PRIVATE_PATH),
+  )? {
+    return Err(anyhow!(
+      "Stack files cannot access protected Core storage"
+    ));
+  }
+  Ok(())
+}
+
 pub(crate) fn file_manager_protected_paths()
 -> anyhow::Result<Vec<ProtectedRepositoryPath>> {
   let core_container_id =

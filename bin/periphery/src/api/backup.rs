@@ -2300,7 +2300,7 @@ fn map_path_through_mount(
   }
 }
 
-fn validate_path_outside_protected_repositories(
+pub(super) fn validate_path_outside_protected_repositories(
   path: &Path,
   protected_repository_sources: &[PathBuf],
   label: &str,
