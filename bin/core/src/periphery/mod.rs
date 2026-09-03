@@ -129,6 +129,35 @@ impl PeripheryClient {
     T: std::fmt::Debug + Serialize + HasResponse,
     T::Response: DeserializeOwned,
   {
+    self.request_pinned_inner(expected, request, None).await
+  }
+
+  /// Completion polling has a deadline, without implying the writer exited.
+  pub async fn request_pinned_with_timeout<T>(
+    &self,
+    expected: PeripheryConnectionArgs<'_>,
+    request: T,
+    timeout: Duration,
+  ) -> anyhow::Result<T::Response>
+  where
+    T: std::fmt::Debug + Serialize + HasResponse,
+    T::Response: DeserializeOwned,
+  {
+    self
+      .request_pinned_inner(expected, request, Some(timeout))
+      .await
+  }
+
+  async fn request_pinned_inner<T>(
+    &self,
+    expected: PeripheryConnectionArgs<'_>,
+    request: T,
+    timeout: Option<Duration>,
+  ) -> anyhow::Result<T::Response>
+  where
+    T: std::fmt::Debug + Serialize + HasResponse,
+    T::Response: DeserializeOwned,
+  {
     let connection = periphery_connections()
       .get(&self.id)
       .await
@@ -138,7 +167,9 @@ impl PeripheryClient {
         "Backup worker connection changed; verify its enrolled identity and retry"
       ));
     }
-    self.request_on_connection(connection, request, None).await
+    self
+      .request_on_connection(connection, request, timeout)
+      .await
   }
 
   async fn request_on_connection<T>(

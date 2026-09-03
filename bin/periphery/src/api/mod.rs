@@ -65,6 +65,7 @@ pub enum PeripheryRequest {
   DiscoverBackupSource(DiscoverBackupSource),
   RunVykarBackup(RunVykarBackup),
   RunVykarBackupBatch(RunVykarBackupBatch),
+  GetVykarBackupCompletion(GetVykarBackupCompletion),
   PreflightVykarRestore(PreflightVykarRestore),
   TransactionalVykarRestore(TransactionalVykarRestore),
   FinalizeVykarRestore(FinalizeVykarRestore),

@@ -50,11 +50,13 @@ use komodo_client::{
 use periphery_client::api::backup::{
   BackupSourceFilters, CancelVykarOperation, DiscoverBackupSource,
   FinalizeVykarRestore, GetBackupVolumeInventory,
-  PeripheryBackupTarget, PreflightVykarRestore,
-  PreflightVykarRestoreResponse, ProtectedRepositoryPath,
-  RunVykarBackup, RunVykarBackupBatch, TransactionalVykarRestore,
-  VykarBackupRepositoryResult, VykarBackupTask,
-  VykarRetainedSnapshot,
+  GetVykarBackupCompletion, PeripheryBackupTarget,
+  PreflightVykarRestore, PreflightVykarRestoreResponse,
+  ProtectedRepositoryPath, RunVykarBackup, RunVykarBackupBatch,
+  RunVykarBackupBatchResponse, RunVykarBackupResponse,
+  TransactionalVykarRestore, VykarBackupCompletion,
+  VykarBackupCompletionState, VykarBackupRepositoryResult,
+  VykarBackupTask, VykarRetainedSnapshot,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -79,6 +81,7 @@ mod crypto;
 const SETTINGS_ID: &str = "singleton";
 const SETTINGS_COLLECTION: &str = "BackupSettings";
 const RUNS_COLLECTION: &str = "BackupRun";
+const PENDING_WORKERS_COLLECTION: &str = "BackupPendingWorker";
 const PLANS_COLLECTION: &str = "BackupRestorePlan";
 const CORE_RECOVERY_COLLECTION: &str = "CoreRecoveryPlan";
 const HEALTH_COLLECTION: &str = "BackupRepositoryHealth";
@@ -115,6 +118,16 @@ struct SealedBackupSettings {
   /// Set only after the mirror repository has initialized successfully.
   #[serde(default)]
   mirror_initialized: bool,
+}
+
+/// Intent is durable before dispatch. Keep the original enrolled identity
+/// across reconnects, Server edits and Core restarts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PendingWorkerBackup {
+  #[serde(rename = "_id")]
+  operation_id: String,
+  run_id: String,
+  server: Server,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -223,6 +236,10 @@ fn runs_collection() -> Collection<BackupRun> {
   db_client().db.collection(RUNS_COLLECTION)
 }
 
+fn pending_workers_collection() -> Collection<PendingWorkerBackup> {
+  db_client().db.collection(PENDING_WORKERS_COLLECTION)
+}
+
 fn plans_collection() -> Collection<StoredRestorePlan> {
   db_client().db.collection(PLANS_COLLECTION)
 }
@@ -236,7 +253,12 @@ fn health_collection() -> Collection<RepositoryHealthRecord> {
 }
 
 fn core_export_includes_collection(name: &str) -> bool {
-  !matches!(name, SETTINGS_COLLECTION | RUNS_COLLECTION)
+  !matches!(
+    name,
+    SETTINGS_COLLECTION
+      | RUNS_COLLECTION
+      | PENDING_WORKERS_COLLECTION
+  )
 }
 
 pub async fn get_settings() -> anyhow::Result<BackupSettings> {
@@ -414,7 +436,10 @@ async fn save_settings_inner(
       .delete_one(doc! { "_id": "mirror" })
       .await?;
   }
-  proposed.updated_at = komodo_timestamp();
+  proposed.updated_at = next_settings_revision(
+    existing.as_ref().map_or(0, |settings| settings.updated_at),
+    komodo_timestamp(),
+  );
   let bytes = serde_json::to_vec(&proposed)?;
   let record = SealedBackupSettings {
     id: SETTINGS_ID.into(),
@@ -444,6 +469,10 @@ async fn save_settings_inner(
   let mut redacted = proposed;
   redacted.redact();
   Ok(redacted)
+}
+
+fn next_settings_revision(previous: i64, now: i64) -> i64 {
+  now.max(previous.saturating_add(1))
 }
 
 fn normalize_bind_mount_patterns(patterns: &mut Vec<String>) {
@@ -1370,6 +1399,79 @@ pub async fn initialize_repositories() -> anyhow::Result<BackupRun> {
 }
 
 pub async fn finalize_interrupted_runs() -> anyhow::Result<u64> {
+  // Runs before listeners/schedulers. Transfer guards to the reconciler,
+  // then let HTTP start so inbound-only workers can reconnect.
+  let operation = backup_operation_lock().lock().await;
+  let actions = activity::quiesce_actions()
+    .expect("Startup reconciliation must precede Action admission");
+  let roles = repository_role_barrier().clone().read_owned().await;
+  let mutations = mutation_barrier().clone().write_owned().await;
+  let pending =
+    find_collect(&pending_workers_collection(), None, None).await;
+  if matches!(&pending, Ok(pending) if pending.is_empty()) {
+    return finalize_reconciled_interrupted_runs().await;
+  }
+  critical_alerts().write().unwrap().reconciliation.insert(
+    "startup".into(),
+    "Core is reconciling interrupted backup dispatches with their original workers. Mutations and Actions remain blocked until each worker reconnects and reports durable completion. Restore the original enrolled worker connection; replacing its identity does not prove completion.".into(),
+  );
+  tokio::spawn(async move {
+    let _guards = (operation, actions, roles, mutations);
+    loop {
+      let result = async {
+        let pending =
+          find_collect(&pending_workers_collection(), None, None)
+            .await?;
+        for pending in pending {
+          let completion = await_worker_completion(&pending).await;
+          if let Some(response) = &completion.result {
+            record_worker_restart_errors(
+              &pending.server,
+              &response.restart_errors,
+            );
+          }
+          if let Some(response) = &completion.batch_result {
+            record_worker_restart_errors(
+              &pending.server,
+              &response.restart_errors,
+            );
+          }
+          acknowledge_worker_completion(&pending).await;
+        }
+        if pending_workers_collection()
+          .find_one(doc! {})
+          .await?
+          .is_some()
+        {
+          return Err(anyhow!(
+            "Completed backup intent cleanup is still pending"
+          ));
+        }
+        finalize_reconciled_interrupted_runs().await?;
+        anyhow::Ok(())
+      }
+      .await;
+      match result {
+        Ok(()) => {
+          critical_alerts()
+            .write()
+            .unwrap()
+            .reconciliation
+            .remove("startup");
+          break;
+        }
+        Err(error) => warn!(
+          "Backup startup reconciliation remains blocked: {error:#}"
+        ),
+      }
+      tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    }
+  });
+  Ok(0)
+}
+
+async fn finalize_reconciled_interrupted_runs() -> anyhow::Result<u64>
+{
   let result = runs_collection()
     .update_many(
       doc! {
@@ -1471,14 +1573,11 @@ async fn finish_run(
 fn append_backup_history_keys(
   keys: &mut Vec<String>,
   id: String,
-  name: String,
+  _name: String,
 ) {
+  // Historical name-only records cannot be safely attributed after name reuse.
+  // Leave those records administrator-only rather than assigning a new owner.
   keys.push(id);
-  // API requests may store names, but ObjectId-shaped names resolve as IDs.
-  // Including those aliases could disclose another resource's history.
-  if id_or_name_filter(&name).contains_key("name") {
-    keys.push(name);
-  }
 }
 
 async fn readable_backup_history_keys<T: KomodoResource>(
@@ -1522,7 +1621,7 @@ pub async fn status(user: &User) -> anyhow::Result<BackupStatus> {
     )
   };
   let recent_runs = runs_collection()
-    .find(history_filter)
+    .find(history_filter.clone())
     .sort(doc! { "started_at": -1, "id": -1 })
     .limit(20)
     .await?
@@ -1530,14 +1629,14 @@ pub async fn status(user: &User) -> anyhow::Result<BackupStatus> {
     .await?;
   let active_runs = find_collect(
     &runs_collection(),
-    doc! {
+    doc! { "$and": [history_filter, {
       "state": {
         "$in": [
           to_bson(&BackupRunState::Queued)?,
           to_bson(&BackupRunState::Running)?,
         ]
       }
-    },
+    }] },
     FindOptions::builder()
       .sort(doc! { "started_at": -1 })
       .build(),
@@ -1774,6 +1873,8 @@ fn repository_health_cache_is_fresh(
 #[derive(Default)]
 struct CriticalAlerts {
   configuration: Option<String>,
+  /// Rebuilt from durable dispatch intents after restart, cleared on terminal proof.
+  reconciliation: BTreeMap<String, String>,
   operational: Vec<String>,
   maintenance: Option<String>,
 }
@@ -1792,6 +1893,7 @@ impl CriticalAlerts {
     let messages = self
       .configuration
       .iter()
+      .chain(self.reconciliation.values())
       .chain(self.operational.iter())
       .chain(self.maintenance.iter())
       .map(String::as_str)
@@ -2233,13 +2335,16 @@ pub async fn run_backup(
   // requests accumulate invisible work before a run ID can be cancelled.
   let _operation = admit_manual_backup(backup_operation_lock())?;
   let user = crate::helpers::query::get_user(&user.id).await?;
-  authorize_manual_backup(target.as_ref(), &user).await?;
+  let target =
+    authorize_manual_backup(target.as_ref(), &user).await?;
   if active_backup_run().await?.is_some() {
     return Err(anyhow!(
       "A backup run or its retries are still active; retry after it finishes"
     ));
   }
-  run_backup_locked(target).await
+  run_backup_locked(target, None)
+    .await?
+    .context("Manual backup was not admitted")
 }
 
 fn admit_manual_backup(
@@ -2253,14 +2358,44 @@ fn admit_manual_backup(
 async fn authorize_manual_backup(
   target: Option<&BackupTarget>,
   user: &User,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<BackupTarget>> {
   if !user.enabled {
     return Err(anyhow!("User is no longer enabled"));
   }
   if let Some(target) = target {
-    authorize_target(target, user, PermissionLevel::Execute).await
+    let target = match target {
+      BackupTarget::Stack { stack_id } => BackupTarget::Stack {
+        stack_id: get_check_permissions::<Stack>(
+          stack_id,
+          user,
+          PermissionLevel::Execute.backups(),
+        )
+        .await?
+        .id,
+      },
+      BackupTarget::Volume {
+        server_id,
+        volume_name,
+      } => BackupTarget::Volume {
+        server_id: get_check_permissions::<Server>(
+          server_id,
+          user,
+          PermissionLevel::Execute.backups(),
+        )
+        .await?
+        .id,
+        volume_name: volume_name.clone(),
+      },
+      target => {
+        authorize_target(target, user, PermissionLevel::Execute)
+          .await?;
+        target.clone()
+      }
+    };
+    // Freeze the ID returned by the very lookup whose permissions were checked.
+    Ok(Some(target))
   } else if user.admin {
-    Ok(())
+    Ok(None)
   } else {
     Err(anyhow!("Fleet backup operations are admin only"))
   }
@@ -2283,31 +2418,27 @@ async fn active_backup_run() -> anyhow::Result<Option<BackupRun>> {
 
 async fn run_backup_locked(
   target: Option<BackupTarget>,
-) -> anyhow::Result<BackupRun> {
+  scheduled_revision: Option<i64>,
+) -> anyhow::Result<Option<BackupRun>> {
   let _actions = activity::quiesce_actions()?;
   let _repository_roles =
     repository_role_barrier().clone().read_owned().await;
+  let settings = get_settings().await?;
+  if !schedule_admission_matches(&settings, scheduled_revision) {
+    return Ok(None);
+  }
   let mut run = new_run(target.clone(), "Backup running").await?;
   let run_id = run.id.clone();
-  let settings = match get_settings().await {
-    Ok(settings) => settings,
-    Err(error) => {
-      let message = format!("{error:#}");
-      let _ = finish_run(run, BackupRunState::Failed, message).await;
-      cancellation_tokens().lock().unwrap().remove(&run_id);
-      return Err(error);
-    }
-  };
   let result = match target {
     Some(target) => run_target(&settings, &run, target)
       .await
-      .map(|partial| (partial, Vec::new())),
-    None => run_fleet(&settings, &run)
-      .await
-      .map(|outcome| (outcome.partial, outcome.retries)),
+      .map(|partial| (partial, partial, Vec::new())),
+    None => run_fleet(&settings, &run).await.map(|outcome| {
+      (outcome.partial, outcome.permanent_partial, outcome.retries)
+    }),
   };
   let finished = match result {
-    Ok((_, _)) if cancellation_requested(&run_id) => {
+    Ok((_, _, _)) if cancellation_requested(&run_id) => {
       finish_run(
         run,
         BackupRunState::Cancelled,
@@ -2315,7 +2446,7 @@ async fn run_backup_locked(
       )
       .await
     }
-    Ok((_, retries)) if !retries.is_empty() => {
+    Ok((_, permanent_partial, retries)) if !retries.is_empty() => {
       run.message =
         "Initial fleet pass was partial; retries are active".into();
       let _ = runs_collection()
@@ -2324,10 +2455,14 @@ async fn run_backup_locked(
           doc! { "$set": { "message": &run.message } },
         )
         .await;
-      spawn_fleet_retry_finalizer(run.clone(), retries);
-      return Ok(run);
+      spawn_fleet_retry_finalizer(
+        run.clone(),
+        permanent_partial,
+        retries,
+      );
+      return Ok(Some(run));
     }
-    Ok((true, _)) => {
+    Ok((true, _, _)) => {
       finish_run(
         run,
         BackupRunState::Partial,
@@ -2335,7 +2470,7 @@ async fn run_backup_locked(
       )
       .await
     }
-    Ok((false, _)) => {
+    Ok((false, _, _)) => {
       finish_run(run, BackupRunState::Complete, "Backup complete")
         .await
     }
@@ -2360,10 +2495,226 @@ async fn run_backup_locked(
   ) {
     queue_maintenance();
   }
-  Ok(finished)
+  Ok(Some(finished))
 }
 
-async fn run_scheduled_backup() -> anyhow::Result<Option<BackupRun>> {
+fn schedule_admission_matches(
+  settings: &BackupSettings,
+  scheduled_revision: Option<i64>,
+) -> bool {
+  scheduled_revision.is_none_or(|revision| {
+    settings.enabled && settings.updated_at == revision
+  })
+}
+
+trait WorkerBackupRequest:
+  std::fmt::Debug + Serialize + mogh_resolver::HasResponse
+{
+  fn operation_id(&self) -> &str;
+  fn run_id(&self) -> &str;
+  fn take_result(
+    completion: VykarBackupCompletion,
+  ) -> Option<Self::Response>;
+  fn restart_errors(response: &Self::Response) -> &[String];
+}
+
+impl WorkerBackupRequest for RunVykarBackup {
+  fn operation_id(&self) -> &str {
+    &self.operation_id
+  }
+  fn run_id(&self) -> &str {
+    &self.run_id
+  }
+  fn take_result(
+    completion: VykarBackupCompletion,
+  ) -> Option<RunVykarBackupResponse> {
+    completion.result
+  }
+  fn restart_errors(response: &RunVykarBackupResponse) -> &[String] {
+    &response.restart_errors
+  }
+}
+
+impl WorkerBackupRequest for RunVykarBackupBatch {
+  fn operation_id(&self) -> &str {
+    &self.operation_id
+  }
+  fn run_id(&self) -> &str {
+    &self.run_id
+  }
+  fn take_result(
+    completion: VykarBackupCompletion,
+  ) -> Option<RunVykarBackupBatchResponse> {
+    completion.batch_result
+  }
+  fn restart_errors(
+    response: &RunVykarBackupBatchResponse,
+  ) -> &[String] {
+    &response.restart_errors
+  }
+}
+
+fn record_worker_restart_errors(server: &Server, errors: &[String]) {
+  if !errors.is_empty() {
+    record_operational_alert(format!(
+      "Backup restart failed on {} ({}): {}",
+      server.name,
+      server.id,
+      errors.join("; ")
+    ));
+  }
+}
+
+fn worker_completion_is_terminal(
+  completion: &VykarBackupCompletion,
+) -> bool {
+  completion.state == VykarBackupCompletionState::Complete
+}
+
+/// A lost RPC is not evidence that the worker exited. No overall deadline is
+/// safe here: the caller retains its activity, role and filesystem guards
+/// until the original worker durably reports completion or fences a late request.
+async fn await_worker_completion(
+  pending: &PendingWorkerBackup,
+) -> VykarBackupCompletion {
+  loop {
+    let result = async {
+      let client = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        periphery_client(&pending.server),
+      )
+      .await
+      .context("Completion connection deadline exceeded")??;
+      if cancellation_requested(&pending.run_id) {
+        let _ = client
+          .request_pinned_with_timeout(
+            PeripheryConnectionArgs::from_server(&pending.server),
+            CancelVykarOperation {
+              operation_id: pending.run_id.clone(),
+            },
+            std::time::Duration::from_secs(10),
+          )
+          .await;
+      }
+      client
+        .request_pinned_with_timeout(
+          PeripheryConnectionArgs::from_server(&pending.server),
+          GetVykarBackupCompletion {
+            operation_id: pending.operation_id.clone(),
+            run_id: pending.run_id.clone(),
+            cancel_if_unknown: true,
+            acknowledge: false,
+          },
+          std::time::Duration::from_secs(10),
+        )
+        .await
+    }
+    .await;
+    match result {
+      Ok(completion)
+        if worker_completion_is_terminal(&completion) =>
+      {
+        return completion;
+      }
+      Ok(_) => {}
+      Err(error) => {
+        warn!(
+          operation_id = pending.operation_id,
+          "Waiting for original backup worker completion: {error:#}"
+        );
+      }
+    }
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+  }
+}
+
+async fn acknowledge_worker_completion(
+  pending: &PendingWorkerBackup,
+) {
+  // Removing the Core intent is safe only after terminal proof and after
+  // restart failures have been surfaced. Failure merely causes reconciliation
+  // to repeat after restart; the worker's terminal identity is never deleted.
+  if let Err(error) = pending_workers_collection()
+    .delete_one(doc! { "_id": &pending.operation_id })
+    .await
+  {
+    warn!("Could not remove completed backup intent: {error:#}");
+    return;
+  }
+  let acknowledgement = async {
+    let client = periphery_client(&pending.server).await?;
+    client
+      .request_pinned_with_timeout(
+        PeripheryConnectionArgs::from_server(&pending.server),
+        GetVykarBackupCompletion {
+          operation_id: pending.operation_id.clone(),
+          run_id: pending.run_id.clone(),
+          cancel_if_unknown: false,
+          acknowledge: true,
+        },
+        std::time::Duration::from_secs(10),
+      )
+      .await
+  };
+  let _ = tokio::time::timeout(
+    std::time::Duration::from_secs(15),
+    acknowledgement,
+  )
+  .await;
+}
+
+async fn run_worker_backup<T>(
+  settings: &BackupSettings,
+  server: &Server,
+  request: T,
+) -> anyhow::Result<T::Response>
+where
+  T: WorkerBackupRequest,
+  T::Response: serde::de::DeserializeOwned,
+{
+  ensure_not_cancelled(request.run_id())?;
+  let client = trusted_backup_client(settings, server).await?;
+  let pending = PendingWorkerBackup {
+    operation_id: request.operation_id().into(),
+    run_id: request.run_id().into(),
+    server: server.clone(),
+  };
+  pending_workers_collection()
+    .insert_one(&pending)
+    .await
+    .context("Could not persist backup dispatch intent")?;
+  let result = match client.request(request).await {
+    Ok(response) => Ok(response),
+    Err(error) => {
+      critical_alerts().write().unwrap().reconciliation.insert(
+        pending.operation_id.clone(), format!(
+        "Backup {} is waiting for completion from its original worker {} ({}); mutations remain blocked until that worker reconnects and reconciles: {error:#}",
+        pending.run_id, server.name, server.id
+      ));
+      let completion = await_worker_completion(&pending).await;
+      match completion.error.clone() {
+        Some(error) => Err(anyhow!(error)),
+        None => T::take_result(completion).context(
+          "Worker completed without the expected backup result",
+        ),
+      }
+    }
+  };
+  if let Ok(response) = &result {
+    record_worker_restart_errors(server, T::restart_errors(response));
+  }
+  acknowledge_worker_completion(&pending).await;
+  critical_alerts()
+    .write()
+    .unwrap()
+    .reconciliation
+    .remove(&pending.operation_id);
+  result
+}
+
+async fn run_scheduled_backup(
+  revision: i64,
+) -> anyhow::Result<Option<BackupRun>> {
   let Ok(_operation) = backup_operation_lock().try_lock() else {
     tracing::info!(
       "Skipping scheduled fleet backup because another backup operation is active"
@@ -2377,11 +2728,12 @@ async fn run_scheduled_backup() -> anyhow::Result<Option<BackupRun>> {
     );
     return Ok(None);
   }
-  run_backup_locked(None).await.map(Some)
+  run_backup_locked(None, Some(revision)).await
 }
 
 fn spawn_fleet_retry_finalizer(
   run: BackupRun,
+  permanent_partial: bool,
   retries: Vec<tokio::task::JoinHandle<bool>>,
 ) {
   tokio::spawn(async move {
@@ -2399,6 +2751,7 @@ fn spawn_fleet_retry_finalizer(
     let (state, message) = fleet_retry_completion(
       cancellation_requested(&run_id),
       all_complete,
+      permanent_partial,
     );
     match finish_run(current, state, message).await {
       Ok(finished)
@@ -2420,10 +2773,11 @@ fn spawn_fleet_retry_finalizer(
 fn fleet_retry_completion(
   cancelled: bool,
   all_complete: bool,
+  permanent_partial: bool,
 ) -> (BackupRunState, &'static str) {
   if cancelled {
     (BackupRunState::Cancelled, "Cancellation requested")
-  } else if all_complete {
+  } else if all_complete && !permanent_partial {
     (BackupRunState::Complete, "Backup retries completed")
   } else {
     (
@@ -2617,6 +2971,7 @@ fn full_verification_due(
 
 struct FleetRunOutcome {
   partial: bool,
+  permanent_partial: bool,
   retries: Vec<tokio::task::JoinHandle<bool>>,
 }
 
@@ -2656,6 +3011,7 @@ async fn run_fleet(
   let mut targets = Vec::new();
   let mut discovery_retry_servers = HashSet::new();
   let mut partial = false;
+  let mut permanent_partial = false;
   if settings.core_enabled {
     match backup_core(settings, run).await {
       Ok(false) => {}
@@ -2717,6 +3073,7 @@ async fn run_fleet(
             stack.name
           );
           partial = true;
+          permanent_partial = true;
         }
         continue;
       }
@@ -2732,6 +3089,7 @@ async fn run_fleet(
           stack.name
         );
         partial = true;
+        permanent_partial = true;
       }
     }
     if settings.stack_selection.mode == BackupSelectionMode::Include {
@@ -2743,6 +3101,7 @@ async fn run_fleet(
           "Explicitly selected Stack '{selected}' no longer exists"
         );
         partial = true;
+        permanent_partial = true;
       }
     }
   }
@@ -2825,6 +3184,7 @@ async fn run_fleet(
           selected.server_id, selected.volume_name
         );
         partial = true;
+        permanent_partial = true;
       }
     }
   }
@@ -2885,6 +3245,7 @@ async fn run_fleet(
               let result = if tasks.is_empty() {
                 Ok(NodeBatchOutcome {
                   partial: !prepared.failed_targets.is_empty(),
+                  permanent_partial: false,
                   retry_tasks: Vec::new(),
                   retry_blocked: false,
                 })
@@ -2914,13 +3275,24 @@ async fn run_fleet(
     });
   }
   while let Some(result) = batches.next().await {
-    ensure_not_cancelled(&run.id)?;
-    let (server_id, targets, tasks, refresh_targets, result) =
-      result?;
+    // Cancellation stops admission, never drops already dispatched workers.
+    // Their completion/restart results must be consumed under the same guards.
+    let result = match result {
+      Ok(result) => result,
+      Err(error) => {
+        partial = true;
+        permanent_partial |= !cancellation_requested(&run.id);
+        warn!("Backup batch was not admitted: {error:#}");
+        continue;
+      }
+    };
+    let (server_id, targets, tasks, refresh_targets, result) = result;
     match result {
       Ok(outcome) => {
         partial |= outcome.partial || !targets.is_empty();
-        if !outcome.retry_blocked
+        permanent_partial |= outcome.permanent_partial;
+        if !cancellation_requested(&run.id)
+          && !outcome.retry_blocked
           && (!outcome.retry_tasks.is_empty() || !targets.is_empty())
         {
           retries.push(spawn_node_retry(
@@ -2936,6 +3308,9 @@ async fn run_fleet(
       Err(error) => {
         warn!("Backup node {server_id} failed: {error:#}");
         partial = true;
+        if cancellation_requested(&run.id) {
+          continue;
+        }
         retries.push(spawn_node_retry(
           settings.clone(),
           run.clone(),
@@ -2947,7 +3322,11 @@ async fn run_fleet(
       }
     }
   }
-  Ok(FleetRunOutcome { partial, retries })
+  Ok(FleetRunOutcome {
+    partial,
+    permanent_partial,
+    retries,
+  })
 }
 
 fn fleet_generation() -> &'static RwLock<String> {
@@ -2970,6 +3349,7 @@ fn spawn_node_retry(
 ) -> tokio::task::JoinHandle<bool> {
   tokio::spawn(async move {
     let mut retry = 0_u32;
+    let mut permanent_partial = false;
     loop {
       if *fleet_generation().read().unwrap() != run.id {
         return false;
@@ -3057,7 +3437,7 @@ fn spawn_node_retry(
         tasks = prepared.tasks;
         if tasks.is_empty() {
           if targets.is_empty() {
-            return true;
+            return !permanent_partial;
           }
           continue;
         }
@@ -3079,6 +3459,7 @@ fn spawn_node_retry(
         }
       };
       let mut retry_tasks = Vec::new();
+      permanent_partial |= refreshed.blocked;
       let mut all_complete = !refreshed.blocked;
       for (current_server_id, current_tasks) in refreshed.groups {
         let attempted = current_tasks.clone();
@@ -3092,6 +3473,7 @@ fn spawn_node_retry(
         {
           Ok(outcome) if outcome.retry_blocked => return false,
           Ok(outcome) => {
+            permanent_partial |= outcome.permanent_partial;
             all_complete &= !outcome.partial;
             retry_tasks.extend(outcome.retry_tasks);
           }
@@ -3106,7 +3488,7 @@ fn spawn_node_retry(
       }
       tasks = retry_tasks;
       if tasks.is_empty() && targets.is_empty() {
-        return all_complete;
+        return all_complete && !permanent_partial;
       }
       warn!("Backup retry {retry} remained partial");
     }
@@ -3383,6 +3765,7 @@ async fn build_node_backup_tasks(
 
 struct NodeBatchOutcome {
   partial: bool,
+  permanent_partial: bool,
   retry_tasks: Vec<VykarBackupTask>,
   retry_blocked: bool,
 }
@@ -3539,11 +3922,14 @@ async fn run_node_batch(
   server_id: &str,
   tasks: Vec<VykarBackupTask>,
 ) -> anyhow::Result<NodeBatchOutcome> {
+  ensure_not_cancelled(&run.id)?;
   let server = resource::get::<Server>(server_id).await?;
   let expected = tasks.len();
-  let response = trusted_backup_client(settings, &server)
-    .await?
-    .request(RunVykarBackupBatch {
+  let response = run_worker_backup(
+    settings,
+    &server,
+    RunVykarBackupBatch {
+      operation_id: Uuid::new_v4().to_string(),
       tasks: tasks.clone(),
       primary: repository_for_periphery(&settings.primary, false)?,
       mirror: settings
@@ -3558,17 +3944,19 @@ async fn run_node_batch(
       protected_repository_paths: protected_backup_paths(settings)?,
       filters: backup_source_filters(settings),
       stop_containers: settings.stop_containers,
-    })
-    .await;
+    },
+  )
+  .await;
   let response = match response {
     Ok(response) => response,
     Err(error) => {
       warn!(
-        "Backup node {} returned no authoritative result; the next attempt will use a fresh snapshot name: {error:#}",
+        "Backup node {} completed without a successful result; the next attempt will use a fresh snapshot name: {error:#}",
         server.name
       );
       return Ok(NodeBatchOutcome {
         partial: true,
+        permanent_partial: false,
         retry_tasks: retry_tasks_after_unknown_result(
           tasks,
           &run.id,
@@ -3584,13 +3972,6 @@ async fn run_node_batch(
       });
     }
   };
-  if !response.restart_errors.is_empty() {
-    record_operational_alert(format!(
-      "Backup restart failed on {}: {}",
-      server.name,
-      response.restart_errors.join("; ")
-    ));
-  }
   let result_count = response.results.len();
   let mut results = response
     .results
@@ -3703,6 +4084,8 @@ async fn run_node_batch(
   }
   Ok(NodeBatchOutcome {
     partial,
+    permanent_partial: explicitly_excluded
+      || !response.restart_errors.is_empty(),
     retry_tasks,
     retry_blocked: !response.restart_errors.is_empty(),
   })
@@ -3742,10 +4125,15 @@ async fn run_target(
 struct CoreRepositoryRetry {
   snapshot_name: String,
   source_label: String,
+  logical_source_label: String,
+  hostname: String,
+  export_digest: String,
+  created_at: i64,
   source_path: String,
   staging: PathBuf,
   retry_primary: bool,
   retry_mirror: bool,
+  retained_snapshots: Vec<VykarRetainedSnapshot>,
 }
 
 fn core_repository_retries()
@@ -3765,18 +4153,12 @@ async fn write_core_repository_snapshot(
   settings: &BackupSettings,
   retry: &CoreRepositoryRetry,
   cancellation: Arc<AtomicBool>,
-  remove_existing: bool,
 ) -> anyhow::Result<komodo_backup::BackupResult> {
   let settings_for_worker = settings.clone();
   let retry_for_worker = retry.clone();
   tokio::task::spawn_blocking(move || {
     let repository =
       core_repository(&repository, &settings_for_worker)?;
-    if remove_existing {
-      repository.delete_snapshot_if_present(
-        &retry_for_worker.snapshot_name,
-      )?;
-    }
     repository.backup_cancellable(
       &retry_for_worker.snapshot_name,
       &retry_for_worker.source_label,
@@ -3837,12 +4219,54 @@ fn core_export_digest(root: &Path) -> anyhow::Result<String> {
   Ok(hex::encode(Sha256::digest(serde_json::to_vec(&files)?)))
 }
 
+fn prepare_core_retry_attempt(
+  retry: &mut CoreRepositoryRetry,
+  name: String,
+  mirror: bool,
+  authorize: impl FnOnce(
+    &str,
+    &str,
+    &str,
+    &str,
+    i64,
+  ) -> anyhow::Result<String>,
+) -> anyhow::Result<()> {
+  let label = authorize(
+    &retry.logical_source_label,
+    &retry.hostname,
+    &name,
+    &retry.export_digest,
+    retry.created_at,
+  )?;
+  // Every retry is an additional, freshly authenticated attempt over the
+  // same immutable export. Keep the old role copies until that role commits
+  // its replacement; never delete a partial before attempting another write.
+  retry.retained_snapshots.push(VykarRetainedSnapshot {
+    snapshot_name: retry.snapshot_name.clone(),
+    retain_primary: true,
+    retain_mirror: mirror,
+  });
+  retry.snapshot_name = name;
+  retry.source_label = label;
+  // Common names preserve primary/mirror correspondence. A successful older
+  // role remains retained if its additional copy fails in this round.
+  retry.retry_primary = true;
+  retry.retry_mirror = mirror;
+  Ok(())
+}
+
 async fn retry_core_repositories(
   settings: &BackupSettings,
   run: &BackupRun,
   mut retry: CoreRepositoryRetry,
 ) -> anyhow::Result<bool> {
   ensure_not_cancelled(&run.id)?;
+  prepare_core_retry_attempt(
+    &mut retry,
+    snapshot_name("core", &run.id),
+    settings.mirror.is_some(),
+    crypto::authorize_core_source_label,
+  )?;
   let cancellation = cancellation_token(&run.id)
     .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
   if retry.retry_primary {
@@ -3851,11 +4275,18 @@ async fn retry_core_repositories(
       settings,
       &retry,
       cancellation.clone(),
-      true,
     )
     .await;
     retry.retry_primary =
       !matches!(&result, Ok(result) if !result.partial);
+    if !retry.retry_primary {
+      retire_retained_repository_copies(
+        settings,
+        &mut retry.retained_snapshots,
+        true,
+      )
+      .await;
+    }
     if let Err(error) = result {
       warn!("Core primary retry failed: {error:#}");
     }
@@ -3871,11 +4302,18 @@ async fn retry_core_repositories(
       settings,
       &retry,
       cancellation,
-      true,
     )
     .await;
     retry.retry_mirror =
       !matches!(&result, Ok(result) if !result.partial);
+    if !retry.retry_mirror {
+      retire_retained_repository_copies(
+        settings,
+        &mut retry.retained_snapshots,
+        false,
+      )
+      .await;
+    }
     if let Err(error) = result {
       warn!("Core mirror retry failed: {error:#}");
     }
@@ -3918,7 +4356,11 @@ async fn backup_core(
     database::utils::backup_excluding(
       &db_client().db,
       &staging,
-      &[SETTINGS_COLLECTION, RUNS_COLLECTION],
+      &[
+        SETTINGS_COLLECTION,
+        RUNS_COLLECTION,
+        PENDING_WORKERS_COLLECTION,
+      ],
     )
     .await?;
   }
@@ -3962,10 +4404,16 @@ async fn backup_core(
   let mut retry = CoreRepositoryRetry {
     snapshot_name: name,
     source_label: label,
+    logical_source_label: BackupTarget::Core
+      .source_label(core_instance_id()?),
+    hostname,
+    export_digest: digest,
+    created_at,
     source_path: path,
     staging: staging.clone(),
     retry_primary: true,
     retry_mirror: settings.mirror.is_some(),
+    retained_snapshots: Vec::new(),
   };
   let cancellation = cancellation_token(&run.id)
     .context("Core backup cancellation token is unavailable")?;
@@ -3974,7 +4422,6 @@ async fn backup_core(
     settings,
     &retry,
     cancellation.clone(),
-    false,
   )
   .await;
   retry.retry_primary =
@@ -3986,7 +4433,6 @@ async fn backup_core(
       settings,
       &retry,
       cancellation,
-      false,
     )
     .await;
     retry.retry_mirror =
@@ -4047,9 +4493,11 @@ async fn backup_stack(
   } else {
     Some(resource::get::<Repo>(&stack.config.linked_repo).await?)
   };
-  let response = trusted_backup_client(settings, &server)
-    .await?
-    .request(RunVykarBackup {
+  let response = run_worker_backup(
+    settings,
+    &server,
+    RunVykarBackup {
+      operation_id: Uuid::new_v4().to_string(),
       target: PeripheryBackupTarget::Stack {
         stack: Box::new(stack),
         repo: repo.map(Box::new),
@@ -4077,16 +4525,9 @@ async fn backup_stack(
       stop_containers: settings.stop_containers,
       mirror_only: false,
       primary_only: false,
-    })
-    .await?;
-  if !response.restart_errors.is_empty() {
-    record_operational_alert(format!(
-      "Containers could not be restarted after Stack backup on {} ({}): {}",
-      server.name,
-      server.id,
-      response.restart_errors.join("; ")
-    ));
-  }
+    },
+  )
+  .await?;
   if let Some(error) = response.primary.error {
     return Err(anyhow!(error));
   }
@@ -4109,9 +4550,11 @@ async fn backup_volume(
   let server = resource::get::<Server>(server_id).await?;
   let snapshot_name = snapshot_name("volume", &run.id);
   let hostname = format!("{PERIPHERY_HOSTNAME_PREFIX}{}", server.id);
-  let response = trusted_backup_client(settings, &server)
-    .await?
-    .request(RunVykarBackup {
+  let response = run_worker_backup(
+    settings,
+    &server,
+    RunVykarBackup {
+      operation_id: Uuid::new_v4().to_string(),
       target: PeripheryBackupTarget::Volume {
         volume_name: volume_name.into(),
       },
@@ -4139,16 +4582,9 @@ async fn backup_volume(
       stop_containers: settings.stop_containers,
       mirror_only: false,
       primary_only: false,
-    })
-    .await?;
-  if !response.restart_errors.is_empty() {
-    record_operational_alert(format!(
-      "Containers could not be restarted after Volume backup on {} ({}): {}",
-      server.name,
-      server.id,
-      response.restart_errors.join("; ")
-    ));
-  }
+    },
+  )
+  .await?;
   if let Some(error) = response.primary.error {
     return Err(anyhow!(error));
   }
@@ -4360,16 +4796,28 @@ pub async fn current_stack_backup_source(
   } else {
     Some(resource::get::<Repo>(&stack.config.linked_repo).await?)
   };
-  let source = periphery_client(&server)
-    .await?
-    .request(DiscoverBackupSource {
-      target: PeripheryBackupTarget::Stack {
-        stack: Box::new(stack),
-        repo: repo.map(Box::new),
+  let client = tokio::time::timeout(
+    std::time::Duration::from_secs(10),
+    periphery_client(&server),
+  )
+  .await
+  .context(
+    "Stack source discovery connection exceeded 10 seconds",
+  )??;
+  let source = client
+    .request_with_timeout(
+      DiscoverBackupSource {
+        target: PeripheryBackupTarget::Stack {
+          stack: Box::new(stack),
+          repo: repo.map(Box::new),
+        },
+        filters: backup_source_filters(&settings),
+        protected_repository_paths: protected_backup_paths(
+          &settings,
+        )?,
       },
-      filters: backup_source_filters(&settings),
-      protected_repository_paths: protected_backup_paths(&settings)?,
-    })
+      std::time::Duration::from_secs(65),
+    )
     .await?;
   Ok((server.id, source.paths))
 }
@@ -6048,6 +6496,10 @@ pub async fn execute_core_recovery(
   let _operation = core_recovery_operation_lock().lock().await;
   let backup_operation = backup_operation_lock().lock().await;
   let actions = activity::quiesce_actions()?;
+  // Same order as backups: repository role before mutation. Settings saves
+  // hold only the role writer and must not acquire a generic mutation reader.
+  let repository_roles =
+    repository_role_barrier().clone().write_owned().await;
   let stored = core_recovery_collection()
     .find_one(doc! { "_id": plan_id, "created_by": user_id })
     .await?
@@ -6094,6 +6546,7 @@ pub async fn execute_core_recovery(
   // Otherwise a mutation can commit to the old database during the delayed
   // restart and disappear from the recovered database.
   let mutation = mutation_barrier().clone().write_owned().await;
+  carry_current_backup_settings(&validation).await?;
   persist_core_recovery_activation(
     &stored.plan.validation_database,
     &stored.recovered_core_instance_id,
@@ -6107,6 +6560,7 @@ pub async fn execute_core_recovery(
   std::mem::forget(backup_operation);
   std::mem::forget(mutation);
   std::mem::forget(actions);
+  std::mem::forget(repository_roles);
   let mut run = committed_core_recovery_run(&stored.plan);
   let mut warnings = Vec::new();
   core_recovery_audit_step(
@@ -6137,6 +6591,30 @@ pub async fn execute_core_recovery(
     record_operational_alert(warning);
   }
   Ok(run)
+}
+
+async fn carry_current_backup_settings(
+  validation: &database::mungos::mongodb::Database,
+) -> anyhow::Result<()> {
+  let target = validation
+    .collection::<SealedBackupSettings>(SETTINGS_COLLECTION);
+  if let Some(settings) = settings_collection()
+    .find_one(doc! { "_id": SETTINGS_ID })
+    .await?
+  {
+    // Carry the sealed bytes AND initialization state, never a redacted DTO.
+    target
+      .replace_one(doc! { "_id": SETTINGS_ID }, settings)
+      .upsert(true)
+      .await?;
+  } else {
+    target.delete_one(doc! { "_id": SETTINGS_ID }).await?;
+  }
+  validation
+    .collection::<RepositoryHealthRecord>(HEALTH_COLLECTION)
+    .delete_many(doc! {})
+    .await?;
+  Ok(())
 }
 
 fn committed_core_recovery_run(plan: &CoreRecoveryPlan) -> BackupRun {
@@ -6444,29 +6922,55 @@ pub async fn cancel_run(run_id: &str) -> anyhow::Result<BackupRun> {
       "This backup operation cannot be cancelled once it has started"
     ));
   }
-  if let Some(token) = cancellation_token(run_id) {
-    token.store(true, Ordering::SeqCst);
-  }
+  // Startup reconciliation also accepts cancellation, although its in-memory
+  // token was lost with the old process.
+  cancellation_tokens()
+    .lock()
+    .unwrap()
+    .entry(run_id.to_string())
+    .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+    .store(true, Ordering::SeqCst);
   if *fleet_generation().read().unwrap() == run_id {
     fleet_generation().write().unwrap().clear();
-  }
-  let repository_retry =
-    core_repository_retries().lock().unwrap().remove(run_id);
-  if let Some(retry) = repository_retry {
-    let _ = tokio::fs::remove_dir_all(retry.staging).await;
   }
   let servers = find_collect(&db_client().servers, None, None)
     .await
     .unwrap_or_default();
-  futures_util::future::join_all(servers.iter().map(
+  let mut servers = servers
+    .into_iter()
+    .map(|server| (server.id.clone(), server))
+    .collect::<HashMap<_, _>>();
+  if let Ok(pending) = find_collect(
+    &pending_workers_collection(),
+    doc! { "run_id": run_id },
+    None,
+  )
+  .await
+  {
+    for pending in pending {
+      // The original dispatch identity overrides subsequently edited settings.
+      servers.insert(pending.server.id.clone(), pending.server);
+    }
+  }
+  futures_util::future::join_all(servers.values().map(
     |server| async move {
-      if let Ok(client) = periphery_client(server).await {
-        let _ = client
-          .request(CancelVykarOperation {
-            operation_id: run_id.to_string(),
-          })
-          .await;
-      }
+      let cancellation = async {
+        let client = periphery_client(server).await?;
+        client
+          .request_pinned_with_timeout(
+            PeripheryConnectionArgs::from_server(server),
+            CancelVykarOperation {
+              operation_id: run_id.to_string(),
+            },
+            std::time::Duration::from_secs(10),
+          )
+          .await
+      };
+      let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        cancellation,
+      )
+      .await;
     },
   ))
   .await;
@@ -6474,6 +6978,9 @@ pub async fn cancel_run(run_id: &str) -> anyhow::Result<BackupRun> {
   // guarantees Core export/repository workers and the initial fleet batch have
   // observed cancellation before the audit record becomes Cancelled.
   let _operation = backup_operation_lock().lock().await;
+  // An active Core retry can still be reading this immutable export. Cleanup
+  // follows its actual completion, never acknowledgement of the cancel flag.
+  discard_core_repository_retry(run_id).await;
   let current = runs_collection()
     .find_one(doc! { "id": run_id })
     .await?
@@ -6648,11 +7155,11 @@ pub fn spawn_scheduler() {
           continue;
         }
       };
-      // The reloaded settings check above prevents a stale timer from running
-      // after disable or reschedule. `current` is intentionally kept alive so
-      // this validation cannot be optimized into the earlier snapshot.
-      drop(current);
-      if let Err(error) = run_scheduled_backup().await {
+      // Carry this exact revision to final admission under the role lease.
+      // A save after this read must invalidate the tick before a run exists.
+      if let Err(error) =
+        run_scheduled_backup(current.updated_at).await
+      {
         error!("Scheduled fleet backup failed: {error:#}");
       }
     }
@@ -6662,6 +7169,145 @@ pub fn spawn_scheduler() {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn scheduled_admission_rechecks_enabled_and_exact_revision() {
+    let mut settings = BackupSettings {
+      enabled: true,
+      updated_at: 10,
+      ..Default::default()
+    };
+    assert!(schedule_admission_matches(&settings, Some(10)));
+    settings.enabled = false;
+    assert!(!schedule_admission_matches(&settings, Some(10)));
+    assert!(schedule_admission_matches(&settings, None));
+    settings.enabled = true;
+    settings.updated_at = 11;
+    assert!(!schedule_admission_matches(&settings, Some(10)));
+    assert!(schedule_admission_matches(&settings, Some(11)));
+    assert_eq!(next_settings_revision(10, 10), 11);
+    assert_eq!(next_settings_revision(11, 9), 12);
+  }
+
+  #[test]
+  fn worker_result_presence_never_substitutes_for_terminal_proof() {
+    let mut receipt = VykarBackupCompletion {
+      result: Some(RunVykarBackupResponse::default()),
+      ..Default::default()
+    };
+    assert!(!worker_completion_is_terminal(&receipt));
+    receipt.state = VykarBackupCompletionState::Running;
+    assert!(!worker_completion_is_terminal(&receipt));
+    receipt.state = VykarBackupCompletionState::Complete;
+    receipt.result = None;
+    receipt.error = Some("Dispatch fenced before admission".into());
+    assert!(worker_completion_is_terminal(&receipt));
+  }
+
+  #[test]
+  fn lost_backup_response_recovers_the_original_restart_errors() {
+    let receipt = VykarBackupCompletion {
+      state: VykarBackupCompletionState::Complete,
+      batch_result: Some(RunVykarBackupBatchResponse {
+        restart_errors: vec!["container still stopped".into()],
+        ..Default::default()
+      }),
+      ..Default::default()
+    };
+    assert!(worker_completion_is_terminal(&receipt));
+    let response = RunVykarBackupBatch::take_result(receipt).unwrap();
+    assert_eq!(
+      RunVykarBackupBatch::restart_errors(&response),
+      &["container still stopped".to_string()]
+    );
+  }
+
+  #[test]
+  fn recovery_settings_record_preserves_sealed_state_and_init_flags()
+  {
+    let settings = SealedBackupSettings {
+      id: SETTINGS_ID.into(),
+      sealed: "current-sealed-settings-not-the-plan-copy".into(),
+      updated_at: 123,
+      primary_initialized: true,
+      mirror_initialized: true,
+    };
+    let saved: SealedBackupSettings =
+      database::bson::from_document(to_document(&settings).unwrap())
+        .unwrap();
+    assert_eq!(saved.sealed, settings.sealed);
+    assert_eq!(saved.updated_at, 123);
+    assert!(saved.primary_initialized && saved.mirror_initialized);
+    assert!(!core_export_includes_collection(
+      PENDING_WORKERS_COLLECTION
+    ));
+  }
+
+  #[test]
+  fn core_retries_resign_fresh_names_over_the_immutable_export() {
+    let mut retry = CoreRepositoryRetry {
+      snapshot_name: "original-partial".into(),
+      source_label: "original-signature".into(),
+      logical_source_label: "core/instance".into(),
+      hostname: "komodo-core-instance".into(),
+      export_digest: "immutable-digest".into(),
+      created_at: 123,
+      source_path: "/private/export".into(),
+      staging: PathBuf::from("/private/export"),
+      retry_primary: false,
+      retry_mirror: true,
+      retained_snapshots: Vec::new(),
+    };
+    let authorize = |source: &str,
+                     host: &str,
+                     name: &str,
+                     digest: &str,
+                     time: i64| {
+      assert_eq!(source, "core/instance");
+      assert_eq!(host, "komodo-core-instance");
+      assert_eq!(digest, "immutable-digest");
+      assert_eq!(time, 123);
+      Ok(format!("signature-for-{name}"))
+    };
+    prepare_core_retry_attempt(
+      &mut retry,
+      "attempt-b".into(),
+      true,
+      authorize,
+    )
+    .unwrap();
+    assert_eq!(retry.source_label, "signature-for-attempt-b");
+    assert_eq!(retry.source_path, "/private/export");
+    assert_eq!(retry.retained_snapshots.len(), 1);
+    assert!(retry.retained_snapshots[0].retain_primary);
+    assert!(retry.retained_snapshots[0].retain_mirror);
+    // Failure in B does not retire either role's diagnostic/good A copy.
+    prepare_core_retry_attempt(
+      &mut retry,
+      "attempt-c".into(),
+      true,
+      authorize,
+    )
+    .unwrap();
+    assert_eq!(retry.retained_snapshots.len(), 2);
+    // A complete C primary retires only older primary copies.
+    assert_eq!(
+      take_retained_repository_copies(
+        &mut retry.retained_snapshots,
+        true
+      ),
+      vec!["original-partial".to_string(), "attempt-b".to_string()]
+    );
+    assert_eq!(retry.retained_snapshots.len(), 2);
+    assert!(
+      retry
+        .retained_snapshots
+        .iter()
+        .all(|copy| copy.retain_mirror)
+    );
+    assert_eq!(retry.created_at, 123);
+    assert_eq!(retry.export_digest, "immutable-digest");
+  }
 
   #[test]
   fn manual_backup_admission_rejects_busy_requests_without_queueing()
@@ -7691,7 +8337,7 @@ mod tests {
       "also-mine".into(),
       "0123456789abcdef01234567".into(),
     );
-    assert_eq!(keys, ["mine", "my-stack", "also-mine"]);
+    assert_eq!(keys, ["mine", "also-mine"]);
   }
 
   #[tokio::test]
@@ -7883,16 +8529,20 @@ mod tests {
   #[test]
   fn fleet_retry_finalization_waits_for_every_retry() {
     assert_eq!(
-      fleet_retry_completion(false, true).0,
+      fleet_retry_completion(false, true, false).0,
       BackupRunState::Complete
     );
     assert_eq!(
-      fleet_retry_completion(false, false).0,
+      fleet_retry_completion(false, false, false).0,
       BackupRunState::Partial
     );
     assert_eq!(
-      fleet_retry_completion(true, true).0,
+      fleet_retry_completion(true, true, false).0,
       BackupRunState::Cancelled
+    );
+    assert_eq!(
+      fleet_retry_completion(false, true, true).0,
+      BackupRunState::Partial
     );
     assert!(fleet_retry_requires_maintenance(
       &BackupRunState::Complete

@@ -185,6 +185,7 @@ enum BackupComposeMount {
 #[derive(Default)]
 struct OperationCancellationRegistry {
   active: HashMap<String, Arc<AtomicBool>>,
+  registrations: HashMap<String, usize>,
   pending: HashMap<String, Instant>,
 }
 
@@ -217,11 +218,14 @@ struct OperationCancellationRegistration(String);
 
 impl Drop for OperationCancellationRegistration {
   fn drop(&mut self) {
-    cancellation_registry()
-      .lock()
-      .unwrap()
-      .active
-      .remove(&self.0);
+    let mut registry = cancellation_registry().lock().unwrap();
+    if let Some(count) = registry.registrations.get_mut(&self.0) {
+      *count -= 1;
+      if *count == 0 {
+        registry.registrations.remove(&self.0);
+        registry.active.remove(&self.0);
+      }
+    }
   }
 }
 
@@ -232,10 +236,15 @@ fn register_operation_cancellation(
   let now = Instant::now();
   registry.prune_pending(now);
   let cancelled = registry.pending.remove(operation_id).is_some();
-  let token = Arc::new(AtomicBool::new(cancelled));
-  registry
+  let token = registry
     .active
-    .insert(operation_id.to_string(), token.clone());
+    .entry(operation_id.to_string())
+    .or_insert_with(|| Arc::new(AtomicBool::new(cancelled)))
+    .clone();
+  *registry
+    .registrations
+    .entry(operation_id.to_string())
+    .or_default() += 1;
   (
     token,
     OperationCancellationRegistration(operation_id.to_string()),
@@ -297,15 +306,241 @@ impl std::fmt::Display for ExcludedBackupSource {
 
 impl std::error::Error for ExcludedBackupSource {}
 
+#[derive(Serialize, Deserialize)]
+struct BackupCompletionReceipt {
+  core: String,
+  run_id: String,
+  batch: Option<bool>,
+  completion: VykarBackupCompletion,
+}
+
+fn backup_completion_lock() -> &'static Mutex<()> {
+  static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+  LOCK.get_or_init(Default::default)
+}
+
+fn backup_completion_dir() -> anyhow::Result<PathBuf> {
+  let directory =
+    internal_storage_dir().join("backup-completion-journals");
+  std::fs::create_dir_all(&directory)?;
+  std::fs::set_permissions(
+    &directory,
+    std::fs::Permissions::from_mode(0o700),
+  )?;
+  fsync_parent(&internal_storage_dir())?;
+  fsync_parent(&directory)?;
+  Ok(directory)
+}
+
+fn backup_completion_path(
+  directory: &Path,
+  operation_id: &str,
+) -> anyhow::Result<PathBuf> {
+  let operation_id = uuid::Uuid::parse_str(operation_id)
+    .context("Backup dispatch requires a valid operation UUID")?;
+  Ok(directory.join(format!("{operation_id}.json")))
+}
+
+fn read_backup_completion(
+  path: &Path,
+) -> anyhow::Result<Option<BackupCompletionReceipt>> {
+  match std::fs::read(path) {
+    Ok(bytes) => serde_json::from_slice(&bytes)
+      .map(Some)
+      .context("Invalid backup completion receipt"),
+    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+      Ok(None)
+    }
+    Err(error) => Err(error.into()),
+  }
+}
+
+fn check_backup_completion_owner(
+  receipt: &BackupCompletionReceipt,
+  core: &str,
+  run_id: &str,
+) -> anyhow::Result<()> {
+  if receipt.core != core || receipt.run_id != run_id {
+    return Err(anyhow!(
+      "Backup dispatch identity belongs to another Core or run"
+    ));
+  }
+  Ok(())
+}
+
+fn claim_backup_completion(
+  directory: &Path,
+  operation_id: &str,
+  core: &str,
+  run_id: &str,
+  batch: bool,
+) -> anyhow::Result<Option<VykarBackupCompletion>> {
+  let _lock = backup_completion_lock().lock().unwrap();
+  let path = backup_completion_path(directory, operation_id)?;
+  if let Some(receipt) = read_backup_completion(&path)? {
+    check_backup_completion_owner(&receipt, core, run_id)?;
+    if receipt.batch.is_some_and(|kind| kind != batch) {
+      return Err(anyhow!(
+        "Backup dispatch identity has a different operation kind"
+      ));
+    }
+    if receipt.completion.state
+      != VykarBackupCompletionState::Complete
+    {
+      return Err(anyhow!(
+        "Backup dispatch is already running; query its completion receipt"
+      ));
+    }
+    return Ok(Some(receipt.completion));
+  }
+  persist_journal(
+    &path,
+    &BackupCompletionReceipt {
+      core: core.into(),
+      run_id: run_id.into(),
+      batch: Some(batch),
+      completion: VykarBackupCompletion {
+        state: VykarBackupCompletionState::Running,
+        ..Default::default()
+      },
+    },
+  )?;
+  Ok(None)
+}
+
+fn finish_backup_completion(
+  directory: &Path,
+  operation_id: &str,
+  core: &str,
+  run_id: &str,
+  completion: VykarBackupCompletion,
+) -> anyhow::Result<()> {
+  let _lock = backup_completion_lock().lock().unwrap();
+  let path = backup_completion_path(directory, operation_id)?;
+  let mut receipt = read_backup_completion(&path)?
+    .context("Backup dispatch receipt disappeared")?;
+  check_backup_completion_owner(&receipt, core, run_id)?;
+  if receipt.completion.state != VykarBackupCompletionState::Running {
+    return Err(anyhow!("Backup dispatch receipt is not running"));
+  }
+  receipt.completion = completion;
+  persist_journal(&path, &receipt)
+}
+
+fn query_backup_completion(
+  directory: &Path,
+  request: &GetVykarBackupCompletion,
+  core: &str,
+) -> anyhow::Result<VykarBackupCompletion> {
+  let _lock = backup_completion_lock().lock().unwrap();
+  let path =
+    backup_completion_path(directory, &request.operation_id)?;
+  let mut receipt = match read_backup_completion(&path)? {
+    Some(receipt) => receipt,
+    None if request.cancel_if_unknown => {
+      // Serialized with dispatch claim: a late request cannot pass this fence.
+      let receipt = BackupCompletionReceipt {
+        core: core.into(),
+        run_id: request.run_id.clone(),
+        batch: None,
+        completion: VykarBackupCompletion {
+          state: VykarBackupCompletionState::Complete,
+          error: Some(
+            "Backup dispatch was fenced before it started".into(),
+          ),
+          ..Default::default()
+        },
+      };
+      persist_journal(&path, &receipt)?;
+      receipt
+    }
+    None => return Ok(VykarBackupCompletion::default()),
+  };
+  check_backup_completion_owner(&receipt, core, &request.run_id)?;
+  let response = receipt.completion.clone();
+  if request.acknowledge
+    && receipt.completion.state
+      == VykarBackupCompletionState::Complete
+  {
+    // Keep the identity forever: deleting it could admit a delayed dispatch.
+    receipt.completion.result = None;
+    receipt.completion.batch_result = None;
+    receipt.completion.error =
+      Some("Backup completion was already acknowledged".into());
+    persist_journal(&path, &receipt)?;
+  }
+  Ok(response)
+}
+
+impl Resolve<Args> for GetVykarBackupCompletion {
+  async fn resolve(
+    self,
+    args: &Args,
+  ) -> anyhow::Result<VykarBackupCompletion> {
+    query_backup_completion(
+      &backup_completion_dir()?,
+      &self,
+      &args.core,
+    )
+  }
+}
+
+fn recover_backup_completions_in(
+  directory: &Path,
+) -> anyhow::Result<()> {
+  let _lock = backup_completion_lock().lock().unwrap();
+  for entry in std::fs::read_dir(directory)? {
+    let path = entry?.path();
+    if path.extension().and_then(|value| value.to_str())
+      != Some("json")
+    {
+      continue;
+    }
+    let mut receipt = read_backup_completion(&path)?
+      .context("Backup completion disappeared during recovery")?;
+    if receipt.completion.state == VykarBackupCompletionState::Running
+    {
+      receipt.completion = VykarBackupCompletion {
+        state: VykarBackupCompletionState::Complete,
+        error: Some("Backup worker restarted; operation interrupted and container recovery completed".into()),
+        ..Default::default()
+      };
+      persist_journal(&path, &receipt)?;
+    }
+  }
+  Ok(())
+}
+
 impl Resolve<Args> for DiscoverBackupSource {
   async fn resolve(
     self,
     _: &Args,
   ) -> anyhow::Result<DiscoverBackupSourceResponse> {
-    discover_source(
-      &self.target,
-      &self.protected_repository_paths,
-      &self.filters,
+    static SLOTS: OnceLock<Arc<tokio::sync::Semaphore>> =
+      OnceLock::new();
+    let runtime = tokio::runtime::Handle::current();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    bounded_backup_discovery(
+      SLOTS
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
+        .clone(),
+      Duration::from_secs(60),
+      move || {
+        runtime.block_on(async {
+          // Cancel pending async Docker queries at the same deadline. Only a
+          // synchronous filesystem call that cannot yet return retains the slot.
+          tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            discover_source(
+              &self.target,
+              &self.protected_repository_paths,
+              &self.filters,
+            ),
+          )
+          .await
+          .context("Backup source discovery exceeded 60 seconds")?
+        })
+      },
     )
     .await
   }
@@ -314,13 +549,92 @@ impl Resolve<Args> for DiscoverBackupSource {
 impl Resolve<Args> for RunVykarBackup {
   async fn resolve(
     self,
-    _: &Args,
+    args: &Args,
   ) -> anyhow::Result<RunVykarBackupResponse> {
+    let directory = backup_completion_dir()?;
+    if let Some(completion) = claim_backup_completion(
+      &directory,
+      &self.operation_id,
+      &args.core,
+      &self.run_id,
+      false,
+    )? {
+      return completion.result.ok_or_else(|| {
+        anyhow!(completion.error.unwrap_or_else(|| {
+          "Backup dispatch has no replayable result".into()
+        }))
+      });
+    }
+    let core = args.core.clone();
+    let (_, cancellation_registration) =
+      register_operation_cancellation(&self.run_id);
+    // The task owns both work and completion publication. Dropping an HTTP
+    // waiter cannot release guards while blocking Vykar work is still active.
+    tokio::spawn(async move {
+      let operation_id = self.operation_id.clone();
+      let run_id = self.run_id.clone();
+      let result = self.run().await;
+      drop(cancellation_registration);
+      let completion = VykarBackupCompletion {
+        state: VykarBackupCompletionState::Complete,
+        result: result.as_ref().ok().cloned(),
+        error: result
+          .as_ref()
+          .err()
+          .map(|error| format!("{error:#}")),
+        ..Default::default()
+      };
+      finish_backup_completion(
+        &directory,
+        &operation_id,
+        &core,
+        &run_id,
+        completion,
+      )?;
+      result
+    })
+    .await
+    .context(
+      "Backup operation task failed; completion remains uncertain",
+    )?
+  }
+}
+
+async fn bounded_backup_discovery<T: Send + 'static>(
+  slots: Arc<tokio::sync::Semaphore>,
+  timeout: Duration,
+  work: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
+) -> anyhow::Result<T> {
+  let permit = slots.try_acquire_owned().context("Backup source discovery is already running; retry after it finishes")?;
+  let worker = tokio::task::spawn_blocking(move || {
+    // Discovery includes synchronous path inspection. If that is stalled on
+    // storage, response expiry must not admit another detached discovery.
+    let _permit = permit;
+    work()
+  });
+  tokio::time::timeout(timeout, worker)
+    .await
+    .context("Backup source discovery exceeded 60 seconds")?
+    .context("Backup source discovery worker failed")?
+}
+
+trait RunBackupOperation {
+  type Response;
+  async fn run(self) -> anyhow::Result<Self::Response>;
+}
+
+impl RunBackupOperation for RunVykarBackup {
+  type Response = RunVykarBackupResponse;
+
+  async fn run(self) -> anyhow::Result<RunVykarBackupResponse> {
     let _operation = backup_operation_lock().lock().await;
+    if operation_cancelled(&self.run_id) {
+      return Err(anyhow!(
+        "Backup cancelled before worker admission"
+      ));
+    }
     let _filesystem = protected_filesystem_guard()?;
     ensure_no_pending_recovery()?;
-    let (_cancellation, _cancellation_registration) =
-      register_operation_cancellation(&self.run_id);
     let discovered = discover_source(
       &self.target,
       &self.protected_repository_paths,
@@ -411,13 +725,67 @@ impl Resolve<Args> for RunVykarBackup {
 impl Resolve<Args> for RunVykarBackupBatch {
   async fn resolve(
     self,
-    _: &Args,
+    args: &Args,
   ) -> anyhow::Result<RunVykarBackupBatchResponse> {
+    let directory = backup_completion_dir()?;
+    if let Some(completion) = claim_backup_completion(
+      &directory,
+      &self.operation_id,
+      &args.core,
+      &self.run_id,
+      true,
+    )? {
+      return completion.batch_result.ok_or_else(|| {
+        anyhow!(completion.error.unwrap_or_else(|| {
+          "Backup dispatch has no replayable batch result".into()
+        }))
+      });
+    }
+    let core = args.core.clone();
+    let (_, cancellation_registration) =
+      register_operation_cancellation(&self.run_id);
+    tokio::spawn(async move {
+      let operation_id = self.operation_id.clone();
+      let run_id = self.run_id.clone();
+      let result = self.run().await;
+      drop(cancellation_registration);
+      let completion = VykarBackupCompletion {
+        state: VykarBackupCompletionState::Complete,
+        batch_result: result.as_ref().ok().cloned(),
+        error: result
+          .as_ref()
+          .err()
+          .map(|error| format!("{error:#}")),
+        ..Default::default()
+      };
+      finish_backup_completion(
+        &directory,
+        &operation_id,
+        &core,
+        &run_id,
+        completion,
+      )?;
+      result
+    })
+    .await
+    .context(
+      "Backup batch task failed; completion remains uncertain",
+    )?
+  }
+}
+
+impl RunBackupOperation for RunVykarBackupBatch {
+  type Response = RunVykarBackupBatchResponse;
+
+  async fn run(self) -> anyhow::Result<RunVykarBackupBatchResponse> {
     let _operation = backup_operation_lock().lock().await;
+    if operation_cancelled(&self.run_id) {
+      return Err(anyhow!(
+        "Backup cancelled before worker admission"
+      ));
+    }
     let _filesystem = protected_filesystem_guard()?;
     ensure_no_pending_recovery()?;
-    let (_cancellation, _cancellation_registration) =
-      register_operation_cancellation(&self.run_id);
     let mut discovered = Vec::new();
     let mut results = Vec::new();
     let mut discovery_errors = Vec::new();
@@ -486,6 +854,7 @@ impl Resolve<Args> for RunVykarBackupBatch {
         break;
       }
       let request = RunVykarBackup {
+        operation_id: self.operation_id.clone(),
         target: task.target,
         primary: self.primary.clone(),
         mirror: self.mirror.clone(),
@@ -737,46 +1106,16 @@ fn backup_manifest_path_aliases(
   compose_bind_path_aliases(stack, Path::new(run_directory))
 }
 
-fn paths_overlap(left: &Path, right: &Path) -> bool {
-  left == right || left.starts_with(right) || right.starts_with(left)
+fn paths_overlap(left: &Path, right: &Path) -> anyhow::Result<bool> {
+  komodo_backup::filesystem::paths_overlap(left, right)
 }
 
 fn resolve_existing_ancestor(path: &Path) -> anyhow::Result<PathBuf> {
-  let mut ancestor = path;
-  let mut missing = Vec::new();
-  loop {
-    match ancestor.canonicalize() {
-      Ok(mut resolved) => {
-        while let Some(component) = missing.pop() {
-          resolved.push(component);
-        }
-        return Ok(resolved);
-      }
-      Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-        let name = ancestor.file_name().with_context(|| {
-          format!(
-            "Restore destination has no resolvable ancestor: {}",
-            path.display()
-          )
-        })?;
-        missing.push(name.to_os_string());
-        ancestor = ancestor.parent().with_context(|| {
-          format!(
-            "Restore destination has no resolvable ancestor: {}",
-            path.display()
-          )
-        })?;
-      }
-      Err(error) => {
-        return Err(error).with_context(|| {
-          format!(
-            "Failed to resolve restore destination ancestor: {}",
-            path.display()
-          )
-        });
-      }
-    }
-  }
+  komodo_backup::filesystem::resolve_existing_ancestor(path)
+}
+
+pub(crate) fn internal_storage_dir() -> PathBuf {
+  periphery_config().stack_dir().join(".komodo-vykar")
 }
 
 fn validate_path_outside_internal_storage(
@@ -784,12 +1123,7 @@ fn validate_path_outside_internal_storage(
   internal_storage: &Path,
   label: &str,
 ) -> anyhow::Result<()> {
-  let resolved_path = resolve_existing_ancestor(path)?;
-  let resolved_internal =
-    resolve_existing_ancestor(internal_storage)?;
-  if paths_overlap(path, internal_storage)
-    || paths_overlap(&resolved_path, &resolved_internal)
-  {
+  if paths_overlap(path, internal_storage)? {
     return Err(ExcludedBackupSource(format!(
       "{label} '{}' overlaps Periphery's internal backup storage '{}'",
       path.display(),
@@ -804,7 +1138,7 @@ fn validate_resolved_restore_destinations(
 ) -> anyhow::Result<()> {
   validate_resolved_restore_destinations_against(
     publish,
-    &periphery_config().stack_dir().join(".komodo-vykar"),
+    &internal_storage_dir(),
   )
 }
 
@@ -817,18 +1151,18 @@ fn validate_resolved_restore_destinations_against(
     .map(|item| {
       validate_restore_destination_ancestors(item)?;
       let destination = Path::new(&item.destination);
-      validate_path_outside_internal_storage(
-        destination,
-        internal_storage,
-        "Restore destination",
-      )?;
-      resolve_existing_ancestor(destination)
-        .map(|resolved| (item.destination.as_str(), resolved))
+      if komodo_backup::filesystem::entry_overlaps_path(
+        destination, internal_storage,
+      )? {
+        return Err(anyhow!("Restore destination overlaps Periphery's internal backup storage"));
+      }
+      Ok((item.destination.as_str(), destination))
     })
     .collect::<anyhow::Result<Vec<_>>>()?;
   for (index, (left_label, left)) in destinations.iter().enumerate() {
     for (right_label, right) in destinations.iter().skip(index + 1) {
-      if paths_overlap(left, right) {
+      if komodo_backup::filesystem::entry_paths_overlap(left, right)?
+      {
         return Err(anyhow!(
           "Restore destinations overlap after resolving filesystem aliases: '{left_label}' and '{right_label}'"
         ));
@@ -857,11 +1191,16 @@ async fn validate_restore_destinations(
     )
     .await?;
   for item in publish {
-    validate_path_outside_protected_repositories(
-      Path::new(&item.destination),
-      &protected_repository_sources,
-      "Restore destination",
-    )?;
+    for protected in &protected_repository_sources {
+      if komodo_backup::filesystem::entry_overlaps_path(
+        Path::new(&item.destination),
+        protected,
+      )? {
+        return Err(anyhow!(
+          "Restore destination overlaps protected repository storage"
+        ));
+      }
+    }
   }
   Ok(())
 }
@@ -936,10 +1275,26 @@ fn insert_bind_backup_root(
       run_directory.display()
     ));
   }
+  if paths_overlap(run_directory, &bind)? {
+    return Err(anyhow!(
+      "Bind source '{}' aliases the Stack run directory; use one non-overlapping source namespace",
+      bind.display()
+    ));
+  }
   if bind_paths.iter().any(|existing| bind.starts_with(existing)) {
     // An ancestor already captures this tree. Keeping both roots would make
     // the resulting full snapshot impossible to publish atomically.
     return Ok(());
+  }
+  for existing in bind_paths.iter() {
+    if !existing.starts_with(&bind) && paths_overlap(existing, &bind)?
+    {
+      return Err(anyhow!(
+        "Selected bind roots '{}' and '{}' overlap through filesystem aliases",
+        existing.display(),
+        bind.display()
+      ));
+    }
   }
   bind_paths.retain(|existing| !existing.starts_with(&bind));
   bind_paths.insert(bind);
@@ -972,7 +1327,8 @@ fn compose_bind_paths(
     } else {
       run_directory.join(source)
     };
-    insert_bind_backup_root(&mut paths, run_directory, &source)?;
+    // Do not discard descendants before include/exclude policy is applied.
+    paths.insert(validate_source_path(&source)?);
   }
   Ok(paths)
 }
@@ -1082,8 +1438,9 @@ fn compose_mount_target(mount: &BackupComposeMount) -> Option<&str> {
   }
 }
 
-/// Associate expressions with the authenticated, interpolated deployment by
-/// service and mount target. Do not expand using the recovery host's env.
+/// Associate relative sources and expressions with the authenticated original
+/// deployment by service and mount target. Neither the recovery host's env nor
+/// the already-remapped run directory describes the original bind source.
 fn resolve_recovered_bind_expressions(
   document: &mut serde_yaml_ng::Value,
   deployed_config: Option<&str>,
@@ -1126,21 +1483,41 @@ fn resolve_recovered_bind_expressions(
           source.as_deref()
         }
       };
-      if !source.is_some_and(|source| source.contains('$')) {
+      let Some(source) = source else {
+        continue;
+      };
+      let relative_bind = !Path::new(source).is_absolute()
+        && (source.starts_with('.')
+          || matches!(
+            &parsed,
+            BackupComposeMount::Long { mount_type, .. }
+              if mount_type.as_deref() == Some("bind")
+          ));
+      if !relative_bind && !source.contains('$') {
         continue;
       }
       let target = compose_mount_target(&parsed)
-        .context("Cannot identify an environment-expanded Compose mount target")?;
+        .context("Cannot identify a relative or environment-expanded Compose mount target")?;
       let deployed_mount = deployed.as_ref()
         .and_then(|config| config.services.get(service_name.as_str()?))
         .and_then(|service| service.volumes.iter().find(|mount| compose_mount_target(mount) == Some(target)))
-        .context("Cannot resolve an environment-expanded Compose mount from snapshot deployment metadata")?;
+        .context("Cannot resolve a relative or environment-expanded Compose mount from snapshot deployment metadata")?;
       let Some(expanded) =
         compose_bind_source(deployed_mount.clone())
       else {
+        if relative_bind {
+          return Err(anyhow!(
+            "Snapshot deployment metadata does not identify the relative bind source for mount '{target}'"
+          ));
+        }
         // The deployed expression names a Docker volume, not a bind source.
         continue;
       };
+      if !Path::new(&expanded).is_absolute() {
+        return Err(anyhow!(
+          "Snapshot deployment metadata has no absolute bind source for mount '{target}'"
+        ));
+      }
       if remap_absolute_bind_source(&expanded, mappings, aliases)
         .is_none()
       {
@@ -1356,6 +1733,7 @@ async fn affected_running_containers(
   target: &PeripheryBackupTarget,
   paths: &BTreeSet<PathBuf>,
   protected_paths: &[ProtectedRepositoryPath],
+  replacing_entries: bool,
 ) -> anyhow::Result<Vec<String>> {
   ensure_target_not_control_plane(
     containers,
@@ -1366,6 +1744,16 @@ async fn affected_running_containers(
   // filesystem gate already excludes other mutations; stopping it would kill
   // the backup/restore before it can restart application containers.
   let own_id = komodo_backup::container::current_container_id();
+  let own_mounts = if let Some(own) =
+    containers.iter().find(|container| {
+      own_id
+        .as_deref()
+        .is_some_and(|id| container_matches_id(container, id))
+    }) {
+    docker.inspect_container(&own.name).await?.mounts
+  } else {
+    Vec::new()
+  };
   let mut affected = running_containers_for_target(
     containers,
     target,
@@ -1382,14 +1770,17 @@ async fn affected_running_containers(
       continue;
     }
     let inspected = docker.inspect_container(&container.name).await?;
-    if inspected.mounts.into_iter().any(|mount| {
-      mount_affects_paths(
+    for mount in inspected.mounts {
+      if mount_affects_paths(
         mount.typ.as_deref(),
         mount.source.as_deref(),
         paths,
-      )
-    }) {
-      affected.insert(container.name.clone());
+        &own_mounts,
+        replacing_entries,
+      )? {
+        affected.insert(container.name.clone());
+        break;
+      }
     }
   }
   Ok(affected.into_iter().collect())
@@ -1403,16 +1794,44 @@ fn mount_affects_paths(
   mount_type: Option<&str>,
   source: Option<&str>,
   paths: &BTreeSet<PathBuf>,
-) -> bool {
+  own_mounts: &[komodo_client::entities::docker::container::MountPoint],
+  replacing_entries: bool,
+) -> anyhow::Result<bool> {
   if !mount_type_affects_paths(mount_type) {
-    return false;
+    return Ok(false);
   }
   let Some(source) = source else {
-    return false;
+    return Ok(false);
   };
   let source = PathBuf::from(source);
-  let source = source.canonicalize().unwrap_or(source);
-  paths.iter().any(|path| paths_overlap(&source, path))
+  let mut sources = vec![source.clone()];
+  // Docker reports host paths. Translate only through this verified worker's
+  // mounts, never an unrelated application's container-side namespace.
+  for mount in own_mounts {
+    if let (Some(host), Some(local)) =
+      (&mount.source, &mount.destination)
+      && let Some(alias) = map_path_through_mount(
+        &source,
+        Path::new(host),
+        Path::new(local),
+      )
+    {
+      sources.push(alias);
+    }
+  }
+  for source in &sources {
+    for path in paths {
+      let overlaps = if replacing_entries {
+        komodo_backup::filesystem::entry_overlaps_path(path, source)?
+      } else {
+        paths_overlap(source, path)?
+      };
+      if overlaps {
+        return Ok(true);
+      }
+    }
+  }
+  Ok(false)
 }
 
 async fn discover_source(
@@ -1462,11 +1881,8 @@ async fn discover_source(
           let source = mount
             .source
             .context("Bind mount did not report a source path")?;
-          insert_bind_backup_root(
-            &mut bind_paths,
-            &run_directory,
-            Path::new(&source),
-          )?;
+          bind_paths
+            .insert(validate_source_path(Path::new(&source))?);
         }
       }
       let bind_paths = select_bind_backup_roots(
@@ -1506,6 +1922,7 @@ async fn discover_source(
         target,
         &affected_paths,
         protected_repository_paths,
+        false,
       )
       .await?;
       let mut paths =
@@ -1535,6 +1952,7 @@ async fn discover_source(
           volume.scope
         ));
       }
+      validate_local_volume_mount_options(&volume.options)?;
       if !filters.include_anonymous_volumes
         && is_anonymous_volume(&volume.name, &volume.labels)
       {
@@ -1561,6 +1979,7 @@ async fn discover_source(
         target,
         &BTreeSet::from([mountpoint.clone()]),
         protected_repository_paths,
+        false,
       )
       .await?;
       Ok(DiscoverBackupSourceResponse {
@@ -1611,9 +2030,22 @@ fn select_bind_backup_roots(
     {
       continue;
     }
-    selected.insert(path);
+    insert_bind_backup_root(&mut selected, run_directory, &path)?;
   }
   Ok(selected)
+}
+
+fn validate_local_volume_mount_options(
+  options: &HashMap<String, String>,
+) -> anyhow::Result<()> {
+  if ["type", "device"].iter().any(|key| {
+    options.get(*key).is_some_and(|value| !value.is_empty())
+  }) {
+    return Err(ExcludedBackupSource(
+      "Mount-backed local Docker volumes (including bind/NFS volumes) are not supported: their inspected mountpoint is not a stable data mount; use an ordinary local volume or back up the underlying storage separately".into(),
+    ).into());
+  }
+  Ok(())
 }
 
 fn unfiltered_source_filters() -> BackupSourceFilters {
@@ -1764,11 +2196,7 @@ fn validate_path_outside_protected_repositories(
   label: &str,
 ) -> anyhow::Result<()> {
   for repository in protected_repository_sources {
-    let resolved_path = resolve_existing_ancestor(path)?;
-    let resolved_repository = resolve_existing_ancestor(repository)?;
-    if paths_overlap(path, repository)
-      || paths_overlap(&resolved_path, &resolved_repository)
-    {
+    if paths_overlap(path, repository)? {
       return Err(ExcludedBackupSource(format!(
         "{label} '{}' overlaps protected Core, repository, or skipped-container storage '{}'",
         path.display(),
@@ -1792,16 +2220,15 @@ async fn discover_running_containers(
   let containers = docker.list_containers().await?;
   let paths = publish
     .iter()
-    .map(|item| {
-      resolve_existing_ancestor(Path::new(&item.destination))
-    })
-    .collect::<anyhow::Result<BTreeSet<_>>>()?;
+    .map(|item| PathBuf::from(&item.destination))
+    .collect::<BTreeSet<_>>();
   affected_running_containers(
     docker,
     &containers,
     target,
     &paths,
     protected_paths,
+    true,
   )
   .await
 }
@@ -3143,6 +3570,7 @@ async fn cleanup_owned_restore_volume_journal(
       format!("Failed to decode restore journal {}", path.display())
     })?;
   if let Some(owned) = &journal.owned_volume {
+    cleanup_volume_staging_journal(path)?;
     remove_owned_restore_volume(owned).await?;
   }
   remove_path(path)?;
@@ -3190,10 +3618,43 @@ fn cleanup_restore_staging_journal(
       )
     })?;
   for owned in journal.paths.iter().rev() {
-    remove_path(owned)?;
-    fsync_parent(owned)?;
+    remove_owned_staging_path(owned)?;
   }
   remove_path(path)?;
+  fsync_parent(path)
+}
+
+/// A created Docker volume owns the parent of its restore staging directory.
+/// Reconcile that child journal before Docker can delete the parent.
+fn cleanup_volume_staging_journal(
+  volume_journal: &Path,
+) -> anyhow::Result<()> {
+  let path = restore_staging_journal_dir()?.join(
+    volume_journal
+      .file_name()
+      .context("Restore volume journal has no file name")?,
+  );
+  match std::fs::symlink_metadata(&path) {
+    Ok(_) => cleanup_restore_staging_journal(&path),
+    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+      Ok(())
+    }
+    Err(error) => Err(error.into()),
+  }
+}
+
+fn remove_owned_staging_path(path: &Path) -> anyhow::Result<()> {
+  match std::fs::symlink_metadata(path) {
+    Ok(metadata) if metadata.is_dir() => {
+      std::fs::remove_dir_all(path)?
+    }
+    Ok(_) => std::fs::remove_file(path)?,
+    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+    Err(error) => return Err(error.into()),
+  }
+  // Missing staging is idempotent only while its parent is available. A
+  // missing parent could instead be unavailable storage; do not erase the
+  // journal's ownership evidence or recreate a deleted Docker volume root.
   fsync_parent(path)
 }
 
@@ -3379,6 +3840,7 @@ pub(crate) async fn recover_restore_journals() -> anyhow::Result<()> {
     if !journal.committed
       && let Some(owned) = &journal.owned_volume
     {
+      cleanup_volume_staging_journal(&path)?;
       remove_owned_restore_volume(owned).await?;
     }
     remove_path(&path)?;
@@ -3428,7 +3890,9 @@ pub(crate) async fn recover_restore_journals() -> anyhow::Result<()> {
       path.display()
     );
   }
-  Ok(())
+  // Only process death plus successful journal/container reconciliation proves
+  // that a formerly running backup no longer owns mutation or quiesce work.
+  recover_backup_completions_in(&backup_completion_dir()?)
 }
 
 fn publish_restore(
@@ -3466,6 +3930,40 @@ fn restore_rollback_path(
   Ok(parent.join(name))
 }
 
+fn validate_restore_rollback_paths(
+  publish: &[RestorePublishPath],
+  journal_id: &str,
+) -> anyhow::Result<()> {
+  let mut rollback_paths = Vec::<PathBuf>::new();
+  for item in publish {
+    let rollback = restore_rollback_path(
+      Path::new(&item.destination),
+      journal_id,
+    )?;
+    for other in &rollback_paths {
+      if komodo_backup::filesystem::entry_paths_overlap(
+        &rollback, other,
+      )? {
+        return Err(anyhow!(
+          "Restore destinations produce overlapping rollback entries"
+        ));
+      }
+    }
+    for destination in publish {
+      if komodo_backup::filesystem::entry_paths_overlap(
+        &rollback,
+        Path::new(&destination.destination),
+      )? {
+        return Err(anyhow!(
+          "Restore rollback entry overlaps a publication destination"
+        ));
+      }
+    }
+    rollback_paths.push(rollback);
+  }
+  Ok(())
+}
+
 fn publish_restore_in(
   staging: &Path,
   publish: &[RestorePublishPath],
@@ -3476,8 +3974,8 @@ fn publish_restore_in(
   defer_finalize: bool,
 ) -> anyhow::Result<bool> {
   validate_resolved_restore_destinations(publish)?;
+  validate_restore_rollback_paths(publish, journal_id)?;
   let mut entries = Vec::new();
-  let mut rollback_paths = HashSet::new();
   let mut preparation_cleanup = RemovePathsOnDrop::default();
   let mut staging_ownership = RestoreStagingJournal {
     paths: vec![staging.to_path_buf()],
@@ -3500,12 +3998,6 @@ fn publish_restore_in(
       .context("Restore destination has no parent")?;
     let original_existed = path_lexists(&destination);
     let rollback = restore_rollback_path(&destination, journal_id)?;
-    if !rollback_paths.insert(rollback.clone()) {
-      return Err(anyhow!(
-        "Restore destinations produce the same rollback path: {}",
-        rollback.display()
-      ));
-    }
     if path_lexists(&rollback) {
       return Err(anyhow!(
         "Rollback path already exists: {}",
@@ -4045,6 +4537,234 @@ impl Resolve<Args> for CancelVykarOperation {
 mod tests {
   use super::*;
 
+  fn completion_query(
+    operation_id: &str,
+  ) -> GetVykarBackupCompletion {
+    GetVykarBackupCompletion {
+      operation_id: operation_id.into(),
+      run_id: "run".into(),
+      cancel_if_unknown: false,
+      acknowledge: false,
+    }
+  }
+
+  #[test]
+  fn durable_backup_claim_replays_completion_and_acknowledgement_fences_reuse()
+   {
+    let root = tempfile::tempdir().unwrap();
+    let id = uuid::Uuid::new_v4().to_string();
+    assert!(
+      claim_backup_completion(root.path(), &id, "core", "run", true)
+        .unwrap()
+        .is_none()
+    );
+    assert!(
+      claim_backup_completion(root.path(), &id, "core", "run", true)
+        .is_err()
+    );
+    assert_eq!(
+      query_backup_completion(
+        root.path(),
+        &completion_query(&id),
+        "core"
+      )
+      .unwrap()
+      .state,
+      VykarBackupCompletionState::Running
+    );
+    assert!(
+      query_backup_completion(
+        root.path(),
+        &completion_query(&id),
+        "other-core"
+      )
+      .is_err()
+    );
+    let mut wrong_run = completion_query(&id);
+    wrong_run.run_id = "different-run".into();
+    assert!(
+      query_backup_completion(root.path(), &wrong_run, "core")
+        .is_err()
+    );
+    finish_backup_completion(
+      root.path(),
+      &id,
+      "core",
+      "run",
+      VykarBackupCompletion {
+        state: VykarBackupCompletionState::Complete,
+        batch_result: Some(RunVykarBackupBatchResponse::default()),
+        ..Default::default()
+      },
+    )
+    .unwrap();
+    assert!(
+      claim_backup_completion(root.path(), &id, "core", "run", false)
+        .is_err()
+    );
+    assert!(
+      claim_backup_completion(root.path(), &id, "core", "run", true)
+        .unwrap()
+        .unwrap()
+        .batch_result
+        .is_some()
+    );
+    let mut acknowledge = completion_query(&id);
+    acknowledge.acknowledge = true;
+    assert!(
+      query_backup_completion(root.path(), &acknowledge, "core")
+        .unwrap()
+        .batch_result
+        .is_some()
+    );
+    let replay =
+      claim_backup_completion(root.path(), &id, "core", "run", true)
+        .unwrap()
+        .unwrap();
+    assert_eq!(replay.state, VykarBackupCompletionState::Complete);
+    assert!(replay.batch_result.is_none());
+    assert!(replay.error.unwrap().contains("acknowledged"));
+  }
+
+  #[test]
+  fn unknown_backup_fence_prevents_a_late_dispatch() {
+    let root = tempfile::tempdir().unwrap();
+    let id = uuid::Uuid::new_v4().to_string();
+    let mut query = completion_query(&id);
+    assert_eq!(
+      query_backup_completion(root.path(), &query, "core")
+        .unwrap()
+        .state,
+      VykarBackupCompletionState::Unknown
+    );
+    query.cancel_if_unknown = true;
+    let fenced =
+      query_backup_completion(root.path(), &query, "core").unwrap();
+    assert_eq!(fenced.state, VykarBackupCompletionState::Complete);
+    assert!(
+      claim_backup_completion(root.path(), &id, "core", "run", false)
+        .unwrap()
+        .unwrap()
+        .error
+        .unwrap()
+        .contains("before it started")
+    );
+    assert!(
+      claim_backup_completion(
+        root.path(),
+        "../invalid",
+        "core",
+        "run",
+        false
+      )
+      .is_err()
+    );
+  }
+
+  #[test]
+  fn startup_reconciles_running_receipts_without_overwriting_completed_results()
+   {
+    let root = tempfile::tempdir().unwrap();
+    let running = uuid::Uuid::new_v4().to_string();
+    let done = uuid::Uuid::new_v4().to_string();
+    for id in [&running, &done] {
+      claim_backup_completion(root.path(), id, "core", "run", false)
+        .unwrap();
+    }
+    finish_backup_completion(
+      root.path(),
+      &done,
+      "core",
+      "run",
+      VykarBackupCompletion {
+        state: VykarBackupCompletionState::Complete,
+        result: Some(RunVykarBackupResponse::default()),
+        ..Default::default()
+      },
+    )
+    .unwrap();
+    recover_backup_completions_in(root.path()).unwrap();
+    assert!(
+      query_backup_completion(
+        root.path(),
+        &completion_query(&running),
+        "core"
+      )
+      .unwrap()
+      .error
+      .unwrap()
+      .contains("interrupted")
+    );
+    assert!(
+      query_backup_completion(
+        root.path(),
+        &completion_query(&done),
+        "core"
+      )
+      .unwrap()
+      .result
+      .is_some()
+    );
+  }
+
+  #[test]
+  fn overlapping_dispatch_registrations_share_cancellation_until_the_last_finishes()
+   {
+    let id = uuid::Uuid::new_v4().to_string();
+    let (first, first_registration) =
+      register_operation_cancellation(&id);
+    let (second, second_registration) =
+      register_operation_cancellation(&id);
+    assert!(Arc::ptr_eq(&first, &second));
+    drop(first_registration);
+    request_operation_cancellation(&id);
+    assert!(second.load(Ordering::SeqCst));
+    drop(second_registration);
+    assert!(
+      !cancellation_registry()
+        .lock()
+        .unwrap()
+        .active
+        .contains_key(&id)
+    );
+  }
+
+  #[tokio::test]
+  async fn expired_discovery_retains_its_nonqueued_slot_until_blocking_work_finishes()
+   {
+    let slots = Arc::new(tokio::sync::Semaphore::new(1));
+    let (release, waiting) = std::sync::mpsc::channel();
+    let expired = bounded_backup_discovery(
+      slots.clone(),
+      Duration::ZERO,
+      move || {
+        waiting.recv().unwrap();
+        Ok(())
+      },
+    )
+    .await;
+    assert!(expired.is_err());
+    assert!(
+      bounded_backup_discovery(
+        slots.clone(),
+        Duration::from_secs(60),
+        || Ok(())
+      )
+      .await
+      .is_err()
+    );
+    release.send(()).unwrap();
+    // Acquiring this permit joins the actual worker lifetime, not its expired
+    // HTTP wait. The next request may enter only after that worker exits.
+    let permit = slots.clone().acquire_owned().await.unwrap();
+    drop(permit);
+    bounded_backup_discovery(slots, Duration::from_secs(60), || {
+      Ok(())
+    })
+    .await
+    .unwrap();
+  }
+
   #[tokio::test]
   async fn backup_inventory_distinguishes_empty_success_from_docker_errors()
    {
@@ -4303,7 +5023,10 @@ mod tests {
       Path::new("/host/data"),
     )
     .unwrap();
-    assert!(!paths_overlap(Path::new("/host/data/stacks"), &mapped));
+    assert!(
+      !paths_overlap(Path::new("/host/data/stacks"), &mapped)
+        .unwrap()
+    );
   }
 
   #[test]
@@ -4505,6 +5228,67 @@ mod tests {
     assert_eq!(selected, [included].into_iter().collect());
   }
 
+  #[test]
+  fn bind_candidates_are_filtered_before_nested_roots_are_coalesced()
+  {
+    let root = tempfile::tempdir().unwrap();
+    let run = root.path().join("run");
+    let parent = root.path().join("data");
+    let child = parent.join("selected");
+    std::fs::create_dir_all(&run).unwrap();
+    std::fs::create_dir_all(&child).unwrap();
+    let mut stack = komodo_client::entities::stack::Stack::default();
+    stack.info.deployed_config = Some(format!(
+      "services:\n  app:\n    volumes:\n      - '{}:/parent'\n      - '{}:/child'\n",
+      parent.display(),
+      child.display(),
+    ));
+    let candidates = compose_bind_paths(&stack, &run).unwrap();
+    assert_eq!(candidates.len(), 2);
+    let selected = select_bind_backup_roots(
+      candidates.clone(),
+      &run,
+      &BackupSourceFilters {
+        bind_mount_include_patterns: vec![
+          child.to_string_lossy().into_owned(),
+        ],
+        ..Default::default()
+      },
+    )
+    .unwrap();
+    assert_eq!(selected, BTreeSet::from([child]));
+    assert_eq!(
+      select_bind_backup_roots(
+        candidates,
+        &run,
+        &BackupSourceFilters::default()
+      )
+      .unwrap(),
+      BTreeSet::from([parent])
+    );
+  }
+
+  #[test]
+  fn options_backed_volumes_are_excluded_without_rejecting_quotas() {
+    for options in [
+      HashMap::from([("type".into(), "nfs".into())]),
+      HashMap::from([
+        ("device".into(), "/srv/data".into()),
+        ("o".into(), "bind".into()),
+      ]),
+    ] {
+      let error =
+        validate_local_volume_mount_options(&options).unwrap_err();
+      assert!(error.is::<ExcludedBackupSource>());
+    }
+    validate_local_volume_mount_options(&HashMap::new()).unwrap();
+    validate_local_volume_mount_options(&HashMap::from([(
+      "size".into(),
+      "10G".into(),
+    )]))
+    .unwrap();
+  }
+
   fn container(
     name: &str,
     state: ContainerStateStatusEnum,
@@ -4675,6 +5459,64 @@ mod tests {
     assert!(
       validate_resolved_restore_destinations_against(
         &publish, &internal,
+      )
+      .is_err()
+    );
+  }
+
+  #[test]
+  fn distinct_symlink_leaf_destinations_can_replace_entries_sharing_a_target()
+   {
+    let root = tempfile::tempdir().unwrap();
+    let target = root.path().join("target");
+    std::fs::write(&target, b"original").unwrap();
+    let publish = ["first", "second"]
+      .into_iter()
+      .map(|name| {
+        let path = root.path().join(name);
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        RestorePublishPath {
+          destination_root: None,
+          snapshot_path: name.into(),
+          destination: path.to_string_lossy().into_owned(),
+        }
+      })
+      .collect::<Vec<_>>();
+    validate_resolved_restore_destinations_against(
+      &publish,
+      &root.path().join("private"),
+    )
+    .unwrap();
+    validate_restore_rollback_paths(&publish, "id").unwrap();
+  }
+
+  #[test]
+  fn rollback_names_must_not_alias_each_other_or_another_destination()
+  {
+    let root = tempfile::tempdir().unwrap();
+    let real = root.path().join("real");
+    let alias = root.path().join("alias");
+    std::fs::create_dir(&real).unwrap();
+    std::os::unix::fs::symlink(&real, &alias).unwrap();
+    let item = |destination: PathBuf| RestorePublishPath {
+      destination_root: None,
+      snapshot_path: "source/config".into(),
+      destination: destination.to_string_lossy().into_owned(),
+    };
+    assert!(
+      validate_restore_rollback_paths(
+        &[item(real.join("config")), item(alias.join("config"))],
+        "id"
+      )
+      .is_err()
+    );
+    assert!(
+      validate_restore_rollback_paths(
+        &[
+          item(real.join("config")),
+          item(real.join("config.komodo-rollback-id"))
+        ],
+        "id"
       )
       .is_err()
     );
@@ -4911,6 +5753,73 @@ mod tests {
       )
       .is_err()
     );
+  }
+
+  #[test]
+  fn recovered_relative_binds_use_original_deployment_and_alias_metadata()
+   {
+    let mut document: serde_yaml_ng::Value = serde_yaml_ng::from_str(
+      "services:\n  app:\n    volumes:\n      - ../data:/data:ro\n      - type: bind\n        source: ../link\n        target: /cache\n      - ./config:/config\n      - named-data:/named\n",
+    ).unwrap();
+    let deployed = "services:\n  app:\n    volumes:\n      - type: bind\n        source: /original/data\n        target: /data\n      - type: bind\n        source: /original/link\n        target: /cache\n      - type: bind\n        source: /original/run/config\n        target: /config\n";
+    let mappings = HashMap::from([
+      ("/original/data".into(), "/recovery/data".into()),
+      ("/original/real".into(), "/recovery/cache".into()),
+      ("/original/run".into(), "/recovery/run".into()),
+    ]);
+    let aliases = HashMap::from([(
+      "/original/link".into(),
+      "/original/real".into(),
+    )]);
+    resolve_recovered_bind_expressions(
+      &mut document,
+      Some(deployed),
+      &mappings,
+      &aliases,
+    )
+    .unwrap();
+    assert_eq!(
+      rewrite_compose_bind_mappings(
+        &mut document,
+        &mappings,
+        &aliases
+      ),
+      3
+    );
+    let rewritten = serde_yaml_ng::to_string(&document).unwrap();
+    for expected in [
+      "/recovery/data:/data:ro",
+      "/recovery/cache",
+      "/recovery/run/config:/config",
+      "named-data:/named",
+    ] {
+      assert!(rewritten.contains(expected), "{rewritten}");
+    }
+    assert!(!rewritten.contains("../"));
+  }
+
+  #[test]
+  fn relative_binds_fail_closed_without_absolute_original_metadata() {
+    for deployed in [
+      None,
+      Some(
+        "services:\n  app:\n    volumes:\n      - type: bind\n        source: ../data\n        target: /data\n",
+      ),
+    ] {
+      let mut document = serde_yaml_ng::from_str(
+        "services:\n  app:\n    volumes:\n      - ../data:/data\n",
+      )
+      .unwrap();
+      assert!(
+        resolve_recovered_bind_expressions(
+          &mut document,
+          deployed,
+          &HashMap::new(),
+          &HashMap::new()
+        )
+        .is_err()
+      );
+    }
   }
 
   #[test]
@@ -5742,6 +6651,62 @@ mod tests {
   }
 
   #[test]
+  fn staging_recovery_preserves_ownership_if_its_parent_is_unavailable()
+   {
+    let root = tempfile::tempdir().unwrap();
+    let volume = root.path().join("volumes/created-volume");
+    let staging = volume.join(".komodo-restore-id");
+    std::fs::create_dir_all(&staging).unwrap();
+    let journal = root.path().join("staging.json");
+    persist_journal(
+      &journal,
+      &RestoreStagingJournal {
+        paths: vec![staging.clone()],
+      },
+    )
+    .unwrap();
+    std::fs::remove_dir_all(&volume).unwrap();
+    assert!(cleanup_restore_staging_journal(&journal).is_err());
+    assert!(journal.exists());
+    assert!(!volume.exists());
+  }
+
+  #[test]
+  fn child_staging_cleanup_completes_before_its_volume_parent_is_removed()
+   {
+    let root = tempfile::tempdir().unwrap();
+    let volume = root.path().join("created-volume");
+    let staging = volume.join(".komodo-restore-id");
+    std::fs::create_dir_all(&staging).unwrap();
+    let journal = root.path().join("staging.json");
+    persist_journal(
+      &journal,
+      &RestoreStagingJournal {
+        paths: vec![staging.clone()],
+      },
+    )
+    .unwrap();
+    cleanup_restore_staging_journal(&journal).unwrap();
+    remove_owned_staging_path(&staging).unwrap();
+    assert!(!journal.exists());
+    std::fs::remove_dir_all(&volume).unwrap();
+  }
+
+  #[test]
+  fn staging_cleanup_does_not_swallow_non_missing_parent_errors() {
+    let root = tempfile::tempdir().unwrap();
+    let parent = root.path().join("not-a-directory");
+    std::fs::write(&parent, b"owned by someone else").unwrap();
+    assert!(
+      remove_owned_staging_path(&parent.join("staging")).is_err()
+    );
+    assert_eq!(
+      std::fs::read(parent).unwrap(),
+      b"owned by someone else"
+    );
+  }
+
+  #[test]
   fn repeated_quiesce_attempts_preserve_every_pending_container() {
     assert_eq!(
       merge_container_quiesce_sets(
@@ -5775,33 +6740,127 @@ mod tests {
       "/docker-data/volumes/data/_data/database",
       "/docker-data/volumes/data",
     ] {
-      assert!(mount_affects_paths(
-        Some("bind"),
-        Some(source),
-        &paths
-      ));
-      assert!(mount_affects_paths(
-        Some("volume"),
-        Some(source),
-        &paths
-      ));
+      assert!(
+        mount_affects_paths(
+          Some("bind"),
+          Some(source),
+          &paths,
+          &[],
+          false,
+        )
+        .unwrap()
+      );
+      assert!(
+        mount_affects_paths(
+          Some("volume"),
+          Some(source),
+          &paths,
+          &[],
+          false,
+        )
+        .unwrap()
+      );
     }
     for source in [
       "/docker-data/volumes/other/_data",
       "/docker-data/volumes/data/_data-other",
     ] {
-      assert!(!mount_affects_paths(
-        Some("bind"),
-        Some(source),
-        &paths
-      ));
+      assert!(
+        !mount_affects_paths(
+          Some("bind"),
+          Some(source),
+          &paths,
+          &[],
+          false,
+        )
+        .unwrap()
+      );
     }
-    assert!(!mount_affects_paths(
-      Some("tmpfs"),
-      Some("/docker-data"),
-      &paths
-    ));
-    assert!(!mount_affects_paths(Some("bind"), None, &paths));
+    assert!(
+      !mount_affects_paths(
+        Some("tmpfs"),
+        Some("/docker-data"),
+        &paths,
+        &[],
+        false,
+      )
+      .unwrap()
+    );
+    assert!(
+      !mount_affects_paths(Some("bind"), None, &paths, &[], false)
+        .unwrap()
+    );
+  }
+
+  #[test]
+  fn quiesce_translates_docker_paths_through_the_verified_worker_mounts()
+   {
+    use komodo_client::entities::docker::container::MountPoint;
+    let root = tempfile::tempdir().unwrap();
+    let local = root.path().join("stacks");
+    std::fs::create_dir_all(local.join("app")).unwrap();
+    let mounts = [MountPoint {
+      source: Some("/host/docker/volumes/stacks/_data".into()),
+      destination: Some(local.to_string_lossy().into_owned()),
+      ..Default::default()
+    }];
+    assert!(
+      mount_affects_paths(
+        Some("volume"),
+        Some("/host/docker/volumes/stacks/_data"),
+        &BTreeSet::from([local.join("app")]),
+        &mounts,
+        false
+      )
+      .unwrap()
+    );
+  }
+
+  #[test]
+  fn restore_quiesces_the_symlink_entry_writer_not_just_its_referent()
+  {
+    let root = tempfile::tempdir().unwrap();
+    let app = root.path().join("app");
+    let external = root.path().join("external");
+    std::fs::create_dir_all(&app).unwrap();
+    std::fs::create_dir_all(&external).unwrap();
+    std::fs::write(external.join("config"), b"original").unwrap();
+    std::os::unix::fs::symlink(
+      external.join("config"),
+      app.join("config"),
+    )
+    .unwrap();
+    let paths = BTreeSet::from([app.join("config")]);
+    assert!(
+      mount_affects_paths(
+        Some("bind"),
+        app.to_str(),
+        &paths,
+        &[],
+        true
+      )
+      .unwrap()
+    );
+    assert!(
+      !mount_affects_paths(
+        Some("bind"),
+        external.to_str(),
+        &paths,
+        &[],
+        true
+      )
+      .unwrap()
+    );
+    assert!(
+      mount_affects_paths(
+        Some("bind"),
+        external.to_str(),
+        &paths,
+        &[],
+        false
+      )
+      .unwrap()
+    );
   }
 
   #[test]

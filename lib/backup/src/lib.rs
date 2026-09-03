@@ -4,6 +4,7 @@
 //! operation opens the selected repository and reads Vykar metadata.
 
 pub mod container;
+pub mod filesystem;
 
 use std::{
   collections::{BTreeMap, HashMap, HashSet},
@@ -472,7 +473,7 @@ impl VykarRepository {
     let destination = destination
       .to_str()
       .context("Restore destination is not valid UTF-8")?;
-    if selected_paths.is_empty() {
+    let stats = if selected_paths.is_empty() {
       commands::restore::run(
         &self.config,
         Some(&self.passphrase),
@@ -481,7 +482,7 @@ impl VykarRepository {
         None,
         true,
         true,
-      )?;
+      )?
     } else {
       let selected: HashSet<String> =
         normalize_selected_paths(selected_paths)?
@@ -495,9 +496,9 @@ impl VykarRepository {
         &selected,
         true,
         true,
-      )?;
-    }
-    Ok(())
+      )?
+    };
+    ensure_restore_metadata_complete(&stats)
   }
 
   /// Read a bounded metadata inventory, decoding one item at a time. Never
@@ -1063,6 +1064,30 @@ pub fn snapshot_name(prefix: &str, run_id: &str) -> String {
   )
 }
 
+fn ensure_restore_metadata_complete(
+  stats: &commands::restore::RestoreStats,
+) -> anyhow::Result<()> {
+  if !stats.warnings.is_empty()
+    || stats.warnings_suppressed != 0
+    || stats.hardlink_copies != 0
+  {
+    return Err(anyhow!(
+      "Vykar could not fully preserve restored metadata ({} warnings, {} additional warnings, {} copied hard links); refusing publication: {}",
+      stats.warnings.len(),
+      stats.warnings_suppressed,
+      stats.hardlink_copies,
+      stats
+        .warnings
+        .iter()
+        .take(8)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("; ")
+    ));
+  }
+  Ok(())
+}
+
 /// Exact internal source-root name for the manifest bundled with a snapshot.
 /// The fresh snapshot name contains a UUID, and hashing it gives Core and
 /// Periphery the same unambiguous marker without classifying user paths by a
@@ -1081,6 +1106,31 @@ mod tests {
     BackupAdvancedSettings, BackupRepository,
     BackupRepositoryBackend, BackupSecret,
   };
+
+  #[test]
+  fn restore_refuses_recorded_and_suppressed_metadata_failures() {
+    use commands::restore::RestoreStats;
+    assert!(
+      ensure_restore_metadata_complete(&RestoreStats::default())
+        .is_ok()
+    );
+    for stats in [
+      RestoreStats {
+        warnings: vec!["Failed to set user.large xattr".into()],
+        ..Default::default()
+      },
+      RestoreStats {
+        warnings_suppressed: 1,
+        ..Default::default()
+      },
+      RestoreStats {
+        hardlink_copies: 1,
+        ..Default::default()
+      },
+    ] {
+      assert!(ensure_restore_metadata_complete(&stats).is_err());
+    }
+  }
 
   #[test]
   fn restore_metadata_limit_is_checked_before_appending() {

@@ -1108,6 +1108,10 @@ pub async fn resolve_root(
   };
 
   ensure_outside_private_journal(&path, &journal_root())?;
+  ensure_outside_private_backup(
+    &path,
+    &crate::api::backup::internal_storage_dir(),
+  )?;
   let docker = docker_client().load();
   let docker = docker.as_ref().as_ref().context("Could not connect to Docker to validate protected File Manager storage")?;
   let excluded = docker.file_manager_excluded_volume_paths().await?;
@@ -1359,48 +1363,19 @@ fn ensure_outside_private_journal(
 }
 
 fn paths_overlap(left: &Path, right: &Path) -> anyhow::Result<bool> {
-  if left.starts_with(right) || right.starts_with(left) {
-    return Ok(true);
-  }
-
-  Ok(
-    path_matches_ancestor(left, right)?
-      || path_matches_ancestor(right, left)?,
-  )
+  komodo_backup::filesystem::paths_overlap(left, right)
 }
 
-fn path_matches_ancestor(
+fn ensure_outside_private_backup(
   path: &Path,
-  other: &Path,
-) -> anyhow::Result<bool> {
-  let Some(identity) = path_identity(path)? else {
-    return Ok(false);
-  };
-  for ancestor in other.ancestors() {
-    if path_identity(ancestor)?.is_some_and(|other| other == identity)
-    {
-      return Ok(true);
-    }
+  private_backup: &Path,
+) -> anyhow::Result<()> {
+  if paths_overlap(path, private_backup)? {
+    return Err(anyhow!(
+      "File Manager roots cannot overlap Periphery's private backup workspace"
+    ));
   }
-  Ok(false)
-}
-
-fn path_identity(path: &Path) -> anyhow::Result<Option<(u64, u64)>> {
-  let metadata = match fs::metadata(path) {
-    Ok(metadata) => metadata,
-    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-      return Ok(None);
-    }
-    Err(error) => {
-      return Err(error).with_context(|| {
-        format!("Failed to inspect File Manager path {path:?}")
-      });
-    }
-  };
-  Ok(Some((
-    cap_fs_ext::MetadataExt::dev(&metadata),
-    cap_fs_ext::MetadataExt::ino(&metadata),
-  )))
+  Ok(())
 }
 
 fn file_identity(metadata: &Metadata) -> FileIdentity {
@@ -9410,6 +9385,33 @@ mod tests {
     .unwrap();
 
     fs::remove_dir_all(directory).unwrap();
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn private_backup_workspace_rejects_roots_descendants_and_aliases()
+  {
+    let root = tempfile::tempdir().unwrap();
+    let stacks = root.path().join("stacks");
+    let private = stacks.join(".komodo-vykar");
+    let alias = root.path().join("alias");
+    fs::create_dir_all(private.join("backup-manifests")).unwrap();
+    std::os::unix::fs::symlink(&stacks, &alias).unwrap();
+    for candidate in [
+      stacks,
+      private.clone(),
+      private.join("backup-manifests"),
+      alias.join(".komodo-vykar/new-keys"),
+    ] {
+      assert!(
+        ensure_outside_private_backup(&candidate, &private).is_err()
+      );
+    }
+    ensure_outside_private_backup(
+      &alias.join("application"),
+      &private,
+    )
+    .unwrap();
   }
 
   #[cfg(unix)]

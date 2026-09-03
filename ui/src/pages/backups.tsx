@@ -1,4 +1,5 @@
-import { RestoreSnapshotButton } from "@/components/backups/resource";
+import { BrowseSnapshotButton, RestoreSnapshotButton } from "@/components/backups/resource";
+import { usePreviewRequest } from "@/components/backups/use-preview-request";
 import { useInvalidate, useRead, useSetTitle, useUser, useWrite } from "@/lib/hooks";
 import { ICONS } from "@/lib/icons";
 import {
@@ -156,6 +157,7 @@ function SnapshotInventory() {
               <Badge color={snapshot.partial ? "orange" : "green"}>
                 {snapshot.partial ? "Partial" : "Complete"}
               </Badge>
+              <BrowseSnapshotButton snapshot={snapshot} compact />
               {!snapshot.partial &&
                 (snapshot.target.type === "Stack" ||
                   snapshot.target.type === "Volume") && (
@@ -674,7 +676,9 @@ function BackupSettingsForm({
 function CoreRecoverySection() {
   const [snapshot, setSnapshot] = useState<string>();
   const [snapshotPage, setSnapshotPage] = useState(1);
-  const [plan, setPlan] = useState<Types.CoreRecoveryPlan>();
+  const { preview: plan, begin, invalidate } = usePreviewRequest<Types.CoreRecoveryPlan>(
+    JSON.stringify({ snapshot, snapshotPage }),
+  );
   const snapshotResponse = useRead("ListBackupSnapshots", {
     target: { type: "Core" },
     page: snapshotPage - 1,
@@ -685,10 +689,7 @@ function CoreRecoverySection() {
     1,
     Math.ceil((snapshotResponse?.total ?? 0) / 100),
   );
-  const { mutate: planRecovery, isPending: planning } = useWrite(
-    "PlanCoreRecovery",
-    { onSuccess: setPlan },
-  );
+  const { mutateAsync: planRecovery, isPending: planning } = useWrite("PlanCoreRecovery");
   const { mutate: executeRecovery, isPending: executing } = useWrite(
     "ExecuteCoreRecovery",
     {
@@ -696,6 +697,15 @@ function CoreRecoverySection() {
         notifications.show({ color: "orange", message: run.message }),
     },
   );
+  const reviewRecovery = async () => {
+    if (!snapshot) return;
+    const accept = begin();
+    try {
+      accept(await planRecovery({ snapshot }));
+    } catch {
+      // useWrite already reports the failed validation request.
+    }
+  };
   return (
     <Section title="Fresh Core recovery" icon={<ICONS.Restart size="1.3rem" />}>
       <Stack>
@@ -721,7 +731,7 @@ function CoreRecoverySection() {
             color="orange"
             loading={planning}
             disabled={!snapshot}
-            onClick={() => snapshot && planRecovery({ snapshot })}
+            onClick={reviewRecovery}
           >
             Restore and validate
           </Button>
@@ -739,7 +749,7 @@ function CoreRecoverySection() {
       </Stack>
       <Modal
         opened={!!plan}
-        onClose={() => setPlan(undefined)}
+        onClose={invalidate}
         title="Activate recovered Core database"
         size="lg"
       >
@@ -749,11 +759,12 @@ function CoreRecoverySection() {
               Core will restart after activation. Do not run another active
               Core against either database during recovery.
             </Alert>
+            <StatusItem label="Snapshot" value={plan.snapshot} />
             <StatusItem label="Snapshot version" value={plan.backup_version} />
             <StatusItem label="Validated database" value={plan.validation_database} />
             <StatusItem label="Retained rollback database" value={plan.current_database} />
             <Group justify="end">
-              <Button variant="default" onClick={() => setPlan(undefined)}>
+              <Button variant="default" onClick={invalidate}>
                 Cancel
               </Button>
               <Button

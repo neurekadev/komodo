@@ -78,6 +78,9 @@ pub struct DiscoverBackupSourceResponse {
 #[response(RunVykarBackupResponse)]
 #[error(anyhow::Error)]
 pub struct RunVykarBackup {
+  /// Unique dispatch identity. Replays never start the operation again.
+  #[serde(default)]
+  pub operation_id: String,
   pub target: PeripheryBackupTarget,
   pub primary: BackupRepository,
   pub mirror: Option<BackupRepository>,
@@ -160,6 +163,9 @@ pub struct VykarRetainedSnapshot {
 #[response(RunVykarBackupBatchResponse)]
 #[error(anyhow::Error)]
 pub struct RunVykarBackupBatch {
+  /// Unique dispatch identity, independent of the fleet cancellation run ID.
+  #[serde(default)]
+  pub operation_id: String,
   pub tasks: Vec<VykarBackupTask>,
   pub primary: BackupRepository,
   pub mirror: Option<BackupRepository>,
@@ -188,6 +194,39 @@ pub struct RunVykarBackupBatchResponse {
   pub results: Vec<VykarBackupTaskResult>,
   pub discovery_errors: Vec<String>,
   pub restart_errors: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Resolve)]
+#[response(VykarBackupCompletion)]
+#[error(anyhow::Error)]
+pub struct GetVykarBackupCompletion {
+  pub operation_id: String,
+  /// Must match the original dispatch and authenticated Core owner.
+  pub run_id: String,
+  /// Fence a not-yet-started dispatch after its transport result was lost.
+  #[serde(default)]
+  pub cancel_if_unknown: bool,
+  /// Discard the bulky result, but retain a terminal replay-prevention marker.
+  #[serde(default)]
+  pub acknowledge: bool,
+}
+
+#[derive(
+  Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq,
+)]
+pub enum VykarBackupCompletionState {
+  #[default]
+  Unknown,
+  Running,
+  Complete,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct VykarBackupCompletion {
+  pub state: VykarBackupCompletionState,
+  pub result: Option<RunVykarBackupResponse>,
+  pub batch_result: Option<RunVykarBackupBatchResponse>,
+  pub error: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Resolve)]

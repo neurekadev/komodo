@@ -1,4 +1,5 @@
 import { useInvalidate, useRead, useWrite } from "@/lib/hooks";
+import { usePreviewRequest } from "./use-preview-request";
 import { ICONS } from "@/lib/icons";
 import ResourceSelector from "@/resources/selector";
 import {
@@ -20,7 +21,7 @@ import { notifications } from "@mantine/notifications";
 import { Types } from "komodo_client";
 import { Section } from "mogh_ui";
 import { ChevronDown, ChevronRight, File, Folder } from "lucide-react";
-import { ReactNode, useState } from "react";
+import { ReactNode, useEffect, useState } from "react";
 
 type ResourceBackupProps = {
   target: Types.BackupTarget;
@@ -90,7 +91,6 @@ export default function ResourceBackups({
     snapshots.data?.snapshots.map((item) => ({
       value: item.name,
       label: `${new Date(item.created_at).toLocaleString()}${item.partial ? " (partial)" : ""}`,
-      disabled: item.partial,
     })) ?? [];
   const selectedSnapshot = snapshots.data?.snapshots.find(
     (item) => item.name === snapshot,
@@ -114,7 +114,7 @@ export default function ResourceBackups({
         <Group align="end">
           <Select
             label="Snapshot"
-            placeholder="Choose a complete snapshot"
+            placeholder="Choose a snapshot"
             data={options}
             value={snapshot}
             onChange={(value) => setSnapshot(value ?? undefined)}
@@ -124,6 +124,10 @@ export default function ResourceBackups({
           <Button variant="subtle" loading={snapshots.isFetching} onClick={() => snapshots.refetch()}>
             Refresh snapshots
           </Button>
+          <BrowseSnapshotButton
+            key={selectedSnapshot?.name ?? "no-snapshot"}
+            snapshot={selectedSnapshot}
+          />
           {canExecute && (
             <>
               <Button
@@ -159,6 +163,41 @@ export default function ResourceBackups({
   );
 }
 
+export function BrowseSnapshotButton({
+  snapshot,
+  compact = false,
+}: {
+  snapshot?: Types.BackupSnapshot;
+  compact?: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  return (
+    <>
+      <Button
+        variant="light"
+        size={compact ? "compact-sm" : undefined}
+        disabled={!snapshot}
+        onClick={() => setOpen(true)}
+      >
+        Browse files
+      </Button>
+      <Modal opened={open && !!snapshot} onClose={() => setOpen(false)} title="Browse snapshot" size="xl">
+        {snapshot && (
+          <Stack>
+            <Code style={{ overflowWrap: "anywhere" }}>{snapshot.name}</Code>
+            {snapshot.partial && (
+              <Alert color="orange">
+                This partial snapshot is available for diagnosis only and cannot be restored.
+              </Alert>
+            )}
+            <SnapshotPicker key={snapshot.name} snapshot={snapshot.name} />
+          </Stack>
+        )}
+      </Modal>
+    </>
+  );
+}
+
 export function RestoreSnapshotButton({
   target,
   sourceServerId,
@@ -176,16 +215,12 @@ export function RestoreSnapshotButton({
   const [destinationVolume, setDestinationVolume] = useState("");
   const [confirmExistingVolume, setConfirmExistingVolume] = useState(false);
   const [bindings, setBindings] = useState<Record<string, string>>({});
-  const [plan, setPlan] = useState<Types.BackupRestorePlan>();
-  const { mutate: createPlan, isPending: planPending } = useWrite(
-    "PlanBackupRestore",
-    { onSuccess: setPlan },
-  );
+  const { mutateAsync: createPlan, isPending: planPending } = useWrite("PlanBackupRestore");
   const { mutate: executeRestore, isPending: restorePending } = useWrite(
     "ExecuteBackupRestore",
     {
       onSuccess: (run) => {
-        setPlan(undefined);
+        invalidatePreview();
         setRestoreOpen(false);
         notifications.show({
           color: run.state === Types.BackupRunState.Complete ? "green" : "red",
@@ -210,6 +245,57 @@ export function RestoreSnapshotButton({
       snapshotSourceServerId !== sourceServerId ||
       destinationServerId !== snapshotSourceServerId ||
       snapshot.source_paths_match_current === false);
+  const fullRestore = stackRecovery || fullSnapshot;
+  const snapshotContext = JSON.stringify({
+    target,
+    sourceServerId,
+    snapshot,
+    forceStackRecovery,
+    forceVolumeRecovery,
+  });
+  const request: Types.PlanBackupRestore = {
+    snapshot: snapshot?.name ?? "",
+    destination_server_id: destinationServerId,
+    selected_paths: fullRestore ? [] : selectedPaths,
+    recovered_stack_name: stackRecovery ? recoveredName : undefined,
+    bind_path_mappings: stackRecovery ? bindings : {},
+    destination_volume_name: chooseDestinationVolume ? destinationVolume : undefined,
+    confirm_existing_volume: chooseDestinationVolume && confirmExistingVolume,
+  };
+  const { preview, begin, invalidate: invalidatePreview } = usePreviewRequest<{
+    plan: Types.BackupRestorePlan;
+    request: Types.PlanBackupRestore;
+  }>(JSON.stringify({ snapshotContext, restoreOpen, stackRecovery, fullRestore, request }));
+  const plan = preview?.plan;
+  const closeRestore = () => {
+    invalidatePreview();
+    setRestoreOpen(false);
+  };
+
+  useEffect(() => {
+    // A changed resource or snapshot starts a new recovery interaction.
+    setRestoreOpen(false);
+    setFullSnapshot(true);
+    setSelectedPaths([]);
+  }, [snapshotContext]);
+  useEffect(() => {
+    if (stackRecovery) {
+      setFullSnapshot(true);
+      setSelectedPaths([]);
+    }
+  }, [stackRecovery]);
+
+  const reviewChanges = async () => {
+    if (!snapshot || snapshot.partial || (!fullRestore && !selectedPaths.length)) return;
+    const accept = begin();
+    const submitted = structuredClone(request);
+    try {
+      const result = await createPlan(submitted);
+      accept({ plan: result, request: submitted });
+    } catch {
+      // useWrite already reports request errors; never install a failed preview.
+    }
+  };
 
   return (
     <>
@@ -217,8 +303,9 @@ export function RestoreSnapshotButton({
         variant="light"
         size={compact ? "compact-sm" : undefined}
         leftSection={<ICONS.Restart size="1rem" />}
-        disabled={!snapshot || snapshot.partial}
+        disabled={!snapshot || snapshot.partial || restorePending}
         onClick={() => {
+          invalidatePreview();
           setFullSnapshot(true);
           setSelectedPaths([]);
           setDestinationServerId(sourceServerId);
@@ -226,7 +313,6 @@ export function RestoreSnapshotButton({
           setDestinationVolume("");
           setConfirmExistingVolume(false);
           setBindings({});
-          setPlan(undefined);
           setRestoreOpen(true);
         }}
       >
@@ -235,7 +321,7 @@ export function RestoreSnapshotButton({
 
       <Modal
         opened={restoreOpen}
-        onClose={() => setRestoreOpen(false)}
+        onClose={closeRestore}
         title={`Restore ${targetLabel(target)}`}
         size="xl"
       >
@@ -316,26 +402,31 @@ export function RestoreSnapshotButton({
           )}
           <Checkbox
             label="Restore entire snapshot"
-            checked={fullSnapshot}
+            checked={fullRestore}
+            disabled={stackRecovery}
             onChange={(event) => {
               setFullSnapshot(event.currentTarget.checked);
               setSelectedPaths([]);
             }}
           />
-          {snapshot && !fullSnapshot && (
+          {snapshot && !fullRestore && (
             <SnapshotPicker
+              key={snapshot.name}
               snapshot={snapshot.name}
-              selected={selectedPaths}
-              onChange={setSelectedPaths}
+              selection={{
+                roots: snapshot.restorable_source_paths,
+                paths: selectedPaths,
+                onChange: setSelectedPaths,
+              }}
             />
           )}
           <Text size="sm" c="dimmed">
-            Uncheck Restore entire snapshot to select specific files or folders.
-            Select at least one path. Children of a selected folder are included;
-            deselect that folder first to choose individual children.
+            {stackRecovery
+              ? "Creating a recovered Stack requires the entire snapshot and every source-root mapping."
+              : "Uncheck Restore entire snapshot to select files or folders within a restorable source root. Parent folders above those roots are navigation-only. Children of a selected folder are included; deselect that folder first to choose individual children."}
           </Text>
           <Group justify="end">
-            <Button variant="default" onClick={() => setRestoreOpen(false)}>
+            <Button variant="default" onClick={closeRestore}>
               Cancel
             </Button>
             <Button
@@ -344,27 +435,14 @@ export function RestoreSnapshotButton({
               disabled={
                 !snapshot ||
                 !destinationServerId ||
-                (!fullSnapshot && selectedPaths.length === 0) ||
+                snapshot.partial ||
+                (!fullRestore && selectedPaths.length === 0) ||
                 (stackRecovery && !recoveredName) ||
                 (stackRecovery &&
                   requiredStackMappings.some((path) => !bindings[path])) ||
                 (chooseDestinationVolume && !destinationVolume)
               }
-              onClick={() =>
-                snapshot &&
-                (fullSnapshot || selectedPaths.length > 0) &&
-                createPlan({
-                  snapshot: snapshot.name,
-                  destination_server_id: destinationServerId,
-                  selected_paths: fullSnapshot ? [] : selectedPaths,
-                  recovered_stack_name:
-                    stackRecovery ? recoveredName : undefined,
-                  bind_path_mappings: bindings,
-                  destination_volume_name:
-                    chooseDestinationVolume ? destinationVolume : undefined,
-                  confirm_existing_volume: confirmExistingVolume,
-                })
-              }
+              onClick={reviewChanges}
             >
               Review changes
             </Button>
@@ -374,12 +452,40 @@ export function RestoreSnapshotButton({
 
       <Modal
         opened={!!plan}
-        onClose={() => setPlan(undefined)}
+        onClose={invalidatePreview}
         title="Confirm exact restore"
         size="lg"
       >
-        {plan && (
+        {plan && preview && (
           <Stack>
+            <Text fw={600}>Snapshot</Text>
+            <Code style={{ overflowWrap: "anywhere" }}>{plan.snapshot}</Code>
+            <Text fw={600}>Destination Server ID</Text>
+            <Code>{plan.destination_server_id}</Code>
+            <Text size="sm">
+              Restore scope: {plan.selected_paths.length ? `${plan.selected_paths.length} selected paths` : "Entire snapshot"}
+            </Text>
+            {preview.request.recovered_stack_name && (
+              <>
+                <Text fw={600}>Requested recovered Stack name</Text>
+                <Code>{preview.request.recovered_stack_name}</Code>
+              </>
+            )}
+            {plan.source.type === "Volume" && (
+              <>
+                <Text fw={600}>Destination volume</Text>
+                <Code>{preview.request.destination_volume_name ?? plan.source.params.volume_name}</Code>
+                <Text size="sm">
+                  Explicitly allow an existing destination volume: {preview.request.confirm_existing_volume ? "Yes" : "No"}
+                </Text>
+              </>
+            )}
+            {Object.entries(preview.request.bind_path_mappings ?? {}).map(([source, destination]) => (
+              <Stack key={source} gap={2}>
+                <Text size="sm">Source root: <Code>{source}</Code></Text>
+                <Text size="sm">Confirmed mapping: <Code>{destination}</Code></Text>
+              </Stack>
+            ))}
             {plan.path_summary &&
               (plan.path_summary.created > plan.created_paths.length ||
                 plan.path_summary.overwritten > plan.overwritten_paths.length ||
@@ -422,7 +528,7 @@ export function RestoreSnapshotButton({
               persisted rollback journal.
             </Alert>
             <Group justify="end">
-              <Button variant="default" onClick={() => setPlan(undefined)}>
+              <Button variant="default" onClick={invalidatePreview}>
                 Cancel
               </Button>
               <Button
@@ -468,12 +574,10 @@ function PreflightList({
 
 function SnapshotPicker({
   snapshot,
-  selected,
-  onChange,
+  selection,
 }: {
   snapshot: string;
-  selected: string[];
-  onChange: (paths: string[]) => void;
+  selection?: SnapshotSelection;
 }) {
   const [search, setSearch] = useState("");
   const [page, setPage] = useState(0);
@@ -504,12 +608,14 @@ function SnapshotPicker({
               key={entry.path}
               snapshot={snapshot}
               entry={entry}
-              selected={selected}
-              onChange={onChange}
+              selection={selection}
               depth={0}
             />
           ))}
-          {!directory.isPending && !directory.data?.entries.length && (
+          {directory.isError && (
+            <Alert color="red">Unable to load snapshot paths. Check your access and repository availability.</Alert>
+          )}
+          {!directory.isPending && !directory.isError && !directory.data?.entries.length && (
             <Text c="dimmed">No matching paths.</Text>
           )}
         </Stack>
@@ -521,17 +627,21 @@ function SnapshotPicker({
   );
 }
 
+type SnapshotSelection = {
+  roots: string[];
+  paths: string[];
+  onChange: (paths: string[]) => void;
+};
+
 function SnapshotEntry({
   snapshot,
   entry,
-  selected,
-  onChange,
+  selection,
   depth,
 }: {
   snapshot: string;
   entry: Types.BackupSnapshotItem;
-  selected: string[];
-  onChange: (paths: string[]) => void;
+  selection?: SnapshotSelection;
   depth: number;
 }) {
   const [open, setOpen] = useState(false);
@@ -541,16 +651,21 @@ function SnapshotEntry({
     { snapshot, parent: entry.path, search: "", page, limit: 100 },
     { enabled: open && entry.directory },
   );
+  const selected = selection?.paths ?? [];
+  const selectable = selection?.roots.some((source) => {
+    const root = source.replace(/^\/+|\/+$/g, "");
+    return !!root && (entry.path === root || isBelow(entry.path, root));
+  }) ?? false;
   const exact = selected.includes(entry.path);
   const ancestor = selected.some((path) => isBelow(entry.path, path));
   const descendants = selected.some((path) => isBelow(path, entry.path));
   const checked = exact || ancestor;
   const toggle = () => {
-    if (ancestor) return;
+    if (!selection || !selectable || ancestor) return;
     if (exact) {
-      onChange(selected.filter((path) => path !== entry.path && !isBelow(path, entry.path)));
+      selection.onChange(selected.filter((path) => path !== entry.path && !isBelow(path, entry.path)));
     } else {
-      onChange([
+      selection.onChange([
         ...selected.filter((path) => !isBelow(path, entry.path)),
         entry.path,
       ]);
@@ -571,14 +686,18 @@ function SnapshotEntry({
         ) : (
           <span style={{ width: 24 }} />
         )}
-        <Checkbox
-          checked={checked}
-          disabled={ancestor}
-          title={ancestor ? "Included by a selected parent; deselect the parent first" : undefined}
-          indeterminate={!checked && descendants}
-          onChange={toggle}
-          aria-label={`Select ${entry.path}`}
-        />
+        {selection && (
+          <Checkbox
+            checked={checked}
+            disabled={!selectable || ancestor}
+            title={!selectable
+              ? "Navigation only: select a path within a restorable source root"
+              : ancestor ? "Included by a selected parent; deselect the parent first" : undefined}
+            indeterminate={!checked && descendants}
+            onChange={toggle}
+            aria-label={`Select ${entry.path}`}
+          />
+        )}
         {entry.directory ? <Folder size="1rem" /> : <File size="1rem" />}
         <Text size="sm" className="text-ellipsis">{entry.name}</Text>
       </Group>
@@ -590,12 +709,16 @@ function SnapshotEntry({
                 key={child.path}
                 snapshot={snapshot}
                 entry={child}
-                selected={selected}
-                onChange={onChange}
+                selection={selection}
                 depth={depth + 1}
               />
             ))}
-            {open && !children.isPending && !children.data?.entries.length && (
+            {open && children.isError && (
+              <Text size="sm" c="red" pl={(depth + 1) * 18 + 24}>
+                Unable to load this folder.
+              </Text>
+            )}
+            {open && !children.isPending && !children.isError && !children.data?.entries.length && (
               <Text size="sm" c="dimmed" pl={(depth + 1) * 18 + 24}>
                 Empty folder
               </Text>
