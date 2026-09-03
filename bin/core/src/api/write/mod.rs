@@ -56,23 +56,34 @@ pub struct WriteArgs {
 }
 
 tokio::task_local! {
-  /// Set while the write router owns the backup mutation barrier's read side.
-  /// Synchronous nested executions reuse that ownership instead of attempting
-  /// a recursive Tokio RwLock read after a writer has queued.
+  /// Shared by guarded writes and executions, including awaited child work.
+  /// Nested work clones this lease rather than recursively reading behind a
+  /// queued backup writer.
   static WRITE_MUTATION_GUARD_HELD: WriteMutationGuard;
 }
 
 type WriteMutationGuard = Arc<tokio::sync::OwnedRwLockReadGuard<()>>;
 
-pub(super) fn mutation_guard_held_by_write_request() -> bool {
-  WRITE_MUTATION_GUARD_HELD.try_with(|_| ()).is_ok()
+pub(super) fn current_request_mutation_guard()
+-> Option<WriteMutationGuard> {
+  WRITE_MUTATION_GUARD_HELD.try_with(Arc::clone).ok()
+}
+
+pub(crate) async fn scope_mutation_guard<T>(
+  guard: Option<WriteMutationGuard>,
+  job: impl std::future::Future<Output = T>,
+) -> T {
+  match guard {
+    Some(guard) => WRITE_MUTATION_GUARD_HELD.scope(guard, job).await,
+    None => job.await,
+  }
 }
 
 /// Share the current lease instead of recursively reading behind a queued
 /// writer. Direct resolver callers acquire their own lease before mutation.
 pub(super) async fn owned_write_mutation_guard() -> WriteMutationGuard
 {
-  if let Ok(guard) = WRITE_MUTATION_GUARD_HELD.try_with(Arc::clone) {
+  if let Some(guard) = current_request_mutation_guard() {
     return guard;
   }
   Arc::new(
@@ -392,15 +403,15 @@ mod tests {
   #[tokio::test]
   async fn synchronous_nested_work_reuses_only_the_current_task_guard()
    {
-    assert!(!mutation_guard_held_by_write_request());
+    assert!(current_request_mutation_guard().is_none());
     let barrier = Arc::new(tokio::sync::RwLock::new(()));
     let guard = Arc::new(barrier.read_owned().await);
     WRITE_MUTATION_GUARD_HELD
       .scope(guard, async {
-        assert!(mutation_guard_held_by_write_request());
+        assert!(current_request_mutation_guard().is_some());
         assert!(
-          !tokio::spawn(async {
-            mutation_guard_held_by_write_request()
+          tokio::spawn(async {
+            current_request_mutation_guard().is_none()
           })
           .await
           .unwrap()
@@ -420,7 +431,7 @@ mod tests {
         (spawn_guarded_write_job(
           owned_write_mutation_guard().await,
           async move {
-            assert!(mutation_guard_held_by_write_request());
+            assert!(current_request_mutation_guard().is_some());
             let _ = wait.await;
           },
         ),)

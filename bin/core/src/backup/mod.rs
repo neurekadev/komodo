@@ -1397,14 +1397,6 @@ async fn finish_run(
 }
 
 pub async fn status() -> anyhow::Result<BackupStatus> {
-  // Fail fast before taking the role barrier. A timed-out health worker keeps
-  // this slot, but must not keep administrators from changing repository roles.
-  let health_refresh = repository_health_refresh_slots()
-    .clone()
-    .try_acquire_owned()
-    .context("Repository health inventory is still running; retry after it finishes")?;
-  let _repository_roles =
-    repository_role_barrier().clone().read_owned().await;
   let recent_runs = find_collect(
     &runs_collection(),
     None,
@@ -1431,36 +1423,50 @@ pub async fn status() -> anyhow::Result<BackupStatus> {
   )
   .await
   .unwrap_or_default();
-  // Admission also coalesces concurrent refreshes of this persisted cache.
-  let previous_primary = health_collection()
-    .find_one(doc! { "_id": "primary" })
-    .await
-    .ok()
-    .flatten()
-    .unwrap_or_default();
-  let previous_mirror = health_collection()
-    .find_one(doc! { "_id": "mirror" })
-    .await
-    .ok()
-    .flatten()
-    .unwrap_or_default();
-  let settings = match get_settings().await {
-    Ok(settings) => settings,
-    Err(error) => {
-      record_configuration_alert(&error);
-      return Ok(BackupStatus {
-        active_runs,
-        recent_runs,
-        critical_alert: current_critical_alert(),
-        ..Default::default()
+  let (
+    (previous_primary, previous_mirror, settings),
+    _repository_roles,
+    health_refresh,
+  ) = load_health_with_refresh_admission(
+    repository_role_barrier().clone(),
+    repository_health_refresh_slots().clone(),
+    || async {
+      let primary = health_collection()
+        .find_one(doc! { "_id": "primary" })
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+      let mirror = health_collection()
+        .find_one(doc! { "_id": "mirror" })
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+      let settings = get_settings()
+        .await
+        .inspect_err(record_configuration_alert)
+        .ok();
+      let fresh = settings.as_ref().is_none_or(|settings| {
+        repository_health_cache_is_fresh(
+          primary.inventory_checked_at,
+          settings.updated_at,
+          komodo_timestamp(),
+        )
       });
-    }
+      Ok(((primary, mirror, settings), fresh))
+    },
+  )
+  .await?;
+  let Some(settings) = settings else {
+    return Ok(BackupStatus {
+      active_runs,
+      recent_runs,
+      critical_alert: current_critical_alert(),
+      ..Default::default()
+    });
   };
-  if repository_health_cache_is_fresh(
-    previous_primary.inventory_checked_at,
-    settings.updated_at,
-    komodo_timestamp(),
-  ) {
+  let Some(health_refresh) = health_refresh else {
     return Ok(BackupStatus {
       active_runs,
       recent_runs,
@@ -1480,7 +1486,7 @@ pub async fn status() -> anyhow::Result<BackupStatus> {
         .last_full_verification_at,
       critical_alert: current_critical_alert(),
     });
-  }
+  };
   let primary_settings = settings.clone();
   let primary_repository = settings.primary.clone();
   let deadline =
@@ -1600,6 +1606,37 @@ fn repository_health_refresh_slots()
   static SLOTS: OnceLock<Arc<tokio::sync::Semaphore>> =
     OnceLock::new();
   SLOTS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
+}
+
+/// Cache readers do not consume inventory admission. Drop the role read guard
+/// before acquiring admission, then reload under a new guard: another refresh
+/// or a repository-role change may have completed in that gap.
+async fn load_health_with_refresh_admission<T, F>(
+  roles: Arc<tokio::sync::RwLock<()>>,
+  slots: Arc<tokio::sync::Semaphore>,
+  mut load: impl FnMut() -> F,
+) -> anyhow::Result<(
+  T,
+  tokio::sync::OwnedRwLockReadGuard<()>,
+  Option<tokio::sync::OwnedSemaphorePermit>,
+)>
+where
+  F: std::future::Future<Output = anyhow::Result<(T, bool)>>,
+{
+  let role = roles.clone().read_owned().await;
+  let (state, fresh) = load().await?;
+  if fresh {
+    return Ok((state, role, None));
+  }
+  drop(role);
+  let permit = slots.try_acquire_owned()
+    .context("Repository health inventory is still running; retry after it finishes")?;
+  let role = roles.read_owned().await;
+  let (state, fresh) = load().await?;
+  if fresh {
+    return Ok((state, role, None));
+  }
+  Ok((state, role, Some(permit)))
 }
 
 fn repository_health_cache_is_fresh(
@@ -6436,6 +6473,76 @@ mod tests {
     assert!(!repository_health_cache_is_fresh(1_000, 500, 301_000));
     assert!(!repository_health_cache_is_fresh(0, 0, 1_000));
     assert!(!repository_health_cache_is_fresh(2_000, 500, 1_000));
+  }
+
+  #[tokio::test]
+  async fn fresh_health_readers_do_not_consume_refresh_admission() {
+    let roles = Arc::new(tokio::sync::RwLock::new(()));
+    let slots = Arc::new(tokio::sync::Semaphore::new(1));
+    let running = slots.clone().try_acquire_owned().unwrap();
+    let read = || {
+      load_health_with_refresh_admission(
+        roles.clone(),
+        slots.clone(),
+        || std::future::ready(Ok(("cached health", true))),
+      )
+    };
+    let (first, second) = tokio::join!(read(), read());
+    for result in [first, second] {
+      let (state, _role, admission) = result.unwrap();
+      assert_eq!(state, "cached health");
+      assert!(admission.is_none());
+    }
+    assert!(slots.clone().try_acquire_owned().is_err());
+    drop(running);
+    assert!(roles.try_write().is_ok());
+  }
+
+  #[tokio::test]
+  async fn health_rechecks_freshness_after_refresh_admission() {
+    let roles = Arc::new(tokio::sync::RwLock::new(()));
+    let slots = Arc::new(tokio::sync::Semaphore::new(1));
+    let mut loads = 0;
+    let (state, _role, admission) =
+      load_health_with_refresh_admission(
+        roles,
+        slots.clone(),
+        || {
+          loads += 1;
+          // A previous refresh/settings change completed between the reads.
+          std::future::ready(Ok((loads, loads == 2)))
+        },
+      )
+      .await
+      .unwrap();
+    assert_eq!(state, 2);
+    assert_eq!(loads, 2);
+    assert!(admission.is_none());
+    assert!(slots.try_acquire_owned().is_ok());
+  }
+
+  #[tokio::test]
+  async fn stale_health_refresh_is_exclusive_without_leaking_role_reads()
+   {
+    let roles = Arc::new(tokio::sync::RwLock::new(()));
+    let slots = Arc::new(tokio::sync::Semaphore::new(1));
+    let read = || {
+      load_health_with_refresh_admission(
+        roles.clone(),
+        slots.clone(),
+        || std::future::ready(Ok(((), false))),
+      )
+    };
+    let (_, role, admission) = read().await.unwrap();
+    let admission = admission.expect("stale health needs admission");
+    assert!(read().await.is_err());
+    assert!(roles.try_write().is_err());
+    drop(role);
+    // Busy callers released their own role reads before failing admission.
+    assert!(roles.try_write().is_ok());
+    assert!(slots.clone().try_acquire_owned().is_err());
+    drop(admission);
+    assert!(slots.try_acquire_owned().is_ok());
   }
 
   #[test]

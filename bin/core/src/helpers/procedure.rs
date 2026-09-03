@@ -198,7 +198,7 @@ async fn execute_execution(
   macro_rules! resolve_execute {
     ($Variant:ident, $req:expr) => {{
       let req = ExecuteRequest::$Variant($req);
-      let _mutation_guard =
+      let mutation_guard =
         crate::api::execute::execution_mutation_guard(&req).await;
       let update = init_execution_update(&req, &user).await?;
       let ExecuteRequest::$Variant(req) = req else {
@@ -206,15 +206,17 @@ async fn execute_execution(
       };
       let update_id = update.id.clone();
       handle_resolve_result(
-        req
-          .resolve(&ExecuteArgs {
+        crate::api::write::scope_mutation_guard(
+          mutation_guard.clone(),
+          req.resolve(&ExecuteArgs {
             user,
             update,
             task_id,
-          })
-          .await
-          .map_err(|e| e.error)
-          .context(concat!("Failed at ", stringify!($Variant))),
+          }),
+        )
+        .await
+        .map_err(|e| e.error)
+        .context(concat!("Failed at ", stringify!($Variant))),
         &update_id,
       )
       .await?

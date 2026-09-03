@@ -1,4 +1,4 @@
-use std::pin::Pin;
+use std::{pin::Pin, sync::Arc};
 
 use anyhow::Context;
 use axum::{
@@ -235,7 +235,7 @@ impl ExecuteRequest {
 
 pub(crate) async fn execution_mutation_guard(
   request: &ExecuteRequest,
-) -> Option<tokio::sync::OwnedRwLockReadGuard<()>> {
+) -> Option<Arc<tokio::sync::OwnedRwLockReadGuard<()>>> {
   execution_mutation_guard_on(
     request,
     crate::backup::mutation_barrier().clone(),
@@ -246,9 +246,12 @@ pub(crate) async fn execution_mutation_guard(
 async fn execution_mutation_guard_on(
   request: &ExecuteRequest,
   barrier: std::sync::Arc<tokio::sync::RwLock<()>>,
-) -> Option<tokio::sync::OwnedRwLockReadGuard<()>> {
+) -> Option<Arc<tokio::sync::OwnedRwLockReadGuard<()>>> {
   if request.needs_mutation_guard() {
-    Some(barrier.read_owned().await)
+    Some(match super::write::current_request_mutation_guard() {
+      Some(guard) => guard,
+      None => Arc::new(barrier.read_owned().await),
+    })
   } else {
     None
   }
@@ -264,16 +267,7 @@ pub fn inner_handler(
   >,
 > {
   Box::pin(async move {
-    let needs_mutation_guard = request.needs_mutation_guard();
-    let mutation_guard = if !needs_mutation_guard
-      || super::write::mutation_guard_held_by_write_request()
-    {
-      None
-    } else {
-      Some(
-        crate::backup::mutation_barrier().clone().read_owned().await,
-      )
-    };
+    let mutation_guard = execution_mutation_guard(&request).await;
     let task_id = Uuid::new_v4();
 
     // Need to validate no cancel is active before any update is created.
@@ -301,19 +295,15 @@ pub fn inner_handler(
     // running after this method returns.
     let task_update = update.clone();
     let handle = tokio::spawn(async move {
-      // A nested execution reached from a write request cannot acquire a
-      // second read guard synchronously: a queued writer would deadlock it
-      // behind the outer read guard. Acquire in the detached execution task
-      // instead, after inner_handler returns and the outer request can finish.
-      let _mutation_guard = if !needs_mutation_guard {
-        None
-      } else {
-        match mutation_guard {
-          Some(guard) => Some(guard),
-          None => execution_mutation_guard(&request).await,
-        }
-      };
-      task(task_id, request, user, task_update).await
+      // Transfer the already acquired/shared lease into the real worker.
+      // Awaited auto-updates must not reacquire behind a queued backup while
+      // their parent still holds the original lease. Propagate the scope for
+      // nested executions such as GlobalAutoUpdate as well.
+      super::write::scope_mutation_guard(
+        mutation_guard,
+        task(task_id, request, user, task_update),
+      )
+      .await
     });
 
     // Spawns another task to monitor the first for failures,
@@ -555,6 +545,67 @@ mod tests {
     let guard = step.await.expect("Mutation must retain a lease");
     assert!(barrier.try_write().is_err());
     drop(guard);
+    assert!(barrier.try_write().is_ok());
+  }
+
+  #[tokio::test]
+  async fn awaited_auto_updates_share_the_parent_lease_past_a_queued_backup()
+   {
+    let barrier = Arc::new(tokio::sync::RwLock::new(()));
+    let parent = Arc::new(barrier.clone().read_owned().await);
+    let mut backup = Box::pin(barrier.clone().write_owned());
+    assert!(futures_util::poll!(backup.as_mut()).is_pending());
+    crate::api::write::scope_mutation_guard(Some(parent), async {
+      for (kind, params) in [
+        ("Deploy", json!({ "deployment": "id" })),
+        ("DeployStack", json!({ "stack": "id" })),
+      ] {
+        let req = request(kind, params);
+        let child = execution_mutation_guard_on(&req, barrier.clone())
+          .now_or_never()
+          .expect("An awaited child must not queue behind its parent's writer")
+          .expect("Deployments require a lease");
+        // Match the dispatcher's detached worker, awaited by the parent.
+        let child_barrier = barrier.clone();
+        tokio::spawn(crate::api::write::scope_mutation_guard(
+          Some(child), async move {
+            assert!(crate::api::write::current_request_mutation_guard().is_some());
+            let nested = request("Deploy", json!({ "deployment": "id" }));
+            assert!(execution_mutation_guard_on(&nested, child_barrier)
+              .now_or_never().expect("Nested execution must share the inherited lease").is_some());
+          },
+        )).await.unwrap();
+        assert!(futures_util::poll!(backup.as_mut()).is_pending());
+      }
+    }).await;
+    drop(backup.await);
+    assert!(barrier.try_write().is_ok());
+  }
+
+  #[tokio::test]
+  async fn child_execution_retains_shared_lease_after_parent_returns()
+  {
+    let barrier = Arc::new(tokio::sync::RwLock::new(()));
+    let parent = Arc::new(barrier.clone().read_owned().await);
+    let (finish, wait) = tokio::sync::oneshot::channel();
+    let (job,) =
+      crate::api::write::scope_mutation_guard(Some(parent), async {
+        let request =
+          request("Deploy", json!({ "deployment": "id" }));
+        let child =
+          execution_mutation_guard_on(&request, barrier.clone())
+            .await;
+        (tokio::spawn(crate::api::write::scope_mutation_guard(
+          child,
+          async move {
+            let _ = wait.await;
+          },
+        )),)
+      })
+      .await;
+    assert!(barrier.try_write().is_err());
+    finish.send(()).unwrap();
+    job.await.unwrap();
     assert!(barrier.try_write().is_ok());
   }
 }
