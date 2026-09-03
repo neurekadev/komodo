@@ -299,7 +299,6 @@ mod tests {
         value: "recovery-passphrase".into(),
         configured: false,
       },
-      ..Default::default()
     };
     configure_source(&mut material, source.clone()).unwrap();
     assert_eq!(material.settings.primary, source);
