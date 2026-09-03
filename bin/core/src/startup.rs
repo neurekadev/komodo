@@ -615,68 +615,6 @@ async fn ensure_init_user_and_resources() -> anyhow::Result<()> {
   Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-  use super::*;
-
-  fn configured_core() -> CoreConfig {
-    CoreConfig {
-      local_auth: true,
-      ..Default::default()
-    }
-  }
-
-  #[test]
-  fn existing_installation_does_not_require_bootstrap_credentials() {
-    assert!(
-      validate_bootstrap_config(&CoreConfig::default(), true).is_ok()
-    );
-  }
-
-  #[test]
-  fn empty_installation_requires_an_access_path() {
-    let config = configured_core();
-    assert!(validate_bootstrap_config(&config, false).is_err());
-  }
-
-  #[test]
-  fn initial_admin_requires_a_real_password() {
-    let mut config = configured_core();
-    config.init_admin_username = Some("admin".into());
-
-    for password in
-      ["", "changeme", "REPLACE_WITH_PASSWORD", "too-short"]
-    {
-      config.init_admin_password = password.into();
-      assert!(validate_bootstrap_config(&config, false).is_err());
-    }
-
-    config.init_admin_password = "a-secure-password".into();
-    assert!(validate_bootstrap_config(&config, false).is_ok());
-  }
-
-  #[test]
-  fn explicit_registration_override_can_bootstrap() {
-    let mut local = configured_core();
-    local.disable_local_user_registration = Some(false);
-    assert!(validate_bootstrap_config(&local, false).is_ok());
-
-    let mut oidc = CoreConfig::default();
-    oidc.oidc_enabled = true;
-    oidc.oidc_provider = "https://identity.example.com".into();
-    oidc.oidc_client_id = "komodo".into();
-    oidc.disable_oidc_user_registration = Some(false);
-    assert!(validate_bootstrap_config(&oidc, false).is_ok());
-  }
-
-  #[test]
-  fn shipped_webhook_placeholder_is_rejected() {
-    let mut config = CoreConfig::default();
-    config.webhook_secret = "a_random_webhook_secret".into();
-    assert!(validate_bootstrap_config(&config, true).is_err());
-  }
-}
-
 /// v1.17.5 removes the ServerTemplate resource.
 /// References to this resource type need to be cleaned up
 /// to avoid type errors reading from the database.
@@ -774,5 +712,71 @@ async fn v2_init_missing_resource_info() {
     .await
   {
     error!("Failed to migrate DeploymentInfo to v2 | {e:?}");
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn configured_core() -> CoreConfig {
+    CoreConfig {
+      local_auth: true,
+      ..Default::default()
+    }
+  }
+
+  #[test]
+  fn existing_installation_does_not_require_bootstrap_credentials() {
+    assert!(
+      validate_bootstrap_config(&CoreConfig::default(), true).is_ok()
+    );
+  }
+
+  #[test]
+  fn empty_installation_requires_an_access_path() {
+    let config = configured_core();
+    assert!(validate_bootstrap_config(&config, false).is_err());
+  }
+
+  #[test]
+  fn initial_admin_requires_a_real_password() {
+    let mut config = configured_core();
+    config.init_admin_username = Some("admin".into());
+
+    for password in
+      ["", "changeme", "REPLACE_WITH_PASSWORD", "too-short"]
+    {
+      config.init_admin_password = password.into();
+      assert!(validate_bootstrap_config(&config, false).is_err());
+    }
+
+    config.init_admin_password = "a-secure-password".into();
+    assert!(validate_bootstrap_config(&config, false).is_ok());
+  }
+
+  #[test]
+  fn explicit_registration_override_can_bootstrap() {
+    let mut local = configured_core();
+    local.disable_local_user_registration = Some(false);
+    assert!(validate_bootstrap_config(&local, false).is_ok());
+
+    let oidc = CoreConfig {
+      oidc_enabled: true,
+      oidc_provider: "https://identity.example.com".into(),
+      oidc_client_id: "komodo".into(),
+      disable_oidc_user_registration: Some(false),
+      ..Default::default()
+    };
+    assert!(validate_bootstrap_config(&oidc, false).is_ok());
+  }
+
+  #[test]
+  fn shipped_webhook_placeholder_is_rejected() {
+    let config = CoreConfig {
+      webhook_secret: "a_random_webhook_secret".into(),
+      ..Default::default()
+    };
+    assert!(validate_bootstrap_config(&config, true).is_err());
   }
 }
