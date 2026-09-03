@@ -1206,10 +1206,6 @@ fn paths_overlap(left: &Path, right: &Path) -> anyhow::Result<bool> {
   komodo_backup::filesystem::paths_overlap(left, right)
 }
 
-fn resolve_existing_ancestor(path: &Path) -> anyhow::Result<PathBuf> {
-  komodo_backup::filesystem::resolve_existing_ancestor(path)
-}
-
 pub(crate) fn internal_storage_dir() -> PathBuf {
   periphery_config().stack_dir().join(".komodo-vykar")
 }
@@ -2512,9 +2508,10 @@ async fn prepare_restore_volume(
     ));
   }
   if exists {
-    let volume = restore_execution_before_deadline(deadline, async {
-      Ok(docker.inspect_volume(volume_name).await?)
-    })
+    let volume = restore_execution_before_deadline(
+      deadline,
+      docker.inspect_volume(volume_name),
+    )
     .await?;
     if volume
       .labels
@@ -2535,7 +2532,11 @@ async fn prepare_restore_volume(
   if !exists {
     let created = async {
       create_restore_volume(volume_name, restore_plan_id).await?;
-      let volume = restore_execution_before_deadline(deadline, async { Ok(docker.inspect_volume(volume_name).await?) }).await?;
+      let volume = restore_execution_before_deadline(
+        deadline,
+        docker.inspect_volume(volume_name),
+      )
+      .await?;
       if volume
         .labels
         .get(RESTORE_PLAN_VOLUME_LABEL)
@@ -4633,44 +4634,12 @@ fn publish_restore_in(
     fsync_parent(staging_journal_path)?;
   }
 
-  for index in 0..journal.entries.len() {
-    if !destination_existence_matches(&journal.entries[index]) {
-      rollback_published(&mut journal, &journal_path)?;
-      cleanup_rolled_back_restore(&journal, &journal_path)?;
-      return Ok(true);
-    }
-    if path_lexists(&journal.entries[index].destination) {
-      if let Err(error) = std::fs::rename(
-        &journal.entries[index].destination,
-        &journal.entries[index].rollback,
-      ) {
-        rollback_published(&mut journal, &journal_path)?;
-        warn!(
-          "Restore rollback preparation failed and earlier publications were rolled back: {error:#}"
-        );
-        cleanup_rolled_back_restore(&journal, &journal_path)?;
-        return Ok(true);
-      }
-      // Make destination -> rollback durable before the journal claims this
-      // entry was published. Recovery must never remove original data after a
-      // power loss that discarded the rename.
-      fsync_parent(&journal.entries[index].destination)?;
-    }
-    // Persist publication intent before source -> destination. On recovery,
-    // this distinguishes a newly-created destination (which has no rollback
-    // path) from an entry that was never reached.
-    journal.entries[index].published = true;
-    persist_journal(&journal_path, &journal)?;
-    if let Err(error) = std::fs::rename(
-      &journal.entries[index].source,
-      &journal.entries[index].destination,
-    ) {
-      rollback_published(&mut journal, &journal_path)?;
-      warn!("Restore publish failed and was rolled back: {error:#}");
-      cleanup_rolled_back_restore(&journal, &journal_path)?;
-      return Ok(true);
-    }
-    fsync_parent(&journal.entries[index].destination)?;
+  if publish_restore_entries(
+    &mut journal,
+    &journal_path,
+    |from, to| std::fs::rename(from, to),
+  )? {
+    return Ok(true);
   }
 
   if defer_finalize {
@@ -4692,6 +4661,54 @@ fn publish_restore_in(
   fsync_parent(staging)?;
   std::fs::remove_file(&journal_path)?;
   fsync_parent(&journal_path)?;
+  Ok(false)
+}
+
+fn publish_restore_entries(
+  journal: &mut RestoreJournal,
+  journal_path: &Path,
+  rename: impl Fn(&Path, &Path) -> std::io::Result<()>,
+) -> anyhow::Result<bool> {
+  for index in 0..journal.entries.len() {
+    if !destination_existence_matches(&journal.entries[index]) {
+      rollback_published(journal, journal_path)?;
+      cleanup_rolled_back_restore(journal, journal_path)?;
+      return Ok(true);
+    }
+    if path_lexists(&journal.entries[index].destination) {
+      if let Err(error) = rename(
+        &journal.entries[index].destination,
+        &journal.entries[index].rollback,
+      ) {
+        rollback_published(journal, journal_path)?;
+        warn!(
+          "Restore rollback preparation failed and earlier publications were rolled back: {error:#}"
+        );
+        cleanup_rolled_back_restore(journal, journal_path)?;
+        return Ok(true);
+      }
+      // Make destination -> rollback durable before the journal claims this
+      // entry was published. Recovery must never remove original data after a
+      // power loss that discarded the rename.
+      fsync_parent(&journal.entries[index].destination)?;
+    }
+    // Persist publication intent before source -> destination. On recovery,
+    // this distinguishes a newly-created destination (which has no rollback
+    // path) from an entry that was never reached.
+    journal.entries[index].published = true;
+    persist_journal(journal_path, journal)?;
+    if let Err(error) = rename(
+      &journal.entries[index].source,
+      &journal.entries[index].destination,
+    ) {
+      rollback_published(journal, journal_path)?;
+      warn!("Restore publish failed and was rolled back: {error:#}");
+      cleanup_rolled_back_restore(journal, journal_path)?;
+      return Ok(true);
+    }
+    fsync_parent(&journal.entries[index].destination)?;
+  }
+
   Ok(false)
 }
 
@@ -5147,13 +5164,12 @@ fn finalization_from_origin(
       "Missing restore journal has no durable finalization proof"
     ));
   }
-  if let Some(finalized) = &origin.finalized {
-    if finalized.complete
-      && finalized.critical_error.is_none()
-      && finalized.rolled_back != commit
-    {
-      return Ok(finalized.clone());
-    }
+  if let Some(finalized) = &origin.finalized
+    && finalized.complete
+    && finalized.critical_error.is_none()
+    && finalized.rolled_back != commit
+  {
+    return Ok(finalized.clone());
   }
   if let Some(restored) = &origin.completion.restore_result
     && !restored.finalization_pending
@@ -6864,7 +6880,10 @@ mod tests {
     std::fs::create_dir(&real).unwrap();
     std::os::unix::fs::symlink(&real, &alias).unwrap();
     assert_eq!(
-      resolve_existing_ancestor(&alias.join("new/child")).unwrap(),
+      komodo_backup::filesystem::resolve_existing_ancestor(
+        &alias.join("new/child"),
+      )
+      .unwrap(),
       real.canonicalize().unwrap().join("new/child")
     );
   }
@@ -7235,16 +7254,26 @@ mod tests {
       ),
       3
     );
-    let rewritten = serde_yaml_ng::to_string(&document).unwrap();
-    for expected in [
-      "/recovery/data:/data:ro",
-      "/recovery/cache",
-      "/recovery/run/config:/config",
-      "named-data:/named",
+    let volumes = document["services"]["app"]["volumes"]
+      .as_sequence()
+      .unwrap();
+    for (index, expected_source, expected_target) in [
+      (0, "/recovery/data", "/data:ro"),
+      (2, "/recovery/run/config", "/config"),
+      (3, "named-data", "/named"),
     ] {
-      assert!(rewritten.contains(expected), "{rewritten}");
+      let (source, target) =
+        split_compose_short_mount(volumes[index].as_str().unwrap())
+          .unwrap();
+      assert_eq!(Path::new(source), Path::new(expected_source));
+      assert_eq!(target, expected_target);
     }
-    assert!(!rewritten.contains("../"));
+    assert_eq!(volumes[1]["type"].as_str().unwrap(), "bind");
+    assert_eq!(
+      Path::new(volumes[1]["source"].as_str().unwrap()),
+      Path::new("/recovery/cache"),
+    );
+    assert_eq!(volumes[1]["target"].as_str().unwrap(), "/cache");
   }
 
   #[test]
@@ -7764,11 +7793,7 @@ mod tests {
     let first = root.path().join("destination");
     std::fs::create_dir_all(&first).unwrap();
     std::fs::write(first.join("original.txt"), b"original").unwrap();
-    // The first publication creates this previously absent sibling as its
-    // rollback copy. The second entry must then fail its existence recheck,
-    // after the first destination has actually been replaced.
-    let second =
-      restore_rollback_path(&first, "rollback-test").unwrap();
+    let second = root.path().join("second");
     let publish = vec![
       RestorePublishPath {
         destination_root: None,
@@ -7781,21 +7806,65 @@ mod tests {
         destination: second.to_string_lossy().into_owned(),
       },
     ];
-    let publication_started = AtomicBool::new(false);
     let journals = root.path().join("journals");
+    std::fs::create_dir(&journals).unwrap();
+    let journal_path = journals.join("rollback-test.json");
+    let entries = publish
+      .iter()
+      .enumerate()
+      .map(|(index, item)| {
+        let source = root
+          .path()
+          .join(format!(".komodo-restore-rollback-test-{index}"));
+        std::fs::rename(download.join(&item.snapshot_path), &source)
+          .unwrap();
+        let destination = PathBuf::from(&item.destination);
+        RestoreJournalEntry {
+          source,
+          rollback: restore_rollback_path(
+            &destination,
+            "rollback-test",
+          )
+          .unwrap(),
+          original_existed: Some(path_lexists(&destination)),
+          destination,
+          published: false,
+        }
+      })
+      .collect();
+    let mut journal = RestoreJournal {
+      staging: download.clone(),
+      entries,
+      committed: false,
+      finalized: false,
+      deferred: false,
+      completed: false,
+      owned_volume: None,
+    };
+    validate_resolved_restore_destinations(&publish).unwrap();
+    validate_restore_rollback_paths(&publish, "rollback-test")
+      .unwrap();
+    persist_journal(&journal_path, &journal).unwrap();
+    let failure_injected = AtomicBool::new(false);
     assert!(
-      publish_restore_in(
-        &download,
-        &publish,
-        "rollback-test",
-        &publication_started,
-        &journals,
-        None,
-        false,
+      publish_restore_entries(
+        &mut journal,
+        &journal_path,
+        |from, to| {
+          if to == second {
+            assert!(first.join("new.txt").exists());
+            assert!(!first.join("original.txt").exists());
+            failure_injected.store(true, Ordering::SeqCst);
+            return Err(std::io::Error::other(
+              "injected publish failure",
+            ));
+          }
+          std::fs::rename(from, to)
+        }
       )
       .unwrap()
     );
-    assert!(publication_started.load(Ordering::SeqCst));
+    assert!(failure_injected.load(Ordering::SeqCst));
     assert_eq!(
       std::fs::read(first.join("original.txt")).unwrap(),
       b"original"

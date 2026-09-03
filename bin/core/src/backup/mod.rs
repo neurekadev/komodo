@@ -7636,8 +7636,10 @@ mod tests {
   #[test]
   fn restore_execution_roundtrip_preserves_original_authority_and_decisions()
    {
-    let mut server = Server::default();
-    server.id = "server".into();
+    let mut server = Server {
+      id: "0123456789abcdef01234567".into(),
+      ..Default::default()
+    };
     server.config.address = "wss://original.example".into();
     server.info.public_key = "original-key".into();
     let execution = StoredRestoreExecution {
@@ -7667,6 +7669,7 @@ mod tests {
     );
     assert_eq!(restored.pending.operation_id, "original-operation");
     assert_eq!(restored.pending.run_id, "original-run");
+    assert_eq!(restored.pending.server.id, server.id);
     assert!(restored.recovered_stack_creation_started);
     assert_eq!(
       restored.finalizations[0].operation_id,
@@ -8755,8 +8758,10 @@ mod tests {
   fn backup_workers_require_explicit_matching_admin_enrollment() {
     use komodo_client::entities::backup::BackupTrustedWorker;
     let mut settings = BackupSettings::default();
-    let mut server = Server::default();
-    server.id = "server-a".into();
+    let mut server = Server {
+      id: "server-a".into(),
+      ..Default::default()
+    };
     server.config.address = "wss://trusted.example".into();
     server.info.public_key = "verified-key".into();
     assert!(

@@ -10,9 +10,7 @@ use transport::channel::channel;
 use uuid::Uuid;
 
 use crate::{
-  connection::{
-    PeripheryConnection, PeripheryConnectionArgs, ResponseChannels,
-  },
+  connection::{PeripheryConnection, PeripheryConnectionArgs},
   state::periphery_connections,
 };
 
@@ -23,7 +21,6 @@ pub mod terminal;
 pub struct PeripheryClient {
   /// Usually the server id
   pub id: String,
-  pub responses: Arc<ResponseChannels>,
 }
 
 impl PeripheryClient {
@@ -47,10 +44,7 @@ impl PeripheryClient {
 
     // Ensure the connection args are unchanged.
     if args.matches(&connection.args) {
-      return Ok(PeripheryClient {
-        id,
-        responses: connection.responses.clone(),
-      });
+      return Ok(PeripheryClient { id });
     }
 
     // The args have changed.
@@ -59,14 +53,11 @@ impl PeripheryClient {
       // Remove this connection, wait and see if client reconnects
       connections.remove(&id).await;
       tokio::time::sleep(Duration::from_millis(500)).await;
-      let connection = connections
+      connections
         .get(&id)
         .await
         .with_context(|| format!("Server {id} is not connected"))?;
-      Ok(PeripheryClient {
-        id,
-        responses: connection.responses.clone(),
-      })
+      Ok(PeripheryClient { id })
     } else {
       // Core -> Periphery connection
       args.spawn_client_connection(id.clone(), insecure_tls).await
@@ -251,15 +242,16 @@ mod tests {
     use encoding::WithChannel;
     use periphery_client::transport::TransportMessage;
 
-    let mut server = Server::default();
-    server.id = "inventory-test".into();
+    let server = Server {
+      id: "inventory-test".into(),
+      ..Default::default()
+    };
     let (connection, mut outgoing) = PeripheryConnection::new(
       PeripheryConnectionArgs::from_server(&server),
     );
     connection.set_connected(true);
     let client = PeripheryClient {
       id: server.id.clone(),
-      responses: connection.responses.clone(),
     };
     let error = client
       .request_on_connection(
@@ -290,8 +282,10 @@ mod tests {
 
   #[test]
   fn pinned_connection_identity_does_not_follow_server_replacement() {
-    let mut server = Server::default();
-    server.id = "server".into();
+    let mut server = Server {
+      id: "server".into(),
+      ..Default::default()
+    };
     server.config.address = "wss://trusted.example".into();
     server.info.public_key = "trusted-key".into();
     let expected = PeripheryConnectionArgs::from_server(&server);
