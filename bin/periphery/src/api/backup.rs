@@ -3681,6 +3681,12 @@ fn remove_path(path: &Path) -> anyhow::Result<()> {
   Ok(())
 }
 
+fn restore_verification_len(is_directory: bool, len: u64) -> u64 {
+  // Directory st_size describes filesystem-specific storage, not copied
+  // contents. Child entries and their metadata are verified independently.
+  if is_directory { 0 } else { len }
+}
+
 fn tree_digest(root: &Path) -> anyhow::Result<Vec<u8>> {
   fn update(
     path: &Path,
@@ -3690,7 +3696,10 @@ fn tree_digest(root: &Path) -> anyhow::Result<Vec<u8>> {
     let metadata = std::fs::symlink_metadata(path)?;
     digest.update(relative.to_string_lossy().as_bytes());
     digest.update(metadata.permissions().mode().to_le_bytes());
-    digest.update(metadata.len().to_le_bytes());
+    digest.update(
+      restore_verification_len(metadata.is_dir(), metadata.len())
+        .to_le_bytes(),
+    );
     digest.update(metadata.uid().to_le_bytes());
     digest.update(metadata.gid().to_le_bytes());
     digest.update(metadata.mtime().to_le_bytes());
@@ -5261,6 +5270,14 @@ mod tests {
       expected_overwritten.sort();
       assert_eq!(overwritten, expected_overwritten);
       assert!(deleted.is_empty());
+    }
+  }
+
+  #[test]
+  fn restore_verification_ignores_only_directory_storage_length() {
+    for len in [0, 6, 4096, u64::MAX] {
+      assert_eq!(restore_verification_len(true, len), 0);
+      assert_eq!(restore_verification_len(false, len), len);
     }
   }
 
