@@ -49,12 +49,14 @@ use komodo_client::{
 };
 use periphery_client::api::backup::{
   BackupSourceFilters, CancelVykarOperation, DiscoverBackupSource,
-  FinalizeVykarRestore, GetBackupVolumeInventory,
-  GetVykarBackupCompletion, PeripheryBackupTarget,
-  PreflightVykarRestore, PreflightVykarRestoreResponse,
-  ProtectedRepositoryPath, RunVykarBackup, RunVykarBackupBatch,
-  RunVykarBackupBatchResponse, RunVykarBackupResponse,
-  TransactionalVykarRestore, VykarBackupCompletion,
+  FinalizeVykarRestore, FinalizeVykarRestoreResponse,
+  GetBackupVolumeInventory, GetVykarBackupCompletion,
+  PeripheryBackupTarget, PreflightVykarRestore,
+  PreflightVykarRestoreResponse, ProtectedRepositoryPath,
+  RunFinalizeVykarRestore, RunTransactionalVykarRestore,
+  RunVykarBackup, RunVykarBackupBatch, RunVykarBackupBatchResponse,
+  RunVykarBackupResponse, TransactionalVykarRestore,
+  TransactionalVykarRestoreResponse, VykarBackupCompletion,
   VykarBackupCompletionState, VykarBackupRepositoryResult,
   VykarBackupTask, VykarRetainedSnapshot,
 };
@@ -137,6 +139,9 @@ struct StoredRestorePlan {
   /// Restore plans are capabilities scoped to the user who confirmed them.
   #[serde(default)]
   created_by: String,
+  /// Aggregate ownership survives prepared publication and Core restart.
+  #[serde(default)]
+  execution: Option<StoredRestoreExecution>,
   plan: BackupRestorePlan,
   publish: Vec<periphery_client::api::backup::RestorePublishPath>,
   #[serde(default)]
@@ -226,6 +231,37 @@ struct RepositoryHealthRecord {
   /// Remains set after an integrity check fails until a full check succeeds.
   #[serde(default)]
   verification_failed: bool,
+  /// Written before destructive maintenance; a crash requires a full check.
+  #[serde(default)]
+  maintenance_in_progress: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredRestoreExecution {
+  pending: PendingWorkerBackup,
+  journal_id: String,
+  deferred: bool,
+  /// A failed insert response does not fence a write still running in MongoDB.
+  #[serde(default)]
+  recovered_stack_creation_started: bool,
+  /// Every decision is durably enrolled before sending its mutating RPC.
+  #[serde(default)]
+  finalizations: Vec<StoredRestoreFinalization>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredRestoreFinalization {
+  operation_id: String,
+  commit: bool,
+  acknowledge: bool,
+}
+
+fn repository_health_is_healthy(
+  record: &RepositoryHealthRecord,
+) -> bool {
+  record.healthy
+    && !record.verification_failed
+    && !record.maintenance_in_progress
 }
 
 fn settings_collection() -> Collection<SealedBackupSettings> {
@@ -258,6 +294,7 @@ fn core_export_includes_collection(name: &str) -> bool {
     SETTINGS_COLLECTION
       | RUNS_COLLECTION
       | PENDING_WORKERS_COLLECTION
+      | PLANS_COLLECTION
   )
 }
 
@@ -267,15 +304,7 @@ pub async fn get_settings() -> anyhow::Result<BackupSettings> {
     .await
     .context("Failed to load backup settings")?
   else {
-    let settings = BackupSettings {
-      timezone: if core_config().timezone.is_empty() {
-        "UTC".into()
-      } else {
-        core_config().timezone.clone()
-      },
-      ..Default::default()
-    };
-    return Ok(settings);
+    return Ok(BackupSettings::default());
   };
   let bytes = crypto::open(&record.sealed)?;
   serde_json::from_slice(&bytes)
@@ -288,14 +317,7 @@ pub async fn get_redacted_settings() -> anyhow::Result<BackupSettings>
     Ok(settings) => settings,
     Err(error) => {
       record_configuration_alert(&error);
-      BackupSettings {
-        timezone: if core_config().timezone.is_empty() {
-          "UTC".into()
-        } else {
-          core_config().timezone.clone()
-        },
-        ..Default::default()
-      }
+      BackupSettings::default()
     }
   };
   settings.redact();
@@ -631,17 +653,15 @@ fn validate_repository_definition(
           "Core-local repository path must be normalized exactly (no surrounding whitespace, '.', '..', duplicate separators, or trailing separator)"
         ));
       }
-      let resolved = resolve_existing_path_ancestor(&normalized)?;
       for reserved in [CORE_PRIVATE_PATH, CORE_CACHE_PATH]
         .into_iter()
         .chain(LEGACY_CORE_STAGING_PATHS)
       {
         let reserved = normalize_core_local_path(reserved);
-        let resolved_reserved =
-          resolve_existing_path_ancestor(&reserved)?;
-        if paths_overlap(&normalized, &reserved)
-          || paths_overlap(&resolved, &resolved_reserved)
-        {
+        if komodo_backup::filesystem::paths_overlap(
+          &normalized,
+          &reserved,
+        )? {
           return Err(anyhow!(
             "Core-local repository path overlaps internal backup staging or cache data"
           ));
@@ -708,15 +728,10 @@ fn repositories_share_location(
     (
       BackupRepositoryBackend::CoreLocal { path: primary },
       BackupRepositoryBackend::CoreLocal { path: mirror },
-    ) => {
-      let primary = resolve_existing_path_ancestor(
-        &normalize_core_local_path(primary),
-      )?;
-      let mirror = resolve_existing_path_ancestor(
-        &normalize_core_local_path(mirror),
-      )?;
-      Ok(primary == mirror)
-    }
+    ) => komodo_backup::filesystem::paths_same_location(
+      &normalize_core_local_path(primary),
+      &normalize_core_local_path(mirror),
+    ),
     _ => {
       Ok(repository_location(primary) == repository_location(mirror))
     }
@@ -731,14 +746,10 @@ fn repositories_overlap(
     (
       BackupRepositoryBackend::CoreLocal { path: primary },
       BackupRepositoryBackend::CoreLocal { path: mirror },
-    ) => Ok(paths_overlap(
-      &resolve_existing_path_ancestor(&normalize_core_local_path(
-        primary,
-      ))?,
-      &resolve_existing_path_ancestor(&normalize_core_local_path(
-        mirror,
-      ))?,
-    )),
+    ) => komodo_backup::filesystem::paths_overlap(
+      &normalize_core_local_path(primary),
+      &normalize_core_local_path(mirror),
+    ),
     _ => repositories_share_location(primary, mirror),
   }
 }
@@ -755,50 +766,6 @@ fn normalize_core_local_path(path: &str) -> PathBuf {
     }
   }
   normalized
-}
-
-fn resolve_existing_path_ancestor(
-  path: &Path,
-) -> anyhow::Result<PathBuf> {
-  let mut ancestor = path;
-  let mut missing = Vec::new();
-  loop {
-    match ancestor.canonicalize() {
-      Ok(mut resolved) => {
-        while let Some(component) = missing.pop() {
-          resolved.push(component);
-        }
-        return Ok(resolved);
-      }
-      Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-        let name = ancestor.file_name().with_context(|| {
-          format!(
-            "Path has no resolvable ancestor: {}",
-            path.display()
-          )
-        })?;
-        missing.push(name.to_os_string());
-        ancestor = ancestor.parent().with_context(|| {
-          format!(
-            "Path has no resolvable ancestor: {}",
-            path.display()
-          )
-        })?;
-      }
-      Err(error) => {
-        return Err(error).with_context(|| {
-          format!(
-            "Failed to resolve path ancestor: {}",
-            path.display()
-          )
-        });
-      }
-    }
-  }
-}
-
-fn paths_overlap(left: &Path, right: &Path) -> bool {
-  left == right || left.starts_with(right) || right.starts_with(left)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1408,12 +1375,21 @@ pub async fn finalize_interrupted_runs() -> anyhow::Result<u64> {
   let mutations = mutation_barrier().clone().write_owned().await;
   let pending =
     find_collect(&pending_workers_collection(), None, None).await;
-  if matches!(&pending, Ok(pending) if pending.is_empty()) {
-    return finalize_reconciled_interrupted_runs().await;
+  let restores = plans_collection()
+    .find_one(pending_restore_execution_filter())
+    .await;
+  if let Some(count) = startup_cleanup_ready(
+    matches!(&pending, Ok(pending) if pending.is_empty()),
+    matches!(&restores, Ok(None)),
+    finalize_reconciled_interrupted_runs(),
+  )
+  .await
+  {
+    return Ok(count);
   }
   critical_alerts().write().unwrap().reconciliation.insert(
     "startup".into(),
-    "Core is reconciling interrupted backup dispatches with their original workers. Mutations and Actions remain blocked until each worker reconnects and reports durable completion. Restore the original enrolled worker connection; replacing its identity does not prove completion.".into(),
+    "Core is completing interrupted-operation audit cleanup or reconciling backup/restore dispatches with their original workers. Mutations and Actions remain blocked until database cleanup and worker recovery succeed. Check database availability and the original enrolled worker connections; replacing worker identity does not prove completion.".into(),
   );
   tokio::spawn(async move {
     let _guards = (operation, actions, roles, mutations);
@@ -1447,6 +1423,7 @@ pub async fn finalize_interrupted_runs() -> anyhow::Result<u64> {
             "Completed backup intent cleanup is still pending"
           ));
         }
+        reconcile_pending_restore_plans().await?;
         finalize_reconciled_interrupted_runs().await?;
         anyhow::Ok(())
       }
@@ -1468,6 +1445,25 @@ pub async fn finalize_interrupted_runs() -> anyhow::Result<u64> {
     }
   });
   Ok(0)
+}
+
+async fn startup_cleanup_ready(
+  no_backup_intents: bool,
+  no_restore_intents: bool,
+  finalize: impl std::future::Future<Output = anyhow::Result<u64>>,
+) -> Option<u64> {
+  if !no_backup_intents || !no_restore_intents {
+    return None;
+  }
+  match finalize.await {
+    Ok(count) => Some(count),
+    Err(error) => {
+      warn!(
+        "Interrupted-run audit cleanup will retry under startup reconciliation: {error:#}"
+      );
+      None
+    }
+  }
 }
 
 async fn finalize_reconciled_interrupted_runs() -> anyhow::Result<u64>
@@ -1691,12 +1687,13 @@ pub async fn status(user: &User) -> anyhow::Result<BackupStatus> {
       active_runs,
       recent_runs,
       next_run_at: next_scheduled_run().unwrap_or_default(),
-      primary_healthy: previous_primary.healthy
-        && !previous_primary.verification_failed,
-      mirror_healthy: settings.mirror.as_ref().map(|_| {
-        previous_mirror.healthy
-          && !previous_mirror.verification_failed
-      }),
+      primary_healthy: repository_health_is_healthy(
+        &previous_primary,
+      ),
+      mirror_healthy: settings
+        .mirror
+        .as_ref()
+        .map(|_| repository_health_is_healthy(&previous_mirror)),
       mirror_lagging_snapshots: if settings.mirror.is_some() {
         previous_primary.mirror_lagging_snapshots
       } else {
@@ -1736,7 +1733,8 @@ pub async fn status(user: &User) -> anyhow::Result<BackupStatus> {
   let primary_inventory_healthy =
     primary.as_ref().is_ok_and(|(_, healthy)| *healthy);
   let primary_healthy = primary_inventory_healthy
-    && !previous_primary.verification_failed;
+    && !previous_primary.verification_failed
+    && !previous_primary.maintenance_in_progress;
   let primary_names =
     primary.map(|(names, _)| names).unwrap_or_default();
   let (mirror_healthy, mirror_lagging_snapshots, _health_refresh) =
@@ -1766,7 +1764,11 @@ pub async fn status(user: &User) -> anyhow::Result<BackupStatus> {
       .context("Mirror health worker failed")?;
       let (healthy, lagging) = match mirror {
         Ok((mirror_snapshots, healthy)) => (
-          Some(healthy && !previous_mirror.verification_failed),
+          Some(
+            healthy
+              && !previous_mirror.verification_failed
+              && !previous_mirror.maintenance_in_progress,
+          ),
           primary_names
             .iter()
             .filter(|(name, primary_partial)| {
@@ -2823,18 +2825,50 @@ async fn record_repository_verification(
   succeeded: bool,
   full: bool,
 ) -> anyhow::Result<()> {
-  let now = komodo_timestamp();
-  let update = if succeeded && full {
+  health_collection()
+    .update_one(
+      doc! { "_id": health_id },
+      repository_verification_update(
+        succeeded,
+        full,
+        false,
+        komodo_timestamp(),
+      ),
+    )
+    .with_options(UpdateOptions::builder().upsert(true).build())
+    .await?;
+  Ok(())
+}
+
+fn repository_verification_update(
+  succeeded: bool,
+  full: bool,
+  maintenance_completed: bool,
+  now: i64,
+) -> Document {
+  if succeeded && full {
     doc! { "$set": {
       "healthy": true,
       "checked_at": now,
       "last_full_verification_at": now,
       "verification_failed": false,
+      "maintenance_in_progress": false,
     } }
+  } else if succeeded && maintenance_completed {
+    // Clear only this completed maintenance cycle. A sample must never clear
+    // a real verification failure, even if this helper is used incorrectly.
+    doc! {
+      "$set": {
+        "healthy": true,
+        "checked_at": now,
+        "maintenance_in_progress": false,
+      },
+      "$setOnInsert": { "verification_failed": false },
+    }
   } else if succeeded {
     // A sample that happens not to encounter previously-recorded corruption
-    // cannot prove that corruption is gone. Only a successful full check may
-    // clear the failure latch.
+    // or interrupted maintenance cannot prove either state is safe. Only a
+    // full check or the owning completed maintenance cycle clears its latch.
     doc! {
       "$set": { "checked_at": now },
       "$setOnInsert": {
@@ -2848,12 +2882,15 @@ async fn record_repository_verification(
       "checked_at": now,
       "verification_failed": !succeeded,
     } }
-  };
-  health_collection()
-    .update_one(doc! { "_id": health_id }, update)
-    .with_options(UpdateOptions::builder().upsert(true).build())
-    .await?;
-  Ok(())
+  }
+}
+
+fn repository_maintenance_started_update(now: i64) -> Document {
+  doc! { "$set": {
+    "healthy": false,
+    "checked_at": now,
+    "maintenance_in_progress": true,
+  } }
 }
 
 async fn run_maintenance() -> anyhow::Result<()> {
@@ -2910,7 +2947,15 @@ async fn run_maintenance() -> anyhow::Result<()> {
         verification.errors.join("; ")
       ));
     }
-    record_repository_verification(health_id, true, full_due).await?;
+    // Persist uncertainty before any deletion/compaction can begin. Process
+    // death cannot run an error handler, so a post-error latch is insufficient.
+    health_collection()
+      .update_one(
+        doc! { "_id": health_id },
+        repository_maintenance_started_update(komodo_timestamp()),
+      )
+      .with_options(UpdateOptions::builder().upsert(true).build())
+      .await?;
     let settings_for_worker = settings.clone();
     let maintenance = tokio::task::spawn_blocking(
       move || -> anyhow::Result<()> {
@@ -2954,6 +2999,20 @@ async fn run_maintenance() -> anyhow::Result<()> {
       record_repository_verification(health_id, false, false).await?;
       return Err(error);
     }
+    // Publish the successful check only after the entire destructive cycle.
+    // A failed write leaves the durable in-progress latch set for restart.
+    health_collection()
+      .update_one(
+        doc! { "_id": health_id },
+        repository_verification_update(
+          true,
+          full_due,
+          true,
+          komodo_timestamp(),
+        ),
+      )
+      .with_options(UpdateOptions::builder().upsert(true).build())
+      .await?;
   }
   Ok(())
 }
@@ -2964,6 +3023,7 @@ fn full_verification_due(
   every_days: u64,
 ) -> bool {
   previous.verification_failed
+    || previous.maintenance_in_progress
     || previous.last_full_verification_at == 0
     || now.saturating_sub(previous.last_full_verification_at)
       >= every_days.max(1) as i64 * 24 * 60 * 60 * 1000
@@ -4360,6 +4420,7 @@ async fn backup_core(
         SETTINGS_COLLECTION,
         RUNS_COLLECTION,
         PENDING_WORKERS_COLLECTION,
+        PLANS_COLLECTION,
       ],
     )
     .await?;
@@ -5158,6 +5219,7 @@ pub async fn plan_restore(
     .insert_one(StoredRestorePlan {
       id: plan.id.clone(),
       created_by: user.id.clone(),
+      execution: None,
       plan: plan.clone(),
       publish,
       recovered_stack_name,
@@ -5376,20 +5438,432 @@ fn recovered_stack_belongs_to_plan(
         == Some(stack.id.as_str()))
 }
 
+fn restore_phase_available(
+  completion: &VykarBackupCompletion,
+) -> bool {
+  matches!(
+    completion.state,
+    VykarBackupCompletionState::Complete
+      | VykarBackupCompletionState::Prepared
+      | VykarBackupCompletionState::RecoveryRequired
+  )
+}
+
+fn require_no_pending_recovered_stack_insert(
+  execution: &StoredRestoreExecution,
+) -> anyhow::Result<()> {
+  if execution.recovered_stack_creation_started {
+    return Err(anyhow!(
+      "Recovered Stack insertion was attempted but no matching Stack is visible. Its database write may still commit, so automatic rollback is unsafe. Reconciliation will commit a delayed matching insertion; otherwise administrator-led recovery must establish that no original insert can still finish before resolving the Stack and worker journals. Mutations remain blocked."
+    ));
+  }
+  Ok(())
+}
+
+fn completed_restore_outcome(
+  completion: &VykarBackupCompletion,
+) -> Option<(BackupRunState, String)> {
+  if completion.state != VykarBackupCompletionState::Complete {
+    return None;
+  }
+  let response = completion.restore_result.as_ref();
+  if response.is_some_and(|response| response.finalization_pending) {
+    return None;
+  }
+  let complete = completion.error.is_none()
+    && response.is_some_and(|response| {
+      response.complete
+        && !response.rolled_back
+        && !response.finalization_pending
+        && response.critical_error.is_none()
+    });
+  let message = completion
+    .error
+    .clone()
+    .or_else(|| {
+      response.and_then(|response| response.critical_error.clone())
+    })
+    .unwrap_or_else(|| {
+      if complete {
+        "Restore complete".into()
+      } else {
+        "Restore interrupted or rolled back".into()
+      }
+    });
+  Some((
+    if complete {
+      BackupRunState::Complete
+    } else {
+      BackupRunState::Failed
+    },
+    message,
+  ))
+}
+
+fn record_restore_reconciliation(
+  pending: &PendingWorkerBackup,
+  reason: &str,
+) {
+  critical_alerts().write().unwrap().reconciliation.insert(
+    pending.operation_id.clone(),
+    format!("Restore {} is awaiting its original worker {} ({}): {reason}. Restore remains non-cancellable and conflicting mutations stay blocked. Reconnect that enrolled worker and repair/restart it if journal recovery is required; do not replace its identity or delete operation records.",
+      pending.run_id, pending.server.name, pending.server.id),
+  );
+}
+
+async fn await_restore_phase(
+  pending: &PendingWorkerBackup,
+) -> VykarBackupCompletion {
+  loop {
+    let query = async {
+      let client = periphery_client(&pending.server).await?;
+      client
+        .request_pinned_with_timeout(
+          PeripheryConnectionArgs::from_server(&pending.server),
+          GetVykarBackupCompletion {
+            operation_id: pending.operation_id.clone(),
+            run_id: pending.run_id.clone(),
+            cancel_if_unknown: true,
+            acknowledge: false,
+          },
+          std::time::Duration::from_secs(10),
+        )
+        .await
+    };
+    let result =
+      tokio::time::timeout(std::time::Duration::from_secs(15), query)
+        .await;
+    match result {
+      Ok(Ok(completion)) if restore_phase_available(&completion) => {
+        let incident = completion
+          .restore_result
+          .as_ref()
+          .and_then(|response| response.critical_error.as_ref())
+          .or_else(|| {
+            completion
+              .finalize_restore_result
+              .as_ref()
+              .and_then(|response| response.critical_error.as_ref())
+          });
+        if let Some(incident) = incident {
+          record_operational_alert(format!(
+            "Restore {} on {} ({}): {incident}",
+            pending.run_id, pending.server.name, pending.server.id
+          ));
+        }
+        return completion;
+      }
+      Ok(Ok(_)) => record_restore_reconciliation(
+        pending,
+        "operation is still running",
+      ),
+      Ok(Err(error)) => {
+        record_restore_reconciliation(pending, &format!("{error:#}"))
+      }
+      Err(_) => record_restore_reconciliation(
+        pending,
+        "completion query timed out",
+      ),
+    }
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+  }
+}
+
+async fn persist_restore_execution(
+  stored: &StoredRestorePlan,
+) -> anyhow::Result<()> {
+  let execution = stored
+    .execution
+    .as_ref()
+    .context("Restore execution identity is missing")?;
+  let updated = plans_collection()
+    .update_one(
+      doc! { "_id": &stored.id },
+      doc! { "$set": {
+        "execution": to_bson(execution)?,
+        "recovered_stack_execution_started": execution.deferred,
+      } },
+    )
+    .await?;
+  if updated.matched_count != 1 {
+    return Err(anyhow!(
+      "Restore plan disappeared before dispatch enrollment"
+    ));
+  }
+  Ok(())
+}
+
+async fn dispatch_restore(
+  stored: &StoredRestorePlan,
+  request: TransactionalVykarRestore,
+) -> anyhow::Result<TransactionalVykarRestoreResponse> {
+  let execution = stored
+    .execution
+    .as_ref()
+    .context("Restore execution identity is missing")?;
+  // Enrollment was persisted before this first send. Never fall back to the
+  // older wire name: old workers would mutate without registering a receipt.
+  let result = async {
+    let client = periphery_client(&execution.pending.server).await?;
+    client
+      .request_pinned(
+        PeripheryConnectionArgs::from_server(
+          &execution.pending.server,
+        ),
+        RunTransactionalVykarRestore(request),
+      )
+      .await
+  }
+  .await;
+  if let Err(error) = result {
+    record_restore_reconciliation(
+      &execution.pending,
+      &format!("{error:#}"),
+    );
+  }
+  loop {
+    let completion = await_restore_phase(&execution.pending).await;
+    if completion.state
+      == VykarBackupCompletionState::RecoveryRequired
+    {
+      if execution.deferred {
+        return Err(anyhow!(
+          "Prepared restore requires guarded saga reconciliation"
+        ));
+      }
+      record_restore_reconciliation(
+        &execution.pending,
+        "worker journal recovery is required",
+      );
+      tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+      continue;
+    }
+    if let Some(error) = completion.error {
+      return Err(anyhow!(error));
+    }
+    return completion.restore_result.context(
+      "Restore worker returned no authoritative restore result",
+    );
+  }
+}
+
+async fn dispatch_restore_finalization(
+  stored: &mut StoredRestorePlan,
+  commit: bool,
+  acknowledge: bool,
+) -> anyhow::Result<FinalizeVykarRestoreResponse> {
+  let decision = StoredRestoreFinalization {
+    operation_id: Uuid::new_v4().to_string(),
+    commit,
+    acknowledge,
+  };
+  stored.execution.as_mut().context(
+    "Legacy restore has no original worker identity; automatic finalization is unsafe",
+  )?.finalizations.push(decision.clone());
+  persist_restore_execution(stored).await?;
+  let execution = stored.execution.as_ref().unwrap();
+  let mut pending = execution.pending.clone();
+  pending.operation_id = decision.operation_id.clone();
+  let request = RunFinalizeVykarRestore(FinalizeVykarRestore {
+    operation_id: decision.operation_id,
+    run_id: pending.run_id.clone(),
+    restore_operation_id: execution.pending.operation_id.clone(),
+    journal_id: execution.journal_id.clone(),
+    commit,
+    acknowledge,
+  });
+  let result = async {
+    let client = periphery_client(&pending.server).await?;
+    client
+      .request_pinned(
+        PeripheryConnectionArgs::from_server(&pending.server),
+        request,
+      )
+      .await
+  }
+  .await;
+  if let Err(error) = result {
+    record_restore_reconciliation(
+      &execution.pending,
+      &format!("{error:#}"),
+    );
+  }
+  let completion = await_restore_phase(&pending).await;
+  if completion.state != VykarBackupCompletionState::Complete {
+    return Err(anyhow!(
+      "Restore finalization requires worker journal recovery"
+    ));
+  }
+  if let Some(error) = completion.error {
+    return Err(anyhow!(error));
+  }
+  completion
+    .finalize_restore_result
+    .context("Worker returned no authoritative finalization result")
+}
+
+async fn finish_restore_execution(
+  stored: &StoredRestorePlan,
+  state: BackupRunState,
+  message: impl Into<String>,
+) -> anyhow::Result<BackupRun> {
+  let execution = stored
+    .execution
+    .as_ref()
+    .context("Restore execution identity is missing")?;
+  let run = runs_collection()
+    .find_one(doc! { "id": &execution.pending.run_id })
+    .await?
+    .context("Restore run disappeared during reconciliation")?;
+  // Preserve aggregate ownership if either durable Core step fails.
+  let run = finish_run(run, state, message).await?;
+  plans_collection()
+    .delete_one(doc! { "_id": &stored.id })
+    .await?;
+  acknowledge_worker_completion(&execution.pending).await;
+  for decision in &execution.finalizations {
+    let mut pending = execution.pending.clone();
+    pending.operation_id = decision.operation_id.clone();
+    acknowledge_worker_completion(&pending).await;
+    critical_alerts()
+      .write()
+      .unwrap()
+      .reconciliation
+      .remove(&pending.operation_id);
+  }
+  critical_alerts()
+    .write()
+    .unwrap()
+    .reconciliation
+    .remove(&execution.pending.operation_id);
+  Ok(run)
+}
+
+async fn reconcile_restore_execution_once(
+  stored: &mut StoredRestorePlan,
+) -> anyhow::Result<BackupRun> {
+  let execution = stored.execution.clone().context(
+    "An already-started legacy restore lacks its original worker/dispatch identity. Automatic recovery is blocked: independently stop the original Core and worker, preserve their database/private journals, and complete administrator-led recovery before admitting mutations. Replacing the Server or deleting journals is not proof of completion.",
+  )?;
+  // Fence not-yet-received decisions and drain every admitted RPC before
+  // reading saga state or issuing another commit/rollback decision.
+  for decision in &execution.finalizations {
+    let mut pending = execution.pending.clone();
+    pending.operation_id = decision.operation_id.clone();
+    await_restore_phase(&pending).await;
+  }
+  let completion = await_restore_phase(&execution.pending).await;
+  if !execution.deferred {
+    let (state, message) = completed_restore_outcome(&completion)
+      .context("Worker restore journals still require recovery")?;
+    return finish_restore_execution(stored, state, message).await;
+  }
+  let name = stored
+    .recovered_stack_name
+    .as_deref()
+    .context("Recovered Stack name is missing")?;
+  let existing =
+    Stack::coll().find_one(doc! { "name": name }).await?;
+  let marked = existing
+    .filter(|stack| recovered_stack_belongs_to_plan(stored, stack));
+  if let Some(stack) = marked {
+    if completion
+      .restore_result
+      .as_ref()
+      .is_some_and(|response| response.rolled_back)
+    {
+      return Err(anyhow!(
+        "Recovered Stack exists but worker reports rolled-back publication; administrator recovery is required"
+      ));
+    }
+    finalize_recovered_stack_saga(stored, &stack).await?;
+    return finish_restore_execution(
+      stored,
+      BackupRunState::Complete,
+      "Restore complete after reconciliation",
+    )
+    .await;
+  }
+  if stored.recovered_stack_id.is_some()
+    || stored.recovered_stack_finalized
+  {
+    return Err(anyhow!(
+      "Marked recovered Stack is missing; cannot choose a safe restore decision"
+    ));
+  }
+  // A read on a new connection cannot fence an earlier insert whose response
+  // was lost. Only a saga that never attempted creation may choose rollback
+  // from the absence of its marker.
+  require_no_pending_recovered_stack_insert(&execution)?;
+  if completion.state == VykarBackupCompletionState::Complete {
+    if completion.restore_result.as_ref().is_some_and(|response| {
+      response.complete && !response.rolled_back
+    }) {
+      return Err(anyhow!(
+        "Worker committed recovered files without a matching Stack; administrator recovery is required"
+      ));
+    }
+    return finish_restore_execution(
+      stored,
+      BackupRunState::Failed,
+      completion.error.unwrap_or_else(|| {
+        "Restore interrupted before recovered Stack creation".into()
+      }),
+    )
+    .await;
+  }
+  let rollback =
+    dispatch_restore_finalization(stored, false, true).await?;
+  if !rollback.complete
+    || !rollback.rolled_back
+    || rollback.critical_error.is_some()
+  {
+    return Err(anyhow!(rollback.critical_error.unwrap_or_else(
+      || "Restore rollback is not yet complete".into()
+    )));
+  }
+  finish_restore_execution(
+    stored,
+    BackupRunState::Failed,
+    "Restore rolled back before recovered Stack creation",
+  )
+  .await
+}
+
+/// Caller retains operation, Action, role and mutation guards for this whole
+/// loop. Database outages and ambiguous worker results cannot reopen admission.
+async fn reconcile_restore_execution(
+  stored: &mut StoredRestorePlan,
+) -> BackupRun {
+  loop {
+    match reconcile_restore_execution_once(stored).await {
+      Ok(run) => return run,
+      Err(error) => {
+        if let Some(execution) = &stored.execution {
+          record_restore_reconciliation(
+            &execution.pending,
+            &format!("{error:#}"),
+          );
+        } else {
+          critical_alerts()
+            .write()
+            .unwrap()
+            .reconciliation
+            .insert(stored.id.clone(), format!("{error:#}"));
+        }
+      }
+    }
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+  }
+}
+
 async fn finalize_recovered_stack_saga(
   stored: &mut StoredRestorePlan,
-  server: &Server,
   stack: &Stack,
 ) -> anyhow::Result<()> {
-  let periphery = periphery_client(server).await?;
   if !stored.recovered_stack_finalized {
-    let finalized = periphery
-      .request(FinalizeVykarRestore {
-        journal_id: stored.id.clone(),
-        commit: true,
-        acknowledge: false,
-      })
-      .await?;
+    let finalized =
+      dispatch_restore_finalization(stored, true, false).await?;
     if !finalized.complete
       || finalized.rolled_back
       || finalized.critical_error.is_some()
@@ -5417,13 +5891,8 @@ async fn finalize_recovered_stack_saga(
     stored.recovered_stack_finalized = true;
   }
 
-  let acknowledged = periphery
-    .request(FinalizeVykarRestore {
-      journal_id: stored.id.clone(),
-      commit: true,
-      acknowledge: true,
-    })
-    .await?;
+  let acknowledged =
+    dispatch_restore_finalization(stored, true, true).await?;
   if !acknowledged.complete
     || acknowledged.rolled_back
     || acknowledged.critical_error.is_some()
@@ -5447,10 +5916,7 @@ async fn finalize_recovered_stack_saga(
     .context(
       "Failed to clear recovered Stack reconciliation marker",
     )?;
-  plans_collection()
-    .delete_one(doc! { "_id": &stored.id })
-    .await
-    .context("Failed to delete completed restore plan")?;
+  // Aggregate execution is consumed only after the final run outcome is durable.
   Ok(())
 }
 
@@ -5462,11 +5928,17 @@ pub async fn execute_restore(
   let _actions = activity::quiesce_actions()?;
   let _repository_roles =
     repository_role_barrier().clone().read_owned().await;
-  let mutation_guard = mutation_barrier().write().await;
+  let _mutation_guard = mutation_barrier().write().await;
   let mut stored = plans_collection()
     .find_one(doc! { "_id": plan_id, "created_by": &user.id })
     .await?
     .context("Restore plan does not exist")?;
+  if stored.execution.is_some()
+    || stored.recovered_stack_name.is_some()
+      && stored.recovered_stack_execution_started
+  {
+    return Ok(reconcile_restore_execution(&mut stored).await);
+  }
   if !stored.plan.selected_paths.is_empty()
     && stored
       .publish
@@ -5677,7 +6149,7 @@ pub async fn execute_restore(
       } else {
         None
       };
-    let periphery = trusted_backup_client(&settings, &server).await?;
+    require_trusted_backup_worker(&settings, &server)?;
     let existing_recovered_stack = recovered_creation
       .as_ref()
       .and_then(|(_, _, existing)| existing.as_ref());
@@ -5686,48 +6158,26 @@ pub async fn execute_restore(
     } else {
       run.id.clone()
     };
-    if recovered_creation.is_some()
-      && existing_recovered_stack.is_none()
-      && stored.recovered_stack_execution_started
-    {
-      // A prior attempt can crash after publication but before the marked
-      // Stack insert. Reset only that stable plan journal before replaying.
-      let reset = periphery
-        .request(FinalizeVykarRestore {
-          journal_id: journal_id.clone(),
-          commit: false,
-          acknowledge: true,
-        })
-        .await?;
-      if !reset.complete
-        || !reset.rolled_back
-        || reset.critical_error.is_some()
-      {
-        return Err(anyhow!(
-          "Previous recovered Stack publication could not be reset: {}",
-          reset
-            .critical_error
-            .unwrap_or_else(|| "incomplete rollback".into())
-        ));
-      }
+    if existing_recovered_stack.is_some() {
+      return Err(anyhow!("Recovered Stack has no original dispatch identity; administrator recovery is required"));
     }
+    let operation_id = Uuid::new_v4().to_string();
+    stored.execution = Some(StoredRestoreExecution {
+      pending: PendingWorkerBackup {
+        operation_id: operation_id.clone(),
+        run_id: run.id.clone(),
+        server: server.clone(),
+      },
+      journal_id: journal_id.clone(),
+      deferred: recovered_creation.is_some(),
+      recovered_stack_creation_started: false,
+      finalizations: Vec::new(),
+    });
+    persist_restore_execution(&stored).await?;
     if existing_recovered_stack.is_none() {
-      if recovered_creation.is_some() {
-        // Persist before the RPC: an interrupted or lost response may already
-        // have published files and must be reconciled after Core restarts.
-        let updated = plans_collection()
-          .update_one(
-            doc! { "_id": &stored.id },
-            doc! { "$set": { "recovered_stack_execution_started": true } },
-          )
-          .await?;
-        if updated.matched_count != 1 {
-          return Err(anyhow!("Restore plan expired before execution"));
-        }
-        stored.recovered_stack_execution_started = true;
-      }
-      let response = periphery
-        .request(TransactionalVykarRestore {
+      let response = dispatch_restore(&stored, TransactionalVykarRestore {
+          operation_id,
+          run_id: run.id.clone(),
           target,
           repository: repository_for_periphery(
             &settings.primary,
@@ -5754,24 +6204,11 @@ pub async fn execute_restore(
         .await?;
       if let Some(error) = response.critical_error {
         record_operational_alert(format!("Restore {} on {} ({}): {error}", stored.id, server.name, server.id));
-        return finish_run(
-          run.clone(),
-          BackupRunState::Failed,
-          error,
-        )
-        .await;
+        return Err(anyhow!(error));
       }
       if !response.complete {
-        if recovered_creation.is_some() && response.rolled_back {
-          plans_collection()
-            .update_one(
-              doc! { "_id": &stored.id },
-              doc! { "$set": { "recovered_stack_execution_started": false } },
-            )
-            .await?;
-        }
-        return finish_run(
-          run.clone(),
+        return finish_restore_execution(
+          &stored,
           BackupRunState::Failed,
           if response.rolled_back {
             "Restore failed and was rolled back"
@@ -5793,6 +6230,8 @@ pub async fn execute_restore(
       } else {
         let mut info = Stack::default_info().await?;
         info.recovery_plan_id = Some(stored.id.clone());
+        stored.execution.as_mut().unwrap().recovered_stack_creation_started = true;
+        persist_restore_execution(&stored).await?;
         match resource::create::<Stack>(
           &name,
           config,
@@ -5826,46 +6265,9 @@ pub async fn execute_restore(
           }
         }
       };
-      let recovered_stack = match creation {
-        Ok(stack) => stack,
-        Err(create_error) => {
-          let rollback = periphery
-            .request(FinalizeVykarRestore {
-              journal_id: stored.id.clone(),
-              commit: false,
-              acknowledge: true,
-            })
-            .await;
-          match rollback {
-            Ok(response)
-              if response.complete
-                && response.rolled_back
-                && response.critical_error.is_none() => {
-                  plans_collection()
-                    .update_one(
-                      doc! { "_id": &stored.id },
-                      doc! { "$set": { "recovered_stack_execution_started": false } },
-                    )
-                    .await?;
-                }
-            Ok(response) => {
-              let message = response.critical_error.unwrap_or_else(|| {
-                "Periphery did not confirm restore rollback".into()
-              });
-              record_operational_alert(format!("Restore {} on {} ({}): {message}", stored.id, server.name, server.id));
-              return Err(create_error.context(message));
-            }
-            Err(rollback_error) => {
-              let message = format!(
-                "Recovered Stack creation failed and restore rollback could not be confirmed: {rollback_error:#}"
-              );
-              record_operational_alert(format!("Restore {} on {} ({}): {message}", stored.id, server.name, server.id));
-              return Err(create_error.context(message));
-            }
-          }
-          return Err(create_error);
-        }
-      };
+      // A database error does not prove the marked insert failed. Once creation
+      // was enrolled, absence alone can never authorize an automatic rollback.
+      let recovered_stack = creation?;
       if stored.recovered_stack_id.as_deref()
         != Some(recovered_stack.id.as_str())
       {
@@ -5880,7 +6282,6 @@ pub async fn execute_restore(
       }
       if let Err(error) = finalize_recovered_stack_saga(
         &mut stored,
-        &server,
         &recovered_stack,
       )
       .await
@@ -5894,17 +6295,8 @@ pub async fn execute_restore(
     }
     // Keep the exclusive mutation barrier through recovered Stack creation
     // and finalization so a competing mutation cannot obscure saga state.
-    drop(mutation_guard);
-    if let Err(error) = plans_collection()
-      .delete_one(doc! { "_id": &stored.id })
-      .await
-    {
-      warn!(
-        "Restore completed but its consumed plan could not be deleted: {error:#}"
-      );
-    }
-    finish_run(
-      run.clone(),
+    finish_restore_execution(
+      &stored,
       BackupRunState::Complete,
       "Restore complete",
     )
@@ -5913,6 +6305,15 @@ pub async fn execute_restore(
   .await;
   match operation {
     Ok(run) => Ok(run),
+    Err(error) if stored.execution.is_some() => {
+      if let Some(execution) = &stored.execution {
+        record_restore_reconciliation(
+          &execution.pending,
+          &format!("{error:#}"),
+        );
+      }
+      Ok(reconcile_restore_execution(&mut stored).await)
+    }
     Err(error) => {
       let message = format!("{error:#}");
       let _ = finish_run(run, BackupRunState::Failed, message).await;
@@ -5988,6 +6389,7 @@ async fn cleanup_expired_restore_plans() -> anyhow::Result<()> {
   plans_collection()
     .delete_many(doc! {
       "plan.expires_at": { "$lt": komodo_timestamp() },
+      "execution": Bson::Null,
       "$or": [
         { "recovered_stack_name": Bson::Null },
         { "recovered_stack_name": { "$exists": false } },
@@ -5998,104 +6400,35 @@ async fn cleanup_expired_restore_plans() -> anyhow::Result<()> {
   Ok(())
 }
 
-async fn reconcile_recovered_stack_restores() -> anyhow::Result<()> {
-  let _operation = backup_operation_lock().lock().await;
-  let _actions = activity::quiesce_actions()?;
-  let _mutation = mutation_barrier().write().await;
-  let collection = plans_collection();
+fn pending_restore_execution_filter() -> Document {
+  doc! { "$or": [
+    { "execution": { "$exists": true, "$ne": Bson::Null } },
+    {
+      "recovered_stack_name": { "$type": "string" },
+      "recovered_stack_execution_started": { "$ne": false },
+    },
+  ] }
+}
+
+async fn reconcile_pending_restore_plans() -> anyhow::Result<()> {
   let plans = find_collect(
-    &collection,
-    doc! { "recovered_stack_execution_started": { "$ne": false } },
+    &plans_collection(),
+    pending_restore_execution_filter(),
     None,
   )
   .await?;
-  let mut errors = Vec::new();
   for mut stored in plans {
-    let Some(name) = stored.recovered_stack_name.clone() else {
-      continue;
-    };
-    let outcome = async {
-      let server_id = stored
-        .plan
-        .destination_server_id
-        .as_deref()
-        .context("Recovered Stack plan has no destination Server")?;
-      let server = resource::get::<Server>(server_id).await?;
-      let existing = Stack::coll()
-        .find_one(doc! { "name": &name })
-        .await?;
-      if let Some(stack) = existing
-        && recovered_stack_belongs_to_plan(&stored, &stack)
-      {
-        finalize_recovered_stack_saga(
-          &mut stored,
-          &server,
-          &stack,
-        )
-        .await?;
-        return anyhow::Ok(());
-      }
-      if stored.recovered_stack_finalized
-        || stored.recovered_stack_id.is_some()
-      {
-        return Err(anyhow!(
-          "Recovered Stack recorded by plan '{}' is missing or no longer linked",
-          stored.id
-        ));
-      }
-      // No marked insert exists, so an interrupted publication must be
-      // rolled back. A missing journal is an idempotent acknowledgement that
-      // this plan never reached publication or was already reset.
-      let rollback = periphery_client(&server)
-        .await?
-        .request(FinalizeVykarRestore {
-          journal_id: stored.id.clone(),
-          commit: false,
-          acknowledge: true,
-        })
-        .await?;
-      if !rollback.complete
-        || !rollback.rolled_back
-        || rollback.critical_error.is_some()
-      {
-        return Err(anyhow!(
-          "Interrupted recovered Stack publication could not be rolled back: {}",
-          rollback
-            .critical_error
-            .unwrap_or_else(|| "incomplete rollback".into())
-        ));
-      }
-      if stored.plan.expires_at < komodo_timestamp() {
-        plans_collection()
-          .delete_one(doc! { "_id": &stored.id })
-          .await?;
-      } else {
-        // A proven rollback no longer needs the destination online. A later
-        // explicit execution will set this marker again before publishing.
-        plans_collection()
-          .update_one(
-            doc! { "_id": &stored.id },
-            doc! { "$set": { "recovered_stack_execution_started": false } },
-          )
-          .await?;
-      }
-      anyhow::Ok(())
-    }
-    .await;
-    if let Err(error) = outcome {
-      errors.push(format!("{}: {error:#}", stored.id));
-    }
+    reconcile_restore_execution(&mut stored).await;
   }
-  if errors.is_empty() {
-    Ok(())
-  } else {
-    let message = format!(
-      "Recovered Stack restore reconciliation failed: {}",
-      errors.join("; ")
-    );
-    record_operational_alert(message.clone());
-    Err(anyhow!(message))
-  }
+  Ok(())
+}
+
+async fn reconcile_recovered_stack_restores() -> anyhow::Result<()> {
+  let _operation = backup_operation_lock().lock().await;
+  let _actions = activity::quiesce_actions()?;
+  let _roles = repository_role_barrier().clone().read_owned().await;
+  let _mutation = mutation_barrier().write().await;
+  reconcile_pending_restore_plans().await
 }
 
 fn parse_core_recovery_database(database: &str) -> Option<&str> {
@@ -6248,19 +6581,14 @@ async fn reconcile_core_recovery_state() -> anyhow::Result<()> {
   reconcile_core_recovery_state_inner().await
 }
 
-fn historical_restore_finalization_update(
+fn historical_restore_marker_cleanup(
   plan_id: &str,
   stack: &Stack,
 ) -> Option<database::bson::Document> {
-  // The marked Stack is inserted only after Periphery publishes every root.
-  // In a restored Core database it may outlive an already acknowledged receipt.
+  // A database import must not revive authority over the old worker.
   (stack.info.recovery_plan_id.as_deref() == Some(plan_id)).then(
     || {
-      doc! { "$set": {
-        "recovered_stack_execution_started": true,
-        "recovered_stack_finalized": true,
-        "recovered_stack_id": &stack.id,
-      } }
+      doc! { "$unset": { "info.recovery_plan_id": "" } }
     },
   )
 }
@@ -6280,11 +6608,25 @@ async fn normalize_historical_restore_sagas(
       .await?;
     if let Some(stack) = stack
       && let Some(update) =
-        historical_restore_finalization_update(&stored.id, &stack)
+        historical_restore_marker_cleanup(&stored.id, &stack)
     {
-      plans.update_one(doc! { "_id": &stored.id }, update).await?;
+      // Imported markers describe historical metadata, not authority to
+      // finalize a live worker. Clear only the matching imported marker.
+      validation
+        .collection::<Stack>("Stack")
+        .update_one(
+          doc! { "info.recovery_plan_id": &stored.id },
+          update,
+        )
+        .await?;
     }
   }
+  // Live coordination and preview capabilities never survive database import.
+  plans.delete_many(doc! {}).await?;
+  validation
+    .collection::<PendingWorkerBackup>(PENDING_WORKERS_COLLECTION)
+    .delete_many(doc! {})
+    .await?;
   Ok(())
 }
 
@@ -7205,6 +7547,173 @@ mod tests {
   }
 
   #[test]
+  fn prepared_and_recovery_required_restore_phases_keep_ownership() {
+    let mut completion = VykarBackupCompletion {
+      restore_result: Some(TransactionalVykarRestoreResponse {
+        complete: true,
+        ..Default::default()
+      }),
+      ..Default::default()
+    };
+    for state in [
+      VykarBackupCompletionState::Prepared,
+      VykarBackupCompletionState::RecoveryRequired,
+    ] {
+      completion.state = state;
+      assert!(restore_phase_available(&completion));
+      assert!(!worker_completion_is_terminal(&completion));
+      assert!(completed_restore_outcome(&completion).is_none());
+    }
+    completion.state = VykarBackupCompletionState::Complete;
+    assert_eq!(
+      completed_restore_outcome(&completion).unwrap().0,
+      BackupRunState::Complete
+    );
+    completion.error =
+      Some("Worker restarted; interrupted outcome".into());
+    assert_eq!(
+      completed_restore_outcome(&completion).unwrap().0,
+      BackupRunState::Failed
+    );
+    completion.error = None;
+    completion.restore_result.as_mut().unwrap().rolled_back = true;
+    assert_eq!(
+      completed_restore_outcome(&completion).unwrap().0,
+      BackupRunState::Failed
+    );
+  }
+
+  #[test]
+  fn receipt_backed_restore_uses_distinct_transparent_wire_names() {
+    use mogh_resolver::HasResponse;
+    assert_ne!(
+      RunTransactionalVykarRestore::req_type(),
+      TransactionalVykarRestore::req_type()
+    );
+    assert_ne!(
+      RunFinalizeVykarRestore::req_type(),
+      FinalizeVykarRestore::req_type()
+    );
+    let request = FinalizeVykarRestore {
+      operation_id: "decision".into(),
+      run_id: "run".into(),
+      restore_operation_id: "original".into(),
+      journal_id: "journal".into(),
+      commit: false,
+      acknowledge: true,
+    };
+    let expected = serde_json::to_value(&request).unwrap();
+    let encoded =
+      serde_json::to_value(RunFinalizeVykarRestore(request)).unwrap();
+    assert_eq!(encoded, expected);
+    assert_eq!(encoded["restore_operation_id"], "original");
+  }
+
+  #[tokio::test]
+  async fn failed_startup_audit_cleanup_requires_retry_even_without_dispatches()
+   {
+    assert_eq!(
+      startup_cleanup_ready(
+        true,
+        true,
+        std::future::ready(Err(anyhow!("transient database outage")))
+      )
+      .await,
+      None,
+    );
+    assert_eq!(
+      startup_cleanup_ready(true, true, std::future::ready(Ok(3)))
+        .await,
+      Some(3),
+    );
+    assert_eq!(
+      startup_cleanup_ready(true, false, std::future::ready(Ok(3)))
+        .await,
+      None,
+    );
+  }
+
+  #[test]
+  fn restore_execution_roundtrip_preserves_original_authority_and_decisions()
+   {
+    let mut server = Server::default();
+    server.id = "server".into();
+    server.config.address = "wss://original.example".into();
+    server.info.public_key = "original-key".into();
+    let execution = StoredRestoreExecution {
+      pending: PendingWorkerBackup {
+        operation_id: "original-operation".into(),
+        run_id: "original-run".into(),
+        server: server.clone(),
+      },
+      journal_id: "journal".into(),
+      deferred: true,
+      recovered_stack_creation_started: true,
+      finalizations: vec![StoredRestoreFinalization {
+        operation_id: "pending-decision".into(),
+        commit: true,
+        acknowledge: false,
+      }],
+    };
+    let restored: StoredRestoreExecution = serde_json::from_value(
+      serde_json::to_value(execution).unwrap(),
+    )
+    .unwrap();
+    server.config.address = "wss://replacement.example".into();
+    server.info.public_key = "replacement-key".into();
+    assert!(
+      !PeripheryConnectionArgs::from_server(&restored.pending.server)
+        .matches(PeripheryConnectionArgs::from_server(&server))
+    );
+    assert_eq!(restored.pending.operation_id, "original-operation");
+    assert_eq!(restored.pending.run_id, "original-run");
+    assert!(restored.recovered_stack_creation_started);
+    assert_eq!(
+      restored.finalizations[0].operation_id,
+      "pending-decision"
+    );
+    assert!(restored.finalizations[0].commit);
+    assert!(!restored.finalizations[0].acknowledge);
+    let filter = pending_restore_execution_filter();
+    assert!(
+      filter.get_array("$or").unwrap()[0]
+        .as_document()
+        .unwrap()
+        .get_document("execution")
+        .unwrap()
+        .get_bool("$exists")
+        .unwrap()
+    );
+  }
+
+  #[test]
+  fn missing_stack_after_attempted_insert_cannot_authorize_rollback()
+  {
+    let mut execution = StoredRestoreExecution {
+      pending: PendingWorkerBackup {
+        operation_id: "original-operation".into(),
+        run_id: "original-run".into(),
+        server: Server::default(),
+      },
+      journal_id: "journal".into(),
+      deferred: true,
+      recovered_stack_creation_started: false,
+      finalizations: Vec::new(),
+    };
+    assert!(
+      require_no_pending_recovered_stack_insert(&execution).is_ok()
+    );
+    execution.recovered_stack_creation_started = true;
+    let recovered: StoredRestoreExecution = serde_json::from_value(
+      serde_json::to_value(execution).unwrap(),
+    )
+    .unwrap();
+    assert!(
+      require_no_pending_recovered_stack_insert(&recovered).is_err()
+    );
+  }
+
+  #[test]
   fn lost_backup_response_recovers_the_original_restart_errors() {
     let receipt = VykarBackupCompletion {
       state: VykarBackupCompletionState::Complete,
@@ -7750,6 +8259,20 @@ mod tests {
       )
       .unwrap()
     );
+    assert!(
+      repositories_share_location(
+        &local(&actual.join("new/repository").to_string_lossy()),
+        &local(&alias.join("new/repository").to_string_lossy()),
+      )
+      .unwrap()
+    );
+    assert!(
+      !repositories_overlap(
+        &local(&actual.join("primary").to_string_lossy()),
+        &local(&alias.join("mirror").to_string_lossy()),
+      )
+      .unwrap()
+    );
   }
 
   #[test]
@@ -7784,7 +8307,10 @@ mod tests {
       STACK_MANIFEST_STAGING_PATH,
     ] {
       assert!(Path::new(path).starts_with(CORE_PRIVATE_PATH));
-      assert!(!paths_overlap(Path::new(path), Path::new("/data")));
+      // This checks the configured layout, independent of the test host's
+      // mount namespace. Filesystem alias policy has separate isolated cases.
+      assert!(!Path::new(path).starts_with("/data"));
+      assert!(!Path::new("/data").starts_with(path));
     }
     assert!(Path::new(CORE_CACHE_PATH).starts_with("/data"));
   }
@@ -7844,9 +8370,10 @@ mod tests {
     std::fs::create_dir_all(&reserved).unwrap();
     let alias = root.path().join("alias");
     symlink(&actual, &alias).unwrap();
-    let repository = resolve_existing_path_ancestor(&alias).unwrap();
-    let reserved = resolve_existing_path_ancestor(&reserved).unwrap();
-    assert!(paths_overlap(&repository, &reserved));
+    assert!(
+      komodo_backup::filesystem::paths_overlap(&alias, &reserved)
+        .unwrap()
+    );
   }
 
   #[test]
@@ -8020,6 +8547,7 @@ mod tests {
     let stored = StoredRestorePlan {
       id: "plan".into(),
       created_by: "user".into(),
+      execution: None,
       plan: BackupRestorePlan {
         created_paths: vec!["/new/b".into(), "/new/a".into()],
         overwritten_paths: vec!["/existing".into()],
@@ -8110,34 +8638,25 @@ mod tests {
       ..Default::default()
     };
     assert!(
-      historical_restore_finalization_update("plan", &stack)
-        .is_none()
+      historical_restore_marker_cleanup("plan", &stack).is_none()
     );
     stack.info.recovery_plan_id = Some("unrelated-plan".into());
     assert!(
-      historical_restore_finalization_update("plan", &stack)
-        .is_none()
+      historical_restore_marker_cleanup("plan", &stack).is_none()
     );
     stack.info.recovery_plan_id = Some("plan".into());
     let update =
-      historical_restore_finalization_update("plan", &stack).unwrap();
-    let fields = update.get_document("$set").unwrap();
-    assert!(fields.get_bool("recovered_stack_finalized").unwrap());
-    assert!(
-      fields
-        .get_bool("recovered_stack_execution_started")
-        .unwrap()
-    );
-    assert_eq!(
-      fields.get_str("recovered_stack_id").unwrap(),
-      "recovered-stack"
-    );
+      historical_restore_marker_cleanup("plan", &stack).unwrap();
+    let fields = update.get_document("$unset").unwrap();
+    assert_eq!(fields.get_str("info.recovery_plan_id").unwrap(), "");
+    assert!(!update.contains_key("$set"));
   }
 
   #[test]
   fn core_export_excludes_control_and_in_flight_run_state() {
     assert!(!core_export_includes_collection(SETTINGS_COLLECTION));
     assert!(!core_export_includes_collection(RUNS_COLLECTION));
+    assert!(!core_export_includes_collection(PLANS_COLLECTION));
     assert!(core_export_includes_collection("Stack"));
   }
 
@@ -8505,6 +9024,102 @@ mod tests {
       ..Default::default()
     };
     assert!(full_verification_due(&previous, now, 30));
+  }
+
+  fn apply_repository_health_update(
+    record: &RepositoryHealthRecord,
+    update: Document,
+  ) -> RepositoryHealthRecord {
+    // The existing-record path deliberately ignores $setOnInsert. A fresh
+    // deserialize models a restart using only the persisted health document.
+    let mut persisted = to_document(record).unwrap();
+    persisted.extend(update.get_document("$set").unwrap().clone());
+    database::bson::from_document(persisted).unwrap()
+  }
+
+  #[test]
+  fn interrupted_maintenance_requires_full_verification_after_restart()
+   {
+    let now = 2_000_000;
+    let healthy = RepositoryHealthRecord {
+      healthy: true,
+      last_full_verification_at: now - 1,
+      ..Default::default()
+    };
+    assert!(!full_verification_due(&healthy, now, 30));
+    let interrupted = apply_repository_health_update(
+      &healthy,
+      repository_maintenance_started_update(now),
+    );
+    assert!(interrupted.maintenance_in_progress);
+    assert!(full_verification_due(&interrupted, now, 30));
+    assert!(!repository_health_is_healthy(&interrupted));
+
+    // A successful inventory cannot clear either latch.
+    let inventory = apply_repository_health_update(
+      &interrupted,
+      doc! { "$set": { "healthy": true, "checked_at": now + 1 } },
+    );
+    assert!(!repository_health_is_healthy(&inventory));
+    assert!(full_verification_due(&inventory, now + 1, 30));
+
+    let sampled = apply_repository_health_update(
+      &inventory,
+      repository_verification_update(true, false, false, now + 2),
+    );
+    assert!(sampled.maintenance_in_progress);
+    assert!(!repository_health_is_healthy(&sampled));
+    assert!(full_verification_due(&sampled, now + 2, 30));
+
+    let fully_verified = apply_repository_health_update(
+      &sampled,
+      repository_verification_update(true, true, false, now + 3),
+    );
+    assert!(!fully_verified.maintenance_in_progress);
+    assert!(repository_health_is_healthy(&fully_verified));
+    assert!(!full_verification_due(&fully_verified, now + 3, 30));
+  }
+
+  #[test]
+  fn completed_maintenance_clears_only_its_own_uncertainty() {
+    let now = 2_000_000;
+    let healthy = RepositoryHealthRecord {
+      healthy: true,
+      last_full_verification_at: now - 1,
+      ..Default::default()
+    };
+    let pending = apply_repository_health_update(
+      &healthy,
+      repository_maintenance_started_update(now),
+    );
+    let completed = apply_repository_health_update(
+      &pending,
+      repository_verification_update(true, false, true, now + 1),
+    );
+    assert!(repository_health_is_healthy(&completed));
+    assert!(!completed.maintenance_in_progress);
+    assert_eq!(completed.last_full_verification_at, now - 1);
+
+    let failed = apply_repository_health_update(
+      &pending,
+      repository_verification_update(false, false, false, now + 1),
+    );
+    assert!(failed.maintenance_in_progress);
+    assert!(failed.verification_failed);
+    for maintenance_completed in [false, true] {
+      let sampled = apply_repository_health_update(
+        &failed,
+        repository_verification_update(
+          true,
+          false,
+          maintenance_completed,
+          now + 2,
+        ),
+      );
+      assert!(sampled.verification_failed);
+      assert!(!repository_health_is_healthy(&sampled));
+      assert!(full_verification_due(&sampled, now + 2, 30));
+    }
   }
 
   #[test]

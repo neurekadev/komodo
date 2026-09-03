@@ -141,6 +141,21 @@ fn contains_anchored(parent: &Anchors, child: &Anchors) -> bool {
   })
 }
 
+fn same_location_anchored(left: &Anchors, right: &Anchors) -> bool {
+  // Equality is stricter than containment in either direction. In particular,
+  // a parent repository cannot inherit a child's initialization or secrets.
+  left.first().is_some_and(|left| Some(left) == right.first())
+}
+
+/// Whether two paths name the same location, including directory bind aliases
+/// and equal missing suffixes, without treating a parent or child as equal.
+pub fn paths_same_location(
+  left: &Path,
+  right: &Path,
+) -> anyhow::Result<bool> {
+  Ok(same_location_anchored(&anchors(left)?, &anchors(right)?))
+}
+
 /// Whether `parent` names the same object as `child`, or contains it, even
 /// through directory bind aliases and not-yet-created descendants.
 pub fn path_contains(
@@ -229,6 +244,29 @@ mod tests {
   }
 
   #[test]
+  fn bind_alias_equality_is_not_parent_or_sibling_overlap() {
+    assert!(same_location_anchored(
+      &aliased("/real"),
+      &aliased("/alias"),
+    ));
+    assert!(same_location_anchored(
+      &aliased("/real/new/repository"),
+      &aliased("/alias/new/repository"),
+    ));
+    for (left, right) in [
+      ("/real", "/alias/repository"),
+      ("/real/repository", "/alias"),
+      ("/real/primary", "/alias/mirror"),
+      ("/real/repository", "/unrelated/repository"),
+    ] {
+      assert!(!same_location_anchored(
+        &aliased(left),
+        &aliased(right)
+      ));
+    }
+  }
+
+  #[test]
   fn aliased_destination_and_rollback_names_collide() {
     for name in ["config", "config.komodo-rollback-operation"] {
       assert!(contains_anchored(
@@ -312,6 +350,7 @@ mod tests {
     ];
     assert!(!contains_anchored(&left, &right));
     assert!(!contains_anchored(&right, &left));
+    assert!(!same_location_anchored(&left, &right));
   }
 
   #[test]
@@ -321,6 +360,15 @@ mod tests {
     let alias = root.path().join("alias");
     fs::create_dir(&real).unwrap();
     std::os::unix::fs::symlink(&real, &alias).unwrap();
+    assert!(paths_same_location(&real, &alias).unwrap());
+    assert!(
+      paths_same_location(
+        &real.join("missing/repository"),
+        &alias.join("missing/repository"),
+      )
+      .unwrap()
+    );
+    assert!(!paths_same_location(&real, &alias.join("new")).unwrap());
     assert!(
       paths_overlap(
         &real.join("private"),

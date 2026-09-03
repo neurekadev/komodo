@@ -310,8 +310,44 @@ impl std::error::Error for ExcludedBackupSource {}
 struct BackupCompletionReceipt {
   core: String,
   run_id: String,
+  #[serde(default)]
   batch: Option<bool>,
+  #[serde(default)]
+  kind: Option<BackupDispatchKind>,
+  /// Durable finalization proof before acknowledgement can erase its journal.
+  #[serde(default)]
+  finalized: Option<FinalizeVykarRestoreResponse>,
   completion: VykarBackupCompletion,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+enum BackupDispatchKind {
+  Backup,
+  BackupBatch,
+  Restore {
+    journal_id: String,
+    deferred: bool,
+  },
+  FinalizeRestore {
+    journal_id: String,
+    restore_operation_id: String,
+    commit: bool,
+    acknowledge: bool,
+  },
+}
+
+impl BackupCompletionReceipt {
+  fn kind(&self) -> Option<BackupDispatchKind> {
+    self.kind.clone().or_else(|| {
+      self.batch.map(|batch| {
+        if batch {
+          BackupDispatchKind::BackupBatch
+        } else {
+          BackupDispatchKind::Backup
+        }
+      })
+    })
+  }
 }
 
 fn backup_completion_lock() -> &'static Mutex<()> {
@@ -375,18 +411,45 @@ fn claim_backup_completion(
   run_id: &str,
   batch: bool,
 ) -> anyhow::Result<Option<VykarBackupCompletion>> {
+  claim_dispatch_completion(
+    directory,
+    operation_id,
+    core,
+    run_id,
+    if batch {
+      BackupDispatchKind::BackupBatch
+    } else {
+      BackupDispatchKind::Backup
+    },
+  )
+}
+
+fn claim_dispatch_completion(
+  directory: &Path,
+  operation_id: &str,
+  core: &str,
+  run_id: &str,
+  kind: BackupDispatchKind,
+) -> anyhow::Result<Option<VykarBackupCompletion>> {
+  if core.is_empty() || run_id.is_empty() {
+    return Err(anyhow!(
+      "Dispatch requires an authenticated Core and run identity"
+    ));
+  }
   let _lock = backup_completion_lock().lock().unwrap();
   let path = backup_completion_path(directory, operation_id)?;
   if let Some(receipt) = read_backup_completion(&path)? {
     check_backup_completion_owner(&receipt, core, run_id)?;
-    if receipt.batch.is_some_and(|kind| kind != batch) {
+    if receipt.kind().is_some_and(|existing| existing != kind) {
       return Err(anyhow!(
         "Backup dispatch identity has a different operation kind"
       ));
     }
-    if receipt.completion.state
-      != VykarBackupCompletionState::Complete
-    {
+    if matches!(
+      receipt.completion.state,
+      VykarBackupCompletionState::Unknown
+        | VykarBackupCompletionState::Running
+    ) {
       return Err(anyhow!(
         "Backup dispatch is already running; query its completion receipt"
       ));
@@ -398,7 +461,9 @@ fn claim_backup_completion(
     &BackupCompletionReceipt {
       core: core.into(),
       run_id: run_id.into(),
-      batch: Some(batch),
+      batch: None,
+      kind: Some(kind),
+      finalized: None,
       completion: VykarBackupCompletion {
         state: VykarBackupCompletionState::Running,
         ..Default::default()
@@ -443,6 +508,8 @@ fn query_backup_completion(
         core: core.into(),
         run_id: request.run_id.clone(),
         batch: None,
+        kind: None,
+        finalized: None,
         completion: VykarBackupCompletion {
           state: VykarBackupCompletionState::Complete,
           error: Some(
@@ -465,6 +532,8 @@ fn query_backup_completion(
     // Keep the identity forever: deleting it could admit a delayed dispatch.
     receipt.completion.result = None;
     receipt.completion.batch_result = None;
+    receipt.completion.restore_result = None;
+    receipt.completion.finalize_restore_result = None;
     receipt.completion.error =
       Some("Backup completion was already acknowledged".into());
     persist_journal(&path, &receipt)?;
@@ -498,15 +567,42 @@ fn recover_backup_completions_in(
     }
     let mut receipt = read_backup_completion(&path)?
       .context("Backup completion disappeared during recovery")?;
-    if receipt.completion.state == VykarBackupCompletionState::Running
+    if receipt.completion.state
+      == VykarBackupCompletionState::Complete
     {
-      receipt.completion = VykarBackupCompletion {
-        state: VykarBackupCompletionState::Complete,
-        error: Some("Backup worker restarted; operation interrupted and container recovery completed".into()),
-        ..Default::default()
-      };
-      persist_journal(&path, &receipt)?;
+      continue;
     }
+    let (journal, pending, original) = match receipt.kind() {
+      Some(BackupDispatchKind::Restore { journal_id, .. }) => (
+        read_restore_journal(&restore_journal_path(&journal_id)?)?,
+        restore_has_pending_journals(&journal_id)?,
+        None,
+      ),
+      Some(BackupDispatchKind::FinalizeRestore {
+        journal_id,
+        restore_operation_id,
+        ..
+      }) => (
+        read_restore_journal(&restore_journal_path(&journal_id)?)?,
+        restore_has_pending_journals(&journal_id)?,
+        if restore_operation_id.is_empty() {
+          None
+        } else {
+          read_backup_completion(&backup_completion_path(
+            directory,
+            &restore_operation_id,
+          )?)?
+        },
+      ),
+      _ => (None, false, None),
+    };
+    receipt.completion = recovered_dispatch_completion(
+      &receipt,
+      journal.as_ref(),
+      pending,
+      original.as_ref(),
+    );
+    persist_journal(&path, &receipt)?;
   }
   Ok(())
 }
@@ -2389,18 +2485,24 @@ async fn prepare_restore_volume(
   restore_plan_id: &str,
   journal_id: &str,
   create_if_missing: bool,
+  deadline: Instant,
 ) -> anyhow::Result<Option<PathBuf>> {
   let docker_guard = docker_client().load();
   let docker = docker_guard
     .as_ref()
     .as_ref()
     .context("Docker is unavailable")?;
-  let containers = docker.list_containers().await?;
-  let exists = docker
-    .list_volumes(&containers)
-    .await?
-    .into_iter()
-    .any(|volume| volume.name == volume_name);
+  let exists = restore_execution_before_deadline(deadline, async {
+    let containers = docker.list_containers().await?;
+    Ok(
+      docker
+        .list_volumes(&containers)
+        .await?
+        .into_iter()
+        .any(|volume| volume.name == volume_name),
+    )
+  })
+  .await?;
   if !create_if_missing {
     if exists {
       return Ok(None);
@@ -2410,7 +2512,10 @@ async fn prepare_restore_volume(
     ));
   }
   if exists {
-    let volume = docker.inspect_volume(volume_name).await?;
+    let volume = restore_execution_before_deadline(deadline, async {
+      Ok(docker.inspect_volume(volume_name).await?)
+    })
+    .await?;
     if volume
       .labels
       .get(RESTORE_PLAN_VOLUME_LABEL)
@@ -2430,7 +2535,7 @@ async fn prepare_restore_volume(
   if !exists {
     let created = async {
       create_restore_volume(volume_name, restore_plan_id).await?;
-      let volume = docker.inspect_volume(volume_name).await?;
+      let volume = restore_execution_before_deadline(deadline, async { Ok(docker.inspect_volume(volume_name).await?) }).await?;
       if volume
         .labels
         .get(RESTORE_PLAN_VOLUME_LABEL)
@@ -2519,10 +2624,98 @@ fn resolve_volume_publish_destinations(
 
 impl Resolve<Args> for TransactionalVykarRestore {
   async fn resolve(
+    self,
+    args: &Args,
+  ) -> anyhow::Result<TransactionalVykarRestoreResponse> {
+    let directory = backup_completion_dir()?;
+    validate_restore_journal_id(&self.journal_id)?;
+    if let Some(completion) = claim_dispatch_completion(
+      &directory,
+      &self.operation_id,
+      &args.core,
+      &self.run_id,
+      BackupDispatchKind::Restore {
+        journal_id: self.journal_id.clone(),
+        deferred: self.defer_finalize,
+      },
+    )? {
+      return completion.restore_result.ok_or_else(|| {
+        anyhow!(completion.error.unwrap_or_else(|| {
+          "Restore dispatch has no replayable result".into()
+        }))
+      });
+    }
+    let args = Args {
+      core: args.core.clone(),
+      id: args.id,
+    };
+    let (_, registration) =
+      register_operation_cancellation(&self.journal_id);
+    tokio::spawn(async move {
+      let operation_id = self.operation_id.clone();
+      let run_id = self.run_id.clone();
+      let journal_id = self.journal_id.clone();
+      let result = self.run_restore(&args).await;
+      drop(registration);
+      let state = if result
+        .as_ref()
+        .is_ok_and(|result| result.finalization_pending)
+      {
+        VykarBackupCompletionState::Prepared
+      } else if restore_has_pending_journals(&journal_id)? {
+        VykarBackupCompletionState::RecoveryRequired
+      } else {
+        VykarBackupCompletionState::Complete
+      };
+      finish_backup_completion(
+        &directory,
+        &operation_id,
+        &args.core,
+        &run_id,
+        VykarBackupCompletion {
+          state,
+          restore_result: result.as_ref().ok().cloned(),
+          error: result
+            .as_ref()
+            .err()
+            .map(|error| format!("{error:#}")),
+          ..Default::default()
+        },
+      )?;
+      result
+    })
+    .await
+    .context("Restore task failed; completion remains uncertain")?
+  }
+}
+
+impl Resolve<Args> for RunTransactionalVykarRestore {
+  async fn resolve(
+    self,
+    args: &Args,
+  ) -> anyhow::Result<TransactionalVykarRestoreResponse> {
+    self.0.resolve(args).await
+  }
+}
+
+trait RunRestoreOperation {
+  async fn run_restore(
+    self,
+    args: &Args,
+  ) -> anyhow::Result<TransactionalVykarRestoreResponse>;
+}
+
+impl RunRestoreOperation for TransactionalVykarRestore {
+  async fn run_restore(
     mut self,
     args: &Args,
   ) -> anyhow::Result<TransactionalVykarRestoreResponse> {
     let _operation = backup_operation_lock().lock().await;
+    if operation_cancelled(&self.journal_id) {
+      return Err(anyhow!(
+        "Restore cancelled before worker admission"
+      ));
+    }
     let _filesystem = protected_filesystem_guard()?;
     ensure_no_pending_recovery()?;
     let current_preview = PreflightVykarRestore {
@@ -2544,8 +2737,8 @@ impl Resolve<Args> for TransactionalVykarRestore {
         "Restore preview changed before the destination filesystem was locked; create and review a fresh preflight"
       ));
     }
-    let (_cancellation, _cancellation_registration) =
-      register_operation_cancellation(&self.journal_id);
+    let preparation_deadline =
+      Instant::now() + RESTORE_PREFLIGHT_TIMEOUT;
     let owned_volume_journal =
       if let PeripheryBackupTarget::Volume { volume_name } =
         &self.target
@@ -2561,54 +2754,56 @@ impl Resolve<Args> for TransactionalVykarRestore {
           volume_restore_plan_id,
           &self.journal_id,
           self.create_volume_if_missing,
+          preparation_deadline,
         )
         .await?
       } else {
         None
       };
-    let preparation = async {
-      if let PeripheryBackupTarget::Volume { volume_name } =
-        &self.target
-      {
-        let mountpoint = discover_source(
-          &self.target,
-          &self.protected_repository_paths,
-          &unfiltered_source_filters(),
-        )
-        .await?
-        .paths
-        .into_iter()
-        .next()
-        .context("Destination volume has no mountpoint")?;
-        resolve_volume_publish_destinations(
-          &mut self.publish,
-          volume_name,
-          &mountpoint,
-          self.selected_paths.is_empty(),
-        )?;
-      }
-      validate_restore_destinations(
-        &self.publish,
-        &self.protected_repository_paths,
-      )
-      .await?;
-      let running_containers = discover_running_containers(
-        &self.target,
-        &self.publish,
-        &self.protected_repository_paths,
-      )
-      .await?;
-      // Persist the complete pre-restore running set before the first stop.
-      // Startup recovery can then restart every affected container after
-      // repairing the filesystem and Volume ownership journal.
-      let container_journal = persist_container_quiesce_journal(
-        &self.journal_id,
-        &running_containers,
-      )?;
-      anyhow::Ok((running_containers, container_journal))
-    }
+    let target = self.target.clone();
+    let protected = self.protected_repository_paths.clone();
+    let mut publish = self.publish.clone();
+    let full_restore = self.selected_paths.is_empty();
+    let runtime = tokio::runtime::Handle::current();
+    let preparation = bounded_restore_execution_read(
+      preparation_deadline,
+      move || {
+        runtime.block_on(restore_execution_before_deadline(
+          preparation_deadline,
+          async {
+            if let PeripheryBackupTarget::Volume { volume_name } =
+              &target
+            {
+              let mountpoint = discover_source(
+                &target,
+                &protected,
+                &unfiltered_source_filters(),
+              )
+              .await?
+              .paths
+              .into_iter()
+              .next()
+              .context("Destination volume has no mountpoint")?;
+              resolve_volume_publish_destinations(
+                &mut publish,
+                volume_name,
+                &mountpoint,
+                full_restore,
+              )?;
+            }
+            validate_restore_destinations(&publish, &protected)
+              .await?;
+            let running_containers = discover_running_containers(
+              &target, &publish, &protected,
+            )
+            .await?;
+            anyhow::Ok((publish, running_containers))
+          },
+        ))
+      },
+    )
     .await;
-    let (running_containers, container_journal) = match preparation {
+    let (publish, running_containers) = match preparation {
       Ok(prepared) => prepared,
       Err(error) => {
         if let Some(journal) = owned_volume_journal.as_deref()
@@ -2618,6 +2813,34 @@ impl Resolve<Args> for TransactionalVykarRestore {
           return Err(error.context(format!(
             "Created restore Volume cleanup failed: {cleanup:#}"
           )));
+        }
+        return Err(error);
+      }
+    };
+    self.publish = publish;
+    // Only the confirmed original-running set may be stopped. It remains the
+    // restart authority even if a stop acknowledgement is lost.
+    let mut expected_running =
+      self.expected_preview.containers_to_stop.clone();
+    let mut current_running = running_containers.clone();
+    expected_running.sort();
+    current_running.sort();
+    if expected_running != current_running {
+      if let Some(journal) = owned_volume_journal.as_deref() {
+        cleanup_owned_restore_volume_journal(journal).await?;
+      }
+      return Err(anyhow!(
+        "Affected containers changed after confirmation; create a fresh restore preview"
+      ));
+    }
+    let container_journal = match persist_container_quiesce_journal(
+      &self.journal_id,
+      &running_containers,
+    ) {
+      Ok(journal) => journal,
+      Err(error) => {
+        if let Some(journal) = owned_volume_journal.as_deref() {
+          cleanup_owned_restore_volume_journal(journal).await?;
         }
         return Err(error);
       }
@@ -2672,7 +2895,17 @@ impl Resolve<Args> for TransactionalVykarRestore {
       stopped_containers.push(container.clone());
     }
 
-    let restore_result = transactional_restore(&self).await;
+    let restore_result = match verify_quiesced_restore_preview(
+      &self,
+      &running_containers,
+    )
+    .await
+    {
+      Ok(()) => transactional_restore(&self).await,
+      Err(error) => {
+        RestoreTransactionResult::FailedBeforePublication(error)
+      }
+    };
     let rolled_back = match restore_result {
       RestoreTransactionResult::Published {
         rolled_back,
@@ -2937,6 +3170,182 @@ impl Resolve<Args> for PreflightVykarRestore {
     Ok(preview)
     }).await
   }
+}
+
+async fn restore_execution_before_deadline<T>(
+  deadline: Instant,
+  work: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+  if Instant::now() >= deadline {
+    return Err(anyhow!(
+      "Restore execution preparation exceeded its 60-second deadline"
+    ));
+  }
+  tokio::time::timeout_at(
+    tokio::time::Instant::from_std(deadline),
+    work,
+  )
+  .await
+  .context(
+    "Restore execution preparation exceeded its 60-second deadline",
+  )?
+}
+
+async fn bounded_restore_execution_read<T: Send + 'static>(
+  deadline: Instant,
+  work: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
+) -> anyhow::Result<T> {
+  bounded_restore_execution_read_in(
+    preflight_slots().clone(),
+    deadline,
+    work,
+  )
+  .await
+}
+
+async fn bounded_restore_execution_read_in<T: Send + 'static>(
+  slots: Arc<tokio::sync::Semaphore>,
+  deadline: Instant,
+  work: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
+) -> anyhow::Result<T> {
+  if Instant::now() >= deadline {
+    return Err(anyhow!(
+      "Restore execution preparation exceeded its deadline"
+    ));
+  }
+  let permit = slots.try_acquire_owned()
+    .context("Another restore inventory is still running; retry after it finishes")?;
+  let worker = tokio::task::spawn_blocking(move || {
+    let _permit = permit;
+    work()
+  });
+  restore_execution_before_deadline(deadline, async {
+    worker
+      .await
+      .context("Restore execution inventory worker failed")?
+  })
+  .await
+}
+
+async fn verify_quiesced_restore_preview(
+  request: &TransactionalVykarRestore,
+  original_running: &[String],
+) -> anyhow::Result<()> {
+  let deadline = Instant::now() + RESTORE_PREFLIGHT_TIMEOUT;
+  let request = request.clone();
+  let original_running = original_running.to_vec();
+  let runtime = tokio::runtime::Handle::current();
+  bounded_restore_execution_read(deadline, move || {
+    runtime.block_on(restore_execution_before_deadline(
+      deadline,
+      validate_restore_destinations(
+        &request.publish,
+        &request.protected_repository_paths,
+      ),
+    ))?;
+    let cache = vykar_cache_dir(&request.hostname)?;
+    let paths = VykarRepository::new(
+      &request.repository,
+      &request.hostname,
+      &cache,
+      &cache,
+      &request.advanced,
+    )?
+    .snapshot_paths(
+      &request.snapshot_name,
+      &request.selected_paths,
+      deadline,
+    )?;
+    let mut changes = compare_restore_paths(
+      &paths,
+      &request.publish,
+      &request.selected_paths,
+      deadline,
+    )?;
+    if !request.expected_preview.destination_exists
+      && request.create_volume_if_missing
+      && let PeripheryBackupTarget::Volume { volume_name } =
+        &request.target
+    {
+      let first = request
+        .publish
+        .first()
+        .context("Restore publish plan is empty")?;
+      let root = if request.selected_paths.is_empty() {
+        first.destination.as_str()
+      } else {
+        first.destination_root.as_deref().context(
+          "New Volume selection has no inspected destination root",
+        )?
+      };
+      normalize_created_volume_preview(
+        &mut changes,
+        Path::new(root),
+        volume_name,
+      )?;
+    }
+    ensure_quiesced_preview_matches(
+      &request.expected_preview,
+      changes,
+      original_running,
+    )
+  })
+  .await
+}
+
+fn ensure_quiesced_preview_matches(
+  expected: &PreflightVykarRestoreResponse,
+  changes: (Vec<String>, Vec<String>, Vec<String>),
+  original_running: Vec<String>,
+) -> anyhow::Result<()> {
+  let mut preview =
+    bounded_restore_preview(changes.0, changes.1, changes.2);
+  // Resource creation was explicitly confirmed already. These filesystem
+  // classifications detect paths created/removed while apps were stopping.
+  preview.destination_exists = expected.destination_exists;
+  preview.containers_to_stop = original_running;
+  if !expected.matches(&preview) {
+    return Err(anyhow!(
+      "Restore paths changed while containers were stopping; no files were published; create and review a fresh preview"
+    ));
+  }
+  Ok(())
+}
+
+fn normalize_created_volume_preview(
+  changes: &mut (Vec<String>, Vec<String>, Vec<String>),
+  mountpoint: &Path,
+  volume_name: &str,
+) -> anyhow::Result<()> {
+  // Docker created this owned root after the missing-volume preview. Only
+  // that root is reclassified; any newly written children still mismatch.
+  if !std::fs::symlink_metadata(mountpoint)?.is_dir() {
+    return Err(anyhow!(
+      "Created Volume mountpoint is not a directory"
+    ));
+  }
+  let (created, overwritten, deleted) = changes;
+  overwritten.retain(|path| {
+    if Path::new(path) == mountpoint {
+      created.push(path.clone());
+      false
+    } else {
+      true
+    }
+  });
+  for paths in [created, overwritten, deleted] {
+    for path in paths {
+      let relative =
+        Path::new(path).strip_prefix(mountpoint).context(
+          "Created Volume preview escaped its inspected mountpoint",
+        )?;
+      *path = format!(
+        "volume://{volume_name}/{}",
+        restore_preview_path(relative)?
+      );
+    }
+  }
+  Ok(())
 }
 
 async fn restore_preflight_before_deadline<T>(
@@ -3227,14 +3636,8 @@ async fn transactional_restore(
       finalization_pending: false,
     };
   }
-  if let Err(error) = validate_restore_destinations(
-    &request.publish,
-    &request.protected_repository_paths,
-  )
-  .await
-  {
-    return RestoreTransactionResult::FailedBeforePublication(error);
-  }
+  // Protection and the complete change set were revalidated under the owned
+  // barrier after quiescing, with a bounded execution inventory.
   let first_destination =
     PathBuf::from(&request.publish[0].destination);
   let Some(parent) = first_destination.parent() else {
@@ -3497,6 +3900,125 @@ fn restore_journal_path(journal_id: &str) -> anyhow::Result<PathBuf> {
   Ok(restore_journal_dir()?.join(format!("{journal_id}.json")))
 }
 
+fn validate_restore_journal_id(
+  journal_id: &str,
+) -> anyhow::Result<()> {
+  if journal_id.is_empty()
+    || !journal_id.bytes().all(|byte| {
+      byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')
+    })
+  {
+    return Err(anyhow!("Restore journal identity is invalid"));
+  }
+  Ok(())
+}
+
+fn recovered_dispatch_completion(
+  receipt: &BackupCompletionReceipt,
+  journal: Option<&RestoreJournal>,
+  pending: bool,
+  original: Option<&BackupCompletionReceipt>,
+) -> VykarBackupCompletion {
+  let recovery_required = |reason: &str| {
+    let mut completion = receipt.completion.clone();
+    completion.state = VykarBackupCompletionState::RecoveryRequired;
+    completion.error = Some(reason.into());
+    completion
+  };
+  match receipt.kind() {
+    Some(BackupDispatchKind::Restore { deferred, .. }) => {
+      if pending {
+        if receipt.completion.state == VykarBackupCompletionState::Prepared {
+          return receipt.completion.clone();
+        }
+        return recovery_required("Restore worker restarted with an unresolved publication; guarded Core reconciliation is required");
+      }
+      if let Some(journal) = journal.filter(|journal| journal.finalized && journal.completed) {
+        return VykarBackupCompletion {
+          state: VykarBackupCompletionState::Complete,
+          restore_result: Some(TransactionalVykarRestoreResponse {
+            complete: journal.committed, rolled_back: !journal.committed,
+            ..Default::default()
+          }), ..Default::default()
+        };
+      }
+      if deferred && matches!(receipt.completion.state, VykarBackupCompletionState::Prepared | VykarBackupCompletionState::RecoveryRequired) {
+        return recovery_required("Prepared restore journal disappeared without a durable finalization outcome");
+      }
+      VykarBackupCompletion {
+        state: VykarBackupCompletionState::Complete,
+        error: Some("Restore worker restarted; journal and container recovery completed, but the interrupted restore outcome is not known".into()),
+        ..Default::default()
+      }
+    }
+    Some(BackupDispatchKind::FinalizeRestore { journal_id, commit, .. }) => {
+      if pending { return recovery_required("Restore finalization requires guarded journal reconciliation"); }
+      let finalized = receipt.finalized.clone().filter(|result| result.complete && result.critical_error.is_none() && result.rolled_back != commit).or_else(|| {
+        journal.filter(|journal| journal.finalized && journal.completed && journal.committed == commit).map(|_| FinalizeVykarRestoreResponse {
+          complete: true, rolled_back: !commit, ..Default::default()
+        })
+      }).or_else(|| {
+        original.filter(|original| original.core == receipt.core && original.run_id == receipt.run_id
+          && match original.kind() {
+            Some(BackupDispatchKind::Restore { journal_id: original_id, .. }) => original_id == journal_id,
+            None => true,
+            _ => false,
+          })
+          .and_then(|original| finalization_from_origin(Some(original), commit).ok())
+      });
+      match finalized {
+        Some(finalized) => VykarBackupCompletion {
+          state: VykarBackupCompletionState::Complete,
+          finalize_restore_result: Some(finalized), ..Default::default()
+        },
+        None => recovery_required("Missing restore journal has no durable matching finalization proof"),
+      }
+    }
+    _ => VykarBackupCompletion {
+      state: VykarBackupCompletionState::Complete,
+      error: Some("Backup worker restarted; operation interrupted and container recovery completed".into()),
+      ..Default::default()
+    },
+  }
+}
+
+fn read_restore_journal(
+  path: &Path,
+) -> anyhow::Result<Option<RestoreJournal>> {
+  match std::fs::read(path) {
+    Ok(bytes) => serde_json::from_slice(&bytes)
+      .map(Some)
+      .context("Invalid restore journal"),
+    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+      Ok(None)
+    }
+    Err(error) => Err(error.into()),
+  }
+}
+
+fn restore_has_pending_journals(
+  journal_id: &str,
+) -> anyhow::Result<bool> {
+  if read_restore_journal(&restore_journal_path(journal_id)?)?
+    .is_some_and(|journal| !journal.finalized || !journal.completed)
+  {
+    return Ok(true);
+  }
+  for directory in [
+    restore_staging_journal_dir()?,
+    container_quiesce_journal_dir()?,
+  ] {
+    match std::fs::symlink_metadata(
+      directory.join(format!("{journal_id}.json")),
+    ) {
+      Ok(_) => return Ok(true),
+      Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+      Err(error) => return Err(error.into()),
+    }
+  }
+  Ok(false)
+}
+
 fn persist_restore_volume_journal(
   journal_id: &str,
   volume_name: &str,
@@ -3534,16 +4056,23 @@ async fn remove_owned_restore_volume(
     .as_ref()
     .as_ref()
     .context("Docker is unavailable")?;
-  let containers = docker.list_containers().await?;
-  let exists = docker
-    .list_volumes(&containers)
-    .await?
-    .into_iter()
-    .any(|volume| volume.name == owned.volume_name);
-  if !exists {
+  let deadline = Instant::now() + RESTORE_PREFLIGHT_TIMEOUT;
+  let volume = restore_execution_before_deadline(deadline, async {
+    let containers = docker.list_containers().await?;
+    let exists = docker
+      .list_volumes(&containers)
+      .await?
+      .into_iter()
+      .any(|volume| volume.name == owned.volume_name);
+    if !exists {
+      return Ok(None);
+    }
+    Ok(Some(docker.inspect_volume(&owned.volume_name).await?))
+  })
+  .await?;
+  let Some(volume) = volume else {
     return Ok(());
-  }
-  let volume = docker.inspect_volume(&owned.volume_name).await?;
+  };
   if volume
     .labels
     .get(RESTORE_PLAN_VOLUME_LABEL)
@@ -4462,7 +4991,7 @@ async fn finalize_restore_publication(
   }
 
   if journal.completed {
-    if acknowledge || !journal.deferred {
+    if acknowledge {
       remove_path(&journal_path)?;
       fsync_parent(&journal_path)?;
     }
@@ -4492,9 +5021,9 @@ async fn finalize_restore_publication(
   journal.completed = true;
   persist_journal(&journal_path, &journal)?;
   // Deferred recovered-Stack publications retain a durable receipt until
-  // Core records the outcome. Other callers preserve the prior cleanup
-  // behavior, and acknowledgement makes receipt removal idempotent.
-  if acknowledge || !journal.deferred {
+  // Core records the outcome. Every receipt-backed finalizer persists its
+  // proof before acknowledgement makes journal removal idempotent.
+  if acknowledge {
     remove_path(&journal_path)?;
     fsync_parent(&journal_path)?;
   }
@@ -4509,17 +5038,249 @@ async fn finalize_restore_publication(
 impl Resolve<Args> for FinalizeVykarRestore {
   async fn resolve(
     self,
-    _: &Args,
+    args: &Args,
   ) -> anyhow::Result<FinalizeVykarRestoreResponse> {
-    let _operation = backup_operation_lock().lock().await;
-    let _filesystem = protected_filesystem_guard()?;
-    finalize_restore_publication(
-      &self.journal_id,
-      self.commit,
-      self.acknowledge,
-    )
-    .await
+    let directory = backup_completion_dir()?;
+    validate_restore_journal_id(&self.journal_id)?;
+    uuid::Uuid::parse_str(&self.restore_operation_id).context(
+      "Restore finalization requires a valid original dispatch UUID",
+    )?;
+    if let Some(completion) = claim_dispatch_completion(
+      &directory,
+      &self.operation_id,
+      &args.core,
+      &self.run_id,
+      BackupDispatchKind::FinalizeRestore {
+        journal_id: self.journal_id.clone(),
+        restore_operation_id: self.restore_operation_id.clone(),
+        commit: self.commit,
+        acknowledge: self.acknowledge,
+      },
+    )? {
+      return completion.finalize_restore_result.ok_or_else(|| {
+        anyhow!(completion.error.unwrap_or_else(|| {
+          "Restore finalization has no replayable result".into()
+        }))
+      });
+    }
+    let args = Args {
+      core: args.core.clone(),
+      id: args.id,
+    };
+    tokio::spawn(async move {
+      let result = run_finalize_restore(&self, &args, &directory).await;
+      let state = if restore_has_pending_journals(&self.journal_id)? {
+        VykarBackupCompletionState::RecoveryRequired
+      } else {
+        VykarBackupCompletionState::Complete
+      };
+      finish_backup_completion(&directory, &self.operation_id, &args.core, &self.run_id, VykarBackupCompletion {
+        state,
+        finalize_restore_result: result.as_ref().ok().cloned(),
+        error: result.as_ref().err().map(|error| format!("{error:#}")),
+        ..Default::default()
+      })?;
+      result
+    }).await.context("Restore finalization task failed; completion remains uncertain")?
   }
+}
+
+impl Resolve<Args> for RunFinalizeVykarRestore {
+  async fn resolve(
+    self,
+    args: &Args,
+  ) -> anyhow::Result<FinalizeVykarRestoreResponse> {
+    self.0.resolve(args).await
+  }
+}
+
+fn restore_origin_receipt(
+  directory: &Path,
+  request: &FinalizeVykarRestore,
+  core: &str,
+) -> anyhow::Result<Option<BackupCompletionReceipt>> {
+  if request.restore_operation_id.is_empty() {
+    return Err(anyhow!(
+      "Restore finalization requires the original tracked dispatch identity; legacy journals need operator reconciliation"
+    ));
+  }
+  let _lock = backup_completion_lock().lock().unwrap();
+  let path =
+    backup_completion_path(directory, &request.restore_operation_id)?;
+  let receipt = read_backup_completion(&path)?.context(
+    "Original restore dispatch has not been fenced or claimed",
+  )?;
+  check_backup_completion_owner(&receipt, core, &request.run_id)?;
+  match receipt.kind() {
+    Some(BackupDispatchKind::Restore { journal_id, .. })
+      if journal_id == request.journal_id => {}
+    None
+      if receipt.completion.state
+        == VykarBackupCompletionState::Complete => {}
+    _ => {
+      return Err(anyhow!(
+        "Finalization does not match the original restore dispatch"
+      ));
+    }
+  }
+  if matches!(
+    receipt.completion.state,
+    VykarBackupCompletionState::Unknown
+      | VykarBackupCompletionState::Running
+  ) {
+    return Err(anyhow!(
+      "Original restore dispatch must exit before finalization"
+    ));
+  }
+  Ok(Some(receipt))
+}
+
+fn finalization_from_origin(
+  origin: Option<&BackupCompletionReceipt>,
+  commit: bool,
+) -> anyhow::Result<FinalizeVykarRestoreResponse> {
+  let origin = origin.context(
+    "Missing restore journal has no original dispatch proof",
+  )?;
+  if origin.completion.state != VykarBackupCompletionState::Complete {
+    return Err(anyhow!(
+      "Missing restore journal has no durable finalization proof"
+    ));
+  }
+  if let Some(finalized) = &origin.finalized {
+    if finalized.complete
+      && finalized.critical_error.is_none()
+      && finalized.rolled_back != commit
+    {
+      return Ok(finalized.clone());
+    }
+  }
+  if let Some(restored) = &origin.completion.restore_result
+    && !restored.finalization_pending
+    && restored.critical_error.is_none()
+    && ((commit && restored.complete && !restored.rolled_back)
+      || (!commit && restored.rolled_back))
+  {
+    return Ok(FinalizeVykarRestoreResponse {
+      complete: true,
+      rolled_back: !commit,
+      containers_restarted: restored.containers_restarted.clone(),
+      critical_error: None,
+    });
+  }
+  if origin.kind().is_none() && !commit {
+    return Ok(FinalizeVykarRestoreResponse {
+      complete: true,
+      rolled_back: true,
+      ..Default::default()
+    });
+  }
+  Err(anyhow!(
+    "Original restore has no durable matching finalization outcome"
+  ))
+}
+
+fn persist_finalization_proof(
+  directory: &Path,
+  request: &FinalizeVykarRestore,
+  core: &str,
+  finalized: &FinalizeVykarRestoreResponse,
+) -> anyhow::Result<()> {
+  let _lock = backup_completion_lock().lock().unwrap();
+  let path =
+    backup_completion_path(directory, &request.operation_id)?;
+  let mut receipt = read_backup_completion(&path)?
+    .context("Finalization dispatch receipt disappeared")?;
+  check_backup_completion_owner(&receipt, core, &request.run_id)?;
+  if receipt.completion.state != VykarBackupCompletionState::Running {
+    return Err(anyhow!(
+      "Finalization dispatch is no longer running"
+    ));
+  }
+  receipt.finalized = Some(finalized.clone());
+  persist_journal(&path, &receipt)?;
+  if !request.restore_operation_id.is_empty() {
+    let path = backup_completion_path(
+      directory,
+      &request.restore_operation_id,
+    )?;
+    let mut origin = read_backup_completion(&path)?
+      .context("Original restore receipt disappeared")?;
+    check_backup_completion_owner(&origin, core, &request.run_id)?;
+    origin.finalized = Some(finalized.clone());
+    origin.completion = VykarBackupCompletion {
+      state: VykarBackupCompletionState::Complete,
+      restore_result: Some(TransactionalVykarRestoreResponse {
+        complete: !finalized.rolled_back,
+        rolled_back: finalized.rolled_back,
+        finalization_pending: false,
+        containers_restarted: finalized.containers_restarted.clone(),
+        critical_error: None,
+      }),
+      ..Default::default()
+    };
+    persist_journal(&path, &origin)?;
+  }
+  Ok(())
+}
+
+async fn run_finalize_restore(
+  request: &FinalizeVykarRestore,
+  args: &Args,
+  directory: &Path,
+) -> anyhow::Result<FinalizeVykarRestoreResponse> {
+  let _operation = backup_operation_lock().lock().await;
+  let _filesystem = protected_filesystem_guard()?;
+  let origin =
+    restore_origin_receipt(directory, request, &args.core)?;
+  let journal = read_restore_journal(&restore_journal_path(
+    &request.journal_id,
+  )?)?;
+  // A fenced never-started dispatch cannot authorize another journal's data.
+  if journal.is_some()
+    && origin
+      .as_ref()
+      .is_some_and(|receipt| receipt.kind().is_none())
+  {
+    return Err(anyhow!(
+      "Fenced restore dispatch does not own this journal"
+    ));
+  }
+  let finalized = if journal.is_some() {
+    finalize_restore_publication(
+      &request.journal_id,
+      request.commit,
+      false,
+    )
+    .await?
+  } else {
+    if restore_has_pending_journals(&request.journal_id)? {
+      return Err(anyhow!(
+        "Missing publication journal still has unreconciled restore work"
+      ));
+    }
+    finalization_from_origin(origin.as_ref(), request.commit)?
+  };
+  if finalized.complete && finalized.critical_error.is_none() {
+    if restore_has_pending_journals(&request.journal_id)? {
+      return Err(anyhow!(
+        "Finalized publication still has unreconciled child journals"
+      ));
+    }
+    // Persist both proofs before acknowledgement can erase the only journal.
+    persist_finalization_proof(
+      directory, request, &args.core, &finalized,
+    )?;
+    if request.acknowledge {
+      finalize_restore_publication(
+        &request.journal_id,
+        request.commit,
+        true,
+      )
+      .await?;
+    }
+  }
+  Ok(finalized)
 }
 
 impl Resolve<Args> for CancelVykarOperation {
@@ -4536,6 +5297,694 @@ impl Resolve<Args> for CancelVykarOperation {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[tokio::test]
+  async fn expired_execution_deadline_never_starts_another_preparation_phase()
+   {
+    let started = AtomicBool::new(false);
+    let result =
+      restore_execution_before_deadline(Instant::now(), async {
+        started.store(true, Ordering::SeqCst);
+        Ok(())
+      })
+      .await;
+    assert!(result.is_err());
+    assert!(!started.load(Ordering::SeqCst));
+    let result = restore_execution_before_deadline(
+      Instant::now() + Duration::from_millis(1),
+      std::future::pending::<anyhow::Result<()>>(),
+    )
+    .await;
+    assert!(result.is_err());
+  }
+
+  #[tokio::test]
+  async fn execution_inventory_timeout_retains_the_actual_blocking_slot()
+   {
+    let slots = Arc::new(tokio::sync::Semaphore::new(1));
+    let (release, waiting) = std::sync::mpsc::channel();
+    let result = bounded_restore_execution_read_in(
+      slots.clone(),
+      Instant::now() + Duration::from_millis(10),
+      move || {
+        waiting.recv().unwrap();
+        Ok(())
+      },
+    )
+    .await;
+    assert!(result.is_err());
+    assert!(slots.clone().try_acquire_owned().is_err());
+    release.send(()).unwrap();
+    let permit = slots.acquire_owned().await.unwrap();
+    drop(permit);
+  }
+
+  #[test]
+  fn post_quiesce_preview_detects_new_deletions_and_changed_classifications()
+   {
+    let root = tempfile::tempdir().unwrap();
+    let config = root.path().join("config");
+    std::fs::write(&config, b"original").unwrap();
+    let snapshot = vec![
+      komodo_backup::SnapshotPath {
+        path: "snapshot/root".into(),
+        directory: true,
+      },
+      komodo_backup::SnapshotPath {
+        path: "snapshot/root/config".into(),
+        directory: false,
+      },
+    ];
+    let publish = vec![RestorePublishPath {
+      destination_root: None,
+      snapshot_path: "snapshot/root".into(),
+      destination: root.path().to_string_lossy().into_owned(),
+    }];
+    let compare = || {
+      compare_restore_paths(
+        &snapshot,
+        &publish,
+        &[],
+        Instant::now() + RESTORE_PREFLIGHT_TIMEOUT,
+      )
+      .unwrap()
+    };
+    let before = compare();
+    let mut expected =
+      bounded_restore_preview(before.0, before.1, before.2);
+    expected.destination_exists = true;
+    expected.containers_to_stop = vec!["writer".into()];
+    ensure_quiesced_preview_matches(
+      &expected,
+      compare(),
+      vec!["writer".into()],
+    )
+    .unwrap();
+    let extra = root.path().join("created-during-stop");
+    std::fs::write(&extra, b"must not silently delete").unwrap();
+    assert!(
+      ensure_quiesced_preview_matches(
+        &expected,
+        compare(),
+        vec!["writer".into()]
+      )
+      .is_err()
+    );
+    assert_eq!(
+      std::fs::read(&extra).unwrap(),
+      b"must not silently delete"
+    );
+    std::fs::remove_file(&extra).unwrap();
+    std::fs::remove_file(&config).unwrap();
+    assert!(
+      ensure_quiesced_preview_matches(
+        &expected,
+        compare(),
+        vec!["writer".into()]
+      )
+      .is_err()
+    );
+  }
+
+  #[test]
+  fn created_volume_post_quiesce_preview_ignores_only_its_owned_root_creation()
+   {
+    let root = tempfile::tempdir().unwrap();
+    let snapshot = vec![
+      komodo_backup::SnapshotPath {
+        path: "snapshot/root".into(),
+        directory: true,
+      },
+      komodo_backup::SnapshotPath {
+        path: "snapshot/root/config".into(),
+        directory: false,
+      },
+    ];
+    let logical = vec![RestorePublishPath {
+      destination_root: None,
+      snapshot_path: "snapshot/root".into(),
+      destination: "/var/lib/docker/volumes/new-volume/_data".into(),
+    }];
+    let before = compare_missing_volume_paths(
+      &snapshot,
+      &logical,
+      "new-volume",
+      Instant::now() + RESTORE_PREFLIGHT_TIMEOUT,
+    )
+    .unwrap();
+    let expected =
+      bounded_restore_preview(before.0, before.1, before.2);
+    let actual = vec![RestorePublishPath {
+      destination: root.path().to_string_lossy().into_owned(),
+      ..logical[0].clone()
+    }];
+    let compare = || {
+      let mut paths = compare_restore_paths(
+        &snapshot,
+        &actual,
+        &[],
+        Instant::now() + RESTORE_PREFLIGHT_TIMEOUT,
+      )
+      .unwrap();
+      normalize_created_volume_preview(
+        &mut paths,
+        root.path(),
+        "new-volume",
+      )
+      .unwrap();
+      paths
+    };
+    ensure_quiesced_preview_matches(&expected, compare(), Vec::new())
+      .unwrap();
+    std::fs::write(
+      root.path().join("unexpected"),
+      b"changed after preview",
+    )
+    .unwrap();
+    assert!(
+      ensure_quiesced_preview_matches(
+        &expected,
+        compare(),
+        Vec::new()
+      )
+      .is_err()
+    );
+    std::fs::remove_file(root.path().join("unexpected")).unwrap();
+    std::fs::write(root.path().join("config"), b"now exists")
+      .unwrap();
+    assert!(
+      ensure_quiesced_preview_matches(
+        &expected,
+        compare(),
+        Vec::new()
+      )
+      .is_err()
+    );
+  }
+
+  fn restore_receipt(
+    kind: BackupDispatchKind,
+    state: VykarBackupCompletionState,
+  ) -> BackupCompletionReceipt {
+    BackupCompletionReceipt {
+      core: "core".into(),
+      run_id: "run".into(),
+      batch: None,
+      kind: Some(kind),
+      finalized: None,
+      completion: VykarBackupCompletion {
+        state,
+        ..Default::default()
+      },
+    }
+  }
+
+  fn restore_kind() -> BackupDispatchKind {
+    BackupDispatchKind::Restore {
+      journal_id: "journal".into(),
+      deferred: true,
+    }
+  }
+
+  fn finalize_request(original: &str) -> FinalizeVykarRestore {
+    FinalizeVykarRestore {
+      operation_id: uuid::Uuid::new_v4().to_string(),
+      run_id: "run".into(),
+      restore_operation_id: original.into(),
+      journal_id: "journal".into(),
+      commit: false,
+      acknowledge: true,
+    }
+  }
+
+  fn finalize_kind(
+    request: &FinalizeVykarRestore,
+  ) -> BackupDispatchKind {
+    BackupDispatchKind::FinalizeRestore {
+      journal_id: request.journal_id.clone(),
+      restore_operation_id: request.restore_operation_id.clone(),
+      commit: request.commit,
+      acknowledge: request.acknowledge,
+    }
+  }
+
+  #[test]
+  fn legacy_backup_receipts_keep_their_original_dispatch_kind() {
+    let receipt: BackupCompletionReceipt =
+      serde_json::from_value(serde_json::json!({
+        "core": "core", "run_id": "run", "batch": true,
+        "completion": VykarBackupCompletion::default(),
+      }))
+      .unwrap();
+    assert_eq!(receipt.kind(), Some(BackupDispatchKind::BackupBatch));
+  }
+
+  #[test]
+  fn prepared_restore_replays_without_reexecution_or_acknowledgement()
+  {
+    let root = tempfile::tempdir().unwrap();
+    let id = uuid::Uuid::new_v4().to_string();
+    claim_dispatch_completion(
+      root.path(),
+      &id,
+      "core",
+      "run",
+      restore_kind(),
+    )
+    .unwrap();
+    assert!(
+      claim_dispatch_completion(
+        root.path(),
+        &id,
+        "core",
+        "run",
+        BackupDispatchKind::Backup
+      )
+      .is_err()
+    );
+    assert!(
+      claim_dispatch_completion(
+        root.path(),
+        &id,
+        "core",
+        "run",
+        BackupDispatchKind::Restore {
+          journal_id: "different".into(),
+          deferred: true
+        }
+      )
+      .is_err()
+    );
+    finish_backup_completion(
+      root.path(),
+      &id,
+      "core",
+      "run",
+      VykarBackupCompletion {
+        state: VykarBackupCompletionState::Prepared,
+        restore_result: Some(TransactionalVykarRestoreResponse {
+          complete: true,
+          finalization_pending: true,
+          ..Default::default()
+        }),
+        ..Default::default()
+      },
+    )
+    .unwrap();
+    let replay = claim_dispatch_completion(
+      root.path(),
+      &id,
+      "core",
+      "run",
+      restore_kind(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(replay.state, VykarBackupCompletionState::Prepared);
+    let mut acknowledge = completion_query(&id);
+    acknowledge.acknowledge = true;
+    query_backup_completion(root.path(), &acknowledge, "core")
+      .unwrap();
+    assert!(
+      read_backup_completion(
+        &backup_completion_path(root.path(), &id).unwrap()
+      )
+      .unwrap()
+      .unwrap()
+      .completion
+      .restore_result
+      .unwrap()
+      .finalization_pending
+    );
+  }
+
+  #[test]
+  fn interrupted_restore_is_not_terminal_while_recovery_is_pending() {
+    for deferred in [false, true] {
+      let receipt = restore_receipt(
+        BackupDispatchKind::Restore {
+          journal_id: "journal".into(),
+          deferred,
+        },
+        VykarBackupCompletionState::Running,
+      );
+      assert_eq!(
+        recovered_dispatch_completion(&receipt, None, true, None)
+          .state,
+        VykarBackupCompletionState::RecoveryRequired
+      );
+    }
+    let prepared = restore_receipt(
+      restore_kind(),
+      VykarBackupCompletionState::Prepared,
+    );
+    assert_eq!(
+      recovered_dispatch_completion(&prepared, None, false, None)
+        .state,
+      VykarBackupCompletionState::RecoveryRequired
+    );
+    let ordinary = restore_receipt(
+      BackupDispatchKind::Restore {
+        journal_id: "journal".into(),
+        deferred: false,
+      },
+      VykarBackupCompletionState::Running,
+    );
+    let recovered =
+      recovered_dispatch_completion(&ordinary, None, false, None);
+    assert_eq!(recovered.state, VykarBackupCompletionState::Complete);
+    assert!(recovered.error.is_some());
+    assert!(recovered.restore_result.is_none());
+  }
+
+  #[test]
+  fn completed_restore_journal_provides_a_recovered_final_outcome() {
+    let receipt = restore_receipt(
+      restore_kind(),
+      VykarBackupCompletionState::RecoveryRequired,
+    );
+    let mut journal = RestoreJournal {
+      staging: PathBuf::new(),
+      entries: Vec::new(),
+      committed: true,
+      finalized: true,
+      deferred: true,
+      completed: true,
+      owned_volume: None,
+    };
+    for commit in [false, true] {
+      journal.committed = commit;
+      let result = recovered_dispatch_completion(
+        &receipt,
+        Some(&journal),
+        false,
+        None,
+      )
+      .restore_result
+      .unwrap();
+      assert_eq!(result.complete, commit);
+      assert_eq!(result.rolled_back, !commit);
+      assert!(!result.finalization_pending);
+    }
+  }
+
+  #[test]
+  fn finalization_requires_matching_nonrunning_original_authority() {
+    let root = tempfile::tempdir().unwrap();
+    let original = uuid::Uuid::new_v4().to_string();
+    claim_dispatch_completion(
+      root.path(),
+      &original,
+      "core",
+      "run",
+      restore_kind(),
+    )
+    .unwrap();
+    let request = finalize_request(&original);
+    assert!(
+      restore_origin_receipt(root.path(), &request, "core").is_err()
+    );
+    finish_backup_completion(
+      root.path(),
+      &original,
+      "core",
+      "run",
+      VykarBackupCompletion {
+        state: VykarBackupCompletionState::Prepared,
+        ..Default::default()
+      },
+    )
+    .unwrap();
+    let path =
+      backup_completion_path(root.path(), &original).unwrap();
+    let unchanged = std::fs::read(&path).unwrap();
+    for (invalid, core) in [
+      (request.clone(), "other-core"),
+      (
+        {
+          let mut value = request.clone();
+          value.run_id = "other-run".into();
+          value
+        },
+        "core",
+      ),
+      (
+        {
+          let mut value = request.clone();
+          value.journal_id = "other-journal".into();
+          value
+        },
+        "core",
+      ),
+      (finalize_request(""), "core"),
+    ] {
+      assert!(
+        restore_origin_receipt(root.path(), &invalid, core).is_err()
+      );
+      assert_eq!(std::fs::read(&path).unwrap(), unchanged);
+    }
+    assert!(
+      restore_origin_receipt(root.path(), &request, "core")
+        .unwrap()
+        .is_some()
+    );
+  }
+
+  #[test]
+  fn finalization_proof_survives_journal_erasure_and_receipt_acknowledgement()
+   {
+    let root = tempfile::tempdir().unwrap();
+    let original = uuid::Uuid::new_v4().to_string();
+    claim_dispatch_completion(
+      root.path(),
+      &original,
+      "core",
+      "run",
+      restore_kind(),
+    )
+    .unwrap();
+    finish_backup_completion(
+      root.path(),
+      &original,
+      "core",
+      "run",
+      VykarBackupCompletion {
+        state: VykarBackupCompletionState::Prepared,
+        ..Default::default()
+      },
+    )
+    .unwrap();
+    let request = finalize_request(&original);
+    claim_dispatch_completion(
+      root.path(),
+      &request.operation_id,
+      "core",
+      "run",
+      finalize_kind(&request),
+    )
+    .unwrap();
+    let outcome = FinalizeVykarRestoreResponse {
+      complete: true,
+      rolled_back: true,
+      containers_restarted: vec!["writer".into()],
+      critical_error: None,
+    };
+    persist_finalization_proof(
+      root.path(),
+      &request,
+      "core",
+      &outcome,
+    )
+    .unwrap();
+    let finalizer = read_backup_completion(
+      &backup_completion_path(root.path(), &request.operation_id)
+        .unwrap(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+      finalizer.completion.state,
+      VykarBackupCompletionState::Running
+    );
+    assert!(finalizer.finalized.is_some());
+    let original = read_backup_completion(
+      &backup_completion_path(root.path(), &original).unwrap(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+      original.completion.state,
+      VykarBackupCompletionState::Complete
+    );
+    let restored =
+      original.completion.restore_result.as_ref().unwrap();
+    assert!(restored.rolled_back);
+    assert!(!restored.finalization_pending);
+    assert_eq!(restored.containers_restarted, ["writer"]);
+    let recovered = recovered_dispatch_completion(
+      &finalizer,
+      None,
+      false,
+      Some(&original),
+    );
+    assert_eq!(recovered.state, VykarBackupCompletionState::Complete);
+    assert!(recovered.finalize_restore_result.unwrap().rolled_back);
+    let mut acknowledged =
+      completion_query(&request.restore_operation_id);
+    acknowledged.acknowledge = true;
+    query_backup_completion(root.path(), &acknowledged, "core")
+      .unwrap();
+    let original =
+      restore_origin_receipt(root.path(), &request, "core")
+        .unwrap()
+        .unwrap();
+    assert!(original.completion.restore_result.is_none());
+    assert!(
+      finalization_from_origin(Some(&original), false)
+        .unwrap()
+        .rolled_back
+    );
+    assert!(finalization_from_origin(Some(&original), true).is_err());
+  }
+
+  #[test]
+  fn missing_journal_without_finalization_proof_stays_unresolved() {
+    let original = uuid::Uuid::new_v4().to_string();
+    let request = finalize_request(&original);
+    let receipt = restore_receipt(
+      finalize_kind(&request),
+      VykarBackupCompletionState::Running,
+    );
+    assert_eq!(
+      recovered_dispatch_completion(&receipt, None, false, None)
+        .state,
+      VykarBackupCompletionState::RecoveryRequired
+    );
+    assert!(finalization_from_origin(None, false).is_err());
+    let prepared = restore_receipt(
+      restore_kind(),
+      VykarBackupCompletionState::Prepared,
+    );
+    assert!(
+      finalization_from_origin(Some(&prepared), false).is_err()
+    );
+  }
+
+  #[test]
+  fn fenced_restore_never_starts_and_cannot_be_committed() {
+    let root = tempfile::tempdir().unwrap();
+    let id = uuid::Uuid::new_v4().to_string();
+    let mut fence = completion_query(&id);
+    fence.cancel_if_unknown = true;
+    query_backup_completion(root.path(), &fence, "core").unwrap();
+    assert!(
+      claim_dispatch_completion(
+        root.path(),
+        &id,
+        "core",
+        "run",
+        restore_kind()
+      )
+      .unwrap()
+      .unwrap()
+      .error
+      .is_some()
+    );
+    let origin = read_backup_completion(
+      &backup_completion_path(root.path(), &id).unwrap(),
+    )
+    .unwrap()
+    .unwrap();
+    assert!(
+      finalization_from_origin(Some(&origin), false)
+        .unwrap()
+        .rolled_back
+    );
+    assert!(finalization_from_origin(Some(&origin), true).is_err());
+  }
+
+  #[test]
+  fn tracked_finalize_uses_a_wire_name_legacy_workers_cannot_execute()
+  {
+    #[derive(Deserialize)]
+    #[serde(tag = "type", content = "params")]
+    enum LegacyRequest {
+      FinalizeVykarRestore(serde_json::Value),
+    }
+    let request = finalize_request(&uuid::Uuid::new_v4().to_string());
+    let value = serde_json::to_value(
+      crate::api::PeripheryRequest::RunFinalizeVykarRestore(
+        RunFinalizeVykarRestore(request),
+      ),
+    )
+    .unwrap();
+    assert_eq!(value["type"], "RunFinalizeVykarRestore");
+    match serde_json::from_value::<LegacyRequest>(value) {
+      Err(_) => {}
+      Ok(LegacyRequest::FinalizeVykarRestore(params)) => {
+        panic!("Legacy worker accepted tracked mutation: {params}")
+      }
+    }
+  }
+
+  #[test]
+  fn finalize_dispatch_identity_binds_the_decision_and_acknowledgement()
+   {
+    let root = tempfile::tempdir().unwrap();
+    let mut request =
+      finalize_request(&uuid::Uuid::new_v4().to_string());
+    claim_dispatch_completion(
+      root.path(),
+      &request.operation_id,
+      "core",
+      "run",
+      finalize_kind(&request),
+    )
+    .unwrap();
+    request.commit = !request.commit;
+    assert!(
+      claim_dispatch_completion(
+        root.path(),
+        &request.operation_id,
+        "core",
+        "run",
+        finalize_kind(&request)
+      )
+      .is_err()
+    );
+    request.commit = !request.commit;
+    request.acknowledge = !request.acknowledge;
+    assert!(
+      claim_dispatch_completion(
+        root.path(),
+        &request.operation_id,
+        "core",
+        "run",
+        finalize_kind(&request)
+      )
+      .is_err()
+    );
+    assert!(
+      claim_dispatch_completion(
+        root.path(),
+        "",
+        "core",
+        "run",
+        restore_kind()
+      )
+      .is_err()
+    );
+    assert!(
+      claim_dispatch_completion(
+        root.path(),
+        &uuid::Uuid::new_v4().to_string(),
+        "core",
+        "",
+        restore_kind()
+      )
+      .is_err()
+    );
+  }
 
   fn completion_query(
     operation_id: &str,

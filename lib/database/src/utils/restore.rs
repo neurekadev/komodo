@@ -14,7 +14,7 @@ use mungos::{
 };
 use tokio::io::BufReader;
 use tokio_util::codec::{FramedRead, LinesCodec};
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 pub async fn restore(
   db: &Database,
@@ -54,6 +54,7 @@ pub async fn restore(
                 10_000
               };
               let mut count = 0;
+              let mut line_number = 0;
 
               let file = tokio::fs::File::open(&restore_file)
                 .await
@@ -71,29 +72,17 @@ pub async fn restore(
                 .await
                 .context("Failed to get next line")?
               {
+                line_number += 1;
                 if line.is_empty() {
                   continue;
                 }
-                let mut document =
-                  match serde_json::from_str::<Document>(&line)
-                    .context("Failed to deserialize line")
-                  {
-                    Ok(doc) => doc,
-                    Err(e) => {
-                      warn!("{e:#}");
-                      continue;
-                    }
-                  };
-                let id = document.remove("_id").with_context(|| {
-                  format!(
-                    "Restore document in collection '{collection}' has no _id"
-                  )
-                })?;
+                let update = restore_document_update(
+                  &line,
+                  &collection,
+                  line_number,
+                )?;
                 count += 1;
-                buffer.push(BulkUpdate {
-                  query: restore_id_query(id),
-                  update: doc! { "$set": document },
-                });
+                buffer.push(update);
                 if buffer.len() >= max_buffer {
                   bulk_update_retry_too_big(
                     &db,
@@ -166,6 +155,28 @@ fn restore_id_query(id: Bson) -> Document {
   doc! { "_id": id }
 }
 
+fn restore_document_update(
+  line: &str,
+  collection: &str,
+  line_number: usize,
+) -> anyhow::Result<BulkUpdate> {
+  let mut document = serde_json::from_str::<Document>(line)
+    .with_context(|| {
+      format!(
+        "Failed to deserialize restore document in collection '{collection}' at line {line_number}"
+      )
+    })?;
+  let id = document.remove("_id").with_context(|| {
+    format!(
+      "Restore document in collection '{collection}' at line {line_number} has no _id"
+    )
+  })?;
+  Ok(BulkUpdate {
+    query: restore_id_query(id),
+    update: doc! { "$set": document },
+  })
+}
+
 async fn latest_restore_folder(
   backups_folder: &Path,
 ) -> anyhow::Result<PathBuf> {
@@ -187,8 +198,7 @@ async fn latest_restore_folder(
       }
       Ok(None) => break,
       Err(e) => {
-        warn!("{e:#}");
-        continue;
+        return Err(e);
       }
     }
   }
@@ -240,8 +250,7 @@ async fn get_restore_files(
       }
       Ok(None) => break,
       Err(e) => {
-        warn!("{e:#}");
-        continue;
+        return Err(e);
       }
     }
   }
@@ -252,6 +261,37 @@ async fn get_restore_files(
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn restore_document_decode_failures_are_fatal() {
+    for line in ["not-json", r#"{"_id":{"$oid":"not-an-object-id"}}"#]
+    {
+      let error = restore_document_update(line, "User", 7)
+        .err()
+        .expect("invalid document must fail the import");
+      let message = error.to_string();
+      assert!(message.contains("collection 'User'"));
+      assert!(message.contains("line 7"));
+    }
+  }
+
+  #[test]
+  fn restore_document_requires_an_id_and_preserves_fields() {
+    assert!(
+      restore_document_update(r#"{"name":"admin"}"#, "User", 1)
+        .is_err()
+    );
+    let update = restore_document_update(
+      r#"{"_id":"user-id","name":"admin"}"#,
+      "User",
+      2,
+    )
+    .unwrap();
+    assert_eq!(update.query.get_str("_id").unwrap(), "user-id");
+    let fields = update.update.get_document("$set").unwrap();
+    assert_eq!(fields.get_str("name").unwrap(), "admin");
+    assert!(!fields.contains_key("_id"));
+  }
 
   #[tokio::test]
   async fn stats_backup_is_optional() {

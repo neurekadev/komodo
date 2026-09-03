@@ -218,6 +218,10 @@ pub enum VykarBackupCompletionState {
   #[default]
   Unknown,
   Running,
+  /// Resolver exited, but Core must commit or roll back its prepared saga.
+  Prepared,
+  /// Original work exited; unresolved journals still require guarded recovery.
+  RecoveryRequired,
   Complete,
 }
 
@@ -226,6 +230,10 @@ pub struct VykarBackupCompletion {
   pub state: VykarBackupCompletionState,
   pub result: Option<RunVykarBackupResponse>,
   pub batch_result: Option<RunVykarBackupBatchResponse>,
+  #[serde(default)]
+  pub restore_result: Option<TransactionalVykarRestoreResponse>,
+  #[serde(default)]
+  pub finalize_restore_result: Option<FinalizeVykarRestoreResponse>,
   pub error: Option<String>,
 }
 
@@ -233,6 +241,10 @@ pub struct VykarBackupCompletion {
 #[response(TransactionalVykarRestoreResponse)]
 #[error(anyhow::Error)]
 pub struct TransactionalVykarRestore {
+  #[serde(default)]
+  pub operation_id: String,
+  #[serde(default)]
+  pub run_id: String,
   pub target: PeripheryBackupTarget,
   pub repository: BackupRepository,
   /// Core-private and repository paths inside Core. Periphery resolves
@@ -270,6 +282,16 @@ pub struct TransactionalVykarRestore {
   #[serde(default)]
   pub defer_finalize: bool,
 }
+
+/// Separate wire name prevents older workers from executing an unreceipted
+/// restore and then reporting the new operation identity as unknown.
+#[derive(Serialize, Deserialize, Debug, Clone, Resolve)]
+#[serde(transparent)]
+#[response(TransactionalVykarRestoreResponse)]
+#[error(anyhow::Error)]
+pub struct RunTransactionalVykarRestore(
+  pub TransactionalVykarRestore,
+);
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct RestorePublishPath {
@@ -346,6 +368,13 @@ pub struct TransactionalVykarRestoreResponse {
 #[response(FinalizeVykarRestoreResponse)]
 #[error(anyhow::Error)]
 pub struct FinalizeVykarRestore {
+  #[serde(default)]
+  pub operation_id: String,
+  #[serde(default)]
+  pub run_id: String,
+  /// Identity of the original restore dispatch, not this finalization RPC.
+  #[serde(default)]
+  pub restore_operation_id: String,
   pub journal_id: String,
   /// Commit the publication when true; restore the original filesystem when
   /// false.
@@ -355,6 +384,12 @@ pub struct FinalizeVykarRestore {
   #[serde(default)]
   pub acknowledge: bool,
 }
+
+#[derive(Serialize, Deserialize, Debug, Clone, Resolve)]
+#[serde(transparent)]
+#[response(FinalizeVykarRestoreResponse)]
+#[error(anyhow::Error)]
+pub struct RunFinalizeVykarRestore(pub FinalizeVykarRestore);
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct FinalizeVykarRestoreResponse {
