@@ -225,6 +225,7 @@ impl Resolve<WriteArgs> for PlanCoreRecovery {
       crate::backup::plan_core_recovery(
         &self.snapshot,
         user.id.clone(),
+        self.repository,
       )
       .await?,
     )

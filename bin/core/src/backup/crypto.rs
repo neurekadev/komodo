@@ -1,8 +1,3 @@
-use std::{
-  fs::OpenOptions, io::Write, os::unix::fs::OpenOptionsExt,
-  path::Path, sync::OnceLock,
-};
-
 use anyhow::{Context, anyhow};
 use chacha20poly1305::{
   XChaCha20Poly1305, XNonce,
@@ -13,9 +8,6 @@ use hmac::{Hmac, KeyInit as HmacKeyInit, Mac};
 use rand::RngExt as _;
 use sha2::Sha256;
 
-const BACKUP_KEY_PATH: &str = "/core-secrets/backup.key";
-const LEGACY_SHARED_BACKUP_KEY_PATH: &str = "/data/keys/backup.key";
-const LEGACY_CONFIG_BACKUP_KEY_PATH: &str = "/config/keys/backup.key";
 const AAD: &[u8] = b"komodo-backup-settings/v1";
 const SOURCE_AUTH_PREFIX: &str = "komodo-auth/v1";
 const SOURCE_AUTH_CONTEXT: &[u8] = b"komodo-backup-source/v1";
@@ -25,116 +17,15 @@ const CORE_SOURCE_AUTH_CONTEXT: &[u8] =
 
 type HmacSha256 = Hmac<Sha256>;
 
-fn backup_key() -> anyhow::Result<&'static [u8; 32]> {
-  static KEY: OnceLock<[u8; 32]> = OnceLock::new();
-  if let Some(key) = KEY.get() {
-    return Ok(key);
-  }
-  let key = load_or_create_key(
-    Path::new(BACKUP_KEY_PATH),
-    &[
-      Path::new(LEGACY_SHARED_BACKUP_KEY_PATH),
-      Path::new(LEGACY_CONFIG_BACKUP_KEY_PATH),
-    ],
-  )?;
-  let _ = KEY.set(key);
-  KEY.get().context("Failed to initialize backup sealing key")
-}
-
-fn load_or_create_key(
-  path: &Path,
-  legacy_paths: &[&Path],
-) -> anyhow::Result<[u8; 32]> {
-  if let Some(key) = read_key(path)? {
-    return Ok(key);
-  }
-  for legacy_path in legacy_paths {
-    // Presence is enough to refuse initialization, including dangling symlinks.
-    // Never read or adopt key material from a worker-writable location.
-    match std::fs::symlink_metadata(legacy_path) {
-      Ok(_) => {
-        return Err(anyhow!(
-          "Refusing untrusted legacy backup key at {}; restore a separately retained Core-only key to {} or follow the backup key rotation procedure",
-          legacy_path.display(),
-          path.display()
-        ));
-      }
-      Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-      Err(error) => {
-        return Err(error).with_context(|| {
-          format!(
-            "Failed to inspect legacy backup key location {}",
-            legacy_path.display()
-          )
-        });
-      }
-    }
-  }
-  let mut key = [0_u8; 32];
-  rand::rng().fill(&mut key);
-  persist_key(path, key)
-}
-
-fn read_key(path: &Path) -> anyhow::Result<Option<[u8; 32]>> {
-  let value = match std::fs::read_to_string(path) {
-    Ok(value) => value,
-    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-      return Ok(None);
-    }
-    Err(error) => return Err(error.into()),
-  };
-  let bytes = hex::decode(value.trim())
-    .context("Backup sealing key is not valid hex")?;
-  bytes.try_into().map(Some).map_err(|_| {
-    anyhow!("Backup sealing key must contain exactly 32 bytes")
-  })
-}
-
-fn persist_key(
-  path: &Path,
-  key: [u8; 32],
-) -> anyhow::Result<[u8; 32]> {
-  let parent =
-    path.parent().context("Backup key path has no parent")?;
-  std::fs::create_dir_all(parent).with_context(|| {
-    format!(
-      "Failed to create backup key directory {}",
-      parent.display()
-    )
-  })?;
-  let file = OpenOptions::new()
-    .create_new(true)
-    .write(true)
-    .mode(0o600)
-    .open(path);
-  let mut file = match file {
-    Ok(file) => file,
-    Err(error)
-      if error.kind() == std::io::ErrorKind::AlreadyExists =>
-    {
-      return read_key(path)?
-        .context("Backup key disappeared after concurrent creation");
-    }
-    Err(error) => {
-      return Err(error).with_context(|| {
-        format!(
-          "Failed to create persisted backup key at {}",
-          path.display()
-        )
-      });
-    }
-  };
-  file.write_all(hex::encode(key).as_bytes())?;
-  file.sync_all()?;
-  std::fs::File::open(parent)?.sync_all()?;
-  Ok(key)
+pub fn backup_key() -> anyhow::Result<&'static [u8; 32]> {
+  Ok(&super::recovery_state::current()?.identity.key)
 }
 
 pub fn seal(plaintext: &[u8]) -> anyhow::Result<String> {
   seal_with_key(plaintext, backup_key()?)
 }
 
-fn seal_with_key(
+pub(super) fn seal_with_key(
   plaintext: &[u8],
   key: &[u8; 32],
 ) -> anyhow::Result<String> {
@@ -259,7 +150,7 @@ pub fn authorize_core_source_label(
   )
 }
 
-fn authorize_core_source_label_with_key(
+pub(super) fn authorize_core_source_label_with_key(
   source: &str,
   hostname: &str,
   name: &str,
@@ -297,7 +188,7 @@ pub fn authenticate_core_source_label(
   )
 }
 
-fn authenticate_core_source_label_with_key(
+pub(super) fn authenticate_core_source_label_with_key(
   label: &str,
   hostname: &str,
   name: &str,
@@ -441,55 +332,6 @@ mod tests {
     assert!(
       open_with_key(&BASE64URL_NOPAD.encode(&bytes), &key).is_err()
     );
-  }
-
-  #[test]
-  fn legacy_key_is_rejected_without_import_or_deletion() {
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("data/backup.key");
-    let legacy_path = directory.path().join("config/backup.key");
-    std::fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
-    let expected = [19_u8; 32];
-    std::fs::write(&legacy_path, hex::encode(expected)).unwrap();
-
-    assert!(load_or_create_key(&path, &[&legacy_path]).is_err());
-    assert!(!path.exists());
-    assert_eq!(read_key(&legacy_path).unwrap(), Some(expected));
-  }
-
-  #[test]
-  fn core_only_key_is_not_replaced_by_a_shared_legacy_copy() {
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("core-only.key");
-    let legacy_path = directory.path().join("shared.key");
-    let expected = [23_u8; 32];
-    std::fs::write(&path, hex::encode(expected)).unwrap();
-    std::fs::write(&legacy_path, hex::encode([31_u8; 32])).unwrap();
-
-    let actual = load_or_create_key(&path, &[&legacy_path]).unwrap();
-
-    assert_eq!(actual, expected);
-    assert_eq!(read_key(&legacy_path).unwrap(), Some([31_u8; 32]));
-  }
-
-  #[test]
-  fn dangling_legacy_symlink_cannot_trigger_fresh_key_creation() {
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("core-only.key");
-    let legacy = directory.path().join("shared.key");
-    std::os::unix::fs::symlink("missing", &legacy).unwrap();
-    assert!(load_or_create_key(&path, &[&legacy]).is_err());
-    assert!(!path.exists());
-  }
-
-  #[test]
-  fn fresh_key_is_persisted_and_reused_without_legacy_material() {
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("core-only/backup.key");
-    let legacy = directory.path().join("missing.key");
-    let key = load_or_create_key(&path, &[&legacy]).unwrap();
-    assert_eq!(read_key(&path).unwrap(), Some(key));
-    assert_eq!(load_or_create_key(&path, &[&legacy]).unwrap(), key);
   }
 
   #[test]

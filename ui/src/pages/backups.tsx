@@ -1,6 +1,6 @@
 import { BrowseSnapshotButton, RestoreSnapshotButton } from "@/components/backups/resource";
 import { usePreviewRequest } from "@/components/backups/use-preview-request";
-import { useInvalidate, useRead, useSetTitle, useUser, useWrite } from "@/lib/hooks";
+import { komodo_client, useInvalidate, useRead, useSetTitle, useUser, useWrite } from "@/lib/hooks";
 import { ICONS } from "@/lib/icons";
 import {
   Accordion,
@@ -44,7 +44,7 @@ const backendDefaults = (
           secret_access_key: {},
           worker_access_key_id: {},
           worker_secret_access_key: {},
-          soft_delete: true,
+          soft_delete: false,
         },
       };
     case "Sftp":
@@ -674,16 +674,32 @@ function BackupSettingsForm({
 }
 
 function CoreRecoverySection() {
+  const [repository, setRepository] = useState<Types.BackupRepository>({
+    name: "Recovery source", backend: backendDefaults("CoreLocal"), passphrase: {},
+  });
   const [snapshot, setSnapshot] = useState<string>();
   const [snapshotPage, setSnapshotPage] = useState(1);
   const { preview: plan, begin, invalidate } = usePreviewRequest<Types.CoreRecoveryPlan>(
-    JSON.stringify({ snapshot, snapshotPage }),
+    JSON.stringify({ snapshot, snapshotPage, repository }),
   );
-  const snapshotResponse = useRead("ListBackupSnapshots", {
-    target: { type: "Core" },
-    page: snapshotPage - 1,
-    limit: 100,
-  }).data;
+  const { preview: snapshotResponse, begin: beginInventory } = usePreviewRequest<Types.BackupSnapshotList>(
+    JSON.stringify({ repository, snapshotPage }),
+  );
+  const [loadingSnapshots, setLoadingSnapshots] = useState(false);
+  const loadSnapshots = async (page = snapshotPage) => {
+    setSnapshot(undefined);
+    const accept = beginInventory();
+    setLoadingSnapshots(true);
+    try {
+      accept(await komodo_client().read("ListCoreRecoverySnapshots", {
+        repository, page: page - 1, limit: 100,
+      }));
+    } catch {
+      notifications.show({ color: "red", message: "Could not open the recovery repository. Check its address, access credentials, and passphrase." });
+    } finally {
+      setLoadingSnapshots(false);
+    }
+  };
   const snapshots = snapshotResponse?.snapshots ?? [];
   const snapshotPages = Math.max(
     1,
@@ -701,7 +717,7 @@ function CoreRecoverySection() {
     if (!snapshot) return;
     const accept = begin();
     try {
-      accept(await planRecovery({ snapshot }));
+      accept(await planRecovery({ snapshot, repository }));
     } catch {
       // useWrite already reports the failed validation request.
     }
@@ -714,6 +730,14 @@ function CoreRecoverySection() {
           verifies its schema, version, and administrator access before it can
           become active; the current database is retained for rollback.
         </Text>
+        <RepositoryEditor label="Existing recovery repository" repository={repository} recoveryOnly onChange={(value) => {
+          setSnapshot(undefined);
+          setSnapshotPage(1);
+          setRepository(value);
+        }} />
+        <Button variant="light" loading={loadingSnapshots} onClick={() => loadSnapshots()}>
+          Load recovery snapshots
+        </Button>
         <Group align="end">
           <Select
             label="Complete Core snapshot"
@@ -730,7 +754,7 @@ function CoreRecoverySection() {
           <Button
             color="orange"
             loading={planning}
-            disabled={!snapshot}
+            disabled={!snapshot || !snapshotResponse}
             onClick={reviewRecovery}
           >
             Restore and validate
@@ -995,8 +1019,10 @@ function RepositoryEditor({
   label,
   repository,
   onChange,
+  recoveryOnly = false,
 }: {
   label: string;
+  recoveryOnly?: boolean;
   repository: Types.BackupRepository;
   onChange: (repository: Types.BackupRepository) => void;
 }) {
@@ -1024,24 +1050,25 @@ function RepositoryEditor({
       {backend.type === "CoreLocal" && (
         <TextInput
           label="Persistent Core path"
-          description="Restart Core after adding or changing a Core-local repository. Backups fail safely until its authenticated endpoint is active."
+          description={recoveryOnly ? "Path to the existing repository mounted into Core." : "Restart Core after adding or changing a Core-local repository."}
           value={backend.params.path}
           onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, path: event.currentTarget.value } })}
         />
       )}
-      {backend.type !== "CoreLocal" && (
+      {backend.type !== "CoreLocal" && !recoveryOnly && (
         <Alert color="blue">
-          Core maintenance credentials stay on Core. Configure distinct worker credentials whose backend policy permits required backup reads and writes but denies deletion and maintenance.
+          Use distinct worker credentials that permit backup reads and writes but deny deletion and maintenance. Trusted workers can also decrypt Core recovery secrets stored in snapshots.
         </Alert>
       )}
       {backend.type === "S3" && (
         <SimpleGrid cols={{ base: 1, md: 2 }}>
           <TextInput label="S3 URL" placeholder="s3://bucket/prefix" value={backend.params.url} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, url: event.currentTarget.value } })} />
+          {<Checkbox label="S3 soft delete" description="Uses tombstones; bucket policies may retain older data and increase storage." checked={backend.params.soft_delete ?? false} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, soft_delete: event.currentTarget.checked } })} />}
           <TextInput label="Region" value={backend.params.region} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, region: event.currentTarget.value } })} />
           <PasswordInput label="Access key ID" description={backend.params.access_key_id.configured ? "Configured" : undefined} value={backend.params.access_key_id.value ?? ""} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, access_key_id: { ...backend.params.access_key_id, value: event.currentTarget.value } } })} />
           <PasswordInput label="Secret access key" description={backend.params.secret_access_key.configured ? "Configured" : undefined} value={backend.params.secret_access_key.value ?? ""} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, secret_access_key: { ...backend.params.secret_access_key, value: event.currentTarget.value } } })} />
-          <PasswordInput label="Worker access key ID" description={backend.params.worker_access_key_id?.configured ? "Configured" : "Required; must be maintenance-denied"} value={backend.params.worker_access_key_id?.value ?? ""} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, worker_access_key_id: { ...backend.params.worker_access_key_id, value: event.currentTarget.value } } })} />
-          <PasswordInput label="Worker secret access key" description={backend.params.worker_secret_access_key?.configured ? "Configured" : "Required; must be maintenance-denied"} value={backend.params.worker_secret_access_key?.value ?? ""} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, worker_secret_access_key: { ...backend.params.worker_secret_access_key, value: event.currentTarget.value } } })} />
+          {!recoveryOnly && (<PasswordInput label="Worker access key ID" description={backend.params.worker_access_key_id?.configured ? "Configured" : "Required; must be maintenance-denied"} value={backend.params.worker_access_key_id?.value ?? ""} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, worker_access_key_id: { ...backend.params.worker_access_key_id, value: event.currentTarget.value } } })} />)}
+          {!recoveryOnly && (<PasswordInput label="Worker secret access key" description={backend.params.worker_secret_access_key?.configured ? "Configured" : "Required; must be maintenance-denied"} value={backend.params.worker_secret_access_key?.value ?? ""} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, worker_secret_access_key: { ...backend.params.worker_secret_access_key, value: event.currentTarget.value } } })} />)}
         </SimpleGrid>
       )}
       {backend.type === "Sftp" && (
@@ -1049,7 +1076,7 @@ function RepositoryEditor({
           <TextInput label="SFTP URL" placeholder="sftp://user@host/path" value={backend.params.url} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, url: event.currentTarget.value } })} />
           <NumberInput label="Timeout (seconds)" min={1} value={backend.params.timeout_seconds} onChange={(value) => updateBackend({ ...backend, params: { ...backend.params, timeout_seconds: Number(value) } })} />
           <Textarea autosize minRows={5} autoComplete="off" spellCheck={false} label="Private key" description={backend.params.private_key.configured ? "Configured; paste only to replace it" : "Paste the complete multiline OpenSSH private key"} value={backend.params.private_key.value ?? ""} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, private_key: { ...backend.params.private_key, value: event.currentTarget.value } } })} />
-          <Textarea autosize minRows={5} autoComplete="off" spellCheck={false} label="Worker private key" description={backend.params.worker_private_key?.configured ? "Configured; paste only to replace it" : "Paste the complete multiline key for a maintenance-denied account"} value={backend.params.worker_private_key?.value ?? ""} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, worker_private_key: { ...backend.params.worker_private_key, value: event.currentTarget.value } } })} />
+          {!recoveryOnly && (<Textarea autosize minRows={5} autoComplete="off" spellCheck={false} label="Worker private key" description={backend.params.worker_private_key?.configured ? "Configured; paste only to replace it" : "Paste the complete multiline key for a maintenance-denied account"} value={backend.params.worker_private_key?.value ?? ""} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, worker_private_key: { ...backend.params.worker_private_key, value: event.currentTarget.value } } })} />)}
           <TextInput label="Known-hosts entry" value={backend.params.known_hosts} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, known_hosts: event.currentTarget.value } })} />
         </SimpleGrid>
       )}
@@ -1057,7 +1084,7 @@ function RepositoryEditor({
         <SimpleGrid cols={{ base: 1, md: 2 }}>
           <TextInput label="REST repository URL" value={backend.params.url} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, url: event.currentTarget.value } })} />
           <PasswordInput label="Access token" description={backend.params.access_token.configured ? "Configured" : undefined} value={backend.params.access_token.value ?? ""} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, access_token: { ...backend.params.access_token, value: event.currentTarget.value } } })} />
-          <PasswordInput label="Worker access token" description={backend.params.worker_access_token?.configured ? "Configured" : "Required; must deny deletion and maintenance"} value={backend.params.worker_access_token?.value ?? ""} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, worker_access_token: { ...backend.params.worker_access_token, value: event.currentTarget.value } } })} />
+          {!recoveryOnly && (<PasswordInput label="Worker access token" description={backend.params.worker_access_token?.configured ? "Configured" : "Required; must deny deletion and maintenance"} value={backend.params.worker_access_token?.value ?? ""} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, worker_access_token: { ...backend.params.worker_access_token, value: event.currentTarget.value } } })} />)}
           <Checkbox label="Allow insecure HTTP" checked={backend.params.allow_insecure_http ?? false} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, allow_insecure_http: event.currentTarget.checked } })} />
         </SimpleGrid>
       )}

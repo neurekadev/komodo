@@ -8,7 +8,7 @@ Additional configuration options for Komodo Core and Periphery, including custom
 
 ## Change Configuration Safely
 
-1. Read the current values from the checked-in [`core.config.toml`](https://github.com/neurekadev/komodo/blob/main/config/core.config.toml), [`periphery.config.toml`](https://github.com/neurekadev/komodo/blob/main/config/periphery.config.toml), [`compose.env`](https://github.com/neurekadev/komodo/blob/main/compose/compose.env), and [`periphery.env`](https://github.com/neurekadev/komodo/blob/main/compose/periphery.env) examples.
+1. Start from the [installation examples](/quick-start/install-komodo) and the current [`core.config.toml`](https://github.com/neurekadev/komodo/blob/main/config/core.config.toml) or [`periphery.config.toml`](https://github.com/neurekadev/komodo/blob/main/config/periphery.config.toml).
 2. Back up the active Compose, environment, and mounted configuration files.
 3. Change one concern at a time and keep secrets in protected files or secret-specific environment-file variables.
 4. Run `docker compose -p komodo config`, recreate the affected service with `docker compose -p komodo up -d <service>`, and inspect its logs. A restart alone does not reload `.env`.
@@ -23,9 +23,7 @@ the first Server. The main Compose installation instead uses an outbound local
 Periphery connection. After startup, confirm the Server reports **OK**.
 
 Set `KOMODO_INTERNET_INTERFACE` only when containerized Core must route outbound
-traffic through a specific interface. Core accepts operational interfaces that
-report either `UP` or `UNKNOWN`, derives the gateway from the interface CIDR,
-and replaces the default route atomically. The container needs the `NET_ADMIN`
+traffic through a specific interface. The container needs the `NET_ADMIN`
 capability for this setting. Leave the value empty to keep the container's
 existing default route.
 
@@ -50,33 +48,7 @@ just mount any required root certificates inside `/usr/local/share/ca-certificat
 
 ## OIDC / OAuth2
 
-To enable OAuth2 login, you must create a client on the respective OAuth provider,
-for example [GitHub](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/creating-an-oauth-app)
-or [Google](https://developers.google.com/identity/protocols/oauth2).
-
-Komodo also supports self hosted OAuth2 providers like [Authentik](https://docs.goauthentik.io/docs/providers/oauth2/), [Gitea](https://docs.gitea.com/development/oauth2-provider) and [Keycloak](https://www.keycloak.org).
-
-- Komodo uses the `web application` login flow.
-- The redirect uri is:
-	- `<KOMODO_HOST>/auth/github/callback` for GitHub.
-	- `<KOMODO_HOST>/auth/google/callback` for Google.
-	- `<KOMODO_HOST>/auth/oidc/callback` for OIDC.
-
-### Authentik
-
-Check out the [Authentik integration docs](https://integrations.goauthentik.io/infrastructure/komodo/).
-
-### Keycloak
-- Create an [OIDC client](https://www.keycloak.org/docs/latest/server_admin/index.html#proc-creating-oidc-client_server_administration_guide) in Keycloak.
-  - Note down the `Client ID` that you enter (e.g.: "komodo"), you will need it for Komodo configuration
-  - `Valid Redirect URIs`: use `<KOMODO_HOST>/auth/oidc/callback` and substitute `<KOMODO_HOST>` with your Komodo url.
-  - Turn `Client authentication` to `On`.
-  - After you finished creating the client, open it and go to `Credentials` tab and copy the `Client Secret`
-- Edit your environment variables for komodo core docker container and set the following:
-  - `KOMODO_OIDC_ENABLED=true`
-  - `KOMODO_OIDC_PROVIDER=https://<your Keycloak url>/realms/master` or replace `master` with another realm if you don't want to use the default one
-  - `KOMODO_OIDC_CLIENT_ID=...` what you specified as `Client ID`
-  - `KOMODO_OIDC_CLIENT_SECRET=...` that you copied from Keycloak
+Follow [Configure User Sign-In](/administration/authentication-and-providers#configure-user-sign-in) for provider setup and callback addresses.
 
 ## Limit Periphery IPs
 

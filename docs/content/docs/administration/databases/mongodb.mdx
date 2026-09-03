@@ -72,4 +72,4 @@ docker compose -p komodo ps komodo-mongo
 
 Check again after at least a minute and confirm Core can reconnect. This override is intentionally absent from the official template. It changes MongoDB's allocator behavior and can reduce performance; use it only for the matching crash signature, then remove it after installing a fixed kernel and compatible MongoDB release.
 
-[View the MongoDB Compose template](https://github.com/neurekadev/komodo/blob/main/compose/mongo.compose.yaml) and [environment example](https://github.com/neurekadev/komodo/blob/main/compose/compose.env).
+The complete deployment files are in [Install Komodo](/quick-start/install-komodo).

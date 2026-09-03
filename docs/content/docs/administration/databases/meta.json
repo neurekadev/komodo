@@ -1,4 +1,4 @@
 {
   "title": "Databases",
-  "pages": ["index", "mongodb", "ferretdb"]
+  "pages": ["mongodb", "ferretdb"]
 }

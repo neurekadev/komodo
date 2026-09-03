@@ -20,9 +20,11 @@ pub enum PeripheryFileManagerTarget {
   Stack {
     stack: Box<Stack>,
     repo: Option<Box<Repo>>,
+    protected_paths: Vec<super::backup::ProtectedRepositoryPath>,
   },
   Volume {
     volume: String,
+    protected_paths: Vec<super::backup::ProtectedRepositoryPath>,
   },
 }
 

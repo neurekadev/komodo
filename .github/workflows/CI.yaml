@@ -92,19 +92,18 @@ jobs:
           docker compose -f dev.compose.yaml config --quiet
           docker compose -f dev.compose.yaml -f expose.compose.yaml config --quiet
           docker compose -f .devcontainer/dev.compose.yaml config --quiet
-          for variant in ferretdb mongo periphery; do
-            directory="$RUNNER_TEMP/compose-$variant"
-            mkdir -p "$directory"
-            cp "compose/$variant.compose.yaml" "$directory/compose.yaml"
-            if [[ "$variant" == "periphery" ]]; then
-              cp compose/periphery.env "$directory/.env"
-            elif [[ "$variant" == "ferretdb" ]]; then
-              cp compose/ferretdb.env "$directory/.env"
-            else
-              cp compose/compose.env "$directory/.env"
-            fi
-            docker compose -p komodo --project-directory "$directory" config --quiet
-          done
+          node docs/scripts/validate-compose-examples.mjs
+
+      - name: Verify Documentation Container
+        run: |
+          set -euo pipefail
+          docker build -t komodo-docs-check docs
+          docker run -d --name komodo-docs-check -p 127.0.0.1:18080:80 komodo-docs-check
+          trap 'docker rm -f komodo-docs-check' EXIT
+          curl --fail --retry 10 --retry-connrefused --retry-delay 1 http://127.0.0.1:18080/ -o "$RUNNER_TEMP/docs-home.html"
+          curl --fail http://127.0.0.1:18080/features/backups -o "$RUNNER_TEMP/docs-backups.html"
+          curl --fail http://127.0.0.1:18080/quick-start -o "$RUNNER_TEMP/docs-quick-start.html"
+          curl --fail http://127.0.0.1:18080/logo.png -o "$RUNNER_TEMP/docs-logo.png"
 
   verify-platforms:
     name: Build ${{ matrix.name }}

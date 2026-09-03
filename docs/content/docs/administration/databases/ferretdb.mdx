@@ -1,39 +1,121 @@
 ---
 title: FerretDB
-description: Install Komodo with the PostgreSQL-backed FerretDB database option.
+description: Install Komodo using PostgreSQL-backed FerretDB.
 ---
 
 
-[**FerretDB**](https://www.ferretdb.com) is a MongoDB-compatible database backed by [Postgres + DocumentDB extension](https://github.com/microsoft/documentdb).
-Use it when MongoDB cannot run on the host or PostgreSQL is an operational requirement.
+Choose FerretDB when you want PostgreSQL-backed storage or MongoDB cannot run on your host. You need Docker Engine with Compose and an HTTPS reverse proxy that can reach port `9120`.
 
-The template pins FerretDB to major `2` and PostgreSQL/DocumentDB to major `17`. Use fresh volumes for a new fork installation; upstream Komodo migrations are not supported. Do not attach data from a different PostgreSQL major or FerretDB v1.
+## Install
 
-1. Create the installation directory and download the FerretDB template as `compose.yaml` and its matching environment file as `.env`:
+1. Create an installation directory with `mkdir -p komodo && cd komodo`.
+2. Save the examples below as `compose.yaml` and `.env`.
+3. Replace every `REPLACE_WITH_*` value. Use independently generated passwords and secrets (`openssl rand -hex 32`), keep the `${...}` references, and run `chmod 600 .env`. The database password must be URL-safe.
+4. Run `docker compose -p komodo config --quiet`, then `docker compose -p komodo up -d`.
+5. Point your HTTPS proxy at port `9120`, open `KOMODO_HOST`, and sign in with your administrator credentials.
+6. Open **Servers → Local** and confirm **OK**.
 
-```bash
-mkdir -p komodo
-cd komodo
-curl -fsSL -o compose.yaml https://raw.githubusercontent.com/neurekadev/komodo/main/compose/ferretdb.compose.yaml
-curl -fsSL -o .env https://raw.githubusercontent.com/neurekadev/komodo/main/compose/ferretdb.env
+Periphery controls the Docker host, including its named volumes. Review [permissions](/administration/users-groups-permissions) before sharing access.
+
+## compose.yaml
+
+```yaml title="compose.yaml"
+services:
+  komodo:
+    image: ghcr.io/neurekadev/komodo-core:${COMPOSE_KOMODO_IMAGE_TAG:-3}
+    container_name: komodo
+    depends_on: [komodo-ferretdb]
+    env_file: [.env]
+    networks:
+      komodo:
+        aliases: [core, komodo-core]
+    ports:
+      - "9120:9120"
+    volumes:
+      - data:/data
+      - backups:/backups
+    restart: unless-stopped
+    init: true
+    command: [core-compose]
+
+  komodo-postgres:
+    image: ghcr.io/ferretdb/postgres-documentdb:17
+    container_name: komodo-postgres
+    env_file: [.env]
+    networks:
+      komodo:
+        aliases: [postgres]
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    restart: unless-stopped
+    labels:
+      komodo.skip: "true"
+
+  komodo-ferretdb:
+    image: ghcr.io/ferretdb/ferretdb:2
+    container_name: komodo-ferretdb
+    depends_on: [komodo-postgres]
+    env_file: [.env]
+    networks:
+      komodo:
+        aliases: [ferretdb, komodo-database]
+    volumes:
+      - ferretdb-state:/state
+    restart: unless-stopped
+    labels:
+      komodo.skip: "true"
+
+  komodo-periphery:
+    image: ghcr.io/neurekadev/komodo-periphery:${COMPOSE_KOMODO_IMAGE_TAG:-3}
+    container_name: komodo-periphery
+    depends_on: [komodo]
+    env_file: [.env]
+    networks:
+      komodo:
+        aliases: [periphery]
+    volumes:
+      - data:/data
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${PERIPHERY_DOCKER_VOLUME_ROOT:-/var/lib/docker/volumes}:${PERIPHERY_DOCKER_VOLUME_ROOT:-/var/lib/docker/volumes}
+      - /proc:/proc
+    restart: unless-stopped
+    init: true
+    command: [periphery-compose]
+
+networks:
+  komodo:
+    name: komodo
+
+volumes:
+  postgres-data:
+  ferretdb-state:
+  data:
+  backups:
+    labels:
+      komodo.file-manager.excluded: "true"
 ```
 
-2. Edit `.env`, replacing every `REPLACE_WITH_*` value. Keep the `${...}` credential references unchanged. Use a URL-safe database password such as `openssl rand -hex 32`, because it is included in a connection URL. Protect `.env` with `chmod 600 .env`.
-3. Review the resolved configuration and deploy:
+## .env
 
-```bash
-docker compose -p komodo config
-docker compose -p komodo up -d
+```dotenv title=".env"
+KOMODO_HOST=https://REPLACE_WITH_HOST
+
+
+KOMODO_DATABASE_USERNAME=komodo
+KOMODO_DATABASE_PASSWORD=REPLACE_WITH_PASSWORD
+POSTGRES_USER=${KOMODO_DATABASE_USERNAME}
+POSTGRES_PASSWORD=${KOMODO_DATABASE_PASSWORD}
+FERRETDB_POSTGRESQL_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@komodo-postgres:5432/postgres
+
+
+KOMODO_INIT_ADMIN_USERNAME=admin
+KOMODO_INIT_ADMIN_PASSWORD=REPLACE_WITH_PASSWORD
+KOMODO_JWT_SECRET=REPLACE_WITH_SECRET
+KOMODO_WEBHOOK_SECRET=REPLACE_WITH_SECRET
 ```
 
-Docker Compose discovers `compose.yaml` and `.env` automatically. Keep `-p komodo` in subsequent commands to preserve the `komodo_*` volume names. Configuration output includes secrets; do not share it publicly.
+## Troubleshooting
 
-The expected result is running `komodo-postgres`, `komodo-ferretdb`, `komodo`, and `komodo-periphery` containers and a working sign-in page. Open **Servers**, select **Local**, and confirm **OK**. If startup fails, inspect PostgreSQL and FerretDB logs first, verify their credentials match, and preserve both database volumes while troubleshooting.
+Run `docker compose -p komodo logs --tail=200 komodo-postgres komodo-ferretdb komodo`. Check that PostgreSQL and FerretDB use matching credentials. Keep `-p komodo` and the named volumes when recreating containers.
 
-[View the current FerretDB Compose template](https://github.com/neurekadev/komodo/blob/main/compose/ferretdb.compose.yaml) and [environment example](https://github.com/neurekadev/komodo/blob/main/compose/ferretdb.env).
-
-<Callout title="Periphery host access" type="warn">
-
-The template intentionally mounts Docker's named-volume root read/write into Periphery for host-visible workspaces and Docker-volume File Manager access. This makes Periphery Docker-host trusted. File Manager refuses to open `komodo_data` because it contains Periphery's private journal and credentials, but Server-level `FileManager` permission covers every other eligible named volume. Review the [File Manager trust boundary and permission scope](/features/file-manager#containerized-periphery) before deploying.
-
-</Callout>
+Continue with [Deploy the First Stack](/quick-start/deploy-first-stack).

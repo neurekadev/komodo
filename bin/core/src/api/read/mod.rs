@@ -90,6 +90,7 @@ enum ReadRequest {
   GetBackupSettings(GetBackupSettings),
   GetBackupStatus(GetBackupStatus),
   ListBackupSnapshots(ListBackupSnapshots),
+  ListCoreRecoverySnapshots(ListCoreRecoverySnapshots),
   ListBackupSnapshotDirectory(ListBackupSnapshotDirectory),
   ListSecrets(ListSecrets),
   ListGitProvidersFromConfig(ListGitProvidersFromConfig),

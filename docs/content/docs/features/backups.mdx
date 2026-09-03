@@ -1,0 +1,33 @@
+---
+title: Backups
+description: Run and monitor encrypted Core, Stack, and Docker volume backups.
+---
+
+
+Protect Komodo and your workloads with scheduled or manual encrypted snapshots. An administrator must [set up repositories and trusted workers](/administration/backups) first.
+
+## Run a backup
+
+1. Open the **Backups** tab on a Stack or Volume you can manage.
+2. Start a backup and follow its progress. You need **Read**, **Execute**, and **Backups** permission on that Stack, or on the Server for a Volume.
+3. Confirm the snapshot is complete before relying on it for recovery. A partial run needs attention; it does not replace a complete recovery point.
+
+Administrators can use the main **Backups** page to run **Back up fleet now** or **Back up Core now**, change the schedule, and inspect fleet-wide status. The default schedule is daily at 01:00 UTC, retaining 14 complete snapshots separately for each protected target.
+
+## Choose what to protect
+
+| Category | Included |
+| --- | --- |
+| Core | Komodo's restorable database state, recovery identity, and backup settings. Keep deployment configuration separately. |
+| Stack | Its Compose run directory and selected local bind directories. Back up Docker named volumes separately. Swarm Stacks are unsupported. |
+| Volume | Eligible local Docker named-volume contents, including volumes outside Komodo-managed Stacks. |
+
+Use **What to protect** to include or exclude Stacks and Volumes. Anonymous volumes and cross-filesystem mount contents are off by default. Enable them only when you intend to include that storage. Bind include/exclude patterns select entire source directories; excluding a child pattern does not remove files inside a separately selected parent directory.
+
+Keep container stopping enabled for consistent application files. It stops all running containers sharing affected storage and restarts them afterward. Core, its database, backup repositories, and containers marked `komodo.skip` are protected from workload backup operations.
+
+## Check the result
+
+Use **Fleet status** and recent runs to find failed nodes or partial snapshots. Fix storage access, unavailable workers, or container errors shown in the run, then retry. If a run reports recovery required, repair the reported problem before restarting Periphery; keep its recovery journals intact.
+
+Continue with [Restore a Backup](/features/restore-backups).

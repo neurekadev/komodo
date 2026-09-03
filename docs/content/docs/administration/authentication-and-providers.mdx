@@ -15,7 +15,7 @@ description: Configure login providers, Git providers, and container registries.
 1. Keep local authentication enabled until the external provider has been tested.
 2. Create the provider application with the appropriate callback: `/auth/github/callback`, `/auth/google/callback`, or `/auth/oidc/callback` beneath the public Komodo URL.
 3. Add the matching environment variables documented in [`core.config.toml`](https://github.com/neurekadev/komodo/blob/main/config/core.config.toml) to `.env`, including the enabled flag, client ID, and client secret.
-4. Restart Core without recreating its data volumes.
+4. Run `docker compose -p komodo up -d komodo` to reload the environment. Keep the data volumes.
 5. Use a private browser window to sign in with the new provider, then enable and permission the new account from **Settings → Users**.
 
 The expected result is a successful callback to the original Komodo hostname and an account that an administrator can review before granting access. If sign-in fails, compare the exact scheme, host, and callback path, inspect Core logs, and confirm the secret was loaded from the intended environment or file variable.

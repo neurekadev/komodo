@@ -10997,6 +10997,7 @@ export interface PlanBackupRestore {
 /** Admin-only. Restore and validate a Core snapshot without switching databases. */
 export interface PlanCoreRecovery {
 	snapshot: string;
+	repository?: BackupRepository;
 }
 
 export type FileManagerOperation =
@@ -12783,6 +12784,7 @@ export type ReadRequest =
 	| { type: "GetBackupSettings", params: GetBackupSettings }
 	| { type: "GetBackupStatus", params: GetBackupStatus }
 	| { type: "ListBackupSnapshots", params: ListBackupSnapshots }
+	| { type: "ListCoreRecoverySnapshots", params: ListCoreRecoverySnapshots }
 	| { type: "ListBackupSnapshotDirectory", params: ListBackupSnapshotDirectory }
 	| { type: "ListSecrets", params: ListSecrets }
 	| { type: "ListGitProvidersFromConfig", params: ListGitProvidersFromConfig }
@@ -13139,3 +13141,10 @@ export type WsLoginMessage =
 	key: string;
 	secret: string;
 }};
+
+/** Admin-only recovery discovery; credentials are never returned. */
+export interface ListCoreRecoverySnapshots {
+	repository?: BackupRepository;
+	page?: U64;
+	limit?: U64;
+}

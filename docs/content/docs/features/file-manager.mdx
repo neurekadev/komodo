@@ -21,7 +21,7 @@ Komodo's File Manager provides browser-based access to files belonging to a Stac
 
 The expected result is access only within the selected logical root. If the tab is missing or unavailable, check both permission layers, the target rules below, and the containerized Periphery volume-root mount.
 
-File Manager clients select a logical Stack or Volume target. Core and Periphery resolve that target to a trusted filesystem root; clients cannot submit arbitrary absolute host paths. Paths within the target are root-relative, and directory traversal through parent components or symlinked directories is rejected.
+
 
 ## Supported Targets
 
@@ -47,9 +47,9 @@ A Stack accepts `FileManager` directly on the Stack or inherits it from its atta
 
 A Server-level `FileManager` grant covers **every eligible Docker named volume on that Server**. Permissions cannot currently be narrowed to an individual volume. Volumes can contain application configuration, credentials, or database files, so grant this permission only to users and groups trusted with all named-volume contents on that host.
 
-Periphery refuses a Volume root whose directory tree equals, contains, or is contained by `${PERIPHERY_ROOT_DIRECTORY}/file-manager-journal`. The check follows filesystem directory identity, so bind mounts, named-volume aliases, and symlink aliases do not bypass it. The official `${COMPOSE_PROJECT_NAME}_data` volume—normally `komodo_data`—is still listed with other Docker volumes, but its Files tab reports File Manager unavailable because the volume contains Periphery's private journal and credentials.
+The shared `komodo_data` volume is listed, but its Files tab is unavailable because it contains private credentials and recovery state.
 
-File Manager also refuses Stack and Volume roots overlapping Periphery's private `.komodo-vykar` workspace beneath its Stack directory, including manifests, cache, temporary repository credentials, and recovery records. This applies to browsing and downloads as well as writes; choosing a files-on-host Stack root does not bypass it. Roots overlapping a Docker volume labelled `komodo.file-manager.excluded` with any value other than `false` are likewise refused. Official Compose applies this label to Core's `backups` and `core-secrets` volumes. The same directory-identity check covers parent, child, bind-mount, and symlink aliases. Docker metadata must be available to validate volume exclusions; an unavailable daemon does not bypass them. Keep the labels on custom deployments too, and inspect existing volumes because Docker does not update their labels automatically. This restricts the File Manager API, not a host administrator or a compromised worker with Docker-socket authority.
+File Manager also refuses roots containing Core recovery files, Periphery's private workspaces, or volumes labelled `komodo.file-manager.excluded` with any value other than `false`. The deployment examples label the `backups` volume. Keep this label on custom repository volumes. These restrictions apply to File Manager; Periphery and host administrators still have Docker-host access.
 
 </Callout>
 
@@ -65,7 +65,7 @@ Depending on the target and permission level, File Manager supports:
 - Conflict review with an explicit choice to overwrite or skip each collision.
 - Progress reporting and cancellation for long-running operations.
 
-Conflict decisions and **Cancel** remain available when a backup or restore is waiting for your operation. They still check the operation's owner and target. The active worker keeps its backup-protection lease until it actually finishes or cancels; submitting a control request does not allow a backup to overlap unfinished filesystem work.
+If a backup is waiting for your operation, finish conflict review or select **Cancel**.
 
 Create, create-folder, rename, move, copy, and delete operations have per-user, per-target undo and redo history when Safe mode is enabled. Recovery manifests and any retained data expire after 24 hours. Text edits, uploads, and archive operations are not added to the undo history.
 
@@ -77,15 +77,11 @@ Create, create-folder, rename, move, copy, and delete operations have per-user, 
 - With Safe mode disabled, those operations run permanently and do not create an Undo entry. Existing Undo and Redo entries are not removed when you change the setting.
 - <kbd>Shift</kbd> + <kbd>Delete</kbd> always requests a permanent delete, even when Safe mode is enabled. The permanent-operation confirmation is still required.
 
-Permanent means the removed or replaced data is no longer available through File Manager Undo. For large trees, File Manager first makes the requested namespace change, reports the operation complete, and removes internal cleanup data asynchronously.
+Permanent means the removed or replaced data is no longer available through File Manager Undo.
 
-### Large Directory Performance and Recovery Storage
+### Recovery storage
 
-On a single filesystem, deleting, moving, or renaming a directory—including a directory containing very many small files—uses filesystem metadata operations instead of copying or scanning every child. Safe-mode Undo uses the same approach. A copy still has to read and write the data, but File Manager copies each file once and publishes the completed top-level item with a rename.
-
-Periphery keeps small, durable recovery manifests beneath `${PERIPHERY_ROOT_DIRECTORY}/file-manager-journal`. Data needed to undo a delete or replacement is retained beside the target in a private, hidden `.komodo-file-manager` directory. That name is reserved: it is not listed and cannot be opened or changed through File Manager. Recovery entries expire after 24 hours and are cleaned in the background.
-
-Operations that cross filesystem boundaries, merge two existing directories, or require upload, archive, or text transaction handling use the compatibility transaction path. Those cases can still require a recursive scan or snapshot because an atomic rename is not available.
+Safe mode retains recovery data for 24 hours and uses additional space beside the target. Keep Periphery's private recovery directories intact so Undo and interrupted-operation recovery can work.
 
 ### Keyboard Shortcuts
 
@@ -120,8 +116,4 @@ The equivalent environment variable is `PERIPHERY_FILE_MANAGER_MAX_ENTRIES`.
 
 ## Containerized Periphery
 
-Docker reports named-volume mountpoints in the host's path namespace. When Periphery runs in a container, Docker-volume access therefore requires Docker's volume root to be mounted read/write at the **same absolute path** inside the container. The official Compose templates use `PERIPHERY_DOCKER_VOLUME_ROOT` for this mapping and also place Periphery's repository, Stack, and build workspace aliases beneath it.
-
-Changing that bind mount to read-only, or mounting only `komodo_data`, disables writable Docker-volume management and breaks the official templates' host-visible workspace paths. This makes the Periphery container part of the Docker host's trusted computing boundary; it already has equivalent host control through the Docker socket. Protect the Core-to-Periphery connection and apply the Server permission warning above.
-
-See [Add Another Server](/quick-start/add-another-server) for the standalone template and rootless-Docker configuration.
+Periphery needs read/write access to Docker's volume directory at the same absolute host path. Follow [custom Docker paths](/administration/container-deployment#custom-docker-paths) for rootless Docker or a different data directory.

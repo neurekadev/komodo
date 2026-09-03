@@ -46,24 +46,7 @@ volumes = """
 """
 ```
 
-### Config fields
-
-| Field              | Description                                                                                                    | Default          |
-| ------------------ | -------------------------------------------------------------------------------------------------------------- | ---------------- |
-| `server`           | The Server to deploy on.                                                                                       | —                |
-| `image`            | Docker image — either a custom image string or an attached Komodo Build.                                       | —                |
-| `network`          | Docker network to connect to. `host` bypasses the virtual network layer.                                       | `host`           |
-| `restart`          | Restart policy (`no`, `on-failure`, `always`, `unless-stopped`).                                               | `unless-stopped` |
-| `ports`            | Port mappings when not using `host` network (e.g. `27018:27017`).                                              | `[]`             |
-| `volumes`          | Bind mounts in `host_path:container_path` format.                                                              | `""`             |
-| `environment`      | Environment variables in `KEY=value` format. Supports [variable interpolation](/features/variables-and-secrets). | `""`             |
-| `labels`           | Docker labels in `key=value` format.                                                                           | `""`             |
-| `command`          | Override the default image command. Appended after the image in `docker run`.                                  | `""`             |
-| `extra_args`       | Additional flags passed directly to `docker run`.                                                              | `""`             |
-| `send_alerts`      | Send alerts on container state changes.                                                                        | `true`           |
-| `auto_update`      | Automatically redeploy when a newer image digest is available (same tag).                                      | `false`          |
-| `poll_for_updates` | Check for newer images and show an update indicator (without auto-deploying).                                  | `false`          |
-| `links`            | Quick links displayed in the resource header.                                                                  | `[]`             |
+Use a mapped port with a Docker network, or select host networking only when the application needs direct host network access. Keep persistent data in volumes or bind mounts. See [Variables and Secrets](/features/variables-and-secrets) and [Automatic Updates](/features/automatic-updates) for those settings.
 
 ### Image source
 

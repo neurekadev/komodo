@@ -176,6 +176,30 @@ impl Resolve<ReadArgs> for ListBackupSnapshotDirectory {
   }
 }
 
+impl Resolve<ReadArgs>
+  for komodo_client::api::read::ListCoreRecoverySnapshots
+{
+  async fn resolve(
+    self,
+    ReadArgs { user }: &ReadArgs,
+  ) -> mogh_error::Result<BackupSnapshotList> {
+    if !user.admin {
+      return Err(
+        anyhow!("Core recovery is admin only")
+          .status_code(StatusCode::FORBIDDEN),
+      );
+    }
+    Ok(
+      crate::backup::list_core_recovery_snapshots(
+        self.repository,
+        self.page,
+        self.limit,
+      )
+      .await?,
+    )
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;

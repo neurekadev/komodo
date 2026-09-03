@@ -1,13 +1,15 @@
 {
   "title": "Administration",
   "pages": [
-    "index",
     "databases",
     "container-deployment",
     "core-configuration",
+    "aws-builders",
     "authentication-and-providers",
     "users-groups-permissions",
     "backups",
+    "backup-repositories",
+    "recover-core",
     "security-and-trust"
   ]
 }

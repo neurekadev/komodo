@@ -1,12 +1,13 @@
 {
   "title": "Features",
   "pages": [
-    "index",
     "servers-and-monitoring",
     "stacks",
     "containers",
     "automatic-updates",
     "file-manager",
+    "backups",
+    "restore-backups",
     "docker-swarm",
     "builds-and-builders",
     "terminals",

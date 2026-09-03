@@ -1,0 +1,29 @@
+---
+title: Manage Backup Repositories
+description: Verify snapshots, control retention, and switch to a mirror.
+---
+
+
+Use the administrator **Backups** page to maintain your repositories. Save settings before running maintenance.
+
+## Verify and retain snapshots
+
+1. Set **Complete backups to keep** for each category. Retention applies independently to Core, each Stack, and each Server/Volume pair.
+2. Use the repository verification action and inspect its result. A failed verification needs investigation before pruning or relying on recovery.
+3. Check storage usage at your provider. Retention removes old snapshots; compaction reclaims unreferenced repository data.
+
+**S3 soft delete** is disabled by default. When enabled, Vykar writes zero-byte tombstones instead of deleting objects. Bucket versioning and lifecycle rules can retain older object data and increase storage use. Disabling the Komodo option does not disable provider versioning or remove versions already retained there.
+
+## Use a mirror
+
+Configure a mirror on separate storage in [backup setup](/administration/backups). Primary and mirror results are reported independently; check both after a run.
+
+If the primary is lost, select the mirror promotion action, review the selected repositories, and confirm. Restart Core after changing Core-local paths. Verify the new primary before resuming scheduled backups.
+
+If Core is also lost, use the surviving repository directly in [Fresh Core recovery](/administration/recover-core). You need its address, access credentials, and encryption passphrase.
+
+## Storage and access
+
+The default local primary is `/backups/vykar`; a local mirror defaults to `/backups/vykar-mirror`. Both use the `backups` volume and share its failure risk. Keep that volume when recreating containers, and do not include repository directories in workload backups.
+
+File Manager refuses local repository volumes labelled `komodo.file-manager.excluded: "true"`. Keep this label on custom repository volumes. A host administrator or compromised Periphery with Docker access can still access host storage.

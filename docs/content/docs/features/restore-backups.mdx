@@ -1,0 +1,33 @@
+---
+title: Restore a Backup
+description: Restore Stack files or Docker volumes to the same server or another host.
+---
+
+
+Restore a complete snapshot from the **Backups** tab on a Stack or Volume. You need **Read**, **Execute**, and **Backups** permission on the target, and the destination Server must be an enrolled backup worker.
+
+## Restore files
+
+1. Select a complete snapshot and browse its files. Choose the whole snapshot or the files and folders you need.
+2. Select the destination. Use the original location, or choose another connected Server and supply the destination paths or Volume name.
+3. Select **Review changes**. Check the snapshot, Server, paths to create/overwrite/delete, and containers that will stop. For a large preview, review the full change counts as well as the displayed sample.
+4. Confirm the restore. Existing contents at the selected destination are replaced; full restores can remove files absent from the snapshot.
+5. Wait for completion, then check the application and its data.
+
+Changing the selection or destination requires a new preview. The source server can be offline when restoring to another server.
+
+## Recover a deleted workload
+
+Administrators can open **Backups → Primary snapshots** to select snapshots whose original resource no longer exists.
+
+For a Stack on another Server, provide a unique new Stack name and an absolute destination for every source directory. Komodo recovers the full Stack and rewrites its included bind paths. Review external databases, secrets, DNS, and named volumes before starting the application; separately restore any required Volume snapshots.
+
+For a Volume, choose a new local Volume or explicitly confirm using an existing one. Restoring an existing Volume stops every running container that uses it.
+
+## If recovery stops
+
+An expired or changed preview needs **Review changes** again. A failed integrity or path check blocks publication. Unsupported volume drivers, missing mounts, or filesystem metadata errors require fixing the destination first.
+
+If Komodo reports **recovery required**, keep the affected containers stopped, inspect Periphery's logs, repair the reported storage or container problem, and restart Periphery so it can finish recovery. Do not delete its journals to clear the warning.
+
+To restore Komodo itself, use [Recover Core](/administration/recover-core).

@@ -29,7 +29,7 @@ A Swarm resource points to one or more **manager nodes** — these are Servers t
 [[swarm]]
 name = "production-swarm"
 [swarm.config]
-server_ids = ["manager-01", "manager-02", "manager-03"]
+servers = ["manager-01", "manager-02", "manager-03"]
 send_unhealthy_alerts = true
 ```
 
@@ -42,33 +42,9 @@ send_unhealthy_alerts = true
 | `maintenance_windows` | Scheduled windows during which alerts are suppressed. | `[]` |
 | `links` | Quick links displayed in the resource header. | `[]` |
 
-## Getting Started
+## Add nodes
 
-To use Docker Swarm with Komodo, you first need to initialize a swarm on one of your connected servers.
-
-### 1. Initialize the Swarm
-
-SSH into your server (or use a Komodo terminal) and run [`docker swarm init`](https://docs.docker.com/reference/cli/docker/swarm/init/):
-
-```bash
-docker swarm init --advertise-addr <SERVER_IP>
-```
-
-### 2. Create the Swarm resource in Komodo
-
-Create a new Swarm resource and add the server as a manager node. Once created, Komodo will detect the swarm and display its nodes.
-
-### 3. Join additional nodes
-
-To add more servers to the swarm, navigate to the Swarm's node list in the UI and click the **Join** button. This will display the [`docker swarm join`](https://docs.docker.com/reference/cli/docker/swarm/join/) command with the correct token and address — copy it and run it on the server you want to add.
-
-There are separate join commands for **worker** and **manager** nodes.
-
-<Callout title="Tip" type="idea">
-
-After a node joins, add it as a Server in Komodo and (for managers) include it in the Swarm resource's `servers` list for redundancy.
-
-</Callout>
+If you need to create the Swarm first, run `docker swarm init --advertise-addr <SERVER_IP>` on a connected Server. After adding that manager to Komodo, use **Join** in the Swarm node list to copy a worker or manager join command. Run it on the new host. Add any new manager to the Swarm resource for failover.
 
 ## Nodes
 
@@ -96,11 +72,7 @@ Deploy compose-based stacks to the swarm using `docker stack deploy`.
 Manage Docker Swarm configs and secrets directly from Komodo.
 
 - **Create** configs and secrets with labels and an optional template driver.
-- **Rotate** configs and secrets — since they are immutable in Docker, Komodo handles the rotation pattern automatically:
-  1. Creates a temporary replacement.
-  2. Updates all referencing services to use the temporary version.
-  3. Removes and recreates the original with the new data.
-  4. Updates services back to the original name.
+- **Rotate** a config or secret to replace its contents and update referencing services.
 - **Remove** configs and secrets.
 
 <Callout title="Note" type="info">

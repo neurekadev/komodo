@@ -71,14 +71,13 @@ use crate::{
   periphery::PeripheryClient,
   permission::{get_check_permissions, load_list_permits},
   resource::{self, KomodoResource},
-  state::{
-    CORE_RECOVERY_ACTIVATION_PATH, db_client,
-    read_core_recovery_activation,
-  },
+  state::db_client,
 };
 
 pub(crate) mod activity;
 mod crypto;
+mod recovery;
+pub(crate) mod recovery_state;
 
 const SETTINGS_ID: &str = "singleton";
 const SETTINGS_COLLECTION: &str = "BackupSettings";
@@ -89,21 +88,14 @@ const CORE_RECOVERY_COLLECTION: &str = "CoreRecoveryPlan";
 const HEALTH_COLLECTION: &str = "BackupRepositoryHealth";
 const OPERATIONAL_ALERT_PATH: &str =
   "/data/backup-operational-alert.json";
-const CORE_PRIVATE_PATH: &str = "/core-secrets";
-const CORE_STAGING_PATH: &str = "/core-secrets/.komodo-core-staging";
+const CORE_PRIVATE_PATH: &str = "/data/core-secrets";
+const CORE_STAGING_PATH: &str =
+  "/data/core-secrets/.komodo-core-staging";
 const CORE_CACHE_PATH: &str = "/data/backups/.komodo-vykar-cache";
 const CORE_RECOVERY_STAGING_PATH: &str =
-  "/core-secrets/.komodo-core-recovery";
+  "/data/core-secrets/.komodo-core-recovery";
 const STACK_MANIFEST_STAGING_PATH: &str =
-  "/core-secrets/.komodo-stack-manifest";
-const LEGACY_CORE_STAGING_PATHS: [&str; 3] = [
-  "/data/backups/.komodo-core-staging",
-  "/data/backups/.komodo-core-recovery",
-  "/data/backups/.komodo-stack-manifest",
-];
-const CORE_INSTANCE_ID_PATH: &str = "/data/keys/backup-instance-id";
-const LEGACY_CORE_INSTANCE_ID_PATH: &str =
-  "/config/keys/backup-instance-id";
+  "/data/core-secrets/.komodo-stack-manifest";
 const PERIPHERY_HOSTNAME_PREFIX: &str = "komodo-periphery-";
 const CORE_RECOVERY_DATABASE_PREFIX: &str = "komodo_recovery_";
 const MAX_FLEET_RETRY_ATTEMPTS: u32 = 8;
@@ -194,7 +186,7 @@ struct StoredCoreRecoveryPlan {
   id: String,
   #[serde(default)]
   created_by: String,
-  recovered_core_instance_id: String,
+  sealed_material: String,
   plan: CoreRecoveryPlan,
 }
 
@@ -653,9 +645,7 @@ fn validate_repository_definition(
           "Core-local repository path must be normalized exactly (no surrounding whitespace, '.', '..', duplicate separators, or trailing separator)"
         ));
       }
-      for reserved in [CORE_PRIVATE_PATH, CORE_CACHE_PATH]
-        .into_iter()
-        .chain(LEGACY_CORE_STAGING_PATHS)
+      for reserved in [CORE_PRIVATE_PATH, CORE_CACHE_PATH].into_iter()
       {
         let reserved = normalize_core_local_path(reserved);
         if komodo_backup::filesystem::paths_overlap(
@@ -766,17 +756,6 @@ fn normalize_core_local_path(path: &str) -> PathBuf {
     }
   }
   normalized
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct CoreRecoveryActivation {
-  database: String,
-  core_instance_id: String,
-  /// The database that was active immediately before this activation. Keep
-  /// it available as the one-step rollback target until another recovery is
-  /// activated.
-  #[serde(default)]
-  previous_database: Option<String>,
 }
 
 fn is_backup_manifest_source(
@@ -964,144 +943,7 @@ fn require_worker_credentials(
 }
 
 fn core_instance_id() -> anyhow::Result<&'static str> {
-  static ID: OnceLock<Result<String, String>> = OnceLock::new();
-  match ID.get_or_init(|| {
-    load_or_create_core_instance_id().map_err(|error| {
-      format!("Failed to load stable Core backup identity: {error:#}")
-    })
-  }) {
-    Ok(id) => Ok(id),
-    Err(error) => Err(anyhow!(error.clone())),
-  }
-}
-
-fn load_or_create_core_instance_id() -> anyhow::Result<String> {
-  match read_core_recovery_activation() {
-    Ok(Some(bytes)) => {
-      let activation: CoreRecoveryActivation =
-        serde_json::from_slice(&bytes)
-          .context("Invalid Core recovery activation record")?;
-      if activation.core_instance_id.len() != 32
-        || !activation
-          .core_instance_id
-          .chars()
-          .all(|character| character.is_ascii_hexdigit())
-      {
-        return Err(anyhow!(
-          "Invalid recovered Core backup identity"
-        ));
-      }
-      return Ok(activation.core_instance_id);
-    }
-    Ok(None) => {}
-    Err(error) => {
-      return Err(error)
-        .context("Failed to read Core recovery activation record");
-    }
-  }
-  let path = Path::new(CORE_INSTANCE_ID_PATH);
-  if let Some(id) = read_core_instance_id(path)? {
-    return Ok(id);
-  }
-  if let Some(id) =
-    read_core_instance_id(Path::new(LEGACY_CORE_INSTANCE_ID_PATH))?
-  {
-    return persist_core_instance_id(path, &id);
-  }
-  persist_core_instance_id(path, &Uuid::new_v4().simple().to_string())
-}
-
-fn read_core_instance_id(
-  path: &Path,
-) -> anyhow::Result<Option<String>> {
-  let id = match std::fs::read_to_string(path) {
-    Ok(id) => id,
-    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-      return Ok(None);
-    }
-    Err(error) => return Err(error.into()),
-  };
-  let id = id.trim();
-  if id.len() == 32
-    && id.chars().all(|character| character.is_ascii_hexdigit())
-  {
-    Ok(Some(id.to_string()))
-  } else {
-    Err(anyhow!("Persisted Core backup identity is invalid"))
-  }
-}
-
-fn persist_core_instance_id(
-  path: &Path,
-  id: &str,
-) -> anyhow::Result<String> {
-  let parent = path
-    .parent()
-    .context("Core backup identity path has no parent")?;
-  std::fs::create_dir_all(parent)?;
-  match OpenOptions::new()
-    .create_new(true)
-    .write(true)
-    .mode(0o600)
-    .open(path)
-  {
-    Ok(mut file) => {
-      file.write_all(id.as_bytes())?;
-      file.sync_all()?;
-      std::fs::File::open(parent)?.sync_all()?;
-      Ok(id.to_string())
-    }
-    Err(error)
-      if error.kind() == std::io::ErrorKind::AlreadyExists =>
-    {
-      read_core_instance_id(path)?.context(
-        "Core backup identity disappeared after concurrent creation",
-      )
-    }
-    Err(error) => Err(error.into()),
-  }
-}
-
-fn persist_core_recovery_activation(
-  database: &str,
-  id: &str,
-  previous_database: Option<&str>,
-) -> anyhow::Result<()> {
-  if id.len() != 32
-    || !id.chars().all(|character| character.is_ascii_hexdigit())
-  {
-    return Err(anyhow!("Recovered Core backup identity is invalid"));
-  }
-  if !crate::state::valid_recovery_database_name(database)
-    || previous_database.is_some_and(|name| {
-      !crate::state::valid_recovery_database_name(name)
-    })
-  {
-    return Err(anyhow!("Unsafe active database name"));
-  }
-  let destination = Path::new(CORE_RECOVERY_ACTIVATION_PATH);
-  let parent = destination
-    .parent()
-    .context("Core backup identity path has no parent")?;
-  std::fs::create_dir_all(parent)?;
-  let temporary = parent.join(format!(
-    ".backup-recovery-activation-{}.tmp",
-    Uuid::new_v4().simple()
-  ));
-  let mut file = OpenOptions::new()
-    .create_new(true)
-    .write(true)
-    .mode(0o600)
-    .open(&temporary)?;
-  file.write_all(&serde_json::to_vec(&CoreRecoveryActivation {
-    database: database.to_string(),
-    core_instance_id: id.to_string(),
-    previous_database: previous_database.map(str::to_string),
-  })?)?;
-  file.sync_all()?;
-  std::fs::rename(temporary, destination)?;
-  std::fs::File::open(parent)?.sync_all()?;
-  Ok(())
+  Ok(&recovery_state::current()?.identity.core_instance_id)
 }
 
 fn core_cache_dir() -> anyhow::Result<PathBuf> {
@@ -1262,6 +1104,18 @@ fn repository_for_periphery(
   })
 }
 
+pub(crate) fn file_manager_protected_paths()
+-> anyhow::Result<Vec<ProtectedRepositoryPath>> {
+  let core_container_id =
+    komodo_backup::container::current_container_id().context(
+      "Cannot identify Core to protect its recovery files",
+    )?;
+  Ok(vec![ProtectedRepositoryPath {
+    path: CORE_PRIVATE_PATH.into(),
+    core_container_id,
+  }])
+}
+
 fn protected_backup_paths(
   settings: &BackupSettings,
 ) -> anyhow::Result<Vec<ProtectedRepositoryPath>> {
@@ -1274,9 +1128,8 @@ fn protected_core_paths(
   settings: &BackupSettings,
   core_container_id: &str,
 ) -> Vec<ProtectedRepositoryPath> {
-  // The private key must never enter a worker-readable repository, including
-  // when every configured repository is external. Also identify Core so the
-  // colocated worker never stops its coordinator while quiescing shared data.
+  // Core exports its durable recovery material separately. Exclude live state
+  // and staging from workload copies, and never stop the backup coordinator.
   std::iter::once(CORE_PRIVATE_PATH.to_string())
     .chain(
       std::iter::once(&settings.primary)
@@ -4435,7 +4288,7 @@ async fn backup_core(
     .collect::<Vec<_>>();
   let created_at = komodo_timestamp();
   let manifest = serde_json::json!({
-    "schema": "komodo.core-export/v1",
+    "schema": recovery::EXPORT_SCHEMA,
     "version": komodo_build_info::version(),
     "core_instance_id": core_instance_id()?,
     "collections": exported_collections,
@@ -4446,6 +4299,7 @@ async fn backup_core(
     serde_json::to_vec_pretty(&manifest)?,
   )
   .await?;
+  recovery::write_material(&staging, settings).await?;
   let name = snapshot_name("core", &run.id);
   let hostname = format!("komodo-core-{}", core_instance_id()?);
   let digest_root = staging.clone();
@@ -6363,7 +6217,6 @@ fn purge_abandoned_core_staging() -> anyhow::Result<()> {
   ]
   .into_iter()
   .map(|path| (path, true))
-  .chain(LEGACY_CORE_STAGING_PATHS.map(|path| (path, false)))
   {
     let path = Path::new(path);
     match std::fs::remove_dir_all(path) {
@@ -6478,20 +6331,12 @@ fn is_managed_core_recovery_database(
 
 fn previous_core_recovery_database() -> anyhow::Result<Option<String>>
 {
-  let bytes = match read_core_recovery_activation() {
-    Ok(Some(bytes)) => bytes,
-    Ok(None) => {
-      return Ok(None);
-    }
-    Err(error) => {
-      return Err(error)
-        .context("Failed to read Core recovery activation record");
-    }
-  };
-  let activation: CoreRecoveryActivation =
-    serde_json::from_slice(&bytes)
-      .context("Invalid Core recovery activation record")?;
-  Ok(activation.previous_database)
+  Ok(
+    recovery_state::current()?
+      .previous
+      .as_ref()
+      .map(|previous| previous.database.clone()),
+  )
 }
 
 fn core_recovery_database_is_orphaned(
@@ -6633,17 +6478,23 @@ async fn normalize_historical_restore_sagas(
 pub async fn plan_core_recovery(
   snapshot_name: &str,
   created_by: String,
+  provided_repository: Option<BackupRepository>,
 ) -> anyhow::Result<CoreRecoveryPlan> {
   let _operation = core_recovery_operation_lock().lock().await;
   let _actions = activity::quiesce_actions()?;
   reconcile_core_recovery_state_inner().await?;
   let _repository_roles =
     repository_role_barrier().clone().read_owned().await;
+  let repository = recovery::repository(provided_repository).await?;
   let snapshot = {
-    let (snapshots, _, _inventory) = list_snapshots().await?;
-    snapshots.into_iter()
+    let (snapshots, _) =
+      recovery::snapshots(repository.clone()).await?;
+    snapshots
+      .into_iter()
       .find(|snapshot| snapshot.name == snapshot_name)
-      .context("Core snapshot does not exist in the active primary repository")?
+      .context(
+        "Core snapshot does not exist in the selected repository",
+      )?
   };
   if snapshot.target != BackupTarget::Core {
     return Err(anyhow!("Selected snapshot is not a Core backup"));
@@ -6654,15 +6505,14 @@ pub async fn plan_core_recovery(
     ));
   }
 
-  let settings = get_settings().await?;
-  let repository = settings.primary.clone();
+  let recovery_source = repository.clone();
   let staging = PathBuf::from(CORE_RECOVERY_STAGING_PATH)
     .join(Uuid::new_v4().to_string());
   tokio::fs::create_dir_all(&staging).await?;
   let _staging_cleanup = RemoveDirectoryOnDrop::new(staging.clone());
   let worker_staging = staging.clone();
   let snapshot_for_worker = snapshot.name.clone();
-  let settings_for_worker = settings.clone();
+  let settings_for_worker = BackupSettings::default();
   tokio::task::spawn_blocking(move || {
     core_repository(&repository, &settings_for_worker)?.restore(
       &snapshot_for_worker,
@@ -6674,29 +6524,23 @@ pub async fn plan_core_recovery(
   .context("Core recovery restore worker failed")??;
 
   let manifest_path =
-    find_file_named(&staging, "komodo-core-manifest.json")
+    find_file_named(&staging, "komodo-core-manifest.json")?
       .context("Core snapshot manifest is missing")?;
   let authenticated_root = manifest_path
     .parent()
     .context("Core manifest has no export root")?
     .to_path_buf();
-  let (_, expected_digest, expected_created_at) =
-    crypto::authenticate_core_source_label(
-      &snapshot.source_label,
-      &snapshot.hostname,
-      &snapshot.name,
-    )?;
   let digest_root = authenticated_root.clone();
-  let actual_digest = tokio::task::spawn_blocking(move || {
-    core_export_digest(&digest_root)
-  })
-  .await
-  .context("Core recovery digest worker failed")??;
-  if actual_digest != expected_digest {
-    return Err(anyhow!(
-      "Core snapshot contents do not match their Core-authorized digest; recovery blocked"
-    ));
-  }
+  let snapshot_for_worker = snapshot.clone();
+  let (mut material, expected_created_at) =
+    tokio::task::spawn_blocking(move || {
+      recovery::validate_snapshot_material(
+        &digest_root,
+        &snapshot_for_worker,
+      )
+    })
+    .await
+    .context("Core recovery validation worker failed")??;
   let manifest: serde_json::Value =
     serde_json::from_slice(&tokio::fs::read(&manifest_path).await?)?;
   if manifest
@@ -6713,7 +6557,7 @@ pub async fn plan_core_recovery(
     .and_then(serde_json::Value::as_str)
     .context("Core snapshot manifest has no schema")?
     .to_string();
-  if backup_schema != "komodo.core-export/v1" {
+  if backup_schema != recovery::EXPORT_SCHEMA {
     return Err(anyhow!(
       "Unsupported Core backup schema '{backup_schema}'"
     ));
@@ -6736,7 +6580,8 @@ pub async fn plan_core_recovery(
     .and_then(serde_json::Value::as_str)
     .context("Core snapshot manifest has no stable Core identity")?
     .to_string();
-  if recovered_core_instance_id.len() != 32
+  if recovered_core_instance_id != material.identity.core_instance_id
+    || recovered_core_instance_id.len() != 32
     || !recovered_core_instance_id
       .chars()
       .all(|character| character.is_ascii_hexdigit())
@@ -6746,6 +6591,9 @@ pub async fn plan_core_recovery(
     ));
   }
 
+  recovery::configure_source(&mut material, recovery_source)?;
+  let sealed_material =
+    crypto::seal(&serde_json::to_vec(&material)?)?;
   let (backup_root, restore_folder) =
     find_core_restore_layout(&authenticated_root)?;
   let current_database = db_client().db.name().to_string();
@@ -6769,32 +6617,7 @@ pub async fn plan_core_recovery(
       .delete_many(doc! {})
       .await
       .context("Failed to discard historical Core recovery plans")?;
-    // Repository credentials are deliberately excluded from Core snapshots.
-    // Carry forward the freshly configured, locally sealed repository settings
-    // so recovery can still access its primary after the database switch.
-    if let Some(active_settings) = settings_collection()
-      .find_one(doc! { "_id": SETTINGS_ID })
-      .await?
-    {
-      validation
-        .collection::<SealedBackupSettings>(SETTINGS_COLLECTION)
-        .update_one(
-          doc! { "_id": SETTINGS_ID },
-          doc! { "$set": to_document(&active_settings)? },
-        )
-        .with_options(UpdateOptions::builder().upsert(true).build())
-        .await
-        .context(
-          "Failed to carry active repository settings into recovery database",
-        )?;
-    }
-    validation
-      .collection::<RepositoryHealthRecord>(HEALTH_COLLECTION)
-      .delete_many(doc! {})
-      .await
-      .context(
-        "Failed to invalidate repository health in recovery database",
-      )?;
+    recovery::save_settings(&validation, &material).await?;
     let enabled_admins = validation
       .collection::<komodo_client::entities::user::User>("User")
       .count_documents(doc! { "enabled": true, "admin": true })
@@ -6818,7 +6641,7 @@ pub async fn plan_core_recovery(
       .insert_one(StoredCoreRecoveryPlan {
         id: plan.id.clone(),
         created_by,
-        recovered_core_instance_id,
+        sealed_material,
         plan: plan.clone(),
       })
       .await?;
@@ -6888,12 +6711,14 @@ pub async fn execute_core_recovery(
   // Otherwise a mutation can commit to the old database during the delayed
   // restart and disappear from the recovered database.
   let mutation = mutation_barrier().clone().write_owned().await;
-  carry_current_backup_settings(&validation).await?;
-  persist_core_recovery_activation(
-    &stored.plan.validation_database,
-    &stored.recovered_core_instance_id,
-    Some(&stored.plan.current_database),
+  let material = recovery::unseal_material(&stored.sealed_material)?;
+  recovery::save_settings(&validation, &material).await?;
+  let next_state = recovery_state::current()?.activated(
+    material.identity,
+    stored.plan.validation_database.clone(),
+    stored.plan.current_database.clone(),
   )?;
+  recovery_state::activate(&next_state)?;
   // Once the durable pointer is published, restart even if recording the
   // final audit result encounters a transient database error.
   schedule_core_restart();
@@ -6933,30 +6758,6 @@ pub async fn execute_core_recovery(
     record_operational_alert(warning);
   }
   Ok(run)
-}
-
-async fn carry_current_backup_settings(
-  validation: &database::mungos::mongodb::Database,
-) -> anyhow::Result<()> {
-  let target = validation
-    .collection::<SealedBackupSettings>(SETTINGS_COLLECTION);
-  if let Some(settings) = settings_collection()
-    .find_one(doc! { "_id": SETTINGS_ID })
-    .await?
-  {
-    // Carry the sealed bytes AND initialization state, never a redacted DTO.
-    target
-      .replace_one(doc! { "_id": SETTINGS_ID }, settings)
-      .upsert(true)
-      .await?;
-  } else {
-    target.delete_one(doc! { "_id": SETTINGS_ID }).await?;
-  }
-  validation
-    .collection::<RepositoryHealthRecord>(HEALTH_COLLECTION)
-    .delete_many(doc! {})
-    .await?;
-  Ok(())
 }
 
 fn committed_core_recovery_run(plan: &CoreRecoveryPlan) -> BackupRun {
@@ -7000,21 +6801,43 @@ async fn core_recovery_audit_step(
   }
 }
 
-fn find_file_named(root: &Path, name: &str) -> Option<PathBuf> {
-  let entries = std::fs::read_dir(root).ok()?;
-  for entry in entries.flatten() {
-    let path = entry.path();
-    let file_type = entry.file_type().ok()?;
-    if file_type.is_file() && entry.file_name() == name {
-      return Some(path);
+fn find_file_named(
+  root: &Path,
+  name: &str,
+) -> anyhow::Result<Option<PathBuf>> {
+  let mut pending = vec![(root.to_path_buf(), 0)];
+  let mut found = None;
+  let mut entries = 0;
+  while let Some((directory, depth)) = pending.pop() {
+    if depth > 128 {
+      return Err(anyhow!(
+        "Core export nesting exceeds 128 directories"
+      ));
     }
-    if file_type.is_dir()
-      && let Some(found) = find_file_named(&path, name)
-    {
-      return Some(found);
+    for entry in std::fs::read_dir(directory)? {
+      let entry = entry?;
+      entries += 1;
+      if entries > 100_000 {
+        return Err(anyhow!("Core export has too many entries"));
+      }
+      let kind = entry.file_type()?;
+      if kind.is_dir() {
+        pending.push((entry.path(), depth + 1));
+      } else if !kind.is_file() {
+        return Err(anyhow!(
+          "Core export contains a symlink or special file"
+        ));
+      } else if entry.file_name() == name {
+        if found.is_some() {
+          return Err(anyhow!(
+            "Core snapshot has duplicate manifests"
+          ));
+        }
+        found = Some(entry.path());
+      }
     }
   }
-  None
+  Ok(found)
 }
 
 fn find_core_restore_layout(
@@ -7506,6 +7329,30 @@ pub fn spawn_scheduler() {
       }
     }
   });
+}
+
+pub async fn list_core_recovery_snapshots(
+  repository: Option<BackupRepository>,
+  page: u64,
+  limit: u64,
+) -> anyhow::Result<komodo_client::api::read::BackupSnapshotList> {
+  let repository = recovery::repository(repository).await?;
+  let (mut snapshots, hidden) =
+    recovery::snapshots(repository).await?;
+  snapshots
+    .sort_by_key(|snapshot| std::cmp::Reverse(snapshot.created_at));
+  let total = snapshots.len() as u64;
+  let limit = limit.clamp(1, 500);
+  let snapshots = snapshots
+    .into_iter()
+    .skip(page.saturating_mul(limit) as usize)
+    .take(limit as usize)
+    .collect();
+  Ok(komodo_client::api::read::BackupSnapshotList {
+    snapshots,
+    total,
+    hidden,
+  })
 }
 
 #[cfg(test)]
@@ -8286,8 +8133,7 @@ mod tests {
       CORE_CACHE_PATH,
       CORE_RECOVERY_STAGING_PATH,
       STACK_MANIFEST_STAGING_PATH,
-      "/core-secrets/.komodo-core-staging/repository",
-      "/data/backups/.komodo-core-staging/repository",
+      "/data/core-secrets/.komodo-core-staging/repository",
       "/data/backups",
       "/data",
     ] {
@@ -8303,7 +8149,7 @@ mod tests {
   }
 
   #[test]
-  fn core_sensitive_work_stays_outside_shared_data() {
+  fn core_sensitive_work_uses_the_protected_shared_subdirectory() {
     for path in [
       CORE_STAGING_PATH,
       CORE_RECOVERY_STAGING_PATH,
@@ -8312,7 +8158,7 @@ mod tests {
       assert!(Path::new(path).starts_with(CORE_PRIVATE_PATH));
       // This checks the configured layout, independent of the test host's
       // mount namespace. Filesystem alias policy has separate isolated cases.
-      assert!(!Path::new(path).starts_with("/data"));
+      assert!(Path::new(path).starts_with("/data"));
       assert!(!Path::new("/data").starts_with(path));
     }
     assert!(Path::new(CORE_CACHE_PATH).starts_with("/data"));

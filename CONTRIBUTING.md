@@ -1,14 +1,8 @@
----
-title: Development
-description: Build, run, and contribute to Komodo.
----
-
+# Contributing
 
 If you are looking to contribute to Komodo, this page is a launching point for setting up your Komodo development environment.
 
-<Callout title="Self-supported source builds" type="info">
-  Komodo officially distributes and supports container images. The commands on this page are for development and self-compiled builds; the project does not publish native binary releases.
-</Callout>
+Komodo officially distributes and supports container images. The commands on this page are for development and self-compiled builds; the project does not publish native binary releases.
 
 ## Dependencies
 
@@ -19,7 +13,7 @@ Running Komodo from [source](https://github.com/neurekadev/komodo) requires eith
     * [MongoDB](https://www.mongodb.com/) or [FerretDB](https://www.ferretdb.com/) available locally.
     * On Debian/Ubuntu: `apt install build-essential pkg-config libssl-dev` required to build the rust source.
 * Web UI
-    * [Node](https://nodejs.org/en) >= 18.18 + NPM
+    * [Node](https://nodejs.org/en) 22 and Yarn 1.22.22
         * [Yarn](https://yarnpkg.com/) - (Tip: use `corepack enable` after installing `node` to use `yarn`)
     * [typeshare](https://github.com/1password/typeshare)
     * [Deno](https://deno.com/) >= 2.0.2
@@ -32,13 +26,13 @@ Running Komodo from [source](https://github.com/neurekadev/komodo) requires eith
 
 After making changes to the project, run `run dev-compose-build` to rebuild Komodo and then `run dev-compose-exposed` to start a Komodo container with the UI accessible at `localhost:9120`. Any changes made to source files will require re-running the `dev-compose-build` and `dev-compose-exposed` commands.
 
-Development Compose persists the default `/backups/vykar` repository in `backups:/backups`, and Core's Vykar cache and operational alerts in `core-data:/data`. The separate `core-secrets` volume holds the repository sealing/authentication key; FerretDB keeps its own `data:/state` volume. Preserve all four across rebuilds and do not use `down -v` when retaining development snapshots. The combined devcontainer persists `/backups` and `/core-secrets` in separate named volumes, but runs Core and Periphery together without production isolation. Existing configured paths and container-layer state are not relocated automatically; preserve them before recreating containers and follow the [Core-local storage guidance](/administration/backups#backend-notes).
+Development Compose persists local repositories in `backups:/backups` and Core state, cache, and recovery identity in `core-data:/data`. FerretDB uses its own `data:/state` volume. Retain these volumes across rebuilds.
 
 ## Devcontainer
 
 Use the included `.devcontainer.json` with VSCode or other compatible IDE to stand-up a full environment, including database, with one click.
 
-Keep the devcontainer's `backups`, `core-secrets`, and database `data` volumes together across rebuilds. Before rebuilding an existing devcontainer that lacks the `/core-secrets` mount, stop Core and preserve its `/core-secrets/backup.key` and any recovery activation record separately. Restore that trusted material into the new persistent `core-secrets` volume before starting Core. Retaining only the repository and database without the original key is not sufficient for managed recovery.
+The devcontainer also persists `/data` and `/backups`. It runs Core and Periphery in one namespace for development.
 
 [VSCode Tasks](https://code.visualstudio.com/Docs/editor/tasks) are provided for building and running Komodo.
 
@@ -117,6 +111,7 @@ run dev-core
 
 ```sh
 run dev-periphery
+```
 
 ```sh
 run dev-ui      # Start in dev (watch) mode
@@ -192,3 +187,11 @@ not publish it to NPM.
 ## Docsite Development
 
 From `docs/`, use `run dev-docs` to start the Fumadocs site in development mode. Changes made under `docs/content/docs/` reload automatically.
+
+## Add a screenshot
+
+1. Capture both themes at the same viewport and UI state when both variants exist.
+2. Name files `<Theme>-<View>.png`, using `Light` or `Dark` for `<Theme>` and a short PascalCase view name.
+3. Place them in `docs/public/screenshots/`.
+4. Add paired figures above with alt text that names the view, theme, and information visible in the image.
+5. Check the gallery at narrow and wide viewport sizes before committing.
