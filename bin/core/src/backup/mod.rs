@@ -7637,7 +7637,7 @@ mod tests {
   fn restore_execution_roundtrip_preserves_original_authority_and_decisions()
    {
     let mut server = Server::default();
-    server.id = "server".into();
+    server.id = "0123456789abcdef01234567".into();
     server.config.address = "wss://original.example".into();
     server.info.public_key = "original-key".into();
     let execution = StoredRestoreExecution {
@@ -7667,6 +7667,7 @@ mod tests {
     );
     assert_eq!(restored.pending.operation_id, "original-operation");
     assert_eq!(restored.pending.run_id, "original-run");
+    assert_eq!(restored.pending.server.id, server.id);
     assert!(restored.recovered_stack_creation_started);
     assert_eq!(
       restored.finalizations[0].operation_id,

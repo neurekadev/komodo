@@ -1206,10 +1206,6 @@ fn paths_overlap(left: &Path, right: &Path) -> anyhow::Result<bool> {
   komodo_backup::filesystem::paths_overlap(left, right)
 }
 
-fn resolve_existing_ancestor(path: &Path) -> anyhow::Result<PathBuf> {
-  komodo_backup::filesystem::resolve_existing_ancestor(path)
-}
-
 pub(crate) fn internal_storage_dir() -> PathBuf {
   periphery_config().stack_dir().join(".komodo-vykar")
 }
@@ -2512,9 +2508,10 @@ async fn prepare_restore_volume(
     ));
   }
   if exists {
-    let volume = restore_execution_before_deadline(deadline, async {
-      Ok(docker.inspect_volume(volume_name).await?)
-    })
+    let volume = restore_execution_before_deadline(
+      deadline,
+      docker.inspect_volume(volume_name),
+    )
     .await?;
     if volume
       .labels
@@ -2535,7 +2532,11 @@ async fn prepare_restore_volume(
   if !exists {
     let created = async {
       create_restore_volume(volume_name, restore_plan_id).await?;
-      let volume = restore_execution_before_deadline(deadline, async { Ok(docker.inspect_volume(volume_name).await?) }).await?;
+      let volume = restore_execution_before_deadline(
+        deadline,
+        docker.inspect_volume(volume_name),
+      )
+      .await?;
       if volume
         .labels
         .get(RESTORE_PLAN_VOLUME_LABEL)
@@ -5147,13 +5148,12 @@ fn finalization_from_origin(
       "Missing restore journal has no durable finalization proof"
     ));
   }
-  if let Some(finalized) = &origin.finalized {
-    if finalized.complete
-      && finalized.critical_error.is_none()
-      && finalized.rolled_back != commit
-    {
-      return Ok(finalized.clone());
-    }
+  if let Some(finalized) = &origin.finalized
+    && finalized.complete
+    && finalized.critical_error.is_none()
+    && finalized.rolled_back != commit
+  {
+    return Ok(finalized.clone());
   }
   if let Some(restored) = &origin.completion.restore_result
     && !restored.finalization_pending
@@ -6864,7 +6864,10 @@ mod tests {
     std::fs::create_dir(&real).unwrap();
     std::os::unix::fs::symlink(&real, &alias).unwrap();
     assert_eq!(
-      resolve_existing_ancestor(&alias.join("new/child")).unwrap(),
+      komodo_backup::filesystem::resolve_existing_ancestor(
+        &alias.join("new/child"),
+      )
+      .unwrap(),
       real.canonicalize().unwrap().join("new/child")
     );
   }
