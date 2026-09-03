@@ -2505,12 +2505,12 @@ fn compare_missing_volume_paths(
         "New Volume preview contains an unsafe relative path"
       ));
     }
-    let display = PathBuf::from(format!(
+    let display = format!(
       "volume://{volume_name}/{}",
-      relative.to_string_lossy()
-    ));
-    budget.consume(&display.to_string_lossy())?;
-    created.push(display.to_string_lossy().into_owned());
+      restore_preview_path(relative)?
+    );
+    budget.consume(&display)?;
+    created.push(display);
   }
   created.sort();
   created.dedup();
@@ -2544,19 +2544,20 @@ fn compare_restore_paths(
     } else {
       Path::new(&mapping.destination).join(relative)
     };
-    budget.consume(&destination.to_string_lossy())?;
+    let display = restore_preview_path(&destination)?;
+    budget.consume(display)?;
     expected.insert(destination.clone());
     match restore_preview_metadata(
       Path::new(&mapping.destination),
       &destination,
     )? {
       None => {
-        created.push(destination.to_string_lossy().into_owned());
+        created.push(display.to_owned());
       }
-      Some(metadata) if !item.directory || !metadata.is_dir() => {
-        overwritten.push(destination.to_string_lossy().into_owned());
+      Some(_) => {
+        // Publication also replaces directory metadata, even for empty dirs.
+        overwritten.push(display.to_owned());
       }
-      Some(_) => {}
     }
   }
 
@@ -2648,13 +2649,20 @@ fn map_snapshot_path<'a>(
   Ok(best.map(|(mapping, relative, _)| (mapping, relative)))
 }
 
+fn restore_preview_path(path: &Path) -> anyhow::Result<&str> {
+  path.to_str().context(
+    "Restore preflight requires lossless UTF-8 filenames; no restore changes were started",
+  )
+}
+
 fn collect_unexpected_paths(
   root: &Path,
   expected: &HashSet<PathBuf>,
   deleted: &mut Vec<String>,
   budget: &mut komodo_backup::RestoreInventoryBudget,
 ) -> anyhow::Result<()> {
-  budget.consume(&root.to_string_lossy())?;
+  let display = restore_preview_path(root)?;
+  budget.consume(display)?;
   let metadata = match std::fs::symlink_metadata(root) {
     Ok(metadata) => metadata,
     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -2663,7 +2671,7 @@ fn collect_unexpected_paths(
     Err(error) => return Err(error.into()),
   };
   if !expected.contains(root) {
-    deleted.push(root.to_string_lossy().into_owned());
+    deleted.push(display.to_owned());
   }
   if !metadata.is_dir() {
     return Ok(());
@@ -2678,9 +2686,10 @@ fn collect_unexpected_paths(
     };
     let entry = entry?;
     let path = entry.path();
-    budget.consume(&path.to_string_lossy())?;
+    let display = restore_preview_path(&path)?;
+    budget.consume(display)?;
     if !expected.contains(&path) {
-      deleted.push(path.to_string_lossy().into_owned());
+      deleted.push(display.to_owned());
     }
     if entry.file_type()?.is_dir() {
       if directories.len() >= MAX_RESTORE_PREVIEW_DEPTH {
@@ -5122,6 +5131,66 @@ mod tests {
     assert!(deleted.iter().any(|path| path.ends_with("extra.txt")));
   }
 
+  #[test]
+  fn existing_empty_directory_is_an_overwrite() {
+    let destination = tempfile::tempdir().unwrap();
+    let (created, overwritten, deleted) = compare_restore_paths(
+      &[komodo_backup::SnapshotPath {
+        path: "root".into(),
+        directory: true,
+      }],
+      &[RestorePublishPath {
+        destination_root: None,
+        snapshot_path: "root".into(),
+        destination: destination.path().to_str().unwrap().into(),
+      }],
+      &[],
+      Instant::now() + RESTORE_PREFLIGHT_TIMEOUT,
+    )
+    .unwrap();
+    assert!(created.is_empty());
+    assert_eq!(
+      overwritten,
+      vec![destination.path().to_str().unwrap()]
+    );
+    assert!(deleted.is_empty());
+    assert_eq!(
+      bounded_restore_preview(created, overwritten, deleted)
+        .path_summary
+        .unwrap()
+        .overwritten,
+      1
+    );
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn non_utf8_destination_names_fail_before_returning_a_preview() {
+    use std::os::unix::ffi::OsStringExt;
+    let destination = tempfile::tempdir().unwrap();
+    for byte in [0xfe, 0xff] {
+      let name = std::ffi::OsString::from_vec(vec![b'x', byte]);
+      std::fs::write(destination.path().join(name), b"keep").unwrap();
+    }
+    let result = compare_restore_paths(
+      &[],
+      &[RestorePublishPath {
+        destination_root: None,
+        snapshot_path: "root".into(),
+        destination: destination.path().to_str().unwrap().into(),
+      }],
+      &[],
+      Instant::now() + RESTORE_PREFLIGHT_TIMEOUT,
+    );
+    assert!(
+      result.unwrap_err().to_string().contains("lossless UTF-8")
+    );
+    assert_eq!(
+      std::fs::read_dir(destination.path()).unwrap().count(),
+      2
+    );
+  }
+
   #[cfg(unix)]
   #[test]
   fn restore_preflight_never_follows_destination_symlinks() {
@@ -5183,10 +5252,14 @@ mod tests {
           link.join("restored.txt").to_string_lossy().into_owned()
         ]
       );
-      assert_eq!(
-        overwritten,
-        vec![link.to_string_lossy().into_owned()]
-      );
+      let mut expected_overwritten =
+        vec![link.to_str().unwrap().to_owned()];
+      if nested {
+        expected_overwritten
+          .push(publish_root.to_str().unwrap().to_owned());
+      }
+      expected_overwritten.sort();
+      assert_eq!(overwritten, expected_overwritten);
       assert!(deleted.is_empty());
     }
   }

@@ -21,7 +21,9 @@ use database::{
     },
   },
 };
-use futures_util::{StreamExt, stream::FuturesUnordered};
+use futures_util::{
+  StreamExt, TryStreamExt, stream::FuturesUnordered,
+};
 use komodo_backup::{
   SnapshotDirectoryPage, VykarRepository,
   backup_manifest_source_name, normalize_selected_paths,
@@ -1396,17 +1398,52 @@ async fn finish_run(
   Ok(run)
 }
 
-pub async fn status() -> anyhow::Result<BackupStatus> {
-  let recent_runs = find_collect(
-    &runs_collection(),
-    None,
-    FindOptions::builder()
-      .sort(doc! { "started_at": -1 })
-      .limit(20)
-      .build(),
+async fn collect_recent_runs<S, F, A>(
+  mut runs: S,
+  mut authorized: F,
+) -> anyhow::Result<Vec<BackupRun>>
+where
+  S: futures_util::Stream<Item = anyhow::Result<BackupRun>> + Unpin,
+  F: FnMut(Option<BackupTarget>) -> A,
+  A: std::future::Future<Output = bool>,
+{
+  let mut recent = Vec::new();
+  while let Some(run) = runs.try_next().await? {
+    if authorized(run.target.clone()).await {
+      recent.push(run);
+      if recent.len() == 20 {
+        break;
+      }
+    }
+  }
+  Ok(recent)
+}
+
+pub async fn status(user: &User) -> anyhow::Result<BackupStatus> {
+  let cursor = runs_collection()
+    .find(doc! {})
+    .sort(doc! { "started_at": -1, "id": -1 })
+    // Non-admins must keep scanning until 20 authorized runs are found.
+    .limit(if user.admin { 20 } else { 0 })
+    .batch_size(100)
+    .await?;
+  let recent_runs = collect_recent_runs(
+    cursor.map_err(anyhow::Error::from),
+    |target| async move {
+      if user.admin {
+        return true;
+      }
+      let Some(target) = target else { return false };
+      authorize_target(
+        &target,
+        user,
+        komodo_client::entities::permission::PermissionLevel::Read,
+      )
+      .await
+      .is_ok()
+    },
   )
-  .await
-  .unwrap_or_default();
+  .await?;
   let active_runs = find_collect(
     &runs_collection(),
     doc! {
@@ -4080,41 +4117,61 @@ async fn snapshot_stack_source(
   let BackupTarget::Stack { stack_id } = &snapshot.target else {
     return Err(anyhow!("Snapshot is not a Stack backup"));
   };
-  let current =
-    Stack::coll().find_one(id_or_name_filter(stack_id)).await?;
+  // Share browsing admission and retain it in the actual blocking worker.
+  // An abandoned or timed-out plan cannot start another manifest reader.
+  let permit = snapshot_tree_slots().clone().try_acquire_owned()
+    .context("Another snapshot tree or manifest request is still running; retry after it finishes")?;
+  let deadline =
+    std::time::Instant::now() + std::time::Duration::from_secs(60);
+  let current = tokio::time::timeout_at(
+    tokio::time::Instant::from_std(deadline),
+    async {
+      Stack::coll().find_one(id_or_name_filter(stack_id)).await
+    },
+  )
+  .await
+  .context(
+    "Stack lookup exceeded the manifest preflight deadline",
+  )??;
   let manifest_source = snapshot
     .source_paths
     .iter()
     .find(|path| is_backup_manifest_source(&snapshot.name, path))
     .context("Stack snapshot has no embedded recovery manifest")?
     .clone();
-  let staging = PathBuf::from(STACK_MANIFEST_STAGING_PATH)
-    .join(Uuid::new_v4().to_string());
-  tokio::fs::create_dir_all(&staging).await?;
-  let _staging_cleanup = RemoveDirectoryOnDrop::new(staging.clone());
-  let destination = staging.clone();
-  let settings = get_settings().await?;
+  let settings = tokio::time::timeout_at(
+    tokio::time::Instant::from_std(deadline),
+    get_settings(),
+  )
+  .await
+  .context(
+    "Stack manifest settings exceeded the preflight deadline",
+  )??;
   let repository = settings.primary.clone();
   let advanced = settings.advanced.clone();
   let hostname = snapshot.hostname.clone();
   let snapshot_name = snapshot.name.clone();
-  tokio::task::spawn_blocking(move || {
-    VykarRepository::new(
-      &repository,
-      &hostname,
-      &core_cache_dir()?,
-      &core_secret_dir()?,
-      &advanced,
-    )?
-    .restore(&snapshot_name, &destination, &[manifest_source])
-  })
-  .await
-  .context("Stack manifest restore worker failed")??;
-  let manifest_path =
-    find_file_named(&staging, "komodo-backup-manifest.json")
-      .context("Stack snapshot recovery manifest is missing")?;
   let manifest: SnapshotBackupManifest =
-    serde_json::from_slice(&std::fs::read(manifest_path)?)?;
+    run_snapshot_tree_worker(permit, deadline, move || {
+      let bytes = VykarRepository::new(
+        &repository,
+        &hostname,
+        &core_cache_dir()?,
+        &core_secret_dir()?,
+        &advanced,
+      )?
+      .read_snapshot_file(
+        &snapshot_name,
+        &format!(
+          "{}/komodo-backup-manifest.json",
+          manifest_source.trim_matches('/')
+        ),
+        deadline,
+      )?;
+      serde_json::from_slice(&bytes)
+        .context("Invalid Stack snapshot recovery manifest")
+    })
+    .await?;
   if manifest.schema != "komodo.backup-manifest/v1"
     || manifest.version != 1
     || manifest.run_id != snapshot.run_id
@@ -7334,6 +7391,44 @@ mod tests {
       "unrelated",
       None
     ));
+  }
+
+  #[tokio::test]
+  async fn recent_history_limits_authorized_runs_not_global_runs() {
+    let runs = (0..65).map(|index| {
+      Ok(BackupRun {
+        id: index.to_string(),
+        target: if index < 25 {
+          None
+        } else {
+          Some(BackupTarget::Stack {
+            stack_id: if index < 30 { "other" } else { "mine" }
+              .into(),
+          })
+        },
+        ..Default::default()
+      })
+    });
+    let recent = collect_recent_runs(futures_util::stream::iter(runs), |target| async move {
+      matches!(target, Some(BackupTarget::Stack { stack_id }) if stack_id == "mine")
+    }).await.unwrap();
+    assert_eq!(recent.len(), 20);
+    assert_eq!(recent.first().unwrap().id, "30");
+    assert_eq!(recent.last().unwrap().id, "49");
+    let admin = collect_recent_runs(
+      futures_util::stream::iter((0..30).map(|index| {
+        Ok(BackupRun {
+          id: index.to_string(),
+          ..Default::default()
+        })
+      })),
+      |_| async { true },
+    )
+    .await
+    .unwrap();
+    assert_eq!(admin.len(), 20);
+    assert_eq!(admin.first().unwrap().id, "0");
+    assert_eq!(admin.last().unwrap().id, "19");
   }
 
   #[tokio::test]

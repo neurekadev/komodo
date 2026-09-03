@@ -14,14 +14,13 @@ import {
   Select,
   Stack,
   Text,
-  Textarea,
   TextInput,
 } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import { Types } from "komodo_client";
 import { Section } from "mogh_ui";
 import { ChevronDown, ChevronRight, File, Folder } from "lucide-react";
-import { ReactNode, useMemo, useState } from "react";
+import { ReactNode, useState } from "react";
 
 type ResourceBackupProps = {
   target: Types.BackupTarget;
@@ -175,7 +174,7 @@ export function RestoreSnapshotButton({
   const [recoveredName, setRecoveredName] = useState("");
   const [destinationVolume, setDestinationVolume] = useState("");
   const [confirmExistingVolume, setConfirmExistingVolume] = useState(false);
-  const [mappingText, setMappingText] = useState("");
+  const [bindings, setBindings] = useState<Record<string, string>>({});
   const [plan, setPlan] = useState<Types.BackupRestorePlan>();
   const { mutate: createPlan, isPending: planPending } = useWrite(
     "PlanBackupRestore",
@@ -210,13 +209,6 @@ export function RestoreSnapshotButton({
       snapshotSourceServerId !== sourceServerId ||
       destinationServerId !== snapshotSourceServerId ||
       snapshot.source_paths_match_current === false);
-  const bindings = useMemo(() => {
-    const pairs = mappingText
-      .split("\n")
-      .map((line) => line.split("=").map((part) => part.trim()))
-      .filter((pair) => pair.length === 2 && pair[0] && pair[1]);
-    return Object.fromEntries(pairs as [string, string][]);
-  }, [mappingText]);
 
   return (
     <>
@@ -231,7 +223,7 @@ export function RestoreSnapshotButton({
           setRecoveredName("");
           setDestinationVolume("");
           setConfirmExistingVolume(false);
-          setMappingText("");
+          setBindings({});
           setPlan(undefined);
           setRestoreOpen(true);
         }}
@@ -274,22 +266,28 @@ export function RestoreSnapshotButton({
                 onChange={(event) => setRecoveredName(event.currentTarget.value)}
                 required
               />
-              <Textarea
-                label="Bind-path mappings"
-                description="One absolute source=destination mapping per line."
-                placeholder="/old/data=/srv/recovered/data"
-                value={mappingText}
-                onChange={(event) => setMappingText(event.currentTarget.value)}
-                autosize
-                minRows={3}
-              />
               <Stack gap={4}>
+                <Text size="sm">Bind-path mappings</Text>
                 <Text size="xs" c="dimmed">
                   Map every source root; the first path is the recovered Stack
                   run directory.
                 </Text>
                 {requiredStackMappings.map((path) => (
-                  <Code key={path}>{path}</Code>
+                  <TextInput
+                    key={path}
+                    label={<Code>{path}</Code>}
+                    description="Absolute destination for this source root. Enter the path literally, including any = characters."
+                    placeholder="/srv/recovered/data"
+                    value={bindings[path] ?? ""}
+                    onChange={(event) => {
+                      const destination = event.currentTarget.value;
+                      setBindings((current) => ({
+                        ...current,
+                        [path]: destination,
+                      }));
+                    }}
+                    required
+                  />
                 ))}
               </Stack>
             </>

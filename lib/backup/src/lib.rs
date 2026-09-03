@@ -68,6 +68,7 @@ pub struct VykarRepository {
 }
 
 const MAX_RESTORE_METADATA_BYTES: usize = 32 * 1024 * 1024;
+const MAX_SNAPSHOT_FILE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RESTORE_INVENTORY_ITEMS: usize = 100_000;
 const MAX_RESTORE_INVENTORY_PATH_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_RESTORE_PATH_DEPTH: usize = 128;
@@ -531,6 +532,55 @@ impl VykarRepository {
     Ok(paths)
   }
 
+  /// Read one regular file without restoring paths or following links. The
+  /// complete metadata inventory must pass browsing/preflight limits first.
+  /// Both declared and actual content are limited to 4 MiB.
+  pub fn read_snapshot_file(
+    &self,
+    snapshot_name: &str,
+    path: &str,
+    deadline: Instant,
+  ) -> anyhow::Result<Vec<u8>> {
+    let mut selected = None;
+    self.visit_bounded_snapshot_items(
+      snapshot_name,
+      deadline,
+      |item| retain_snapshot_file(&mut selected, item, path),
+    )?;
+    let item =
+      selected.context("Snapshot recovery manifest is missing")?;
+    check_snapshot_file_deadline(deadline)?;
+    let (mut repo, _session) =
+      commands::util::open_repo_with_read_session(
+        &self.config,
+        Some(&self.passphrase),
+        vykar_core::repo::OpenOptions::new(),
+      )?;
+    repo.set_blob_cache_max_bytes(MAX_SNAPSHOT_FILE_BYTES);
+    check_snapshot_file_deadline(deadline)?;
+    if !item.chunks.is_empty() {
+      repo.load_chunk_index()?;
+    }
+    let mut bytes = Vec::new();
+    for chunk in &item.chunks {
+      check_snapshot_file_deadline(deadline)?;
+      let data = repo.read_chunk(&chunk.id)?;
+      check_snapshot_file_deadline(deadline)?;
+      append_snapshot_file_chunk(
+        &mut bytes,
+        &data,
+        chunk.size as usize,
+      )?;
+    }
+    check_snapshot_file_deadline(deadline)?;
+    if bytes.len() as u64 != item.size {
+      return Err(anyhow!(
+        "Snapshot recovery manifest size does not match its metadata"
+      ));
+    }
+    Ok(bytes)
+  }
+
   /// Shared by preflight and lazy browsing: apply limits before retaining an
   /// item, including items outside the requested selection or directory page.
   fn visit_bounded_snapshot_items(
@@ -581,6 +631,8 @@ impl VykarRepository {
     }
     let mut budget = RestoreInventoryBudget::new(deadline);
     commands::list::for_each_decoded_item(&stream, |item| {
+      validate_snapshot_item_path(&item)
+        .map_err(std::io::Error::other)?;
       budget.consume(&item.path).map_err(std::io::Error::other)?;
       visit(item).map_err(std::io::Error::other)?;
       Ok(())
@@ -675,6 +727,77 @@ impl VykarRepository {
         .collect(),
     })
   }
+}
+
+fn validate_snapshot_item_path(item: &Item) -> anyhow::Result<()> {
+  if item.has_raw_path() {
+    return Err(anyhow!(
+      "Snapshot inventory requires lossless UTF-8 filenames; no partial preview can be confirmed"
+    ));
+  }
+  Ok(())
+}
+
+fn check_snapshot_file_deadline(
+  deadline: Instant,
+) -> anyhow::Result<()> {
+  if Instant::now() >= deadline {
+    return Err(anyhow!(
+      "Snapshot recovery manifest read exceeded its time limit"
+    ));
+  }
+  Ok(())
+}
+
+fn retain_snapshot_file(
+  selected: &mut Option<Item>,
+  item: Item,
+  path: &str,
+) -> anyhow::Result<()> {
+  if item.path != path {
+    return Ok(());
+  }
+  if selected.is_some() {
+    return Err(anyhow!(
+      "Snapshot recovery manifest path is duplicated"
+    ));
+  }
+  item.validate()?;
+  if item.entry_type != ItemType::RegularFile {
+    return Err(anyhow!(
+      "Snapshot recovery manifest must be a regular file"
+    ));
+  }
+  let mut size = 0u64;
+  for chunk in &item.chunks {
+    size = size
+      .checked_add(u64::from(chunk.size))
+      .context("Snapshot recovery manifest size overflow")?;
+  }
+  if item.size > MAX_SNAPSHOT_FILE_BYTES as u64 || size != item.size {
+    return Err(anyhow!(
+      "Snapshot recovery manifest exceeds 4 MiB or has inconsistent chunk sizes"
+    ));
+  }
+  *selected = Some(item);
+  Ok(())
+}
+
+fn append_snapshot_file_chunk(
+  bytes: &mut Vec<u8>,
+  chunk: &[u8],
+  expected: usize,
+) -> anyhow::Result<()> {
+  if chunk.len() != expected
+    || chunk.len()
+      > MAX_SNAPSHOT_FILE_BYTES.saturating_sub(bytes.len())
+  {
+    return Err(anyhow!(
+      "Snapshot recovery manifest chunk exceeds its size limit"
+    ));
+  }
+  bytes.extend_from_slice(chunk);
+  Ok(())
 }
 
 fn restorable_source_paths(
@@ -973,6 +1096,86 @@ mod tests {
     let mut bytes = vec![1];
     append_restore_metadata(&mut bytes, &[2, 3]).unwrap();
     assert_eq!(bytes, [1, 2, 3]);
+  }
+
+  fn manifest_item() -> Item {
+    Item {
+      path: "manifest/komodo-backup-manifest.json".into(),
+      entry_type: ItemType::RegularFile,
+      mode: 0o600,
+      uid: 0,
+      gid: 0,
+      user: None,
+      group: None,
+      mtime: 0,
+      atime: None,
+      ctime: None,
+      size: 0,
+      chunks: Vec::new(),
+      link_target: None,
+      xattrs: None,
+      raw_names: None,
+      hardlink: None,
+    }
+  }
+
+  #[test]
+  fn manifest_selection_rejects_duplicates_links_and_oversized_content()
+   {
+    let item = manifest_item();
+    let path = item.path.clone();
+    let mut selected = None;
+    retain_snapshot_file(&mut selected, item.clone(), "other")
+      .unwrap();
+    assert!(selected.is_none());
+    retain_snapshot_file(&mut selected, item.clone(), &path).unwrap();
+    assert!(
+      retain_snapshot_file(&mut selected, item.clone(), &path)
+        .is_err()
+    );
+    let mut oversized = item.clone();
+    oversized.size = MAX_SNAPSHOT_FILE_BYTES as u64 + 1;
+    assert!(
+      retain_snapshot_file(&mut None, oversized, &path).is_err()
+    );
+    let mut link = item;
+    link.entry_type = ItemType::Symlink;
+    link.link_target = Some("/etc/passwd".into());
+    assert!(retain_snapshot_file(&mut None, link, &path).is_err());
+  }
+
+  #[test]
+  fn manifest_chunk_limits_are_checked_before_append() {
+    let mut bytes = vec![1];
+    assert!(
+      append_snapshot_file_chunk(&mut bytes, &[2, 3], 1).is_err()
+    );
+    assert_eq!(bytes, [1]);
+    append_snapshot_file_chunk(&mut bytes, &[2, 3], 2).unwrap();
+    assert_eq!(bytes, [1, 2, 3]);
+    let chunk = vec![0; MAX_SNAPSHOT_FILE_BYTES];
+    assert!(
+      append_snapshot_file_chunk(&mut bytes, &chunk, chunk.len())
+        .is_err()
+    );
+    assert_eq!(bytes, [1, 2, 3]);
+    assert!(check_snapshot_file_deadline(Instant::now()).is_err());
+  }
+
+  #[test]
+  fn snapshot_raw_filenames_cannot_enter_a_lossy_preview() {
+    let mut item = manifest_item();
+    validate_snapshot_item_path(&item).unwrap();
+    for byte in [0xfe, 0xff] {
+      let raw = vec![b'x', byte];
+      item.path = String::from_utf8_lossy(&raw).into_owned();
+      item.raw_names =
+        Some(vykar_core::snapshot::item::ItemRawNames {
+          path: Some(raw),
+          link_target: None,
+        });
+      assert!(validate_snapshot_item_path(&item).is_err());
+    }
   }
 
   #[test]
