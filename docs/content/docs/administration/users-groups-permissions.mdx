@@ -5,6 +5,50 @@ description: Give people and teams the Komodo access they need.
 
 Use User Groups to grant a team's access once, then add or remove members as needed. You must be an administrator to enable accounts and manage other users' access.
 
+## Control registration and default access
+
+By default, new user registration is closed and only administrators can create resources. Existing users can still sign in, and enabled non-admin users keep their direct and group permissions. The minimum length for newly created or changed local passwords is 15 characters; existing password hashes continue to work.
+
+1. Back up the main installation's `.env` and add the overrides you need from the tables below.
+2. Run `docker compose -p komodo config --quiet`, then `docker compose -p komodo up -d komodo` to reload Core. A restart alone does not reload `.env`.
+3. Use a private browser window to check the intended registration behavior. Sign in as an existing non-admin user to verify resource visibility and creation access.
+
+### Registration and approval
+
+| Environment variable | Default | Effect |
+| --- | --- | --- |
+| `KOMODO_INIT_ADMIN_USERNAME` | Unset | Creates the first local administrator on an empty database. The Compose examples set this to `admin`. |
+| `KOMODO_INIT_ADMIN_PASSWORD` | Unset | Required with the initial administrator username. It must not be an example placeholder and must meet the configured minimum length. Use `KOMODO_INIT_ADMIN_PASSWORD_FILE` to read it from a protected file. |
+| `KOMODO_MIN_PASSWORD_LENGTH` | `15` | Sets the minimum character count for new and changed local passwords. Existing password hashes remain valid. |
+| `KOMODO_DISABLE_USER_REGISTRATION` | `true` | Blocks new self-registered accounts. Local and OIDC overrides take precedence for their providers; GitHub and Google follow this setting. |
+| `KOMODO_DISABLE_LOCAL_USER_REGISTRATION` | Inherits the global registration setting | Set to `true` to hide **Sign Up** and block local username/password registration. Existing local accounts can still sign in while local authentication is enabled. |
+| `KOMODO_DISABLE_OIDC_USER_REGISTRATION` | Inherits the global registration setting | Set to `true` to block new accounts through OIDC. Existing OIDC accounts can still sign in. |
+| `KOMODO_ENABLE_NEW_USERS` | `false` | Set to `true` to enable newly registered accounts automatically. This skips administrator approval; it does not make users administrators or grant resource permissions. |
+
+To keep self-registration closed, leave the default in place and remove any local or OIDC registration overrides from `.env` and mounted configuration. On an empty database, configure `KOMODO_INIT_ADMIN_USERNAME` and a non-placeholder `KOMODO_INIT_ADMIN_PASSWORD` of at least 15 characters. Core stops before accepting requests when an empty installation has neither a valid initial administrator nor an explicitly enabled registration path.
+
+To allow OIDC registration while blocking local signups, keep the OIDC provider enabled and add:
+
+```dotenv
+KOMODO_DISABLE_LOCAL_USER_REGISTRATION=true
+KOMODO_DISABLE_OIDC_USER_REGISTRATION=false
+```
+
+Leave `KOMODO_ENABLE_NEW_USERS=false` when accounts should wait for approval in **Settings → Users**. Changing it affects future registrations; review existing accounts individually. For login providers and `KOMODO_LOCAL_AUTH`, see [Authentication and Providers](/administration/authentication-and-providers#configure-user-sign-in).
+
+To allow local registration, keep local authentication enabled and set `KOMODO_DISABLE_LOCAL_USER_REGISTRATION=false`. GitHub and Google do not have provider-specific registration switches; enabling new registration through either requires `KOMODO_DISABLE_USER_REGISTRATION=false`. Set the local and OIDC overrides to `true` if those paths should stay closed.
+
+### Default resource access
+
+| Environment variable | Default | Effect |
+| --- | --- | --- |
+| `KOMODO_TRANSPARENT_MODE` | `false` | Set to `true` to give every enabled user base Read access to all resources. Specific permissions such as File Manager remain separate. |
+| `KOMODO_DISABLE_NON_ADMIN_CREATE` | `true` | Allows only administrators to create resources, even when a user has Server or Build creation permission. Existing resource permissions still apply. Set to `false` to delegate creation. |
+
+When you set `KOMODO_DISABLE_NON_ADMIN_CREATE=false`, Server and Build creation still require their separate user permissions, and administrator-only resource types remain restricted. Use direct or group grants for access to existing resources. Enable transparent mode only when every enabled user should see every resource; combined with automatic account approval, it makes that visibility available to anyone who can register.
+
+If a setting appears ineffective, check for environment overrides of mounted configuration and recreate Core. For unexpectedly broad resource access, review the user's direct grants, groups, and resource base permissions.
+
 ## Grant access to a team
 
 1. Open **Settings → Users** and enable approved accounts.
@@ -22,8 +66,6 @@ Users inherit grants from every group they belong to. An **Everyone** group appl
 | Read | View the resource and configuration. |
 | Execute | Read and run actions, such as deployment or builds. |
 | Write | Execute, change configuration, and delete the resource. |
-
-`KOMODO_TRANSPARENT_MODE=true` gives everyone base Read access. It does not grant specific permissions such as File Manager.
 
 ## Specific permissions
 
@@ -59,4 +101,4 @@ permissions = [
 
 The initial super administrator can use **Make Admin** on a user's page. Administrators have unrestricted resource access and can manage non-admin users.
 
-New users need administrator approval unless `KOMODO_ENABLE_NEW_USERS=true`. Disable an account from **Settings → Users** to block its GUI and API access. Grant global Server or Build creation permission only when the user should create those resources.
+Disable an account from **Settings → Users** to block its GUI and API access. Grant global Server or Build creation permission only when the user should create those resources; the [non-admin creation policy](#default-resource-access) must also allow it.

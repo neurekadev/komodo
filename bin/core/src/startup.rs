@@ -1,6 +1,6 @@
 use std::str::FromStr;
 
-use anyhow::Context;
+use anyhow::{Context, anyhow};
 use database::mungos::{
   find::find_collect,
   mongodb::bson::{
@@ -21,6 +21,7 @@ use komodo_client::{
   entities::{
     ResourceTarget,
     builder::{PartialBuilderConfig, PartialServerBuilderConfig},
+    config::core::CoreConfig,
     deployment::DeploymentInfo,
     komodo_timestamp,
     procedure::{EnabledExecution, ProcedureConfig, ProcedureStage},
@@ -31,7 +32,7 @@ use komodo_client::{
     user::{action_user, system_user},
   },
 };
-use mogh_auth_server::api::login::local::sign_up_local_user;
+use mogh_auth_server::AuthImpl;
 use mogh_resolver::Resolve;
 use uuid::Uuid;
 
@@ -42,7 +43,13 @@ use crate::{
   },
   auth::KomodoAuthImpl,
   config::core_config,
-  helpers::update::init_execution_update,
+  helpers::{
+    update::init_execution_update,
+    validations::{
+      validate_password_length, validate_username,
+      validate_webhook_secret,
+    },
+  },
   network, resource,
   state::db_client,
 };
@@ -104,7 +111,7 @@ pub async fn run_startup_actions() {
 
 /// This function should be run on startup,
 /// after the db client has been initialized
-pub async fn on_startup() {
+pub async fn on_startup() -> anyhow::Result<()> {
   // Configure manual network interface if specified
   network::configure_internet_gateway().await;
 
@@ -114,16 +121,20 @@ pub async fn on_startup() {
     v2_init_missing_resource_info(),
   );
 
+  // Validate and establish access before the API begins accepting requests.
+  ensure_init_user_and_resources().await?;
+
   // Standard startup tasks
   tokio::join!(
     in_progress_update_cleanup(),
     open_alert_cleanup(),
     action_api_key_cleanup(),
     ensure_first_server_and_builder(),
-    ensure_init_user_and_resources(),
     warn_legacy_backup_schedules(),
     backup_run_cleanup(),
   );
+
+  Ok(())
 }
 
 async fn backup_run_cleanup() {
@@ -353,51 +364,119 @@ async fn ensure_first_server_and_builder() {
   }
 }
 
-async fn ensure_init_user_and_resources() {
+fn validate_bootstrap_config(
+  config: &CoreConfig,
+  has_users: bool,
+) -> anyhow::Result<()> {
+  if !config.webhook_secret.trim().is_empty() {
+    validate_webhook_secret(&config.webhook_secret)
+      .context("Invalid KOMODO_WEBHOOK_SECRET")?;
+  }
+
+  if has_users {
+    return Ok(());
+  }
+
+  if let Some(username) = &config.init_admin_username {
+    anyhow::ensure!(
+      config.local_auth,
+      "KOMODO_LOCAL_AUTH must be true to create the initial administrator"
+    );
+    validate_username(username)
+      .context("Invalid KOMODO_INIT_ADMIN_USERNAME")?;
+    anyhow::ensure!(
+      !config.init_admin_password.trim().is_empty(),
+      "KOMODO_INIT_ADMIN_PASSWORD must be configured"
+    );
+    anyhow::ensure!(
+      !["changeme", "REPLACE_WITH_PASSWORD"].iter().any(
+        |placeholder| config
+          .init_admin_password
+          .trim()
+          .eq_ignore_ascii_case(placeholder)
+      ),
+      "KOMODO_INIT_ADMIN_PASSWORD must not use an example placeholder"
+    );
+    validate_password_length(
+      &config.init_admin_password,
+      config.min_password_length as usize,
+    )
+    .context("Invalid KOMODO_INIT_ADMIN_PASSWORD")?;
+    return Ok(());
+  }
+
+  let local_registration_enabled = config.local_auth
+    && !config
+      .disable_local_user_registration
+      .unwrap_or(config.disable_user_registration);
+  let oidc_registration_enabled = config.oidc_enabled()
+    && !config
+      .disable_oidc_user_registration
+      .unwrap_or(config.disable_user_registration);
+  let named_oauth_registration_enabled = !config
+    .disable_user_registration
+    && (config.github_oauth.enabled()
+      || config.google_oauth.enabled());
+
+  anyhow::ensure!(
+    local_registration_enabled
+      || oidc_registration_enabled
+      || named_oauth_registration_enabled,
+    "The user database is empty and registration is disabled. Configure an initial administrator or explicitly enable registration for an enabled login provider"
+  );
+
+  Ok(())
+}
+
+async fn ensure_init_user_and_resources() -> anyhow::Result<()> {
   let db = db_client();
 
   // Assumes if there are any existing users, procedures, or tags,
   // the default procedures do not need to be set up.
-  let Ok((None, procedures, tags)) = tokio::try_join!(
+  let (user, procedures, tags) = tokio::try_join!(
     db.users.find_one(Document::new()),
     db.procedures.find_one(Document::new()),
     db.tags.find_one(Document::new()),
-  ).inspect_err(|e| error!("Failed to initialize default procedures | Failed to query db | {e:?}")) else {
-    return
-  };
+  )
+  .context("Failed to query the database during initial setup")?;
 
   let config = core_config();
+  validate_bootstrap_config(config, user.is_some())?;
+
+  if user.is_some() {
+    return Ok(());
+  }
 
   // Init admin user if set in config.
   if let Some(username) = &config.init_admin_username {
     info!("Creating init admin user...");
-    if let Err(e) = sign_up_local_user(
+    let hashed_password = bcrypt::hash(
+      config.init_admin_password.as_bytes(),
+      KomodoAuthImpl.local_auth_bcrypt_cost(),
+    )
+    .context("Failed to hash the initial administrator password")?;
+    AuthImpl::sign_up_local_user(
       &KomodoAuthImpl,
       username.to_string(),
-      &config.init_admin_password,
+      hashed_password,
+      true,
     )
     .await
-    {
-      error!("Failed to create init admin user | {:#}", e.error);
-      return;
-    }
-    match db
+    .map_err(|e| {
+      anyhow!("Failed to create init admin user | {:#}", e.error)
+    })?;
+    let initialized_user = db
       .users
       .find_one(doc! { "username": username })
       .await
       .context(
         "Failed to query database for init admin user after creation",
-      ) {
-      Ok(Some(_)) => {
-        info!("Successfully created init admin user.")
-      }
-      Ok(None) => {
-        error!("Failed to find init admin user after creation");
-      }
-      Err(e) => {
-        error!("{e:#}");
-      }
-    }
+      )?;
+    anyhow::ensure!(
+      initialized_user.is_some(),
+      "Failed to find init admin user after creation"
+    );
+    info!("Successfully created init admin user.");
   }
 
   if config.disable_init_resources
@@ -405,7 +484,7 @@ async fn ensure_init_user_and_resources() {
     || tags.is_some()
   {
     info!("Skipping initial system resource creation");
-    return;
+    return Ok(());
   }
 
   info!("Creating initial system resources...");
@@ -532,6 +611,8 @@ async fn ensure_init_user_and_resources() {
       );
     }
   }.await;
+
+  Ok(())
 }
 
 /// v1.17.5 removes the ServerTemplate resource.
@@ -631,5 +712,71 @@ async fn v2_init_missing_resource_info() {
     .await
   {
     error!("Failed to migrate DeploymentInfo to v2 | {e:?}");
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn configured_core() -> CoreConfig {
+    CoreConfig {
+      local_auth: true,
+      ..Default::default()
+    }
+  }
+
+  #[test]
+  fn existing_installation_does_not_require_bootstrap_credentials() {
+    assert!(
+      validate_bootstrap_config(&CoreConfig::default(), true).is_ok()
+    );
+  }
+
+  #[test]
+  fn empty_installation_requires_an_access_path() {
+    let config = configured_core();
+    assert!(validate_bootstrap_config(&config, false).is_err());
+  }
+
+  #[test]
+  fn initial_admin_requires_a_real_password() {
+    let mut config = configured_core();
+    config.init_admin_username = Some("admin".into());
+
+    for password in
+      ["", "changeme", "REPLACE_WITH_PASSWORD", "too-short"]
+    {
+      config.init_admin_password = password.into();
+      assert!(validate_bootstrap_config(&config, false).is_err());
+    }
+
+    config.init_admin_password = "a-secure-password".into();
+    assert!(validate_bootstrap_config(&config, false).is_ok());
+  }
+
+  #[test]
+  fn explicit_registration_override_can_bootstrap() {
+    let mut local = configured_core();
+    local.disable_local_user_registration = Some(false);
+    assert!(validate_bootstrap_config(&local, false).is_ok());
+
+    let oidc = CoreConfig {
+      oidc_enabled: true,
+      oidc_provider: "https://identity.example.com".into(),
+      oidc_client_id: "komodo".into(),
+      disable_oidc_user_registration: Some(false),
+      ..Default::default()
+    };
+    assert!(validate_bootstrap_config(&oidc, false).is_ok());
+  }
+
+  #[test]
+  fn shipped_webhook_placeholder_is_rejected() {
+    let config = CoreConfig {
+      webhook_secret: "a_random_webhook_secret".into(),
+      ..Default::default()
+    };
+    assert!(validate_bootstrap_config(&config, true).is_err());
   }
 }

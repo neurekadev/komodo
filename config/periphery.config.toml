@@ -158,7 +158,7 @@ exclude_disk_mounts = []
 ## Must match an existing Server name or id.
 ## Env: PERIPHERY_CONNECT_AS
 ## Default: None
-# connect_as = "server-name"
+# connect_as = "server-id-or-name"
 
 ## Make Onboarding Keys in Server settings.
 ## Not needed if connecting as Server that already exists.

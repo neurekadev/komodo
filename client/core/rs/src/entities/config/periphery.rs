@@ -166,7 +166,7 @@ pub struct Env {
   pub periphery_core_addresses: Option<Vec<String>>,
   /// Override `core_tls_insecure_skip_verify`
   pub periphery_core_tls_insecure_skip_verify: Option<bool>,
-  /// Override `connect_as`
+  /// Override `connect_as` with a Server ID or exact name.
   pub periphery_connect_as: Option<String>,
   /// Override `server_enabled`
   pub periphery_server_enabled: Option<bool>,

@@ -2,7 +2,9 @@ use anyhow::{Context, anyhow};
 use axum::http::HeaderMap;
 use serde::Deserialize;
 
-use crate::config::core_config;
+use crate::{
+  config::core_config, helpers::validations::effective_webhook_secret,
+};
 
 use super::{ExtractBranch, VerifySecret};
 
@@ -21,11 +23,10 @@ impl VerifySecret for Gitlab {
       .context("No gitlab token in headers")?;
     let token =
       token.to_str().context("Failed to get token as string")?;
-    let secret = if custom_secret.is_empty() {
-      core_config().webhook_secret.as_str()
-    } else {
-      custom_secret
-    };
+    let secret = effective_webhook_secret(
+      custom_secret,
+      &core_config().webhook_secret,
+    )?;
     if token == secret {
       Ok(())
     } else {

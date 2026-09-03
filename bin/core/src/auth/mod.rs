@@ -192,9 +192,10 @@ impl AuthImpl for KomodoAuthImpl {
   fn no_users_exist(
     &self,
   ) -> mogh_auth_server::DynFuture<mogh_error::Result<bool>> {
-    Box::pin(async {
-      Ok(db_client().users.find_one(Document::new()).await?.is_none())
-    })
+    // Komodo assigns first-user privileges inside each enabled provider's
+    // mutation guard. Returning false here prevents the auth library from
+    // bypassing a disabled provider merely because the database is empty.
+    Box::pin(async { Ok(false) })
   }
 
   fn locked_usernames(&self) -> &'static [String] {
@@ -270,6 +271,12 @@ impl AuthImpl for KomodoAuthImpl {
   ) -> mogh_auth_server::DynFuture<mogh_error::Result<String>> {
     Box::pin(async move {
       let _mutation_guard = middleware::mutation_guard().await;
+      let no_users_exist = no_users_exist
+        || db_client()
+          .users
+          .find_one(Document::new())
+          .await?
+          .is_none();
       let user = User::new(NewUserParams {
         username,
         enabled: no_users_exist || core_config().enable_new_users,
@@ -394,6 +401,12 @@ impl AuthImpl for KomodoAuthImpl {
   ) -> mogh_auth_server::DynFuture<mogh_error::Result<String>> {
     Box::pin(async move {
       let _mutation_guard = middleware::mutation_guard().await;
+      let no_users_exist = no_users_exist
+        || db_client()
+          .users
+          .find_one(Document::new())
+          .await?
+          .is_none();
       let user = User::new(NewUserParams {
         username,
         enabled: no_users_exist || core_config().enable_new_users,
@@ -488,6 +501,12 @@ impl AuthImpl for KomodoAuthImpl {
   ) -> mogh_auth_server::DynFuture<mogh_error::Result<String>> {
     Box::pin(async move {
       let _mutation_guard = middleware::mutation_guard().await;
+      let no_users_exist = no_users_exist
+        || db_client()
+          .users
+          .find_one(Document::new())
+          .await?
+          .is_none();
       let user = User::new(NewUserParams {
         username,
         enabled: no_users_exist || core_config().enable_new_users,
@@ -580,6 +599,12 @@ impl AuthImpl for KomodoAuthImpl {
   ) -> mogh_auth_server::DynFuture<mogh_error::Result<String>> {
     Box::pin(async move {
       let _mutation_guard = middleware::mutation_guard().await;
+      let no_users_exist = no_users_exist
+        || db_client()
+          .users
+          .find_one(Document::new())
+          .await?
+          .is_none();
       let user = User::new(NewUserParams {
         username,
         enabled: no_users_exist || core_config().enable_new_users,

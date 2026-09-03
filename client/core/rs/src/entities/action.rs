@@ -144,14 +144,15 @@ pub struct ActionConfig {
   #[partial_default(default_failure_alert())]
   pub failure_alert: bool,
 
-  /// Whether incoming webhooks actually trigger action.
+  /// Whether incoming webhooks actually trigger action. Disabled by default.
   #[serde(default = "default_webhook_enabled")]
   #[builder(default = "default_webhook_enabled()")]
   #[partial_default(default_webhook_enabled())]
   pub webhook_enabled: bool,
 
   /// Optionally provide an alternate webhook secret for this procedure.
-  /// If its an empty string, use the default secret from the config.
+  /// If empty, use the global configured secret. Requests are rejected
+  /// when neither location contains a valid secret.
   #[serde(default)]
   #[builder(default)]
   pub webhook_secret: String,
@@ -205,7 +206,7 @@ fn default_run_at_startup() -> bool {
 }
 
 fn default_webhook_enabled() -> bool {
-  true
+  false
 }
 
 impl ActionConfig {

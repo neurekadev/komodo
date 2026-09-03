@@ -33,11 +33,60 @@ pub const MAX_PASSWORD_LENGTH: usize = 1000;
 ///
 /// - Between [CoreConfig::min_password_length][komodo_client::entities::config::core::CoreConfig::min_password_length] and [MAX_PASSWORD_LENGTH] characters
 pub fn validate_password(password: &str) -> anyhow::Result<()> {
-  StringValidator::default()
-    .min_length(core_config().min_password_length as usize)
-    .max_length(MAX_PASSWORD_LENGTH)
-    .validate(password)
-    .context("Failed to validate password")
+  validate_password_length(
+    password,
+    core_config().min_password_length as usize,
+  )
+  .context("Failed to validate password")
+}
+
+pub(crate) fn validate_password_length(
+  password: &str,
+  min_length: usize,
+) -> anyhow::Result<()> {
+  let length = password.chars().count();
+  anyhow::ensure!(
+    length >= min_length,
+    "Password must contain at least {min_length} characters"
+  );
+  anyhow::ensure!(
+    length <= MAX_PASSWORD_LENGTH,
+    "Password must contain at most {MAX_PASSWORD_LENGTH} characters"
+  );
+  Ok(())
+}
+
+/// Return the resource-specific webhook secret when set, otherwise the
+/// global secret. Empty values and placeholders shipped in examples are
+/// never valid authentication keys.
+pub(crate) fn effective_webhook_secret<'a>(
+  custom_secret: &'a str,
+  global_secret: &'a str,
+) -> anyhow::Result<&'a str> {
+  let secret = if custom_secret.trim().is_empty() {
+    global_secret
+  } else {
+    custom_secret
+  };
+  validate_webhook_secret(secret)?;
+  Ok(secret)
+}
+
+pub(crate) fn validate_webhook_secret(
+  secret: &str,
+) -> anyhow::Result<()> {
+  let secret = secret.trim();
+  anyhow::ensure!(
+    !secret.is_empty(),
+    "No webhook secret is configured"
+  );
+  anyhow::ensure!(
+    !["a_random_webhook_secret", "REPLACE_WITH_SECRET"]
+      .iter()
+      .any(|placeholder| secret.eq_ignore_ascii_case(placeholder)),
+    "The configured webhook secret is an example placeholder"
+  );
+  Ok(())
 }
 
 /// Maximum length for API key names
@@ -82,4 +131,48 @@ pub fn validate_variable_value(value: &str) -> anyhow::Result<()> {
     .max_length(MAX_VARIABLE_VALUE_LENGTH)
     .validate(value)
     .context("Failed to validate variable value")
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn password_length_counts_unicode_code_points() {
+    assert!(validate_password_length("short", 15).is_err());
+    assert!(validate_password_length("123456789012345", 15).is_ok());
+    assert!(
+      validate_password_length("🔐🔐🔐🔐🔐🔐🔐🔐🔐🔐🔐🔐🔐🔐🔐", 15)
+        .is_ok()
+    );
+    assert!(
+      validate_password_length(
+        &"a".repeat(MAX_PASSWORD_LENGTH + 1),
+        15
+      )
+      .is_err()
+    );
+  }
+
+  #[test]
+  fn webhook_secrets_require_a_real_configured_value() {
+    assert!(effective_webhook_secret("", "").is_err());
+    assert!(
+      effective_webhook_secret("", "a_random_webhook_secret")
+        .is_err()
+    );
+    assert!(
+      effective_webhook_secret("REPLACE_WITH_SECRET", "valid-global")
+        .is_err()
+    );
+    assert_eq!(
+      effective_webhook_secret("", "valid-global").unwrap(),
+      "valid-global"
+    );
+    assert_eq!(
+      effective_webhook_secret("valid-resource", "valid-global")
+        .unwrap(),
+      "valid-resource"
+    );
+  }
 }

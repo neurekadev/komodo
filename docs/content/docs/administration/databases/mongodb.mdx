@@ -52,15 +52,13 @@ docker inspect komodo-mongo --format 'status={{.State.Status}} exit={{.State.Exi
 docker logs --tail=200 komodo-mongo
 ```
 
-If the kernel is affected, add this temporary `environment` block to the `komodo-mongo` service in your Compose file. Keep its existing `env_file` entry:
+The installation template applies the workaround directly to `komodo-mongo` with list-style `VAR=VALUE` syntax:
 
 ```yaml
 services:
   komodo-mongo:
     environment:
-      # Temporary SERVER-121912 workaround: override the image's rseq=0.
-      # Remove after upgrading to a fixed kernel and compatible MongoDB release.
-      GLIBC_TUNABLES: glibc.pthread.rseq=1
+      - GLIBC_TUNABLES=glibc.pthread.rseq=1
 ```
 
 Recreate only MongoDB and verify that it stays running:
@@ -70,6 +68,6 @@ docker compose -p komodo up -d --force-recreate komodo-mongo
 docker compose -p komodo ps komodo-mongo
 ```
 
-Check again after at least a minute and confirm Core can reconnect. This override is intentionally absent from the official template. It changes MongoDB's allocator behavior and can reduce performance; use it only for the matching crash signature, then remove it after installing a fixed kernel and compatible MongoDB release.
+Check again after at least a minute and confirm Core can reconnect. The override changes MongoDB's allocator behavior and can reduce performance. Remove it from the MongoDB service after installing a fixed kernel and compatible MongoDB release.
 
 The complete deployment files are in [Install Komodo](/quick-start/install-komodo).

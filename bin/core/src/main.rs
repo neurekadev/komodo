@@ -62,7 +62,7 @@ async fn app() -> anyhow::Result<()> {
     // Init db_client check to crash on db init failure
     state::init_db_client().await;
     // Run after db connection.
-    startup::on_startup().await;
+    startup::on_startup().await?;
 
     // Spawn background tasks
     monitor::spawn_monitoring_loops();
@@ -77,9 +77,11 @@ async fn app() -> anyhow::Result<()> {
     report::spawn_reporting_loop();
     api::write::spawn_managed_transaction_reconciliation_loop();
     resource::spawn_stack_delete_reconciliation_loop();
+
+    Ok::<(), anyhow::Error>(())
   }
   .instrument(startup_span)
-  .await;
+  .await?;
 
   // Register embedded repository routes before the backup scheduler can run.
   let api = api::app().await?;

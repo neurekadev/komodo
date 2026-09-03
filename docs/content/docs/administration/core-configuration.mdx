@@ -6,6 +6,26 @@ description: Configure certificates, OAuth/OIDC, network restrictions, and mount
 
 Additional configuration options for Komodo Core and Periphery, including custom certificate authorities, OAuth/OIDC providers, and mounted config files.
 
+## Find an environment variable
+
+You can add supported optional variables to your deployment's `.env`. The installation examples contain required inputs; omitted settings use application or Compose startup defaults.
+
+Use the `Env:` and `Default:` descriptions in the configuration references to find a variable's exact name, value format, and behavior:
+
+- [Core configuration](https://github.com/neurekadev/komodo/blob/main/config/core.config.toml): login providers, registration, permissions, UI behavior, polling intervals, logging, and AWS credentials.
+- [Periphery configuration](https://github.com/neurekadev/komodo/blob/main/config/periphery.config.toml): terminal controls, disk filters, logging, connections, and working directories.
+- [CLI configuration](https://github.com/neurekadev/komodo/blob/main/config/komodo.cli.toml): CLI connections, database access, and export paths.
+
+For registration switches and default permissions, follow [Control registration and default access](/administration/users-groups-permissions#control-registration-and-default-access). The Compose startup commands also supply [deployment defaults](https://github.com/neurekadev/komodo/blob/main/bin/compose-defaults.sh), including local authentication enabled and persistent key/workspace paths; these can differ from the standalone application defaults in the TOML references.
+
+## Security-sensitive defaults
+
+Komodo closes user registration, restricts resource creation to administrators, requires 15 characters for new local passwords, and creates no administrator unless both initial administrator variables are supplied. Core stops before opening the API when an empty user database has no valid initial administrator and no explicitly enabled registration path.
+
+New Builds, Repos, Stacks, Resource Syncs, Procedures, and Actions also start with webhooks disabled. An enabled webhook requires either a resource-specific secret or `KOMODO_WEBHOOK_SECRET`; empty values and the placeholders shipped in examples are rejected.
+
+An empty `KOMODO_CORS_ALLOWED_ORIGINS` list permits no additional browser origins. Add exact origins when another web application must call Core, or use `*` only when every origin should be accepted. The default `KOMODO_X_XSS_PROTECTION=0` disables the obsolete browser XSS auditor.
+
 ## Change Configuration Safely
 
 1. Start from the [installation examples](/quick-start/install-komodo) and the current [`core.config.toml`](https://github.com/neurekadev/komodo/blob/main/config/core.config.toml) or [`periphery.config.toml`](https://github.com/neurekadev/komodo/blob/main/config/periphery.config.toml).
