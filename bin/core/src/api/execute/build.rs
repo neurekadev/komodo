@@ -40,7 +40,6 @@ use komodo_client::{
 use mogh_resolver::Resolve;
 use periphery_client::api;
 use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
 
 use crate::{
   alert::send_alerts,

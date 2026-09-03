@@ -46,8 +46,6 @@ impl PeripheryConnectionArgs<'_> {
     let (connection, mut receiver) =
       periphery_connections().insert(id.clone(), self).await;
 
-    let responses = connection.responses.clone();
-
     let _id = id.clone();
     tokio::spawn(async move {
       loop {
@@ -113,7 +111,7 @@ impl PeripheryConnectionArgs<'_> {
       }
     });
 
-    Ok(PeripheryClient { id, responses })
+    Ok(PeripheryClient { id })
   }
 }
 
