@@ -291,6 +291,7 @@ mod tests {
       },
     );
     let source = BackupRepository {
+      name: "Recovery source".into(),
       backend: BackupRepositoryBackend::CoreLocal {
         path: "/surviving-mirror".into(),
       },

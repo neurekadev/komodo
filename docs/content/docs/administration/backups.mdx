@@ -6,6 +6,8 @@ description: Configure encrypted repositories and trusted backup workers.
 
 Set up one encrypted repository and a shared schedule for Core, Stacks, and Docker volumes. You must be a Komodo administrator.
 
+The bundled [Vykar release](https://github.com/borgbase/vykar/tree/v0.19.1) is marked as not ready for production backups. Test recovery and keep an independent backup alongside it.
+
 Keep the repository address, access credentials, and encryption passphrase somewhere you can reach if Komodo is lost. A complete Core snapshot includes its recovery identity and backup settings; no separate `backup.key` is required. Keep your installation's Compose file and `.env` separately too.
 
 ## Configure backups

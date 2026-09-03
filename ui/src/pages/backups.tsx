@@ -679,6 +679,7 @@ function CoreRecoverySection() {
   });
   const [snapshot, setSnapshot] = useState<string>();
   const [snapshotPage, setSnapshotPage] = useState(1);
+  const [snapshotPages, setSnapshotPages] = useState(1);
   const { preview: plan, begin, invalidate } = usePreviewRequest<Types.CoreRecoveryPlan>(
     JSON.stringify({ snapshot, snapshotPage, repository }),
   );
@@ -701,10 +702,11 @@ function CoreRecoverySection() {
     }
   };
   const snapshots = snapshotResponse?.snapshots ?? [];
-  const snapshotPages = Math.max(
-    1,
-    Math.ceil((snapshotResponse?.total ?? 0) / 100),
-  );
+  useEffect(() => {
+    if (snapshotResponse) {
+      setSnapshotPages(Math.max(1, Math.ceil(snapshotResponse.total / 100)));
+    }
+  }, [snapshotResponse]);
   const { mutateAsync: planRecovery, isPending: planning } = useWrite("PlanCoreRecovery");
   const { mutate: executeRecovery, isPending: executing } = useWrite(
     "ExecuteCoreRecovery",
@@ -733,6 +735,7 @@ function CoreRecoverySection() {
         <RepositoryEditor label="Existing recovery repository" repository={repository} recoveryOnly onChange={(value) => {
           setSnapshot(undefined);
           setSnapshotPage(1);
+          setSnapshotPages(1);
           setRepository(value);
         }} />
         <Button variant="light" loading={loadingSnapshots} onClick={() => loadSnapshots()}>
