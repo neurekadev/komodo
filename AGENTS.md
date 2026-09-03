@@ -2,30 +2,32 @@
 
 Komodo documentation is part of the product. Every change that affects a user-visible feature, configuration option, security boundary, deployment workflow, or migration must update `docs/` in the same change.
 
-## Write for end users first
+## Write for people using and self-hosting Komodo
 
-- Start with what the reader can accomplish and why they would do it.
-- Put prerequisites immediately before the task that needs them.
-- Give numbered UI or command steps using current Komodo labels and repository-provided commands.
-- State the expected result, then cover common troubleshooting.
-- Put advanced configuration, architecture, security, and recovery information after the end-user workflow. Do not make routine users read administrator internals before they can complete the task.
-- Keep security warnings beside the action that creates the risk.
-- Prefer short, task-based pages over broad inventories. Link to one canonical explanation instead of duplicating configuration details.
+- Keep each page focused on one task or a small set of closely related tasks. Start with what the reader can accomplish and why.
+- Include only the prerequisites, numbered UI or command steps, expected result, and troubleshooting needed to complete the task. Use current Komodo labels and verified commands.
+- Explain a setting only when it helps the reader make a choice or complete an action. Keep consequential warnings short and beside the relevant action.
+- Split distinct workflows into linked pages. Do not append implementation narratives, internal algorithms, exhaustive edge cases, or change history to user guides.
+- Keep contributor setup and implementation material outside the published user guide, in CONTRIBUTING.md or source documentation.
+- Use editorial judgment without a word-count limit. Before finishing, remove unnecessary detail and duplication from every changed page; shortening a page must not remove instructions needed to use the feature safely.
 
 ## Keep the documentation organized
 
-- Keep **Quick Start** first in navigation and use it for the shortest supported path to install Core, connect a server, and deploy a first stack.
-- Put user-facing capabilities in **Features**.
-- Put operator-only configuration, authentication, permissions, backup, recovery, and trust-boundary material in **Administration**.
-- Put the resource model, CLI, API and client libraries, integrations, and contributor information in **Reference**.
-- Keep product images in **Screenshots** and use the documented filename and metadata convention.
+- Keep **Quick Start** and its landing page first in navigation, providing the shortest supported path to install Core, connect a server, and deploy a first stack.
+- Put user-facing capabilities, including running backups and restoring workloads, in **Features**.
+- Put installation, configuration, authentication, permissions, backup setup, and disaster-recovery tasks in **Administration**.
+- Put practical resource-model, CLI, API, client-library, and integration guidance in **Reference**.
+- Use navigation groups instead of category landing pages that repeat the sidebar. Quick Start is the intentional exception; retain the site homepage too.
+- List each destination once in documentation navigation. Keep the top **Screenshots** link and do not add a second gallery entry at the bottom.
+- Keep product images in **Screenshots** and follow the filename and metadata convention documented for contributors.
 - Keep actionable upgrade instructions in **Migrations**. Host release notes only in GitHub Releases; do not add release-note or inline-changelog pages.
 - Komodo 3.0.0+ is a divergent hard fork. Do not offer upstream migration guides or promise upstream backward compatibility, including from `v2.3.2`. Cherry-picking upstream fixes does not change this policy. Any future fork-to-fork upgrade guide must begin with a backup and include verification and rollback steps.
 
 ## Keep examples synchronized
 
-- Copy commands and examples from the repository's Compose templates, configuration, generated schemas, and current UI labels whenever possible.
-- Update the relevant documentation whenever those sources change.
+- Keep complete production Compose and environment examples inline in the MongoDB, FerretDB, and standalone Periphery deployment guides. Those examples are canonical; link to them instead of maintaining duplicate templates or download files.
+- Validate the exact deployment examples users copy. Keep them synchronized with configuration, image startup behavior, generated schemas, and current UI labels.
+- Update relevant task instructions whenever product behavior or an example changes.
 - Use root-relative links for this site. It is served only at `/`; do not introduce `/docs` base paths, compatibility redirects, `DOCSITE_URL`, `DOCSITE_BASE_URL`, a CNAME, or GitHub Pages deployment configuration.
 
 ## Verify documentation changes
