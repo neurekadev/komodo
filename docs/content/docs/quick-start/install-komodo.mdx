@@ -58,7 +58,7 @@ services:
     restart: unless-stopped
     command: --quiet --wiredTigerCacheSizeGB 0.25
     labels:
-      komodo.skip: "true" # Keep Komodo from stopping its own database.
+      komodo.skip: "true"
 
   komodo-periphery:
     image: ghcr.io/neurekadev/komodo-periphery:${COMPOSE_KOMODO_IMAGE_TAG:-3}
@@ -91,6 +91,8 @@ volumes:
 ```
 
 ## .env
+
+Keep the database credential references below; [each container reads different variable names](/administration/container-deployment#database-credentials).
 
 ```dotenv title=".env"
 KOMODO_HOST=https://REPLACE_WITH_HOST

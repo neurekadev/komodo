@@ -20,6 +20,19 @@ Start with the complete examples for [MongoDB](/quick-start/install-komodo), [Fe
 | `PERIPHERY_CONNECT_AS` | Connect Periphery to an existing Server by exact name. |
 | `PERIPHERY_DOCKER_VOLUME_ROOT` | Use a different Docker volume directory. |
 
+## Database credentials
+
+Set `KOMODO_DATABASE_USERNAME` and `KOMODO_DATABASE_PASSWORD` once in the main installation's `.env` and keep the `${...}` references intact. The examples reuse the same account under the names each image requires:
+
+| Variables | Consumer and purpose |
+| --- | --- |
+| `KOMODO_DATABASE_USERNAME`, `KOMODO_DATABASE_PASSWORD` | Core and the Komodo CLI authenticate to the database. |
+| `MONGO_INITDB_ROOT_USERNAME`, `MONGO_INITDB_ROOT_PASSWORD` | The MongoDB image creates the initial database account. |
+| `POSTGRES_USER`, `POSTGRES_PASSWORD` | The PostgreSQL/DocumentDB image creates the initial database account. |
+| `FERRETDB_POSTGRESQL_URL` | FerretDB connects to PostgreSQL using that account. |
+
+The native image variables are required wiring, not additional credentials to choose. Removing them breaks initialization or authentication in these examples. Changing `.env` does not change passwords already stored in MongoDB or PostgreSQL; update the database account separately before recreating containers with matching credentials.
+
 ## Custom Docker paths
 
 Run `docker info --format '{{.DockerRootDir}}/volumes'` on the host and set `PERIPHERY_DOCKER_VOLUME_ROOT` to that absolute path. Keep it mounted read/write at the same path inside Periphery so Docker bind mounts and Volume File Manager operations work.
