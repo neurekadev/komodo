@@ -142,6 +142,11 @@ impl PeripheryConnection {
         .context("Failed to receive Login V1PasskeyFlow message")?;
 
     if v1_passkey_flow {
+      if self.args.periphery_public_key.is_some() {
+        return Err(anyhow!(
+          "A pinned Periphery public key requires public-key authentication; refusing passkey downgrade"
+        ));
+      }
       handle_passkey_login(socket, self.args.passkey.as_deref()).await
     } else {
       self

@@ -236,11 +236,32 @@ pub fn router() -> Router {
     ))
 }
 
+const UPLOAD_BODY_DEADLINE: Duration = Duration::from_secs(10 * 60);
+
+async fn within_upload_deadline<T>(
+  deadline: tokio::time::Instant,
+  body: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+  if tokio::time::Instant::now() >= deadline {
+    return Err(anyhow!(
+      "Upload exceeded its 10-minute total transfer deadline"
+    ));
+  }
+  tokio::time::timeout_at(deadline, body).await.context(
+    "Upload exceeded its 10-minute total transfer deadline",
+  )?
+}
+
 async fn upload(
   Extension(user): Extension<User>,
   Path(token): Path<String>,
   body: Body,
 ) -> mogh_error::Result<Json<FileManagerOperationStatus>> {
+  // A ticket can predate a backup/restore. Keep the barrier through body
+  // forwarding, Periphery publication acknowledgement, and the audit write.
+  let _mutation_guard =
+    crate::backup::mutation_barrier().read().await;
+  let deadline = tokio::time::Instant::now() + UPLOAD_BODY_DEADLINE;
   let session = consume_transfer_session(&token, &user.id)?;
   let TransferSessionKind::Upload {
     destination,
@@ -277,6 +298,9 @@ async fn upload(
     format!("{destination}/{file_name}")
   };
   let result = async {
+    // The deadline is fixed, not renewed by chunks. Expiry before Complete
+    // drops the transfer and sends Cancel without authorizing publication.
+    let (mut transfer, bytes, sha256) = within_upload_deadline(deadline, async {
     let mut transfer = periphery_client(&resolved.server)
       .await?
       .start_file_manager_upload(StartFileManagerUpload {
@@ -329,15 +353,16 @@ async fn upload(
       }
     }
     let sha256: [u8; 32] = hasher.finalize().into();
-    transfer
-      .send(FileTransferMessage::Complete { bytes, sha256 })
-      .await?;
-    let acknowledgement = tokio::time::timeout(
-      Duration::from_secs(60),
-      transfer.receive(),
-    )
-    .await
-    .context("Upload acknowledgement timed out")??;
+    anyhow::Ok((transfer, bytes, sha256))
+    }).await?;
+    // The final channel-capacity wait and publication acknowledgement share
+    // the body's absolute deadline; neither starts a fresh timeout window.
+    let acknowledgement = within_upload_deadline(deadline, async {
+      transfer
+        .send(FileTransferMessage::Complete { bytes, sha256 })
+        .await?;
+      transfer.receive().await
+    }).await?;
     transfer.close().await;
     match acknowledgement {
       FileTransferMessage::Complete {
@@ -591,4 +616,88 @@ async fn audit_transfer(
   update.finalize();
   add_update(update).await?;
   Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[tokio::test]
+  async fn upload_deadline_releases_barrier_without_publication() {
+    let barrier = tokio::sync::RwLock::new(());
+    let guard = barrier.read().await;
+    let result = within_upload_deadline(
+      tokio::time::Instant::now(),
+      async move {
+        let _guard = guard;
+        std::future::pending::<anyhow::Result<()>>().await
+      },
+    )
+    .await;
+    assert!(
+      result
+        .unwrap_err()
+        .to_string()
+        .contains("total transfer deadline")
+    );
+    assert!(barrier.try_write().is_ok());
+  }
+
+  #[tokio::test]
+  async fn upload_body_can_complete_before_its_fixed_deadline() {
+    let result = within_upload_deadline(
+      tokio::time::Instant::now() + UPLOAD_BODY_DEADLINE,
+      async { Ok(42) },
+    )
+    .await
+    .unwrap();
+    assert_eq!(result, 42);
+  }
+
+  #[tokio::test]
+  async fn expired_upload_deadline_does_not_send_complete() {
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+    let result =
+      within_upload_deadline(tokio::time::Instant::now(), async {
+        sender.send("Complete").await?;
+        anyhow::Ok(())
+      })
+      .await;
+    assert!(result.is_err());
+    assert!(receiver.try_recv().is_err());
+  }
+
+  #[tokio::test]
+  async fn full_final_send_channel_cannot_extend_upload_deadline() {
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+    sender.send("Chunk").await.unwrap();
+    let result = within_upload_deadline(
+      tokio::time::Instant::now() + Duration::from_millis(10),
+      async {
+        sender.send("Complete").await?;
+        std::future::pending::<anyhow::Result<()>>().await
+      },
+    )
+    .await;
+    assert!(result.is_err());
+    assert_eq!(receiver.try_recv().unwrap(), "Chunk");
+    assert!(receiver.try_recv().is_err());
+  }
+
+  #[tokio::test]
+  async fn publication_acknowledgement_cannot_extend_upload_deadline()
+  {
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+    let result = within_upload_deadline(
+      tokio::time::Instant::now() + Duration::from_millis(10),
+      async {
+        sender.send("Complete").await?;
+        std::future::pending::<anyhow::Result<()>>().await
+      },
+    )
+    .await;
+    assert!(result.is_err());
+    // An acknowledgement timeout does not prove publication was cancelled.
+    assert_eq!(receiver.try_recv().unwrap(), "Complete");
+  }
 }

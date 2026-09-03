@@ -32,9 +32,13 @@ Running Komodo from [source](https://github.com/neurekadev/komodo) requires eith
 
 After making changes to the project, run `run dev-compose-build` to rebuild Komodo and then `run dev-compose-exposed` to start a Komodo container with the UI accessible at `localhost:9120`. Any changes made to source files will require re-running the `dev-compose-build` and `dev-compose-exposed` commands.
 
+Development Compose persists the default `/backups/vykar` repository in `backups:/backups`, and Core's Vykar cache and operational alerts in `core-data:/data`. The separate `core-secrets` volume holds the repository sealing/authentication key; FerretDB keeps its own `data:/state` volume. Preserve all four across rebuilds and do not use `down -v` when retaining development snapshots. The combined devcontainer persists `/backups` and `/core-secrets` in separate named volumes, but runs Core and Periphery together without production isolation. Existing configured paths and container-layer state are not relocated automatically; preserve them before recreating containers and follow the [Core-local storage guidance](/administration/backups#backend-notes).
+
 ## Devcontainer
 
 Use the included `.devcontainer.json` with VSCode or other compatible IDE to stand-up a full environment, including database, with one click.
+
+Keep the devcontainer's `backups`, `core-secrets`, and database `data` volumes together across rebuilds. Before rebuilding an existing devcontainer that lacks the `/core-secrets` mount, stop Core and preserve its `/core-secrets/backup.key` and any recovery activation record separately. Restore that trusted material into the new persistent `core-secrets` volume before starting Core. Retaining only the repository and database without the original key is not sufficient for managed recovery.
 
 [VSCode Tasks](https://code.visualstudio.com/Docs/editor/tasks) are provided for building and running Komodo.
 

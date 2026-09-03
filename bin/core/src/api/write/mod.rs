@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use anyhow::Context;
 use axum::{
   Extension, Router, extract::Path, middleware, routing::post,
@@ -21,6 +23,7 @@ use super::Variant;
 mod action;
 mod alert;
 mod alerter;
+mod backup;
 mod build;
 mod builder;
 mod deployment;
@@ -52,6 +55,49 @@ pub struct WriteArgs {
   pub user: User,
 }
 
+tokio::task_local! {
+  /// Shared by guarded writes and executions, including awaited child work.
+  /// Nested work clones this lease rather than recursively reading behind a
+  /// queued backup writer.
+  static WRITE_MUTATION_GUARD_HELD: WriteMutationGuard;
+}
+
+type WriteMutationGuard = Arc<tokio::sync::OwnedRwLockReadGuard<()>>;
+
+pub(super) fn current_request_mutation_guard()
+-> Option<WriteMutationGuard> {
+  WRITE_MUTATION_GUARD_HELD.try_with(Arc::clone).ok()
+}
+
+pub(crate) async fn scope_mutation_guard<T>(
+  guard: Option<WriteMutationGuard>,
+  job: impl std::future::Future<Output = T>,
+) -> T {
+  match guard {
+    Some(guard) => WRITE_MUTATION_GUARD_HELD.scope(guard, job).await,
+    None => job.await,
+  }
+}
+
+/// Share the current lease instead of recursively reading behind a queued
+/// writer. Direct resolver callers acquire their own lease before mutation.
+pub(super) async fn owned_write_mutation_guard() -> WriteMutationGuard
+{
+  if let Some(guard) = current_request_mutation_guard() {
+    return guard;
+  }
+  Arc::new(
+    crate::backup::mutation_barrier().clone().read_owned().await,
+  )
+}
+
+pub(super) fn spawn_guarded_write_job(
+  guard: WriteMutationGuard,
+  job: impl std::future::Future<Output = ()> + Send + 'static,
+) -> tokio::task::JoinHandle<()> {
+  tokio::spawn(WRITE_MUTATION_GUARD_HELD.scope(guard, job))
+}
+
 #[typeshare]
 #[derive(
   Serialize, Deserialize, Debug, Clone, Resolve, EnumDiscriminants,
@@ -62,6 +108,18 @@ pub struct WriteArgs {
 #[error(mogh_error::Error)]
 #[serde(tag = "type", content = "params")]
 pub enum WriteRequest {
+  // ==== BACKUPS ====
+  UpdateBackupSettings(UpdateBackupSettings),
+  InitializeBackupRepositories(InitializeBackupRepositories),
+  RunBackup(RunBackup),
+  PlanBackupRestore(PlanBackupRestore),
+  ExecuteBackupRestore(ExecuteBackupRestore),
+  VerifyBackupRepository(VerifyBackupRepository),
+  PromoteBackupMirror(PromoteBackupMirror),
+  CancelBackupRun(CancelBackupRun),
+  PlanCoreRecovery(PlanCoreRecovery),
+  ExecuteCoreRecovery(ExecuteCoreRecovery),
+
   // ==== RESOURCE ====
   UpdateResourceMeta(UpdateResourceMeta),
 
@@ -272,10 +330,44 @@ async fn handler(
   res?
 }
 
+async fn request_mutation_guard(
+  request: &WriteRequest,
+  barrier: &Arc<tokio::sync::RwLock<()>>,
+) -> Option<tokio::sync::OwnedRwLockReadGuard<()>> {
+  // These File Manager controls only signal an ownership-checked operation.
+  // Its original worker keeps the mutation lease until it actually exits.
+  // A new read lease here would queue behind a backup writer that is itself
+  // waiting for that worker to accept a conflict decision or cancellation.
+  if matches!(
+    request,
+    WriteRequest::UpdateBackupSettings(_)
+      | WriteRequest::InitializeBackupRepositories(_)
+      | WriteRequest::RunBackup(_)
+      | WriteRequest::PlanBackupRestore(_)
+      | WriteRequest::ExecuteBackupRestore(_)
+      | WriteRequest::VerifyBackupRepository(_)
+      | WriteRequest::PromoteBackupMirror(_)
+      | WriteRequest::CancelBackupRun(_)
+      | WriteRequest::PlanCoreRecovery(_)
+      | WriteRequest::ExecuteCoreRecovery(_)
+      | WriteRequest::ResolveFileManagerOperationConflict(_)
+      | WriteRequest::CancelFileManagerOperation(_)
+  ) {
+    None
+  } else {
+    Some(barrier.clone().read_owned().await)
+  }
+}
+
 async fn task(
   request: WriteRequest,
   user: User,
 ) -> mogh_error::Result<axum::response::Response> {
+  let mutation_guard = request_mutation_guard(
+    &request,
+    crate::backup::mutation_barrier(),
+  )
+  .await;
   let task_id = Uuid::new_v4();
   let method: WriteRequestMethod = (&request).into();
 
@@ -297,7 +389,15 @@ async fn task(
     );
   }
 
-  let res = request.resolve(&WriteArgs { user }).await;
+  let args = WriteArgs { user };
+  let resolve = request.resolve(&args);
+  let res = if let Some(_mutation_guard) = mutation_guard {
+    WRITE_MUTATION_GUARD_HELD
+      .scope(Arc::new(_mutation_guard), resolve)
+      .await
+  } else {
+    resolve.await
+  };
 
   if let Err(e) = &res {
     warn!(
@@ -311,4 +411,128 @@ async fn task(
   }
 
   res.map(|res| res.0)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[tokio::test]
+  async fn file_manager_controls_remain_reachable_behind_a_backup_writer()
+   {
+    use futures_util::FutureExt;
+    use komodo_client::entities::file_manager::{
+      FileManagerConflictAction, FileManagerTarget,
+    };
+
+    let target = FileManagerTarget::Stack {
+      stack: "stack".into(),
+    };
+    let barrier = Arc::new(tokio::sync::RwLock::new(()));
+    let worker = barrier.clone().read_owned().await;
+    let mut writer = Box::pin(barrier.clone().write_owned());
+    assert!(futures_util::poll!(writer.as_mut()).is_pending());
+    let controls = [
+      WriteRequest::CancelFileManagerOperation(
+        CancelFileManagerOperation {
+          target: target.clone(),
+          operation_id: "operation".into(),
+        },
+      ),
+      WriteRequest::ResolveFileManagerOperationConflict(
+        ResolveFileManagerOperationConflict {
+          target: target.clone(),
+          operation_id: "operation".into(),
+          decision_id: "decision".into(),
+          action: FileManagerConflictAction::Skip,
+          apply_to_all: false,
+        },
+      ),
+    ];
+    for control in controls {
+      assert!(
+        request_mutation_guard(&control, &barrier)
+          .now_or_never()
+          .expect("Control signals must not queue behind a backup")
+          .is_none()
+      );
+      assert!(futures_util::poll!(writer.as_mut()).is_pending());
+    }
+    let commit = WriteRequest::CommitFileManagerOperation(
+      CommitFileManagerOperation {
+        target,
+        plan_id: "plan".into(),
+        decisions: Vec::new(),
+        confirmed: true,
+      },
+    );
+    let mut new_operation =
+      Box::pin(request_mutation_guard(&commit, &barrier));
+    assert!(futures_util::poll!(new_operation.as_mut()).is_pending());
+    // Signalling cancellation does not release the existing worker's lease.
+    drop(worker);
+    let backup = writer.await;
+    assert!(futures_util::poll!(new_operation.as_mut()).is_pending());
+    drop(backup);
+    assert!(new_operation.await.is_some());
+  }
+
+  #[tokio::test]
+  async fn synchronous_nested_work_reuses_only_the_current_task_guard()
+   {
+    assert!(current_request_mutation_guard().is_none());
+    let barrier = Arc::new(tokio::sync::RwLock::new(()));
+    let guard = Arc::new(barrier.read_owned().await);
+    WRITE_MUTATION_GUARD_HELD
+      .scope(guard, async {
+        assert!(current_request_mutation_guard().is_some());
+        assert!(
+          tokio::spawn(async {
+            current_request_mutation_guard().is_none()
+          })
+          .await
+          .unwrap()
+        );
+      })
+      .await;
+  }
+
+  #[tokio::test]
+  async fn detached_job_keeps_the_request_lease_until_completion() {
+    let barrier = Arc::new(tokio::sync::RwLock::new(()));
+    let guard = Arc::new(barrier.clone().read_owned().await);
+    let (finish, wait) = tokio::sync::oneshot::channel();
+    let (job,) = WRITE_MUTATION_GUARD_HELD
+      .scope(guard, async {
+        // Return the detached handle without awaiting its completion here.
+        (spawn_guarded_write_job(
+          owned_write_mutation_guard().await,
+          async move {
+            assert!(current_request_mutation_guard().is_some());
+            let _ = wait.await;
+          },
+        ),)
+      })
+      .await;
+    assert!(barrier.try_write().is_err());
+    finish.send(()).unwrap();
+    job.await.unwrap();
+    assert!(barrier.try_write().is_ok());
+  }
+
+  #[tokio::test]
+  async fn detached_job_reuses_lease_even_after_a_writer_queues() {
+    use futures_util::FutureExt;
+    let barrier = Arc::new(tokio::sync::RwLock::new(()));
+    let guard = Arc::new(barrier.clone().read_owned().await);
+    let mut writer = Box::pin(barrier.clone().write_owned());
+    assert!(futures_util::poll!(writer.as_mut()).is_pending());
+    WRITE_MUTATION_GUARD_HELD.scope(guard, async {
+      let shared = owned_write_mutation_guard().now_or_never()
+        .expect("Sharing a live read lease must never queue behind a writer");
+      assert!(Arc::strong_count(&shared) >= 2);
+    }).await;
+    drop(writer.await);
+    assert!(barrier.try_write().is_ok());
+  }
 }

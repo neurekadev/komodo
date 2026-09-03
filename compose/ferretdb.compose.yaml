@@ -14,8 +14,12 @@ services:
     ports:
       - "9120:9120"
     volumes:
-      # Keys, backups, syncs, and repository cache stay in the existing volume.
+      # Communication keys, working data, and cache remain shared.
       - data:/data
+      # The repository is Core-only; workers use the authenticated endpoint.
+      - backups:/backups
+      # Backup authentication and sealing material must remain Core-only.
+      - core-secrets:/core-secrets
       # Optional: mount custom configuration or a trusted root CA.
       # - /path/to/core.config.toml:/config/config.toml:ro
       # - /path/to/root_ca.crt:/usr/local/share/ca-certificates/root_ca.crt:ro
@@ -59,7 +63,7 @@ services:
       komodo:
         aliases: [periphery]
     volumes:
-      # Keep the established shared data volume and host-visible Docker paths.
+      # Persist Periphery state and its Vykar cache at host-visible Docker paths.
       - data:/data
       # Docker socket and volume access give Periphery control of this host.
       - /var/run/docker.sock:/var/run/docker.sock
@@ -80,3 +84,10 @@ volumes:
   postgres-data:
   ferretdb-state:
   data:
+  backups:
+    labels:
+      komodo.file-manager.excluded: "true"
+  # Core-only backup authentication and sealing key
+  core-secrets:
+    labels:
+      komodo.file-manager.excluded: "true"

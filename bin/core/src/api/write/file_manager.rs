@@ -701,6 +701,12 @@ pub fn spawn_managed_transaction_reconciliation_loop() {
         {
           continue;
         }
+        // API-triggered mutations hold the same read side in the write
+        // router. Background reconciliation must do so explicitly, keeping
+        // the resource update and durable intent finalization indivisible
+        // from Core's database export.
+        let _mutation_guard =
+          crate::backup::mutation_barrier().read().await;
         match claim_managed_transaction(&transaction).await {
           Ok(true) => {}
           Ok(false) => continue,
@@ -746,6 +752,8 @@ pub fn spawn_managed_transaction_reconciliation_loop() {
         {
           continue;
         }
+        let _mutation_guard =
+          crate::backup::mutation_barrier().read().await;
         if let Err(error) =
           reconcile_managed_environment_migration(&migration).await
         {
@@ -1037,6 +1045,7 @@ impl Resolve<WriteArgs> for CommitFileManagerOperation {
     WriteArgs { user }: &WriteArgs,
   ) -> mogh_error::Result<FileManagerOperationTicket> {
     ensure_writes_enabled()?;
+    let mutation_guard = super::owned_write_mutation_guard().await;
     let resolved =
       resolve_target(&self.target, user, PermissionLevel::Write)
         .await?;
@@ -1093,7 +1102,7 @@ impl Resolve<WriteArgs> for CommitFileManagerOperation {
       .map(|transaction| transaction.stack_id.clone());
     let actor = user.clone();
     let target = self.target;
-    tokio::spawn(async move {
+    super::spawn_guarded_write_job(mutation_guard, async move {
       let _live_managed = live_managed;
       let result = async {
       let client = periphery_client(&resolved.server).await?;
@@ -1397,6 +1406,7 @@ impl Resolve<WriteArgs> for UndoFileManagerOperation {
     WriteArgs { user }: &WriteArgs,
   ) -> mogh_error::Result<FileManagerOperationTicket> {
     ensure_writes_enabled()?;
+    let mutation_guard = super::owned_write_mutation_guard().await;
     let resolved =
       resolve_target(&self.target, user, PermissionLevel::Write)
         .await?;
@@ -1409,7 +1419,7 @@ impl Resolve<WriteArgs> for UndoFileManagerOperation {
       operation_id: operation_id.clone(),
     };
     let actor = user.clone();
-    tokio::spawn(async move {
+    super::spawn_guarded_write_job(mutation_guard, async move {
       let result = async {
         let response = periphery_client(&resolved.server)
           .await?
@@ -1469,6 +1479,7 @@ impl Resolve<WriteArgs> for RedoFileManagerOperation {
     WriteArgs { user }: &WriteArgs,
   ) -> mogh_error::Result<FileManagerOperationTicket> {
     ensure_writes_enabled()?;
+    let mutation_guard = super::owned_write_mutation_guard().await;
     let resolved =
       resolve_target(&self.target, user, PermissionLevel::Write)
         .await?;
@@ -1481,7 +1492,7 @@ impl Resolve<WriteArgs> for RedoFileManagerOperation {
       operation_id: operation_id.clone(),
     };
     let actor = user.clone();
-    tokio::spawn(async move {
+    super::spawn_guarded_write_job(mutation_guard, async move {
       let result = async {
         let response = periphery_client(&resolved.server)
           .await?

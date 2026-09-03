@@ -29,6 +29,8 @@ pub mod alert;
 pub mod alerter;
 /// Subtypes of [ApiKey][api_key::ApiKey].
 pub mod api_key;
+/// Backup configuration, inventory, and restore types.
+pub mod backup;
 /// Subtypes of [Build][build::Build].
 pub mod build;
 /// Subtypes of [Builder][builder::Builder].

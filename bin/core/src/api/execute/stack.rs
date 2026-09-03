@@ -272,6 +272,7 @@ impl Resolve<ExecuteArgs> for DeployStack {
       };
 
       let info = StackInfo {
+        recovery_plan_id: stack.info.recovery_plan_id.clone(),
         missing_files,
         deployed_project_name: project_name.into(),
         deployed_services,

@@ -7,9 +7,9 @@ use komodo_client::entities::{
 };
 use mogh_resolver::Resolve;
 use periphery_client::api::{
-  build::*, compose::*, container::*, docker::*, file_manager::*,
-  git::*, keys::*, poll::*, stack::*, stats::*, swarm::*,
-  terminal::*, *,
+  backup::*, build::*, compose::*, container::*, docker::*,
+  file_manager::*, git::*, keys::*, poll::*, stack::*, stats::*,
+  swarm::*, terminal::*, *,
 };
 use serde::{Deserialize, Serialize};
 use strum::EnumDiscriminants;
@@ -19,6 +19,7 @@ use crate::{config::periphery_config, state::stats_client};
 
 pub mod terminal;
 
+pub(crate) mod backup;
 mod build;
 mod compose;
 mod container;
@@ -58,6 +59,19 @@ pub enum PeripheryRequest {
   ListGitProviders(ListGitProviders),
   ListImageRegistries(ListImageRegistries),
   ListSecrets(ListSecrets),
+
+  // Backup and transactional restore
+  GetBackupVolumeInventory(GetBackupVolumeInventory),
+  DiscoverBackupSource(DiscoverBackupSource),
+  RunVykarBackup(RunVykarBackup),
+  RunVykarBackupBatch(RunVykarBackupBatch),
+  GetVykarBackupCompletion(GetVykarBackupCompletion),
+  PreflightVykarRestore(PreflightVykarRestore),
+  RunTransactionalVykarRestore(RunTransactionalVykarRestore),
+  RunFinalizeVykarRestore(RunFinalizeVykarRestore),
+  TransactionalVykarRestore(TransactionalVykarRestore),
+  FinalizeVykarRestore(FinalizeVykarRestore),
+  CancelVykarOperation(CancelVykarOperation),
 
   // File Manager
   GetFileManagerCapabilities(GetFileManagerCapabilities),

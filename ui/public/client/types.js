@@ -808,6 +808,22 @@ export var StackState;
     /** Server not reachable for status */
     StackState["Unknown"] = "unknown";
 })(StackState || (StackState = {}));
+export var BackupRunState;
+(function (BackupRunState) {
+    BackupRunState["Queued"] = "Queued";
+    BackupRunState["Running"] = "Running";
+    BackupRunState["Complete"] = "Complete";
+    BackupRunState["Partial"] = "Partial";
+    BackupRunState["Failed"] = "Failed";
+    BackupRunState["Cancelled"] = "Cancelled";
+})(BackupRunState || (BackupRunState = {}));
+/** Whether all, only selected, or all except selected resources are backed up. */
+export var BackupSelectionMode;
+(function (BackupSelectionMode) {
+    BackupSelectionMode["All"] = "All";
+    BackupSelectionMode["Include"] = "Include";
+    BackupSelectionMode["Exclude"] = "Exclude";
+})(BackupSelectionMode || (BackupSelectionMode = {}));
 export var FileManagerConflictAction;
 (function (FileManagerConflictAction) {
     FileManagerConflictAction["Skip"] = "skip";
@@ -1176,6 +1192,11 @@ export var RepoWebhookAction;
 /** The specific types of permission that a User or UserGroup can have on a resource. */
 export var SpecificPermission;
 (function (SpecificPermission) {
+    /**
+     * On **Server / Stack**
+     * - Read backup inventories and execute permitted backup/restore actions.
+     */
+    SpecificPermission["Backups"] = "Backups";
     /**
      * On **Server / Stack**
      * - Access File Manager APIs for the resource

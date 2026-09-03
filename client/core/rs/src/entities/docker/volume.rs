@@ -22,6 +22,9 @@ pub struct VolumeListItem {
   pub mountpoint: String,
   pub created: Option<String>,
   pub scope: VolumeScopeEnum,
+  /// Whether Docker created the volume without an explicit name.
+  #[serde(default)]
+  pub anonymous: bool,
   /// Amount of disk space used by the volume (in bytes). This information is only available for volumes created with the `\"local\"` volume driver. For volumes created with other volume drivers, this field is set to `-1` (\"not available\")
   pub size: Option<I64>,
   /// Whether the volume is currently attached to any container
@@ -29,6 +32,20 @@ pub struct VolumeListItem {
   /// Disk usage from the most recent successful background measurement.
   #[serde(default)]
   pub disk_usage: VolumeDiskUsage,
+}
+
+/// Docker marks anonymous volumes with an internal label on current engines.
+/// The 64-character lowercase hexadecimal fallback also covers older creation
+/// paths that did not add that label.
+pub fn is_anonymous_volume(
+  name: &str,
+  labels: &HashMap<String, String>,
+) -> bool {
+  labels.contains_key("com.docker.volume.anonymous")
+    || (name.len() == 64
+      && name.bytes().all(|byte| {
+        byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+      }))
 }
 
 #[typeshare]
@@ -393,4 +410,34 @@ pub struct VolumeUsageData {
   /// The number of containers referencing this volume. This field is set to `-1` if the reference-count is not available.
   #[serde(rename = "RefCount")]
   pub ref_count: I64,
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn anonymous_volume_detection_handles_label_and_name_forms() {
+    let generated = "a".repeat(64);
+    assert!(is_anonymous_volume(&generated, &HashMap::new()));
+    assert!(is_anonymous_volume(
+      "legacy-short-name",
+      &HashMap::from([(
+        "com.docker.volume.anonymous".into(),
+        String::new()
+      )])
+    ));
+    assert!(!is_anonymous_volume(
+      "application-data",
+      &HashMap::new()
+    ));
+    assert!(!is_anonymous_volume(
+      &generated.to_uppercase(),
+      &HashMap::new()
+    ));
+    assert!(is_anonymous_volume(
+      &generated,
+      &HashMap::from([("owner".into(), "operator".into())])
+    ));
+  }
 }

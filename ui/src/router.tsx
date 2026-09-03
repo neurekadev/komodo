@@ -21,6 +21,7 @@ const Update = lazy(() => import("@/pages/update"));
 const Alerts = lazy(() => import("@/pages/alerts"));
 const Alert = lazy(() => import("@/pages/alert"));
 const Dashboard = lazy(() => import("@/pages/dashboard"));
+const Backups = lazy(() => import("@/pages/backups"));
 const Resources = lazy(() => import("@/pages/resources"));
 const Resource = lazy(() => import("@/pages/resource"));
 const Profile = lazy(() => import("@/pages/profile"));
@@ -63,6 +64,7 @@ export const Router = () => {
           <Route element={<RequireAuth />}>
             <Route path="/" element={<App />}>
               <Route path="" element={<Dashboard />} />
+              <Route path="backups" element={<Backups />} />
               <Route path="containers" element={<Containers />} />
               <Route path="terminals" element={<Terminals />} />
               <Route path="stats" element={<Stats />} />

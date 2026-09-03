@@ -11,8 +11,7 @@ use futures_util::future::join_all;
 use komodo_client::{
   api::{
     execute::{
-      BackupCoreDatabase, Execution, GlobalAutoUpdate,
-      RotateAllServerKeys, RunAction,
+      Execution, GlobalAutoUpdate, RotateAllServerKeys, RunAction,
     },
     write::{
       CreateBuilder, CreateProcedure, CreateServer, CreateTag,
@@ -122,7 +121,53 @@ pub async fn on_startup() {
     action_api_key_cleanup(),
     ensure_first_server_and_builder(),
     ensure_init_user_and_resources(),
+    warn_legacy_backup_schedules(),
+    backup_run_cleanup(),
   );
+}
+
+async fn backup_run_cleanup() {
+  match crate::backup::finalize_interrupted_runs().await {
+    Ok(0) => {}
+    Ok(count) => info!(
+      "Finalized {count} interrupted backup run(s) during startup"
+    ),
+    Err(error) => {
+      error!("Failed to finalize interrupted backup runs: {error:#}")
+    }
+  }
+}
+
+async fn warn_legacy_backup_schedules() {
+  let procedures = match find_collect(
+    &db_client().procedures,
+    doc! { "config.schedule_enabled": true },
+    None,
+  )
+  .await
+  {
+    Ok(procedures) => procedures,
+    Err(error) => {
+      warn!("Failed to inspect legacy backup schedules: {error:#}");
+      return;
+    }
+  };
+  for procedure in procedures {
+    if procedure.config.stages.iter().any(|stage| {
+      stage.executions.iter().any(|execution| {
+        execution.enabled
+          && matches!(
+            execution.execution,
+            Execution::BackupCoreDatabase(_)
+          )
+      })
+    }) {
+      warn!(
+        "Legacy Core database backup scheduling remains enabled on Procedure '{}'. Migrate it to /backups to avoid duplicate exports.",
+        procedure.name
+      );
+    }
+  }
 }
 
 async fn in_progress_update_cleanup() {
@@ -383,49 +428,6 @@ async fn ensure_init_user_and_resources() {
       Vec::new()
     }
   };
-
-  // Backup Core Database
-  async {
-    let Ok(config) = ProcedureConfig::builder()
-      .stages(vec![ProcedureStage {
-        name: String::from("Stage 1"),
-        enabled: true,
-        executions: vec![
-          EnabledExecution {
-            execution: Execution::BackupCoreDatabase(BackupCoreDatabase {}),
-            enabled: true
-          }
-        ]
-      }])
-      .schedule(String::from("Every day at 01:00"))
-      .build()
-      .inspect_err(|e| error!("Failed to initialize backup core database procedure | Failed to build Procedure | {e:?}")) else {
-      return;
-    };
-    let procedure = match (CreateProcedure {
-      name: String::from("Backup Core Database"),
-      config: config.into()
-    }).resolve(&write_args).await {
-      Ok(procedure) => procedure,
-      Err(e) => {
-        error!(
-          "Failed to initialize default database backup Procedure | Failed to create Procedure | {:#}",
-          e.error
-        );
-        return;
-      }
-    };
-    if let Err(e) = (UpdateResourceMeta {
-      target: ResourceTarget::Procedure(procedure.id),
-      tags: Some(default_tags.clone()),
-      description: Some(String::from(
-        "Triggers the Core database backup at the scheduled time.",
-      )),
-      template: None,
-    }).resolve(&write_args).await {
-      warn!("Failed to update default database backup Procedure tags / description | {:#}", e.error);
-    }
-  }.await;
 
   // GlobalAutoUpdate
   async {

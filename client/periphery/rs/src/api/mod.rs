@@ -7,6 +7,7 @@ use komodo_client::entities::{
 use mogh_resolver::Resolve;
 use serde::{Deserialize, Serialize};
 
+pub mod backup;
 pub mod build;
 pub mod compose;
 pub mod container;

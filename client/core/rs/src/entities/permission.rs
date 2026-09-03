@@ -160,6 +160,9 @@ impl Default for &PermissionLevel {
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub enum SpecificPermission {
   /// On **Server / Stack**
+  ///   - Read backup inventories and execute permitted backup/restore actions.
+  Backups,
+  /// On **Server / Stack**
   ///   - Access File Manager APIs for the resource
   FileManager,
   /// On **Server**
@@ -260,6 +263,11 @@ impl PermissionLevel {
   /// Operation requires File Manager permission
   pub fn file_manager(self) -> PermissionLevelAndSpecifics {
     self.specific(SpecificPermission::FileManager)
+  }
+
+  /// Operation requires Backups permission
+  pub fn backups(self) -> PermissionLevelAndSpecifics {
+    self.specific(SpecificPermission::Backups)
   }
 
   /// Operation requires Attach permission
@@ -396,6 +404,11 @@ impl PermissionLevelAndSpecifics {
     self.specific(SpecificPermission::FileManager)
   }
 
+  /// Operation requires Backups permission
+  pub fn backups(self) -> PermissionLevelAndSpecifics {
+    self.specific(SpecificPermission::Backups)
+  }
+
   /// Operation requires Attach permission
   pub fn attach(self) -> PermissionLevelAndSpecifics {
     self.specific(SpecificPermission::Attach)
@@ -458,5 +471,19 @@ mod tests {
     assert!(!PermissionLevel::Read.file_manager().fulfills(&write));
     assert!(PermissionLevel::Write.file_manager().fulfills(&write));
     assert!(PermissionLevel::Write.all().fulfills(&write));
+  }
+
+  #[test]
+  fn backups_requires_level_and_specific_permission() {
+    let browse = PermissionLevel::Read.backups();
+    let execute = PermissionLevel::Execute.backups();
+    assert!(PermissionLevel::Read.backups().fulfills(&browse));
+    assert!(
+      !PermissionLevelAndSpecifics::from(PermissionLevel::Write)
+        .fulfills(&browse)
+    );
+    assert!(!PermissionLevel::Read.backups().fulfills(&execute));
+    assert!(PermissionLevel::Execute.backups().fulfills(&execute));
+    assert!(PermissionLevel::Write.all().fulfills(&execute));
   }
 }

@@ -31,6 +31,7 @@ mogh_logger.workspace = true
 mogh_cache.workspace = true
 mogh_pki.workspace = true
 git.workspace = true
+komodo_backup.workspace = true
 # mogh
 mogh_error = { workspace = true, features = ["axum"] }
 mogh_auth_client = { workspace = true, features = ["utoipa"] }
@@ -81,6 +82,12 @@ toml.workspace = true
 uuid.workspace = true
 envy.workspace = true
 hmac.workspace = true
+chacha20poly1305.workspace = true
+vykar-server.workspace = true
 sha2.workspace = true
 hex.workspace = true
+rand.workspace = true
 url.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

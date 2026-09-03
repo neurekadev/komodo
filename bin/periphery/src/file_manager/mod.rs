@@ -215,12 +215,27 @@ where
   T: Send + 'static,
   F: FnOnce() -> anyhow::Result<T> + Send + 'static,
 {
+  let filesystem = crate::api::backup::filesystem_mutation_guard()?;
+  run_heavy_blocking_with_lease(filesystem, task).await
+}
+
+async fn run_heavy_blocking_with_lease<T, F>(
+  filesystem: tokio::sync::OwnedRwLockReadGuard<()>,
+  task: F,
+) -> anyhow::Result<T>
+where
+  T: Send + 'static,
+  F: FnOnce() -> anyhow::Result<T> + Send + 'static,
+{
+  // Keep protection in the blocking closure, not just its awaiting task:
+  // cancelling an RPC does not cancel filesystem work already running.
   let permit = heavy_job_permits()
     .clone()
     .acquire_owned()
     .await
     .context("File Manager job queue is unavailable")?;
   tokio::task::spawn_blocking(move || {
+    let _filesystem = filesystem;
     let _permit = permit;
     task()
   })
@@ -244,6 +259,30 @@ where
   })
   .await
   .context("File Manager read job stopped unexpectedly")?
+}
+
+async fn cleanup_download_staging(
+  staging: PathBuf,
+  barrier: Arc<tokio::sync::RwLock<()>>,
+) -> anyhow::Result<()> {
+  // Cleanup owns no earlier filesystem lease and cannot fail just because a
+  // protected operation started while the download was streaming.
+  let filesystem = barrier.read_owned().await;
+  run_heavy_blocking_with_lease(filesystem, move || {
+    match fs::remove_dir_all(&staging) {
+      Ok(()) => Ok(()),
+      Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        Ok(())
+      }
+      Err(error) => Err(error).with_context(|| {
+        format!(
+          "Failed to remove download staging {}",
+          staging.display()
+        )
+      }),
+    }
+  })
+  .await
 }
 
 async fn run_root_blocking<T, F>(
@@ -1069,6 +1108,14 @@ pub async fn resolve_root(
   };
 
   ensure_outside_private_journal(&path, &journal_root())?;
+  ensure_outside_private_backup(
+    &path,
+    &crate::api::backup::internal_storage_dir(),
+  )?;
+  let docker = docker_client().load();
+  let docker = docker.as_ref().as_ref().context("Could not connect to Docker to validate protected File Manager storage")?;
+  let excluded = docker.file_manager_excluded_volume_paths().await?;
+  ensure_outside_excluded_volumes(&path, &excluded)?;
 
   let mut hash = Sha256::new();
   hash.update(path.as_os_str().as_encoded_bytes());
@@ -1291,6 +1338,20 @@ fn write_private_file(
 
 const PRIVATE_JOURNAL_OVERLAP_REASON: &str = "File Manager target overlaps protected Periphery private journal data and cannot be opened";
 
+fn ensure_outside_excluded_volumes(
+  path: &Path,
+  excluded: &[PathBuf],
+) -> anyhow::Result<()> {
+  for protected in excluded {
+    if paths_overlap(path, protected)? {
+      return Err(anyhow!(
+        "File Manager target overlaps protected Docker volume storage and cannot be opened"
+      ));
+    }
+  }
+  Ok(())
+}
+
 fn ensure_outside_private_journal(
   path: &Path,
   private_journal: &Path,
@@ -1302,48 +1363,19 @@ fn ensure_outside_private_journal(
 }
 
 fn paths_overlap(left: &Path, right: &Path) -> anyhow::Result<bool> {
-  if left.starts_with(right) || right.starts_with(left) {
-    return Ok(true);
-  }
-
-  Ok(
-    path_matches_ancestor(left, right)?
-      || path_matches_ancestor(right, left)?,
-  )
+  komodo_backup::filesystem::paths_overlap(left, right)
 }
 
-fn path_matches_ancestor(
+fn ensure_outside_private_backup(
   path: &Path,
-  other: &Path,
-) -> anyhow::Result<bool> {
-  let Some(identity) = path_identity(path)? else {
-    return Ok(false);
-  };
-  for ancestor in other.ancestors() {
-    if path_identity(ancestor)?.is_some_and(|other| other == identity)
-    {
-      return Ok(true);
-    }
+  private_backup: &Path,
+) -> anyhow::Result<()> {
+  if paths_overlap(path, private_backup)? {
+    return Err(anyhow!(
+      "File Manager roots cannot overlap Periphery's private backup workspace"
+    ));
   }
-  Ok(false)
-}
-
-fn path_identity(path: &Path) -> anyhow::Result<Option<(u64, u64)>> {
-  let metadata = match fs::metadata(path) {
-    Ok(metadata) => metadata,
-    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-      return Ok(None);
-    }
-    Err(error) => {
-      return Err(error).with_context(|| {
-        format!("Failed to inspect File Manager path {path:?}")
-      });
-    }
-  };
-  Ok(Some((
-    cap_fs_ext::MetadataExt::dev(&metadata),
-    cap_fs_ext::MetadataExt::ino(&metadata),
-  )))
+  Ok(())
 }
 
 fn file_identity(metadata: &Metadata) -> FileIdentity {
@@ -1927,6 +1959,7 @@ pub async fn prepare_managed_environment_migration(
   old_path: &str,
   new_path: &str,
 ) -> anyhow::Result<FileManagerManagedTransactionStatus> {
+  let _filesystem = crate::api::backup::filesystem_mutation_guard()?;
   Uuid::parse_str(operation_id)
     .context("Managed environment migration id is invalid")?;
   relative_path(old_path, false)?;
@@ -2096,6 +2129,7 @@ pub async fn finalize_managed_environment_migration(
   operation_id: &str,
   action: FileManagerManagedTransactionFinalizeAction,
 ) -> anyhow::Result<FileManagerManagedTransactionStatus> {
+  let _filesystem = crate::api::backup::filesystem_mutation_guard()?;
   Uuid::parse_str(operation_id)
     .context("Managed environment migration id is invalid")?;
   let root = resolve_root(target).await?;
@@ -2324,6 +2358,7 @@ pub async fn finalize_managed_transaction(
   operation_id: &str,
   action: FileManagerManagedTransactionFinalizeAction,
 ) -> anyhow::Result<FileManagerManagedTransactionStatus> {
+  let _filesystem = crate::api::backup::filesystem_mutation_guard()?;
   Uuid::parse_str(operation_id)
     .context("Managed transaction id is invalid")?;
   let root = resolve_root(target).await?;
@@ -2621,6 +2656,8 @@ pub async fn commit(
 ) -> anyhow::Result<
   periphery_client::api::file_manager::FileManagerCommitResponse,
 > {
+  let filesystem = crate::api::backup::filesystem_mutation_guard()?;
+  crate::api::backup::ensure_no_pending_recovery()?;
   let root = resolve_root(target).await?;
   if durable_managed {
     match prepare_durable_managed_commit(
@@ -2703,6 +2740,7 @@ pub async fn commit(
           == FileManagerExecutionMode::Recoverable,
     };
   tokio::spawn(async move {
+    let _filesystem = filesystem;
     let _archive_permit = if matches!(
       &plan.operation,
       FileManagerOperation::CreateArchive { .. }
@@ -3239,6 +3277,8 @@ pub async fn undo(
 ) -> anyhow::Result<
   periphery_client::api::file_manager::FileManagerCommitResponse,
 > {
+  let filesystem = crate::api::backup::filesystem_mutation_guard()?;
+  crate::api::backup::ensure_no_pending_recovery()?;
   if !confirmed {
     return Err(anyhow!("Explicit confirmation is required"));
   }
@@ -3301,6 +3341,7 @@ pub async fn undo(
       undoable: !record.recovery,
     };
   tokio::spawn(async move {
+    let _filesystem = filesystem;
     let lock = root_lock(&root_key).await;
     let guard = lock.lock_owned().await;
     let outcome = run_heavy_blocking(move || {
@@ -3430,6 +3471,8 @@ pub async fn redo(
 ) -> anyhow::Result<
   periphery_client::api::file_manager::FileManagerCommitResponse,
 > {
+  let filesystem = crate::api::backup::filesystem_mutation_guard()?;
+  crate::api::backup::ensure_no_pending_recovery()?;
   if !confirmed {
     return Err(anyhow!("Explicit confirmation is required"));
   }
@@ -3483,6 +3526,7 @@ pub async fn redo(
       undoable: true,
     };
   tokio::spawn(async move {
+    let _filesystem = filesystem;
     let lock = root_lock(&root_key).await;
     let guard = lock.lock_owned().await;
     let outcome = run_heavy_blocking(move || {
@@ -3617,6 +3661,8 @@ pub async fn start_upload(
   core: &str,
   request: StartFileManagerUpload,
 ) -> anyhow::Result<Uuid> {
+  let filesystem = crate::api::backup::filesystem_mutation_guard()?;
+  crate::api::backup::ensure_no_pending_recovery()?;
   let StartFileManagerUpload {
     target,
     actor,
@@ -3656,6 +3702,7 @@ pub async fn start_upload(
   let (sender, mut receiver) = tokio::sync::mpsc::channel(32);
   file_transfer_channels().insert(channel, sender).await;
   tokio::spawn(async move {
+    let _filesystem = filesystem;
     let result = async {
       let begin = tokio::time::timeout(
         std::time::Duration::from_secs(30),
@@ -4253,16 +4300,20 @@ pub async fn start_download(
       Err(error) => progress.fail(error),
     }
     file_transfer_channels().remove(&channel).await;
-    let _ = run_heavy_blocking(move || {
-      let _ = fs::remove_dir_all(staging);
-      Ok(())
-    })
-    .await;
+    // Notify the client before waiting for a backup to release cleanup access.
     spawn_file_transfer_final(
       connection.sender.clone(),
       channel,
       result.map(FileTransferMessage::into_raw),
     );
+    if let Err(error) = cleanup_download_staging(
+      staging,
+      crate::api::backup::filesystem_barrier().clone(),
+    )
+    .await
+    {
+      warn!("Download staging cleanup failed: {error:#}");
+    }
   });
   Ok(StartFileManagerDownloadResponse {
     channel,
@@ -8309,6 +8360,49 @@ fn path_string(path: &Path) -> anyhow::Result<String> {
 mod tests {
   use super::*;
 
+  #[tokio::test]
+  async fn download_cleanup_waits_for_protected_work_and_then_removes_staging()
+   {
+    let root = tempfile::tempdir().unwrap();
+    let staging = root.path().join("download");
+    fs::create_dir(&staging).unwrap();
+    fs::write(staging.join("private-copy"), b"download").unwrap();
+    let barrier = Arc::new(tokio::sync::RwLock::new(()));
+    let protected = barrier.clone().write_owned().await;
+    let mut cleanup = Box::pin(cleanup_download_staging(
+      staging.clone(),
+      barrier.clone(),
+    ));
+    assert!(futures_util::poll!(cleanup.as_mut()).is_pending());
+    assert!(staging.join("private-copy").exists());
+    drop(protected);
+    cleanup.await.unwrap();
+    assert!(!staging.exists());
+    // Repeated cleanup is harmless if another cleanup already removed it.
+    cleanup_download_staging(staging, barrier).await.unwrap();
+  }
+
+  #[tokio::test]
+  async fn cancelled_waiter_keeps_running_filesystem_work_guarded() {
+    let barrier = Arc::new(tokio::sync::RwLock::new(()));
+    let guard = barrier.clone().read_owned().await;
+    let (started, ready) = tokio::sync::oneshot::channel();
+    let (finish, wait) = std::sync::mpsc::channel();
+    let job =
+      tokio::spawn(run_heavy_blocking_with_lease(guard, move || {
+        let _ = started.send(());
+        let _ = wait.recv();
+        Ok(())
+      }));
+    ready.await.unwrap();
+    job.abort();
+    assert!(job.await.unwrap_err().is_cancelled());
+    assert!(barrier.try_write().is_err());
+    finish.send(()).unwrap();
+    drop(barrier.write().await);
+    assert!(barrier.try_write().is_ok());
+  }
+
   fn test_journal_record(
     id: &str,
     created_at: i64,
@@ -9291,6 +9385,60 @@ mod tests {
     .unwrap();
 
     fs::remove_dir_all(directory).unwrap();
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn private_backup_workspace_rejects_roots_descendants_and_aliases()
+  {
+    let root = tempfile::tempdir().unwrap();
+    let stacks = root.path().join("stacks");
+    let private = stacks.join(".komodo-vykar");
+    let alias = root.path().join("alias");
+    fs::create_dir_all(private.join("backup-manifests")).unwrap();
+    std::os::unix::fs::symlink(&stacks, &alias).unwrap();
+    for candidate in [
+      stacks,
+      private.clone(),
+      private.join("backup-manifests"),
+      alias.join(".komodo-vykar/new-keys"),
+    ] {
+      assert!(
+        ensure_outside_private_backup(&candidate, &private).is_err()
+      );
+    }
+    ensure_outside_private_backup(
+      &alias.join("application"),
+      &private,
+    )
+    .unwrap();
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn excluded_volume_rejects_direct_parent_and_aliased_file_manager_roots()
+   {
+    let directory = tempfile::tempdir().unwrap();
+    let private = directory.path().join("repository");
+    let alias = directory.path().join("alias");
+    fs::create_dir_all(private.join("vykar")).unwrap();
+    std::os::unix::fs::symlink(&private, &alias).unwrap();
+    let protected = vec![private.clone()];
+    for path in [
+      private,
+      alias.clone(),
+      alias.join("vykar"),
+      directory.path().to_path_buf(),
+    ] {
+      assert!(
+        ensure_outside_excluded_volumes(&path, &protected).is_err()
+      );
+    }
+    ensure_outside_excluded_volumes(
+      &directory.path().join("application"),
+      &protected,
+    )
+    .unwrap();
   }
 
   #[test]

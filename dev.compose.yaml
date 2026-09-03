@@ -15,7 +15,10 @@ services:
       KOMODO_LOCAL_AUTH: true
       KOMODO_JWT_SECRET: a_random_secret
     volumes:
+      - core-data:/data
+      - backups:/backups
       - repo-cache:/repo-cache
+      - core-secrets:/core-secrets
 
   periphery:
     build:
@@ -46,12 +49,21 @@ services:
       - FERRETDB_HANDLER=sqlite
     volumes:
       - data:/state
+    labels:
+      komodo.skip: "true"
 
 networks:
   default: {}
 
 volumes:
   data:
+  core-data:
+  backups:
+    labels:
+      komodo.file-manager.excluded: "true"
   repo-cache:
+  core-secrets:
+    labels:
+      komodo.file-manager.excluded: "true"
   repos:
   stacks:

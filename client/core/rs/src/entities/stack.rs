@@ -375,6 +375,11 @@ pub enum StackState {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 pub struct StackInfo {
+  /// Internal marker linking a newly recovered Stack to the durable restore
+  /// plan until Core and Periphery acknowledge the same finalization outcome.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub recovery_plan_id: Option<String>,
+
   /// If any of the expected compose / additional files are missing in the repo,
   /// they will be stored here.
   #[serde(default)]

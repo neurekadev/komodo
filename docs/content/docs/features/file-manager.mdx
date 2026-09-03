@@ -49,6 +49,8 @@ A Server-level `FileManager` grant covers **every eligible Docker named volume o
 
 Periphery refuses a Volume root whose directory tree equals, contains, or is contained by `${PERIPHERY_ROOT_DIRECTORY}/file-manager-journal`. The check follows filesystem directory identity, so bind mounts, named-volume aliases, and symlink aliases do not bypass it. The official `${COMPOSE_PROJECT_NAME}_data` volume—normally `komodo_data`—is still listed with other Docker volumes, but its Files tab reports File Manager unavailable because the volume contains Periphery's private journal and credentials.
 
+File Manager also refuses Stack and Volume roots overlapping Periphery's private `.komodo-vykar` workspace beneath its Stack directory, including manifests, cache, temporary repository credentials, and recovery records. This applies to browsing and downloads as well as writes; choosing a files-on-host Stack root does not bypass it. Roots overlapping a Docker volume labelled `komodo.file-manager.excluded` with any value other than `false` are likewise refused. Official Compose applies this label to Core's `backups` and `core-secrets` volumes. The same directory-identity check covers parent, child, bind-mount, and symlink aliases. Docker metadata must be available to validate volume exclusions; an unavailable daemon does not bypass them. Keep the labels on custom deployments too, and inspect existing volumes because Docker does not update their labels automatically. This restricts the File Manager API, not a host administrator or a compromised worker with Docker-socket authority.
+
 </Callout>
 
 See [Permissioning](/administration/users-groups-permissions#specific-permissions) for permission examples.
@@ -62,6 +64,8 @@ Depending on the target and permission level, File Manager supports:
 - Creating and extracting common archive formats.
 - Conflict review with an explicit choice to overwrite or skip each collision.
 - Progress reporting and cancellation for long-running operations.
+
+Conflict decisions and **Cancel** remain available when a backup or restore is waiting for your operation. They still check the operation's owner and target. The active worker keeps its backup-protection lease until it actually finishes or cancels; submitting a control request does not allow a backup to overlap unfinished filesystem work.
 
 Create, create-folder, rename, move, copy, and delete operations have per-user, per-target undo and redo history when Safe mode is enabled. Recovery manifests and any retained data expire after 24 hours. Text edits, uploads, and archive operations are not added to the undo history.
 

@@ -7,7 +7,7 @@ services:
     env_file: [.env]
     networks: [komodo-periphery]
     volumes:
-      # Keep the established shared data volume and host-visible Docker paths.
+      # Persist Periphery state and its Vykar cache at host-visible Docker paths.
       - data:/data
       # Docker socket and volume access give Periphery control of this host.
       - /var/run/docker.sock:/var/run/docker.sock

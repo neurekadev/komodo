@@ -22,3 +22,6 @@ anyhow.workspace = true
 bcrypt.workspace = true
 chrono.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

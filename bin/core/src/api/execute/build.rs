@@ -54,7 +54,7 @@ use crate::{
       get_variables_and_secrets,
     },
     registry_token,
-    update::{init_execution_update, update_update},
+    update::update_update,
   },
   permission::get_check_permissions,
   resource::{self, refresh_build_state_cache},
@@ -637,21 +637,10 @@ async fn handle_post_build_redeploy(build_id: &str) {
             stop_time: None,
           });
           let user = auto_redeploy_user().to_owned();
-          let res = async {
-            let update = init_execution_update(&req, &user).await?;
-            Deploy {
-              deployment: deployment.id.clone(),
-              stop_signal: None,
-              stop_time: None,
-            }
-            .resolve(&ExecuteArgs {
-              user,
-              update,
-              task_id: Uuid::new_v4(),
-            })
-            .await
-          }
-          .await;
+          // This detached continuation outlives RunBuild's mutation lease.
+          // Use the guarded dispatcher so redeploys wait for any backup and
+          // retain their own lease until their container mutations finish.
+          let res = super::inner_handler(req, user).await;
           Some((deployment.id.clone(), res))
         } else {
           None
@@ -665,7 +654,7 @@ async fn handle_post_build_redeploy(build_id: &str) {
     if let Err(e) = res {
       warn!(
         "failed post build redeploy for deployment {id}: {:#}",
-        e.error
+        e
       );
     }
   }

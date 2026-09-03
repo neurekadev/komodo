@@ -7,7 +7,7 @@
     "core-configuration",
     "authentication-and-providers",
     "users-groups-permissions",
-    "backup-restore",
+    "backups",
     "security-and-trust"
   ]
 }

@@ -81,6 +81,7 @@ impl super::KomodoResource for Stack {
 
   fn creator_specific_permissions() -> IndexSet<SpecificPermission> {
     [
+      SpecificPermission::Backups,
       SpecificPermission::FileManager,
       SpecificPermission::Inspect,
       SpecificPermission::Logs,
@@ -782,6 +783,14 @@ fn validate_effective_file_paths(
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn stack_creators_receive_backup_access() {
+    assert!(
+      <Stack as crate::resource::KomodoResource>::creator_specific_permissions()
+        .contains(&SpecificPermission::Backups)
+    );
+  }
 
   #[test]
   fn validates_create_and_partial_update_file_paths() {

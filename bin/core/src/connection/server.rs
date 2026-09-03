@@ -380,6 +380,10 @@ async fn onboard_new_server_handler(
       }
     };
 
+    // Login and public-key exchange must finish before taking the barrier.
+    // Keep every onboarding database write in the same export window, but
+    // release it before waiting on the peer's success/close handshake.
+    let mutation_guard = crate::backup::mutation_barrier().read().await;
     let server_id = match create_server_maybe_builder(
       server_query,
       public_key.into_inner(),
@@ -389,6 +393,7 @@ async fn onboard_new_server_handler(
     ).await {
       Ok(server_id) => server_id,
       Err(e) => {
+        drop(mutation_guard);
         warn!("{e:#}");
         if let Err(e) = socket
           .send_login_error(&e)
@@ -402,6 +407,17 @@ async fn onboard_new_server_handler(
       }
     };
 
+    let res = db_client()
+      .onboarding_keys
+      .update_one(
+        doc! { "public_key": &onboarding_key.public_key },
+        doc! { "$push": { "onboarded": &server_id } },
+      ).await;
+    if let Err(e) = res {
+      warn!("Failed to update onboarding key 'onboarded' | {e:?}");
+    }
+    drop(mutation_guard);
+
     if let Err(e) = socket
       .send_message(LoginMessage::Success)
       .await
@@ -414,17 +430,6 @@ async fn onboard_new_server_handler(
     // Server created, close and trigger reconnect
     // and handling using existing server handler.
     let _ = socket.close().await;
-
-    // Add the server to onboarding key "Onboarded"
-    let res = db_client()
-      .onboarding_keys
-      .update_one(
-        doc! { "public_key": &onboarding_key.public_key },
-        doc! { "$push": { "onboarded": server_id } },
-      ).await;
-    if let Err(e) = res {
-      warn!("Failed to update onboarding key 'onboarded' | {e:?}");
-    }
   }))
 }
 

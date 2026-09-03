@@ -2,6 +2,7 @@ import ContainersSection from "@/components/docker/containers-section";
 import DockerLabelsSection from "@/components/docker/labels-section";
 import DockerOptions from "@/components/docker/options";
 import FileManager from "@/components/file-manager";
+import ResourceBackups from "@/components/backups/resource";
 import InspectSection from "@/components/inspect-section";
 import { useExecute, usePermissions, useRead, useSetTitle } from "@/lib/hooks";
 import { useServer } from "@/resources/server";
@@ -22,11 +23,12 @@ import { useEffect } from "react";
 import { DockerDiskMetric } from "@/components/docker/metrics";
 import { serverDockerPath } from "@/lib/navigation";
 
-type VolumeView = "Info" | "Files";
+type VolumeView = "Info" | "Files" | "Backups";
 
 const VOLUME_TABS: TabNoContent[] = [
   { value: "Info", icon: ICONS.Info },
   { value: "Files", icon: ICONS.FileManager },
+  { value: "Backups", icon: ICONS.Backup },
 ];
 
 export default function Volume() {
@@ -60,10 +62,13 @@ function VolumeInner({
   useSetTitle(`${server?.name} | Volume | ${volumeName}`);
   const nav = useNavigate();
 
-  const { specific, specificFileManager, permissionsLoaded } = usePermissions({
-    type: "Server",
-    id: serverId,
-  });
+  const {
+    specific,
+    specificFileManager,
+    specificBackups,
+    canExecute,
+    permissionsLoaded,
+  } = usePermissions({ type: "Server", id: serverId });
 
   const {
     data: volume,
@@ -77,6 +82,10 @@ function VolumeInner({
     },
     { refetchInterval: 10_000 },
   );
+  const backupsSupported = volume
+    ? volume.Driver === "local" &&
+      volume.Scope === Types.VolumeScopeEnum.Local
+    : undefined;
 
   const { mutate: deleteVolume, isPending: deletePending } = useExecute(
     "DeleteVolume",
@@ -94,7 +103,11 @@ function VolumeInner({
   ).data?.filter((container) => container.volumes?.includes(volumeName));
 
   const view =
-    storedView === "Files" && !specificFileManager ? "Info" : storedView;
+    (storedView === "Files" && !specificFileManager) ||
+    (storedView === "Backups" &&
+      (!specificBackups || backupsSupported === false))
+      ? "Info"
+      : storedView;
   useEffect(() => {
     if (
       permissionsLoaded &&
@@ -103,7 +116,21 @@ function VolumeInner({
     ) {
       setView("Info");
     }
-  }, [permissionsLoaded, setView, specificFileManager, storedView]);
+    if (
+      permissionsLoaded &&
+      storedView === "Backups" &&
+      (!specificBackups || backupsSupported === false)
+    ) {
+      setView("Info");
+    }
+  }, [
+    permissionsLoaded,
+    backupsSupported,
+    setView,
+    specificBackups,
+    specificFileManager,
+    storedView,
+  ]);
 
   if (isPending) {
     return (
@@ -138,7 +165,12 @@ function VolumeInner({
       tabs={VOLUME_TABS.map((tab) =>
         tab.value === "Files"
           ? { ...tab, hidden: !specificFileManager }
-          : tab,
+          : tab.value === "Backups"
+            ? {
+                ...tab,
+                hidden: !specificBackups || backupsSupported !== true,
+              }
+            : tab,
       )}
       value={view}
       onValueChange={setView as any}
@@ -183,6 +215,18 @@ function VolumeInner({
               type: "Volume",
               params: { server: serverId, volume: volumeName },
             }}
+            titleOther={selector}
+          />
+        ) : view === "Backups" ? (
+          <ResourceBackups
+            target={{
+              type: "Volume",
+              params: { server_id: serverId, volume_name: volumeName },
+            }}
+            sourceServerId={serverId}
+            canExecute={
+              canExecute && specificBackups && backupsSupported === true
+            }
             titleOther={selector}
           />
         ) : (

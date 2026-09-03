@@ -269,6 +269,7 @@ impl AuthImpl for KomodoAuthImpl {
     no_users_exist: bool,
   ) -> mogh_auth_server::DynFuture<mogh_error::Result<String>> {
     Box::pin(async move {
+      let _mutation_guard = middleware::mutation_guard().await;
       let user = User::new(NewUserParams {
         username,
         enabled: no_users_exist || core_config().enable_new_users,
@@ -314,6 +315,7 @@ impl AuthImpl for KomodoAuthImpl {
     username: String,
   ) -> mogh_auth_server::DynFuture<mogh_error::Result<()>> {
     Box::pin(async move {
+      let _mutation_guard = middleware::mutation_guard().await;
       let update = doc! { "$set": { "username": username } };
 
       update_one_by_id(&db_client().users, &user_id, update, None)
@@ -337,6 +339,7 @@ impl AuthImpl for KomodoAuthImpl {
     hashed_password: String,
   ) -> mogh_auth_server::DynFuture<mogh_error::Result<()>> {
     Box::pin(async move {
+      let _mutation_guard = middleware::mutation_guard().await;
       let user = get_user(&user_id).await?;
       db_client()
         .set_user_hashed_password(&user, hashed_password)
@@ -390,6 +393,7 @@ impl AuthImpl for KomodoAuthImpl {
     no_users_exist: bool,
   ) -> mogh_auth_server::DynFuture<mogh_error::Result<String>> {
     Box::pin(async move {
+      let _mutation_guard = middleware::mutation_guard().await;
       let user = User::new(NewUserParams {
         username,
         enabled: no_users_exist || core_config().enable_new_users,
@@ -422,6 +426,7 @@ impl AuthImpl for KomodoAuthImpl {
     subject: SubjectIdentifier,
   ) -> mogh_auth_server::DynFuture<mogh_error::Result<()>> {
     Box::pin(async move {
+      let _mutation_guard = middleware::mutation_guard().await;
       let user = get_user(&user_id).await?;
 
       if let UserConfig::Oidc { .. } = &user.config {
@@ -482,6 +487,7 @@ impl AuthImpl for KomodoAuthImpl {
     no_users_exist: bool,
   ) -> mogh_auth_server::DynFuture<mogh_error::Result<String>> {
     Box::pin(async move {
+      let _mutation_guard = middleware::mutation_guard().await;
       let user = User::new(NewUserParams {
         username,
         enabled: no_users_exist || core_config().enable_new_users,
@@ -515,6 +521,7 @@ impl AuthImpl for KomodoAuthImpl {
     avatar_url: String,
   ) -> mogh_auth_server::DynFuture<mogh_error::Result<()>> {
     Box::pin(async move {
+      let _mutation_guard = middleware::mutation_guard().await;
       let user = get_user(&user_id).await?;
 
       if let UserConfig::Github { .. } = &user.config {
@@ -572,6 +579,7 @@ impl AuthImpl for KomodoAuthImpl {
     no_users_exist: bool,
   ) -> mogh_auth_server::DynFuture<mogh_error::Result<String>> {
     Box::pin(async move {
+      let _mutation_guard = middleware::mutation_guard().await;
       let user = User::new(NewUserParams {
         username,
         enabled: no_users_exist || core_config().enable_new_users,
@@ -605,6 +613,7 @@ impl AuthImpl for KomodoAuthImpl {
     avatar_url: String,
   ) -> mogh_auth_server::DynFuture<mogh_error::Result<()>> {
     Box::pin(async move {
+      let _mutation_guard = middleware::mutation_guard().await;
       let user = get_user(&user_id).await?;
 
       if let UserConfig::Google { .. } = &user.config {
@@ -641,6 +650,7 @@ impl AuthImpl for KomodoAuthImpl {
     provider: LoginProvider,
   ) -> mogh_auth_server::DynFuture<mogh_error::Result<()>> {
     Box::pin(async move {
+      let _mutation_guard = middleware::mutation_guard().await;
       let field = format!("linked_logins.{provider}");
 
       let update = doc! {
@@ -667,6 +677,7 @@ impl AuthImpl for KomodoAuthImpl {
     passkey: Option<Passkey>,
   ) -> mogh_auth_server::DynFuture<mogh_error::Result<()>> {
     Box::pin(async move {
+      let _mutation_guard = middleware::mutation_guard().await;
       let update = if let Some(passkey) = passkey {
         let passkey = to_bson(&passkey)
           .context("Failed to serialize passkey to BSON")?;
@@ -706,6 +717,7 @@ impl AuthImpl for KomodoAuthImpl {
     hashed_recovery_codes: Vec<String>,
   ) -> mogh_auth_server::DynFuture<mogh_error::Result<()>> {
     Box::pin(async move {
+      let _mutation_guard = middleware::mutation_guard().await;
       update_one_by_id(
         &db_client().users,
         &user_id,
@@ -729,6 +741,7 @@ impl AuthImpl for KomodoAuthImpl {
     user_id: String,
   ) -> mogh_auth_server::DynFuture<mogh_error::Result<()>> {
     Box::pin(async move {
+      let _mutation_guard = middleware::mutation_guard().await;
       update_one_by_id(
         &db_client().users,
         &user_id,
@@ -756,6 +769,7 @@ impl AuthImpl for KomodoAuthImpl {
     external_skip_2fa: bool,
   ) -> mogh_auth_server::DynFuture<mogh_error::Result<()>> {
     Box::pin(async move {
+      let _mutation_guard = middleware::mutation_guard().await;
       let update = doc! {
         "$set": {
           "external_skip_2fa": external_skip_2fa
@@ -807,6 +821,7 @@ impl AuthImpl for KomodoAuthImpl {
     hashed_secret: String,
   ) -> mogh_auth_server::DynFuture<mogh_error::Result<()>> {
     Box::pin(async move {
+      let _mutation_guard = middleware::mutation_guard().await;
       api_key::create_api_key(user_id, body, key, hashed_secret)
         .await
         .map_err(Into::into)
@@ -818,6 +833,7 @@ impl AuthImpl for KomodoAuthImpl {
     key: String,
   ) -> mogh_auth_server::DynFuture<mogh_error::Result<()>> {
     Box::pin(async move {
+      let _mutation_guard = middleware::mutation_guard().await;
       api_key::delete_api_key(&key).await.map_err(Into::into)
     })
   }
