@@ -3,7 +3,7 @@
 # Ordinary Core, Periphery, and AWS builder commands do not use these profiles.
 
 komodo_core_compose_defaults() {
-  export KOMODO_DATABASE_ADDRESS="${KOMODO_DATABASE_ADDRESS:-komodo-database:27017}"
+  export KOMODO_DATABASE_ADDRESS="${KOMODO_DATABASE_ADDRESS:-komodo-mongo:27017}"
   export KOMODO_PRIVATE_KEY="${KOMODO_PRIVATE_KEY:-file:/data/keys/core.key}"
   export KOMODO_REPORTING_PRIVATE_KEY="${KOMODO_REPORTING_PRIVATE_KEY:-file:/data/keys/reporting.key}"
   export KOMODO_PERIPHERY_PUBLIC_KEY="${KOMODO_PERIPHERY_PUBLIC_KEY:-file:/data/keys/periphery.pub}"

@@ -22,7 +22,7 @@ assert_equal() {
   assert_equal "$KOMODO_CLI_BACKUPS_FOLDER" /data/backups
   assert_equal "$KOMODO_SYNC_DIRECTORY" /data/syncs
   assert_equal "$KOMODO_REPO_DIRECTORY" /data/repo-cache
-  assert_equal "$KOMODO_DATABASE_ADDRESS" komodo-database:27017
+  assert_equal "$KOMODO_DATABASE_ADDRESS" komodo-mongo:27017
   assert_equal "$KOMODO_FIRST_SERVER_NAME" Local
   assert_equal "$KOMODO_LOCAL_AUTH" true
 )
