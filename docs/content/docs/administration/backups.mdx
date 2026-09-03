@@ -59,11 +59,13 @@ Pattern selection and filesystem-boundary protection are independent: a path mus
 
 Every eligible local Docker named volume is included by default, including volumes not managed by a Komodo Stack. Anonymous volumes are excluded by default; enable **Include anonymous Docker volumes** to include them in fleet discovery and direct Volume backups. Komodo recognizes Docker's internal `com.docker.volume.anonymous` label and also treats the daemon-generated 64-character lowercase hexadecimal name form as anonymous for older Docker creation paths that omitted the label. Ordinary unlabeled named volumes remain included.
 
-Komodo checks the driver and mountpoint again at backup time. Docker mounts that expose a configured Core-local repository are excluded so a repository cannot recursively back up itself. Remote/plugin volume drivers and non-local volume scope are rejected in this version.
+Komodo checks the driver and mountpoint again at backup time. Core's private `/core-secrets` storage is always excluded, including when the repository is external and when container stopping is disabled. Docker mounts that expose a configured Core-local repository are excluded so a repository cannot recursively back up itself. These protections cover host paths and Periphery mount aliases and also reject restore destinations that overlap protected storage. Remote/plugin volume drivers and non-local volume scope are rejected in this version.
+
+Core-owned volumes and its Compose Stack are not ordinary backup targets. Containers labelled `komodo.skip` (any value other than `false`) and their mounted storage are also excluded; this covers the database services in the official production and development Compose files. Retain this label on custom deployments' database services, including any downstream storage service such as PostgreSQL behind FerretDB. Use the logical **Core** backup for the database and retain the private key separately. Default fleet selection skips these safety exclusions without retrying them; an explicit **Include** selection reports a partial run, and a direct backup or restore request is rejected. Exclusions never delete existing snapshots.
 
 Safe container stopping includes containers that bind-mount the Volume's inspected storage path, a parent directory, or a subtree, even when Docker does not list them as named-volume consumers. Restore applies the same overlap check to the actual destination paths. Only containers that were running are stopped and later restarted.
 
-Periphery does not stop its own container when its Docker-volume-root mount overlaps the source. Its filesystem-operation guard prevents other managed mutations while that worker performs the backup or restore.
+Periphery never stops itself or the identified Core container when a shared mount overlaps an application source. Periphery's filesystem-operation guard and Core's mutation/Action barriers protect their managed writes while application containers are quiesced. Core's Docker identity is required for worker backup and restore operations with every backend; retain Docker's hostname mount or its default container-ID hostname. An unidentifiable Core fails closed instead of guessing from a container name or image.
 
 Use **All**, **Include**, or **Exclude** selection for Stacks and Volumes. Volumes are identified directly by Server and Docker volume name, so unmanaged volumes can be selected without inventing a Stack association. Core has no include/exclude filter.
 
@@ -115,6 +117,8 @@ Fleet run status polls every 15 seconds, while repository health and mirror lag 
 
 Core admits one snapshot-inventory request at a time, before opening the repository, and retains that slot until the result has been filtered/paged or reduced to the selected snapshot. Concurrent inventory requests receive a busy error and should be retried after the active request finishes. The response deadline is 60 seconds; a disconnected or timed-out request cannot free the slot while its backend worker is still running. This bounds concurrent full-repository inventories, not the size of the repository itself. Target authorization and the 500-snapshot page limit remain unchanged.
 
+Stack lists release the inventory slot after paging, before asking Periphery to compare current source paths. A slow or unavailable Server therefore cannot monopolize repository inventory access. Failed source discovery leaves that comparison unknown; it does not assert a path mismatch or force recovered-Stack creation. Restore planning and execution still revalidate the actual source and destination before changing data.
+
 Critical operational alerts accumulate independently in the `messages` array in `/data/backup-operational-alert.json` and survive Core restarts; a later failure does not erase an earlier node's incident. To acknowledge an individual incident, first verify that its affected workloads and Periphery restore/quiesce journals have recovered, then stop Core, save a copy of the alert file, remove only that incident's entry from `messages`, and restart Core. Leave all other entries intact. Archive the whole file only after verifying every incident. Do not clear alerts while containers remain stopped or a restore is indeterminate; acknowledging a message does not clear a recovery journal or unblock unsafe operations.
 
 ## Restore a Stack or Volume
@@ -162,6 +166,8 @@ When recovered-Stack bind mappings require Compose processing, every Compose pat
 ## Recover Core on a fresh install
 
 The original `/core-secrets/backup.key` is required before Komodo can identify or decrypt a Core snapshot. It authenticates snapshot identities and opens the repository credentials stored in the restored database. The official Compose templates keep it in the Core-only `core-secrets` volume rather than the `/data` volume shared with Periphery.
+
+Do not store this key inside a shared worker backup repository: participating workers know that repository's encryption passphrase. If an earlier deployment captured `core-secrets` in a Volume or bind backup, exclusion does not revoke those existing copies. Treat the key as exposed and follow [Rotate an exposed backup key](#rotate-an-exposed-backup-key), retaining independent recovery material first.
 
 Core never automatically imports a backup key from `/data/keys/backup.key` or `/config/keys/backup.key`. If the private key is absent and either legacy path exists, key initialization fails without reading, copying, or deleting that file. Restore a separately retained, trusted Core-only key; do not promote a key from shared storage merely to clear the error. A key previously exposed to a worker remains compromised even after its shared copy is deleted or a copy is placed in `core-secrets`.
 

@@ -9,6 +9,7 @@ use std::collections::HashMap;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ProtectedRepositoryPath {
+  /// Core-private or repository storage that no worker may capture or restore.
   pub path: String,
   /// Identity read inside Core, not an inferred application container name.
   pub core_container_id: String,
@@ -50,7 +51,7 @@ pub struct DiscoverBackupSource {
   pub target: PeripheryBackupTarget,
   #[serde(default)]
   pub filters: BackupSourceFilters,
-  /// Core-local repository paths as mounted inside Core. Periphery resolves
+  /// Core-private and repository paths inside Core. Periphery resolves
   /// their Docker mount sources and refuses to capture those sources.
   #[serde(default)]
   pub protected_repository_paths: Vec<ProtectedRepositoryPath>,
@@ -75,7 +76,7 @@ pub struct RunVykarBackup {
   pub snapshot_name: String,
   pub run_id: String,
   pub komodo_version: String,
-  /// Core-local repository paths as mounted inside Core. Periphery resolves
+  /// Core-private and repository paths inside Core. Periphery resolves
   /// their Docker mount sources and refuses to capture those sources.
   #[serde(default)]
   pub protected_repository_paths: Vec<ProtectedRepositoryPath>,
@@ -103,6 +104,9 @@ pub struct VykarBackupRepositoryResult {
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct RunVykarBackupResponse {
+  /// A deliberate safety exclusion, not a failed write or a retryable error.
+  #[serde(default)]
+  pub excluded: Option<String>,
   pub primary: VykarBackupRepositoryResult,
   pub mirror: Option<VykarBackupRepositoryResult>,
   pub stopped_containers: Vec<String>,
@@ -152,7 +156,7 @@ pub struct RunVykarBackupBatch {
   pub hostname: String,
   pub run_id: String,
   pub komodo_version: String,
-  /// Core-local repository paths as mounted inside Core. Periphery resolves
+  /// Core-private and repository paths inside Core. Periphery resolves
   /// their Docker mount sources and refuses to capture those sources.
   #[serde(default)]
   pub protected_repository_paths: Vec<ProtectedRepositoryPath>,
@@ -181,7 +185,7 @@ pub struct RunVykarBackupBatchResponse {
 pub struct TransactionalVykarRestore {
   pub target: PeripheryBackupTarget,
   pub repository: BackupRepository,
-  /// Core-local repository paths as mounted inside Core. Periphery resolves
+  /// Core-private and repository paths inside Core. Periphery resolves
   /// their Docker mount sources and refuses to publish into those sources.
   #[serde(default)]
   pub protected_repository_paths: Vec<ProtectedRepositoryPath>,
@@ -233,7 +237,7 @@ pub struct RestorePublishPath {
 pub struct PreflightVykarRestore {
   pub target: PeripheryBackupTarget,
   pub repository: BackupRepository,
-  /// Core-local repository paths as mounted inside Core. Periphery resolves
+  /// Core-private and repository paths inside Core. Periphery resolves
   /// their Docker mount sources and refuses to publish into those sources.
   #[serde(default)]
   pub protected_repository_paths: Vec<ProtectedRepositoryPath>,

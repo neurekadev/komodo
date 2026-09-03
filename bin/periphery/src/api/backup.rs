@@ -207,6 +207,20 @@ fn backup_operation_lock() -> &'static tokio::sync::Mutex<()> {
   LOCK.get_or_init(Default::default)
 }
 
+#[derive(Debug)]
+struct ExcludedBackupSource(String);
+
+impl std::fmt::Display for ExcludedBackupSource {
+  fn fmt(
+    &self,
+    formatter: &mut std::fmt::Formatter<'_>,
+  ) -> std::fmt::Result {
+    formatter.write_str(&self.0)
+  }
+}
+
+impl std::error::Error for ExcludedBackupSource {}
+
 impl Resolve<Args> for DiscoverBackupSource {
   async fn resolve(
     self,
@@ -308,6 +322,7 @@ impl Resolve<Args> for RunVykarBackup {
       Err(error) => return Err(error),
     };
     Ok(RunVykarBackupResponse {
+      excluded: None,
       primary,
       mirror,
       stopped_containers: stopped,
@@ -328,6 +343,7 @@ impl Resolve<Args> for RunVykarBackupBatch {
     let (_cancellation, _cancellation_registration) =
       register_operation_cancellation(&self.run_id);
     let mut discovered = Vec::new();
+    let mut results = Vec::new();
     let mut discovery_errors = Vec::new();
     let mut running = BTreeSet::new();
     for task in self.tasks {
@@ -341,6 +357,15 @@ impl Resolve<Args> for RunVykarBackupBatch {
         Ok(source) => {
           running.extend(source.running_containers.iter().cloned());
           discovered.push((task, source.paths));
+        }
+        Err(error) if error.is::<ExcludedBackupSource>() => {
+          results.push(VykarBackupTaskResult {
+            source_label: task.source_label,
+            result: RunVykarBackupResponse {
+              excluded: Some(error.to_string()),
+              ..Default::default()
+            },
+          });
         }
         Err(error) => discovery_errors
           .push(format!("{}: {error:#}", task.source_label)),
@@ -380,7 +405,6 @@ impl Resolve<Args> for RunVykarBackupBatch {
       }
     }
 
-    let mut results = Vec::new();
     for (task, paths) in discovered {
       if operation_cancelled(&self.run_id) {
         break;
@@ -690,11 +714,11 @@ fn validate_path_outside_internal_storage(
   if paths_overlap(path, internal_storage)
     || paths_overlap(&resolved_path, &resolved_internal)
   {
-    return Err(anyhow!(
+    return Err(ExcludedBackupSource(format!(
       "{label} '{}' overlaps Periphery's internal backup storage '{}'",
       path.display(),
       internal_storage.display()
-    ));
+    )).into());
   }
   Ok(())
 }
@@ -743,9 +767,6 @@ async fn validate_restore_destinations(
   protected_repository_paths: &[ProtectedRepositoryPath],
 ) -> anyhow::Result<()> {
   validate_resolved_restore_destinations(publish)?;
-  if protected_repository_paths.is_empty() {
-    return Ok(());
-  }
   let docker_guard = docker_client().load();
   let docker = docker_guard
     .as_ref()
@@ -1258,7 +1279,13 @@ async fn affected_running_containers(
   containers: &[ContainerListItem],
   target: &PeripheryBackupTarget,
   paths: &BTreeSet<PathBuf>,
+  protected_paths: &[ProtectedRepositoryPath],
 ) -> anyhow::Result<Vec<String>> {
+  ensure_target_not_control_plane(
+    containers,
+    target,
+    protected_paths,
+  )?;
   // The worker mounts Docker's volume root to perform this operation. Its own
   // filesystem gate already excludes other mutations; stopping it would kill
   // the backup/restore before it can restart application containers.
@@ -1267,11 +1294,13 @@ async fn affected_running_containers(
     containers,
     target,
     own_id.as_deref(),
+    protected_paths,
   )
   .into_iter()
   .collect::<BTreeSet<_>>();
   for container in containers.iter().filter(|container| {
     container_is_quiesce_candidate(container, own_id.as_deref())
+      && !is_core_container(container, protected_paths)
   }) {
     if affected.contains(&container.name) {
       continue;
@@ -1400,6 +1429,7 @@ async fn discover_source(
         &containers,
         target,
         &affected_paths,
+        protected_repository_paths,
       )
       .await?;
       let mut paths =
@@ -1454,6 +1484,7 @@ async fn discover_source(
         &containers,
         target,
         &BTreeSet::from([mountpoint.clone()]),
+        protected_repository_paths,
       )
       .await?;
       Ok(DiscoverBackupSourceResponse {
@@ -1522,17 +1553,20 @@ async fn resolve_protected_repository_sources(
   containers: &[ContainerListItem],
   protected_repository_paths: &[ProtectedRepositoryPath],
 ) -> anyhow::Result<Vec<PathBuf>> {
-  if protected_repository_paths.is_empty() {
-    return Ok(Vec::new());
-  }
   let mut sources = BTreeSet::new();
+  let own_id = komodo_backup::container::current_container_id();
   for container in containers.iter().filter(|container| {
-    protected_repository_paths.iter().any(|repository| {
-      container_matches_id(container, &repository.core_container_id)
-    })
+    is_core_container(container, protected_repository_paths)
+      || (container_backup_is_skipped(container)
+        && !own_id
+          .as_deref()
+          .is_some_and(|id| container_matches_id(container, id)))
   }) {
     let inspected = docker.inspect_container(&container.name).await?;
     for mount in inspected.mounts {
+      if !mount_type_affects_paths(mount.typ.as_deref()) {
+        continue;
+      }
       let Some(destination) = mount.destination.map(PathBuf::from)
       else {
         continue;
@@ -1540,6 +1574,14 @@ async fn resolve_protected_repository_sources(
       let Some(source) = mount.source.map(PathBuf::from) else {
         continue;
       };
+      if container_backup_is_skipped(container)
+        && !is_core_container(container, protected_repository_paths)
+      {
+        // Refusing these sources (even for stopped containers) avoids either
+        // stopping the database or taking an inconsistent live database copy.
+        sources.insert(source.canonicalize().unwrap_or(source));
+        continue;
+      }
       for repository in
         protected_repository_paths.iter().filter(|repository| {
           container_matches_id(
@@ -1590,6 +1632,22 @@ async fn resolve_protected_repository_sources(
       }
     }
   }
+  if let Some(own) = containers.iter().find(|container| {
+    own_id
+      .as_deref()
+      .is_some_and(|id| container_matches_id(container, id))
+  }) {
+    // Core and Periphery may share the development container's namespace.
+    // Protect its private files even when they are not Docker-mounted paths.
+    sources.extend(
+      protected_repository_paths
+        .iter()
+        .filter(|path| {
+          container_matches_id(own, &path.core_container_id)
+        })
+        .map(|path| PathBuf::from(&path.path)),
+    );
+  }
   Ok(sources.into_iter().collect())
 }
 
@@ -1635,11 +1693,11 @@ fn validate_path_outside_protected_repositories(
     if paths_overlap(path, repository)
       || paths_overlap(&resolved_path, &resolved_repository)
     {
-      return Err(anyhow!(
-        "{label} '{}' overlaps a Core-local repository mount '{}'",
+      return Err(ExcludedBackupSource(format!(
+        "{label} '{}' overlaps protected Core, repository, or skipped-container storage '{}'",
         path.display(),
         repository.display()
-      ));
+      )).into());
     }
   }
   Ok(())
@@ -1648,6 +1706,7 @@ fn validate_path_outside_protected_repositories(
 async fn discover_running_containers(
   target: &PeripheryBackupTarget,
   publish: &[RestorePublishPath],
+  protected_paths: &[ProtectedRepositoryPath],
 ) -> anyhow::Result<Vec<String>> {
   let docker_guard = docker_client().load();
   let docker = docker_guard
@@ -1661,14 +1720,64 @@ async fn discover_running_containers(
       resolve_existing_ancestor(Path::new(&item.destination))
     })
     .collect::<anyhow::Result<BTreeSet<_>>>()?;
-  affected_running_containers(docker, &containers, target, &paths)
-    .await
+  affected_running_containers(
+    docker,
+    &containers,
+    target,
+    &paths,
+    protected_paths,
+  )
+  .await
+}
+
+fn is_core_container(
+  container: &ContainerListItem,
+  protected_paths: &[ProtectedRepositoryPath],
+) -> bool {
+  protected_paths.iter().any(|path| {
+    container_matches_id(container, &path.core_container_id)
+  })
+}
+
+fn container_backup_is_skipped(
+  container: &ContainerListItem,
+) -> bool {
+  container
+    .labels
+    .get("komodo.skip")
+    .is_some_and(|value| value != "false")
+}
+
+fn ensure_target_not_control_plane(
+  containers: &[ContainerListItem],
+  target: &PeripheryBackupTarget,
+  protected_paths: &[ProtectedRepositoryPath],
+) -> anyhow::Result<()> {
+  for container in containers.iter().filter(|container| {
+    is_core_container(container, protected_paths)
+      || container_backup_is_skipped(container)
+  }) {
+    let consumes_target = match target {
+      PeripheryBackupTarget::Stack { stack, .. } => {
+        container.labels.get(COMPOSE_PROJECT_LABEL)
+          == Some(&stack.project_name(false))
+      }
+      PeripheryBackupTarget::Volume { volume_name } => {
+        container.volumes.contains(volume_name)
+      }
+    };
+    if consumes_target {
+      return Err(ExcludedBackupSource(format!("Backup/restore target belongs to protected container '{}'; use Core's logical backup and retain its private recovery material separately", container.name)).into());
+    }
+  }
+  Ok(())
 }
 
 fn running_containers_for_target(
   containers: &[ContainerListItem],
   target: &PeripheryBackupTarget,
   own_id: Option<&str>,
+  protected_paths: &[ProtectedRepositoryPath],
 ) -> Vec<String> {
   match target {
     PeripheryBackupTarget::Stack { stack, .. } => {
@@ -1677,6 +1786,7 @@ fn running_containers_for_target(
         .iter()
         .filter(|container| {
           container_is_quiesce_candidate(container, own_id)
+            && !is_core_container(container, protected_paths)
             && container.labels.get(COMPOSE_PROJECT_LABEL)
               == Some(&project_name)
         })
@@ -1687,6 +1797,7 @@ fn running_containers_for_target(
       .iter()
       .filter(|container| {
         container_is_quiesce_candidate(container, own_id)
+          && !is_core_container(container, protected_paths)
           && container.volumes.contains(volume_name)
       })
       .map(|container| container.name.clone())
@@ -1700,6 +1811,7 @@ fn container_is_quiesce_candidate(
 ) -> bool {
   container.state == ContainerStateStatusEnum::Running
     && !own_id.is_some_and(|id| container_matches_id(container, id))
+    && !container_backup_is_skipped(container)
 }
 
 fn validate_source_path(path: &Path) -> anyhow::Result<PathBuf> {
@@ -1957,7 +2069,7 @@ impl Resolve<Args> for TransactionalVykarRestore {
       {
         let mountpoint = discover_source(
           &self.target,
-          &[],
+          &self.protected_repository_paths,
           &unfiltered_source_filters(),
         )
         .await?
@@ -1977,9 +2089,12 @@ impl Resolve<Args> for TransactionalVykarRestore {
         &self.protected_repository_paths,
       )
       .await?;
-      let running_containers =
-        discover_running_containers(&self.target, &self.publish)
-          .await?;
+      let running_containers = discover_running_containers(
+        &self.target,
+        &self.publish,
+        &self.protected_repository_paths,
+      )
+      .await?;
       // Persist the complete pre-restore running set before the first stop.
       // Startup recovery can then restart every affected container after
       // repairing the filesystem and Volume ownership journal.
@@ -2188,7 +2303,7 @@ impl Resolve<Args> for PreflightVykarRestore {
         // recovered Stack; execution recreates its mapped filesystem roots.
         discover_source(
           &self.target,
-          &[],
+          &self.protected_repository_paths,
           &unfiltered_source_filters(),
         )
         .await
@@ -2213,7 +2328,7 @@ impl Resolve<Args> for PreflightVykarRestore {
           Some(
             discover_source(
               &self.target,
-              &[],
+              &self.protected_repository_paths,
               &unfiltered_source_filters(),
             )
             .await?,
@@ -2255,7 +2370,12 @@ impl Resolve<Args> for PreflightVykarRestore {
         &self.protected_repository_paths,
       )
       .await?;
-      discover_running_containers(&self.target, &self.publish).await?
+      discover_running_containers(
+        &self.target,
+        &self.publish,
+        &self.protected_repository_paths,
+      )
+      .await?
     };
     let repository = self.repository.clone();
     let advanced = self.advanced.clone();
@@ -3972,6 +4092,144 @@ mod tests {
   }
 
   #[test]
+  fn private_core_mounts_and_worker_aliases_are_safety_exclusions() {
+    let root = tempfile::tempdir().unwrap();
+    let private = root.path().join("core-secrets");
+    let alias = root.path().join("worker-alias");
+    std::fs::create_dir_all(&private).unwrap();
+    std::os::unix::fs::symlink(&private, &alias).unwrap();
+    let mapped = map_path_through_mount(
+      Path::new("/core-secrets"),
+      Path::new("/core-secrets"),
+      &private,
+    )
+    .unwrap();
+    for path in [
+      private.as_path(),
+      alias.as_path(),
+      &alias.join("backup.key"),
+      root.path(),
+    ] {
+      for operation in ["Backup source", "Restore destination"] {
+        let error = validate_path_outside_protected_repositories(
+          path,
+          std::slice::from_ref(&mapped),
+          operation,
+        )
+        .unwrap_err();
+        assert!(error.is::<ExcludedBackupSource>());
+      }
+    }
+    validate_path_outside_protected_repositories(
+      &root.path().join("application"),
+      &[mapped],
+      "Backup source",
+    )
+    .unwrap();
+  }
+
+  #[test]
+  fn core_and_skipped_database_targets_are_refused_even_when_stopped()
+  {
+    let core_id = "a".repeat(64);
+    let protected = vec![ProtectedRepositoryPath {
+      path: "/core-secrets".into(),
+      core_container_id: core_id.clone(),
+    }];
+    let stack = komodo_client::entities::stack::Stack {
+      name: "control-plane".into(),
+      ..Default::default()
+    };
+    let core = ContainerListItem {
+      id: Some(core_id),
+      name: "custom-core-name".into(),
+      state: ContainerStateStatusEnum::Exited,
+      volumes: vec!["private-secrets".into()],
+      labels: HashMap::from([(
+        COMPOSE_PROJECT_LABEL.into(),
+        stack.project_name(false),
+      )]),
+      ..Default::default()
+    };
+    let database = ContainerListItem {
+      name: "database".into(),
+      state: ContainerStateStatusEnum::Exited,
+      volumes: vec!["database-data".into()],
+      labels: HashMap::from([("komodo.skip".into(), "true".into())]),
+      ..Default::default()
+    };
+    let containers = vec![core, database];
+    for volume_name in ["private-secrets", "database-data"] {
+      let error = ensure_target_not_control_plane(
+        &containers,
+        &PeripheryBackupTarget::Volume {
+          volume_name: volume_name.into(),
+        },
+        &protected,
+      )
+      .unwrap_err();
+      assert!(error.is::<ExcludedBackupSource>());
+    }
+    assert!(
+      ensure_target_not_control_plane(
+        &containers,
+        &PeripheryBackupTarget::Stack {
+          stack: Box::new(stack),
+          repo: None
+        },
+        &protected
+      )
+      .is_err()
+    );
+    ensure_target_not_control_plane(
+      &containers,
+      &PeripheryBackupTarget::Volume {
+        volume_name: "application-data".into(),
+      },
+      &protected,
+    )
+    .unwrap();
+  }
+
+  #[test]
+  fn quiescing_keeps_core_and_skip_label_containers_running() {
+    let protected = vec![ProtectedRepositoryPath {
+      path: "/core-secrets".into(),
+      core_container_id: "a".repeat(64),
+    }];
+    let core = ContainerListItem {
+      id: Some("a".repeat(64)),
+      name: "core".into(),
+      state: ContainerStateStatusEnum::Running,
+      volumes: vec!["shared".into()],
+      ..Default::default()
+    };
+    let database = ContainerListItem {
+      id: Some("b".repeat(64)),
+      name: "database".into(),
+      labels: HashMap::from([("komodo.skip".into(), "true".into())]),
+      ..core.clone()
+    };
+    let application = ContainerListItem {
+      id: Some("c".repeat(64)),
+      name: "application".into(),
+      labels: HashMap::from([("komodo.skip".into(), "false".into())]),
+      ..core.clone()
+    };
+    assert_eq!(
+      running_containers_for_target(
+        &[core, database, application],
+        &PeripheryBackupTarget::Volume {
+          volume_name: "shared".into()
+        },
+        Some(&"d".repeat(64)),
+        &protected
+      ),
+      vec!["application"]
+    );
+  }
+
+  #[test]
   fn repository_aliases_require_the_actual_core_container_identity() {
     let core = ContainerListItem {
       id: Some("a".repeat(64)),
@@ -4100,7 +4358,7 @@ mod tests {
     ];
 
     assert_eq!(
-      running_containers_for_target(&containers, &target, None),
+      running_containers_for_target(&containers, &target, None, &[]),
       ["web", "worker"]
     );
   }
@@ -4138,7 +4396,7 @@ mod tests {
     ];
 
     assert_eq!(
-      running_containers_for_target(&containers, &target, None),
+      running_containers_for_target(&containers, &target, None, &[]),
       ["stack-a-web", "stack-b-worker"]
     );
   }

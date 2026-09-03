@@ -1200,23 +1200,51 @@ fn repository_for_periphery(
   })
 }
 
-fn core_local_repository_paths(
+fn protected_backup_paths(
   settings: &BackupSettings,
 ) -> anyhow::Result<Vec<ProtectedRepositoryPath>> {
-  std::iter::once(&settings.primary)
-    .chain(settings.mirror.iter())
-    .filter_map(|repository| match &repository.backend {
-      BackupRepositoryBackend::CoreLocal { path } => {
-        Some(komodo_backup::container::current_container_id()
-          .context("Cannot identify the Core Docker container for repository protection; retain Docker's hostname mount or default container-ID hostname")
-          .map(|core_container_id| ProtectedRepositoryPath {
-            path: path.clone(),
-            core_container_id,
-          }))
-      }
-      _ => None,
+  let core_container_id = komodo_backup::container::current_container_id()
+    .context("Cannot identify the Core Docker container for backup protection; retain Docker's hostname mount or default container-ID hostname")?;
+  Ok(protected_core_paths(settings, &core_container_id))
+}
+
+fn protected_core_paths(
+  settings: &BackupSettings,
+  core_container_id: &str,
+) -> Vec<ProtectedRepositoryPath> {
+  // The private key must never enter a worker-readable repository, including
+  // when every configured repository is external. Also identify Core so the
+  // colocated worker never stops its coordinator while quiescing shared data.
+  std::iter::once(CORE_PRIVATE_PATH.to_string())
+    .chain(
+      std::iter::once(&settings.primary)
+        .chain(settings.mirror.iter())
+        .filter_map(|repository| match &repository.backend {
+          BackupRepositoryBackend::CoreLocal { path } => {
+            Some(path.clone())
+          }
+          _ => None,
+        }),
+    )
+    .map(|path| ProtectedRepositoryPath {
+      path,
+      core_container_id: core_container_id.to_string(),
     })
     .collect()
+}
+
+fn excluded_target_was_requested(
+  settings: &BackupSettings,
+  target: &PeripheryBackupTarget,
+) -> bool {
+  match target {
+    PeripheryBackupTarget::Stack { .. } => {
+      settings.stack_selection.mode == BackupSelectionMode::Include
+    }
+    PeripheryBackupTarget::Volume { .. } => {
+      settings.volume_selection.mode == BackupSelectionMode::Include
+    }
+  }
 }
 
 fn backup_source_filters(
@@ -3324,9 +3352,7 @@ async fn run_node_batch(
       hostname: format!("komodo-periphery-{}", server.id),
       run_id: run.id.clone(),
       komodo_version: komodo_build_info::version().into(),
-      protected_repository_paths: core_local_repository_paths(
-        settings,
-      )?,
+      protected_repository_paths: protected_backup_paths(settings)?,
       filters: backup_source_filters(settings),
       stop_containers: settings.stop_containers,
     })
@@ -3369,6 +3395,7 @@ async fn run_node_batch(
     .map(|result| (result.source_label, result.result))
     .collect::<HashMap<_, _>>();
   let mut retry_tasks = Vec::new();
+  let mut explicitly_excluded = false;
   for mut task in tasks {
     let Some(result) = results.remove(&task.source_label) else {
       let mut unknown = retry_tasks_after_unknown_result(
@@ -3382,6 +3409,17 @@ async fn run_node_batch(
       retry_tasks.extend(unknown);
       continue;
     };
+    if let Some(reason) = result.excluded {
+      warn!(
+        source = task.source_label,
+        "Backup source excluded: {reason}"
+      );
+      explicitly_excluded |=
+        excluded_target_was_requested(settings, &task.target);
+      // Deliberately excluded sources neither create snapshots nor enter the
+      // retry/retention path. Existing copies are not deleted as failed writes.
+      continue;
+    }
     let mirror_configured = settings.mirror.is_some();
     let primary_complete =
       result.primary.complete && result.primary.error.is_none();
@@ -3444,6 +3482,7 @@ async fn run_node_batch(
     }
   }
   let partial = result_count != expected
+    || explicitly_excluded
     || !response.discovery_errors.is_empty()
     || !response.restart_errors.is_empty()
     || !retry_tasks.is_empty();
@@ -3814,9 +3853,7 @@ async fn backup_stack(
       snapshot_name,
       run_id: run.id.clone(),
       komodo_version: komodo_build_info::version().into(),
-      protected_repository_paths: core_local_repository_paths(
-        settings,
-      )?,
+      protected_repository_paths: protected_backup_paths(settings)?,
       filters: backup_source_filters(settings),
       stop_containers: settings.stop_containers,
       mirror_only: false,
@@ -3878,9 +3915,7 @@ async fn backup_volume(
       snapshot_name,
       run_id: run.id.clone(),
       komodo_version: komodo_build_info::version().into(),
-      protected_repository_paths: core_local_repository_paths(
-        settings,
-      )?,
+      protected_repository_paths: protected_backup_paths(settings)?,
       filters: backup_source_filters(settings),
       stop_containers: settings.stop_containers,
       mirror_only: false,
@@ -4094,9 +4129,7 @@ pub async fn current_stack_backup_source(
         repo: repo.map(Box::new),
       },
       filters: backup_source_filters(&settings),
-      protected_repository_paths: core_local_repository_paths(
-        &settings,
-      )?,
+      protected_repository_paths: protected_backup_paths(&settings)?,
     })
     .await?;
   Ok((server.id, source.paths))
@@ -4402,9 +4435,7 @@ pub async fn plan_restore(
     .request(PreflightVykarRestore {
       target,
       repository: repository_for_periphery(&settings.primary, false)?,
-      protected_repository_paths: core_local_repository_paths(
-        &settings,
-      )?,
+      protected_repository_paths: protected_backup_paths(&settings)?,
       advanced: settings.advanced,
       hostname: format!("komodo-periphery-{}", server.id),
       snapshot_name: snapshot.name.clone(),
@@ -4878,9 +4909,7 @@ pub async fn execute_restore(
     .request(PreflightVykarRestore {
       target: target.clone(),
       repository: repository_for_periphery(&settings.primary, false)?,
-      protected_repository_paths: core_local_repository_paths(
-        &settings,
-      )?,
+      protected_repository_paths: protected_backup_paths(&settings)?,
       advanced: settings.advanced.clone(),
       hostname: format!("komodo-periphery-{}", server.id),
       snapshot_name: stored.plan.snapshot.clone(),
@@ -5015,7 +5044,7 @@ pub async fn execute_restore(
             &settings.primary,
             false,
           )?,
-          protected_repository_paths: core_local_repository_paths(
+          protected_repository_paths: protected_backup_paths(
             &settings,
           )?,
           advanced: settings.advanced,
@@ -6713,6 +6742,54 @@ mod tests {
         "accepted noncanonical path {path:?}"
       );
     }
+  }
+
+  #[test]
+  fn external_repositories_still_protect_the_core_private_volume() {
+    let settings = BackupSettings {
+      primary: BackupRepository {
+        backend: BackupRepositoryBackend::Rest {
+          url: "https://repository.invalid".into(),
+          access_token: Default::default(),
+          worker_access_token: Default::default(),
+          allow_insecure_http: false,
+        },
+        ..Default::default()
+      },
+      ..Default::default()
+    };
+    let paths = protected_core_paths(&settings, &"a".repeat(64));
+    assert_eq!(paths.len(), 1);
+    assert_eq!(paths[0].path, CORE_PRIVATE_PATH);
+    assert_eq!(paths[0].core_container_id, "a".repeat(64));
+    let local_paths = protected_core_paths(
+      &BackupSettings::default(),
+      &"b".repeat(64),
+    );
+    assert!(
+      local_paths
+        .iter()
+        .any(|path| path.path == CORE_PRIVATE_PATH)
+    );
+    assert!(
+      local_paths
+        .iter()
+        .any(|path| path.path == "/data/backups/vykar")
+    );
+  }
+
+  #[test]
+  fn intentional_exclusions_only_make_explicit_include_runs_partial()
+  {
+    let mut settings = BackupSettings::default();
+    let target = PeripheryBackupTarget::Volume {
+      volume_name: "private-secrets".into(),
+    };
+    assert!(!excluded_target_was_requested(&settings, &target));
+    settings.volume_selection.mode = BackupSelectionMode::Exclude;
+    assert!(!excluded_target_was_requested(&settings, &target));
+    settings.volume_selection.mode = BackupSelectionMode::Include;
+    assert!(excluded_target_was_requested(&settings, &target));
   }
 
   #[test]

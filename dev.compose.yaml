@@ -48,6 +48,8 @@ services:
       - FERRETDB_HANDLER=sqlite
     volumes:
       - data:/state
+    labels:
+      komodo.skip: "true"
 
 networks:
   default: {}
