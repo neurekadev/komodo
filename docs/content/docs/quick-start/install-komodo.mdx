@@ -26,6 +26,8 @@ Periphery controls Docker and can read and write the host's Docker volumes. Gran
 
 ## compose.yaml
 
+The MongoDB service scopes `GLIBC_TUNABLES=glibc.pthread.rseq=1` to that container to avoid the [MongoDB 8 crash on Linux kernel 6.19 and newer](/administration/databases/mongodb#mongodb-exits-with-code-139-on-linux-619-or-newer). Keep the workaround while the selected MongoDB image is affected.
+
 ```yaml title="compose.yaml"
 services:
   komodo:
@@ -33,9 +35,7 @@ services:
     container_name: komodo
     depends_on: [komodo-mongo]
     env_file: [.env]
-    networks:
-      komodo:
-        aliases: [core, komodo-core]
+    networks: [komodo]
     ports:
       - "9120:9120"
     volumes:
@@ -48,10 +48,9 @@ services:
   komodo-mongo:
     image: mongo:8
     container_name: komodo-mongo
+    environment: [GLIBC_TUNABLES=glibc.pthread.rseq=1]
     env_file: [.env]
-    networks:
-      komodo:
-        aliases: [mongo, komodo-database]
+    networks: [komodo]
     volumes:
       - mongo-data:/data/db
       - mongo-config:/data/configdb
@@ -65,9 +64,7 @@ services:
     container_name: komodo-periphery
     depends_on: [komodo]
     env_file: [.env]
-    networks:
-      komodo:
-        aliases: [periphery]
+    networks: [komodo]
     volumes:
       - data:/data
       - /var/run/docker.sock:/var/run/docker.sock
@@ -96,13 +93,14 @@ Keep the database credential references below; [each container reads different v
 
 ```dotenv title=".env"
 KOMODO_HOST=https://REPLACE_WITH_HOST
+KOMODO_FIRST_SERVER_NAME=Local
+PERIPHERY_CONNECT_AS=Local
 
-
+KOMODO_DATABASE_ADDRESS=komodo-mongo:27017
 KOMODO_DATABASE_USERNAME=komodo
 KOMODO_DATABASE_PASSWORD=REPLACE_WITH_PASSWORD
 MONGO_INITDB_ROOT_USERNAME=${KOMODO_DATABASE_USERNAME}
 MONGO_INITDB_ROOT_PASSWORD=${KOMODO_DATABASE_PASSWORD}
-
 
 KOMODO_INIT_ADMIN_USERNAME=admin
 KOMODO_INIT_ADMIN_PASSWORD=REPLACE_WITH_PASSWORD
@@ -112,6 +110,6 @@ KOMODO_WEBHOOK_SECRET=REPLACE_WITH_SECRET
 
 ## If startup fails
 
-Run `docker compose -p komodo logs --tail=200 komodo komodo-periphery komodo-mongo`. Check the host address and credentials; see [MongoDB troubleshooting](/administration/databases/mongodb#troubleshooting) if the database exits.
+Run `docker compose -p komodo logs --tail=200 komodo komodo-periphery komodo-mongo`. Core intentionally refuses to start on an empty database when the initial administrator password is missing, shorter than 15 characters, or still uses `REPLACE_WITH_PASSWORD`. It also rejects `REPLACE_WITH_SECRET` as the webhook secret. Check the host address and credentials; see [MongoDB troubleshooting](/administration/databases/mongodb#troubleshooting) if the database exits.
 
 Keep `-p komodo` in later commands and retain the named volumes. They contain your database, identities, working files, and local backup repository. For image tags or a custom Docker root, see [Container Deployment](/administration/container-deployment).

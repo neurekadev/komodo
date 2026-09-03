@@ -153,8 +153,8 @@ local_auth = false
 
 ## Configure a minimum password length.
 ## Env: KOMODO_MIN_PASSWORD_LENGTH
-## Default: 1
-min_password_length = 1
+## Default: 15
+min_password_length = 15
 
 ## Initialize the first admin user when starting up Komodo for the first time.
 ## Env: KOMODO_INIT_ADMIN_USERNAME or KOMODO_INIT_ADMIN_USERNAME_FILE
@@ -163,14 +163,14 @@ min_password_length = 1
 
 ## Set password for first admin user
 ## Env: KOMODO_INIT_ADMIN_PASSWORD or KOMODO_INIT_ADMIN_PASSWORD_FILE
-## Default: changeme
-init_admin_password = "changeme"
+## Required when init_admin_username is set on an empty database.
+## There is no default.
+# init_admin_password = ""
 
-## Normally new users will be registered, but not enabled until an Admin enables them.
-## With `disable_user_registration = true`, only the first user to log in will registered as a user.
+## Prevent new users from registering. Existing users can still sign in.
 ## Env: KOMODO_DISABLE_USER_REGISTRATION
-## Default: false
-disable_user_registration = false
+## Default: true
+disable_user_registration = true
 
 ## Disable local (username/password) user registration only.
 ## When set to true, the "Sign Up" button is hidden and local signups are blocked,
@@ -198,11 +198,10 @@ enable_new_users = false
 ## Default: false
 transparent_mode = false
 
-## Normally all enabled users can create resources.
-## If `disable_non_admin_create = true`, only admin users can create resources.
+## Restrict resource creation to admin users.
 ## Env: KOMODO_DISABLE_NON_ADMIN_CREATE
-## Default: false
-disable_non_admin_create = false
+## Default: true
+disable_non_admin_create = true
 
 ## Normally users can update their username / password using the API.
 ## This will disable this ability for specific users or all users.
@@ -355,8 +354,7 @@ auth_rate_limit_window_seconds = 15
 ############################
 
 ## Specifically set list of CORS allowed origins.
-## If empty, allows all origins (`*`).
-## Production setups should configure this explicitly.
+## An empty list allows no additional origins. Use `["*"]` to allow all.
 ## Env: KOMODO_CORS_ALLOWED_ORIGINS
 ## Default: empty
 cors_allowed_origins = []
@@ -389,8 +387,8 @@ x_frame_options = "DENY"
 ## `X-Xss-Protection` header value.
 ## Set as empty string to omit the header.
 ## Env: KOMODO_X_XSS_PROTECTION
-## Default: "1; mode=block"
-x_xss_protection = "1; mode=block"
+## Default: "0"
+x_xss_protection = "0"
 
 ## Apply Referrer Policy directives.
 ## If empty string, no header is applied.
@@ -485,10 +483,11 @@ database.app_name = "komodo_core"
 
 ## This token must be given to git provider during repo webhook config.
 ## The secret configured on the git provider side must match the secret configured here.
-## If not provided, 
+## A resource-specific webhook secret can be configured instead.
+## Requests without a configured secret are rejected.
 ## Env: KOMODO_WEBHOOK_SECRET or KOMODO_WEBHOOK_SECRET_FILE
 ## Optional, no default.
-webhook_secret = "a_random_webhook_secret"
+# webhook_secret = ""
 
 ## An alternate base url that is used to recieve git webhook requests.
 ## If empty or not specified, will use 'host' address as base.

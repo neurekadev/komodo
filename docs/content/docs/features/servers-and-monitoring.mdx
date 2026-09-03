@@ -14,7 +14,7 @@ The recommended Komodo installation includes Periphery for the local host. To ma
 3. Confirm its connection status is **OK**.
 4. Review CPU, memory, disk, system process, and Docker resource information.
 
-If a Server is disconnected, inspect its Periphery container logs and confirm that it can reach Core. For outbound connections, the Server name must match `PERIPHERY_CONNECT_AS` and the Server must not be configured for a Core-to-Periphery address.
+If a Server is disconnected, inspect its Periphery container logs and confirm that it can reach Core. For outbound connections, `PERIPHERY_CONNECT_AS` must contain the Server ID or exact name, and the Server must not be configured for a Core-to-Periphery address. Prefer the ID so Server renames do not interrupt the connection.
 
 ## View Docker usage metrics
 

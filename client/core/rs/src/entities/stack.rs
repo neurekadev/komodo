@@ -597,14 +597,15 @@ pub struct StackConfig {
   #[builder(default)]
   pub reclone: bool,
 
-  /// Whether incoming webhooks actually trigger action.
+  /// Whether incoming webhooks actually trigger action. Disabled by default.
   #[serde(default = "default_webhook_enabled")]
   #[builder(default = "default_webhook_enabled()")]
   #[partial_default(default_webhook_enabled())]
   pub webhook_enabled: bool,
 
   /// Optionally provide an alternate webhook secret for this stack.
-  /// If its an empty string, use the default secret from the config.
+  /// If empty, use the global configured secret. Requests are rejected
+  /// when neither location contains a valid secret.
   #[serde(default)]
   #[builder(default)]
   pub webhook_secret: String,
@@ -821,7 +822,7 @@ fn default_branch() -> String {
 }
 
 fn default_webhook_enabled() -> bool {
-  true
+  false
 }
 
 fn default_send_alerts() -> bool {

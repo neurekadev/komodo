@@ -14,13 +14,13 @@ description: Configure login providers, Git providers, and container registries.
 
 1. Keep `KOMODO_LOCAL_AUTH=true` until the external provider has been tested. The Compose examples enable it by default. Setting it to `false` disables local username/password sign-in, including existing local accounts.
 2. Create the provider application with the appropriate callback: `/auth/github/callback`, `/auth/google/callback`, or `/auth/oidc/callback` beneath the public Komodo URL.
-3. Add the matching environment variables documented in [`core.config.toml`](https://github.com/neurekadev/komodo/blob/main/config/core.config.toml) to `.env`, including the enabled flag, client ID, and client secret.
+3. Add the matching environment variables documented in [`core.config.toml`](https://github.com/neurekadev/komodo/blob/main/config/core.config.toml) to `.env`, including the enabled flag, client ID, and client secret. New registration is closed by default: set `KOMODO_DISABLE_OIDC_USER_REGISTRATION=false` for OIDC, or `KOMODO_DISABLE_USER_REGISTRATION=false` for GitHub or Google.
 4. Run `docker compose -p komodo up -d komodo` to reload the environment. Keep the data volumes.
 5. Use a private browser window to sign in with the new provider, then enable and permission the new account from **Settings → Users**.
 
 The expected result is a successful callback to the original Komodo hostname and an account that an administrator can review before granting access. If sign-in fails, compare the exact scheme, host, and callback path, inspect Core logs, and confirm the secret was loaded from the intended environment or file variable.
 
-To control who can register and whether new accounts need approval, follow [Control registration and default access](/administration/users-groups-permissions#control-registration-and-default-access). Blocking local registration preserves existing local logins, which is useful when new users should register through OIDC.
+To control who can register and whether new accounts need approval, follow [Control registration and default access](/administration/users-groups-permissions#control-registration-and-default-access). Blocking local registration preserves existing local logins, which is useful when new users should register through OIDC. GitHub and Google follow the global registration setting; set the local and OIDC overrides to `true` when opening the global setting only for those named providers.
 
 ## Configure Git and Registry Providers
 

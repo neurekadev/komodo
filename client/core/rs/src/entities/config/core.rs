@@ -458,7 +458,7 @@ pub struct CoreConfig {
   pub local_auth: bool,
 
   /// Configure a minimum password length.
-  /// Default: 1
+  /// Default: 15
   #[serde(default = "default_min_password_length")]
   pub min_password_length: u16,
 
@@ -468,8 +468,8 @@ pub struct CoreConfig {
   pub init_admin_username: Option<String>,
 
   /// Upon fresh launch, initalize an Admin user with this password.
-  /// Default: `changeme`
-  #[serde(default = "default_init_admin_password")]
+  /// Required when `init_admin_username` is configured on an empty database.
+  #[serde(default)]
   pub init_admin_password: String,
 
   /// Enable transparent mode, which gives all (enabled) users read access to all resources.
@@ -481,9 +481,9 @@ pub struct CoreConfig {
   #[serde(default)]
   pub enable_new_users: bool,
 
-  /// Normally new users will be registered, but not enabled until an Admin enables them.
-  /// With `disable_user_registration = true`, only the first user to log in will registered as a user.
-  #[serde(default)]
+  /// Prevent new users from registering. Existing users can still sign in.
+  /// Default: true
+  #[serde(default = "default_disable_user_registration")]
   pub disable_user_registration: bool,
 
   /// Disable local (username/password) user registration only.
@@ -507,9 +507,9 @@ pub struct CoreConfig {
   #[serde(default, skip_serializing_if = "Vec::is_empty")]
   pub lock_login_credentials_for: Vec<String>,
 
-  /// Normally all users can create resources.
-  /// If `disable_non_admin_create = true`, only admins will be able to create resources.
-  #[serde(default)]
+  /// If true, only admins can create resources.
+  /// Default: true
+  #[serde(default = "default_disable_non_admin_create")]
   pub disable_non_admin_create: bool,
 
   /// Optionally provide a specific jwt secret.
@@ -603,8 +603,7 @@ pub struct CoreConfig {
   // = CORS =
   // =======
   /// List of CORS allowed origins.
-  /// If empty, allows all origins (`*`).
-  /// Production setups should configure this explicitly.
+  /// An empty list allows no additional origins. Use `["*"]` to allow all.
   /// Example: `["https://komodo.example.com", "https://app.example.com"]`.
   #[serde(default)]
   pub cors_allowed_origins: Vec<String>,
@@ -634,7 +633,7 @@ pub struct CoreConfig {
   #[serde(default = "default_x_frame_options")]
   pub x_frame_options: String,
   /// `X-XSS-PROTECTION` header value. Return an empty string to
-  /// omit the header entirely. Default: `1; mode=block`
+  /// omit the header entirely. Default: `0`
   #[serde(default = "default_x_xss_protection")]
   pub x_xss_protection: String,
   /// Apply Referrer Policy directives.
@@ -865,11 +864,15 @@ fn default_jwt_ttl() -> Timelength {
 }
 
 fn default_min_password_length() -> u16 {
-  1
+  15
 }
 
-fn default_init_admin_password() -> String {
-  String::from("changeme")
+fn default_disable_user_registration() -> bool {
+  true
+}
+
+fn default_disable_non_admin_create() -> bool {
+  true
 }
 
 fn default_auth_rate_limit_max_attempts() -> u16 {
@@ -889,7 +892,7 @@ fn default_x_frame_options() -> String {
 }
 
 fn default_x_xss_protection() -> String {
-  String::from("1; mode=block")
+  String::from("0")
 }
 
 fn default_referrer_policy() -> String {
@@ -952,14 +955,14 @@ impl Default for CoreConfig {
       local_auth: Default::default(),
       min_password_length: default_min_password_length(),
       init_admin_username: Default::default(),
-      init_admin_password: default_init_admin_password(),
+      init_admin_password: Default::default(),
       transparent_mode: Default::default(),
       enable_new_users: Default::default(),
-      disable_user_registration: Default::default(),
+      disable_user_registration: default_disable_user_registration(),
       disable_local_user_registration: Default::default(),
       disable_oidc_user_registration: Default::default(),
       lock_login_credentials_for: Default::default(),
-      disable_non_admin_create: Default::default(),
+      disable_non_admin_create: default_disable_non_admin_create(),
       jwt_secret: Default::default(),
       jwt_ttl: default_jwt_ttl(),
       oidc_enabled: Default::default(),
@@ -1229,5 +1232,21 @@ impl mogh_server::session::SessionConfig for &CoreConfig {
   }
   fn allow_cross_site(&self) -> bool {
     self.session_allow_cross_site
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn security_sensitive_defaults_are_closed() {
+    let config = CoreConfig::default();
+    assert!(config.disable_user_registration);
+    assert!(config.disable_non_admin_create);
+    assert_eq!(config.min_password_length, 15);
+    assert!(config.init_admin_password.is_empty());
+    assert_eq!(config.x_xss_protection, "0");
+    assert!(config.cors_allowed_origins.is_empty());
   }
 }

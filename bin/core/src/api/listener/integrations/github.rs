@@ -5,7 +5,9 @@ use hmac::{Hmac, KeyInit as _, Mac};
 use serde::Deserialize;
 use sha2::Sha256;
 
-use crate::config::core_config;
+use crate::{
+  config::core_config, helpers::validations::effective_webhook_secret,
+};
 
 use super::{ExtractBranch, VerifySecret};
 
@@ -29,12 +31,11 @@ impl VerifySecret for Github {
       .context("Failed to get signature as string")?;
     let signature =
       signature.strip_prefix("sha256=").unwrap_or(signature);
-    let secret_bytes = if custom_secret.is_empty() {
-      core_config().webhook_secret.as_bytes()
-    } else {
-      custom_secret.as_bytes()
-    };
-    let mut mac = HmacSha256::new_from_slice(secret_bytes)
+    let secret = effective_webhook_secret(
+      custom_secret,
+      &core_config().webhook_secret,
+    )?;
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
       .context("Failed to create hmac sha256 from secret")?;
     mac.update(body.as_bytes());
     let expected = mac.finalize().into_bytes().encode_hex::<String>();

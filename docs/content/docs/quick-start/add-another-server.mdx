@@ -19,7 +19,7 @@ The main installation already manages its local Docker host. Use this guide for 
    ```
 
 5. In **Servers**, select the new Server and confirm **OK**.
-6. Remove `PERIPHERY_ONBOARDING_KEY` from `.env` and run `docker compose -p komodo up -d --force-recreate`. Disable the key in Komodo when no other server needs it.
+6. Copy the Server ID from the new Server resource, replace the name in `PERIPHERY_CONNECT_AS` with that ID, and remove `PERIPHERY_ONBOARDING_KEY` from `.env`. Run `docker compose -p komodo up -d --force-recreate`, then disable the key in Komodo when no other server needs it. Using the ID keeps the connection stable if the Server is renamed.
 
 Periphery controls this Docker host and its volumes. Keep its persistent data volume when recreating the container; it contains its identity and managed files.
 
@@ -54,7 +54,6 @@ volumes:
 ```dotenv title=".env"
 PERIPHERY_CORE_ADDRESS=https://REPLACE_WITH_HOST
 PERIPHERY_CONNECT_AS=my-server
-
 
 PERIPHERY_ONBOARDING_KEY=REPLACE_WITH_API_KEY
 ```

@@ -16,11 +16,13 @@ Start with the complete examples for [MongoDB](/quick-start/install-komodo), [Fe
 | --- | --- |
 | `COMPOSE_KOMODO_IMAGE_TAG` | Choose a specific release or `edge`; the default is `3`. Keep Core and Periphery on the same release. |
 | `TZ` | Change the container timezone from UTC. Backups have their own timezone setting. |
-| `KOMODO_FIRST_SERVER_NAME` | Choose the initial local Server name instead of `Local`. |
-| `PERIPHERY_CONNECT_AS` | Connect Periphery to an existing Server by exact name. |
+| `KOMODO_FIRST_SERVER_NAME` | Choose the initial local Server name instead of `Local`. This is used only when Core has no Server yet. |
+| `PERIPHERY_CONNECT_AS` | Connect Periphery to an existing Server by ID or exact name. Use the Server ID after initial setup so renaming it does not interrupt the connection. |
 | `PERIPHERY_DOCKER_VOLUME_ROOT` | Use a different Docker volume directory. |
 
 For registration, automatic account approval, and default permissions, see [Control registration and default access](/administration/users-groups-permissions#control-registration-and-default-access). Other optional variables, including login providers, UI settings, monitoring, and logging, are covered by the [environment variable references](/administration/core-configuration#find-an-environment-variable).
+
+The full installation examples initially set `KOMODO_FIRST_SERVER_NAME=Local` followed by `PERIPHERY_CONNECT_AS=Local`, because the Server ID does not exist yet. After the first successful connection, copy the Server ID from the Server resource, replace only `PERIPHERY_CONNECT_AS` with that ID, and recreate Periphery with `docker compose -p komodo up -d komodo-periphery`. The connection will then survive Server renames.
 
 ## Database credentials
 
@@ -28,12 +30,13 @@ Set `KOMODO_DATABASE_USERNAME` and `KOMODO_DATABASE_PASSWORD` once in the main i
 
 | Variables | Consumer and purpose |
 | --- | --- |
+| `KOMODO_DATABASE_ADDRESS` | Core connects to the database service. Use `komodo-mongo:27017` for the MongoDB example or `komodo-ferretdb:27017` for the FerretDB example. |
 | `KOMODO_DATABASE_USERNAME`, `KOMODO_DATABASE_PASSWORD` | Core and the Komodo CLI authenticate to the database. |
 | `MONGO_INITDB_ROOT_USERNAME`, `MONGO_INITDB_ROOT_PASSWORD` | The MongoDB image creates the initial database account. |
 | `POSTGRES_USER`, `POSTGRES_PASSWORD` | The PostgreSQL/DocumentDB image creates the initial database account. |
 | `FERRETDB_POSTGRESQL_URL` | FerretDB connects to PostgreSQL using that account. |
 
-The native image variables are required wiring, not additional credentials to choose. Removing them breaks initialization or authentication in these examples. Changing `.env` does not change passwords already stored in MongoDB or PostgreSQL; update the database account separately before recreating containers with matching credentials.
+The address uses the Compose service name directly. The native image variables are required wiring, not additional credentials to choose. Removing them breaks initialization or authentication in these examples. Changing `.env` does not change passwords already stored in MongoDB or PostgreSQL; update the database account separately before recreating containers with matching credentials.
 
 ## Custom Docker paths
 

@@ -9,10 +9,12 @@ Komodo is a deployment control plane. A user or process with broad Komodo permis
 
 1. Put Core behind an HTTPS reverse proxy you operate.
 2. Restrict network access to Core, database services, and Periphery endpoints.
-3. Configure authentication and disable unused login providers.
+3. Configure the initial administrator, keep registration closed unless onboarding users, and disable unused login providers.
 4. Create groups for operators and developers, then grant the minimum resource and specific permissions they need.
 5. Configure database backups and test a restore.
 6. Protect onboarding keys, API keys, provider tokens, and generated Core/Periphery private keys.
+
+An empty installation requires an explicit initial administrator or an explicitly enabled registration path before Core opens its API. Registration and non-admin resource creation are disabled by default, and new local passwords require at least 15 characters. Review these controls under [Users, Groups, and Permissions](/administration/users-groups-permissions#control-registration-and-default-access).
 
 ## Expected result
 

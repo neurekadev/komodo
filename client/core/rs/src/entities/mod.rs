@@ -463,6 +463,25 @@ mod environment_tests {
   }
 }
 
+#[cfg(test)]
+mod webhook_default_tests {
+  use super::{
+    action::ActionConfig, build::BuildConfig,
+    procedure::ProcedureConfig, repo::RepoConfig, stack::StackConfig,
+    sync::ResourceSyncConfig,
+  };
+
+  #[test]
+  fn new_resources_disable_webhooks() {
+    assert!(!ActionConfig::default().webhook_enabled);
+    assert!(!BuildConfig::default().webhook_enabled);
+    assert!(!ProcedureConfig::default().webhook_enabled);
+    assert!(!RepoConfig::default().webhook_enabled);
+    assert!(!StackConfig::default().webhook_enabled);
+    assert!(!ResourceSyncConfig::default().webhook_enabled);
+  }
+}
+
 #[typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]

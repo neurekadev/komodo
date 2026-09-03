@@ -26,9 +26,7 @@ services:
     container_name: komodo
     depends_on: [komodo-ferretdb]
     env_file: [.env]
-    networks:
-      komodo:
-        aliases: [core, komodo-core]
+    networks: [komodo]
     ports:
       - "9120:9120"
     volumes:
@@ -42,9 +40,7 @@ services:
     image: ghcr.io/ferretdb/postgres-documentdb:17
     container_name: komodo-postgres
     env_file: [.env]
-    networks:
-      komodo:
-        aliases: [postgres]
+    networks: [komodo]
     volumes:
       - postgres-data:/var/lib/postgresql/data
     restart: unless-stopped
@@ -56,9 +52,7 @@ services:
     container_name: komodo-ferretdb
     depends_on: [komodo-postgres]
     env_file: [.env]
-    networks:
-      komodo:
-        aliases: [ferretdb, komodo-database]
+    networks: [komodo]
     volumes:
       - ferretdb-state:/state
     restart: unless-stopped
@@ -70,9 +64,7 @@ services:
     container_name: komodo-periphery
     depends_on: [komodo]
     env_file: [.env]
-    networks:
-      komodo:
-        aliases: [periphery]
+    networks: [komodo]
     volumes:
       - data:/data
       - /var/run/docker.sock:/var/run/docker.sock
@@ -101,14 +93,15 @@ Keep the database credential references below; [each container reads different v
 
 ```dotenv title=".env"
 KOMODO_HOST=https://REPLACE_WITH_HOST
+KOMODO_FIRST_SERVER_NAME=Local
+PERIPHERY_CONNECT_AS=Local
 
-
+KOMODO_DATABASE_ADDRESS=komodo-ferretdb:27017
 KOMODO_DATABASE_USERNAME=komodo
 KOMODO_DATABASE_PASSWORD=REPLACE_WITH_PASSWORD
 POSTGRES_USER=${KOMODO_DATABASE_USERNAME}
 POSTGRES_PASSWORD=${KOMODO_DATABASE_PASSWORD}
 FERRETDB_POSTGRESQL_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@komodo-postgres:5432/postgres
-
 
 KOMODO_INIT_ADMIN_USERNAME=admin
 KOMODO_INIT_ADMIN_PASSWORD=REPLACE_WITH_PASSWORD
@@ -118,6 +111,6 @@ KOMODO_WEBHOOK_SECRET=REPLACE_WITH_SECRET
 
 ## Troubleshooting
 
-Run `docker compose -p komodo logs --tail=200 komodo-postgres komodo-ferretdb komodo`. Check that PostgreSQL and FerretDB use matching credentials. Keep `-p komodo` and the named volumes when recreating containers.
+Run `docker compose -p komodo logs --tail=200 komodo-postgres komodo-ferretdb komodo`. Core intentionally refuses to start on an empty database when the initial administrator password is missing, shorter than 15 characters, or still uses `REPLACE_WITH_PASSWORD`. It also rejects `REPLACE_WITH_SECRET` as the webhook secret. Check that PostgreSQL and FerretDB use matching credentials. Keep `-p komodo` and the named volumes when recreating containers.
 
 Continue with [Deploy the First Stack](/quick-start/deploy-first-stack).
