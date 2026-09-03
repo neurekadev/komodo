@@ -2247,6 +2247,17 @@ impl Resolve<Args> for TransactionalVykarRestore {
           },
         });
       }
+      RestoreTransactionResult::StagingCleanupFailed(error) => {
+        return Ok(TransactionalVykarRestoreResponse {
+          complete: false,
+          rolled_back: false,
+          finalization_pending: false,
+          containers_restarted: Vec::new(),
+          critical_error: Some(format!(
+            "Restore failed before publication; original data is unchanged, but staging recovery is required and affected containers remain stopped: {error:#}"
+          )),
+        });
+      }
       RestoreTransactionResult::Indeterminate(error) => {
         return Ok(TransactionalVykarRestoreResponse {
           complete: false,
@@ -2295,6 +2306,8 @@ impl Resolve<Args> for PreflightVykarRestore {
     mut self,
     _: &Args,
   ) -> anyhow::Result<PreflightVykarRestoreResponse> {
+    let deadline = Instant::now() + RESTORE_PREFLIGHT_TIMEOUT;
+    restore_preflight_before_deadline(deadline, async move {
     let permit = preflight_slots().clone().try_acquire_owned()
       .context("Another restore preflight is still running on this Periphery; retry after it finishes")?;
     let discovered = match &self.target {
@@ -2383,7 +2396,6 @@ impl Resolve<Args> for PreflightVykarRestore {
     let snapshot = self.snapshot_name.clone();
     let selected = self.selected_paths;
     let publish = self.publish;
-    let deadline = Instant::now() + RESTORE_PREFLIGHT_TIMEOUT;
     let worker = tokio::task::spawn_blocking(move || {
       // Keep the slot inside the worker if a caller disconnects or times out.
       // Slow backend reads must not spawn unlimited abandoned inventories.
@@ -2412,10 +2424,8 @@ impl Resolve<Args> for PreflightVykarRestore {
         deadline,
       )
     });
-    let (created_paths, overwritten_paths, deleted_paths) =
-      tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), worker)
+    let (created_paths, overwritten_paths, deleted_paths) = worker
       .await
-      .context("Restore preflight exceeded 60 seconds; no restore changes were started")?
       .context("Restore preflight worker failed")??;
     Ok(PreflightVykarRestoreResponse {
       destination_exists,
@@ -2424,7 +2434,20 @@ impl Resolve<Args> for PreflightVykarRestore {
       deleted_paths,
       containers_to_stop: running_containers,
     })
+    }).await
   }
+}
+
+async fn restore_preflight_before_deadline<T>(
+  deadline: Instant,
+  preflight: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+  tokio::time::timeout_at(
+    tokio::time::Instant::from_std(deadline),
+    preflight,
+  )
+  .await
+  .context("Restore preflight exceeded 60 seconds; no restore changes were started")?
 }
 
 fn compare_missing_volume_paths(
@@ -2650,7 +2673,32 @@ enum RestoreTransactionResult {
     finalization_pending: bool,
   },
   FailedBeforePublication(anyhow::Error),
+  StagingCleanupFailed(anyhow::Error),
   Indeterminate(anyhow::Error),
+}
+
+fn finish_restore_before_publication(
+  error: Option<anyhow::Error>,
+  cleanup: anyhow::Result<()>,
+) -> RestoreTransactionResult {
+  if let Err(cleanup) = cleanup {
+    let reason = error
+      .map(|error| format!("Restore failed: {error:#}"))
+      .unwrap_or_else(|| "Restore was cancelled".into());
+    return RestoreTransactionResult::StagingCleanupFailed(
+      cleanup
+        .context(format!("{reason}; restore staging cleanup failed")),
+    );
+  }
+  match error {
+    Some(error) => {
+      RestoreTransactionResult::FailedBeforePublication(error)
+    }
+    None => RestoreTransactionResult::Published {
+      rolled_back: true,
+      finalization_pending: false,
+    },
+  }
 }
 
 async fn transactional_restore(
@@ -2723,16 +2771,18 @@ async fn transactional_restore(
   match restore_result {
     Ok(Ok(())) => {}
     Ok(Err(error)) => {
-      let _ = cleanup_restore_staging_journal(&staging_journal);
-      return RestoreTransactionResult::FailedBeforePublication(
-        error,
+      return finish_restore_before_publication(
+        Some(error),
+        cleanup_restore_staging_journal(&staging_journal),
       );
     }
     Err(error) => {
-      let _ = cleanup_restore_staging_journal(&staging_journal);
-      return RestoreTransactionResult::FailedBeforePublication(
-        anyhow::Error::new(error)
-          .context("Vykar restore worker failed"),
+      return finish_restore_before_publication(
+        Some(
+          anyhow::Error::new(error)
+            .context("Vykar restore worker failed"),
+        ),
+        cleanup_restore_staging_journal(&staging_journal),
       );
     }
   }
@@ -2740,16 +2790,17 @@ async fn transactional_restore(
   if let Err(error) =
     rewrite_recovered_stack_compose_files(request, &staging)
   {
-    let _ = cleanup_restore_staging_journal(&staging_journal);
-    return RestoreTransactionResult::FailedBeforePublication(error);
+    return finish_restore_before_publication(
+      Some(error),
+      cleanup_restore_staging_journal(&staging_journal),
+    );
   }
 
   if operation_cancelled(&request.journal_id) {
-    let _ = cleanup_restore_staging_journal(&staging_journal);
-    return RestoreTransactionResult::Published {
-      rolled_back: true,
-      finalization_pending: false,
-    };
+    return finish_restore_before_publication(
+      None,
+      cleanup_restore_staging_journal(&staging_journal),
+    );
   }
 
   let publish = request.publish.clone();
@@ -2779,8 +2830,10 @@ async fn transactional_restore(
       if publication_started.load(Ordering::SeqCst) {
         RestoreTransactionResult::Indeterminate(error)
       } else {
-        let _ = cleanup_restore_staging_journal(&staging_journal);
-        RestoreTransactionResult::FailedBeforePublication(error)
+        finish_restore_before_publication(
+          Some(error),
+          cleanup_restore_staging_journal(&staging_journal),
+        )
       }
     }
     Err(error) => {
@@ -2789,8 +2842,10 @@ async fn transactional_restore(
       if publication_started.load(Ordering::SeqCst) {
         RestoreTransactionResult::Indeterminate(error)
       } else {
-        let _ = cleanup_restore_staging_journal(&staging_journal);
-        RestoreTransactionResult::FailedBeforePublication(error)
+        finish_restore_before_publication(
+          Some(error),
+          cleanup_restore_staging_journal(&staging_journal),
+        )
       }
     }
   }
@@ -4780,6 +4835,97 @@ mod tests {
       compare_restore_paths(&[], &publish, &[], Instant::now())
         .is_err()
     );
+  }
+
+  #[tokio::test]
+  async fn preflight_deadline_covers_pending_discovery_and_releases_guards()
+   {
+    let filesystem = Arc::new(tokio::sync::RwLock::new(()));
+    let guard = filesystem.clone().write_owned().await;
+    let slots = Arc::new(tokio::sync::Semaphore::new(1));
+    let permit = slots.clone().try_acquire_owned().unwrap();
+    let result =
+      restore_preflight_before_deadline(Instant::now(), async move {
+        let _guard = guard;
+        let _permit = permit;
+        // Model a Docker discovery future that never responds, before the
+        // inventory worker exists.
+        std::future::pending::<anyhow::Result<()>>().await
+      })
+      .await;
+    assert!(
+      result
+        .unwrap_err()
+        .to_string()
+        .contains("exceeded 60 seconds")
+    );
+    assert!(filesystem.try_read().is_ok());
+    assert_eq!(slots.available_permits(), 1);
+  }
+
+  #[tokio::test]
+  async fn preflight_timeout_keeps_admission_until_inventory_worker_exits()
+   {
+    let slots = Arc::new(tokio::sync::Semaphore::new(1));
+    let permit = slots.clone().try_acquire_owned().unwrap();
+    let (finish, finished) = tokio::sync::oneshot::channel::<()>();
+    let mut worker = tokio::spawn(async move {
+      let _permit = permit;
+      finished.await.unwrap();
+    });
+    let result =
+      restore_preflight_before_deadline(Instant::now(), async {
+        (&mut worker).await?;
+        Ok(())
+      })
+      .await;
+    assert!(result.is_err());
+    assert_eq!(slots.available_permits(), 0);
+    finish.send(()).unwrap();
+    worker.await.unwrap();
+    assert_eq!(slots.available_permits(), 1);
+  }
+
+  #[test]
+  fn failed_staging_cleanup_requires_recovery_even_after_cancellation()
+   {
+    for error in [Some(anyhow!("snapshot restore failed")), None] {
+      let result = finish_restore_before_publication(
+        error,
+        Err(anyhow!("cannot remove staging journal")),
+      );
+      let RestoreTransactionResult::StagingCleanupFailed(error) =
+        result
+      else {
+        panic!("A surviving staging journal must require recovery");
+      };
+      let message = format!("{error:#}");
+      assert!(message.contains("restore staging cleanup failed"));
+      assert!(message.contains("cannot remove staging journal"));
+      assert!(
+        message.contains("snapshot restore failed")
+          || message.contains("cancelled")
+      );
+    }
+  }
+
+  #[test]
+  fn successful_staging_cleanup_preserves_failure_or_proves_cancellation()
+   {
+    assert!(matches!(
+      finish_restore_before_publication(
+        Some(anyhow!("restore failed")),
+        Ok(())
+      ),
+      RestoreTransactionResult::FailedBeforePublication(_)
+    ));
+    assert!(matches!(
+      finish_restore_before_publication(None, Ok(())),
+      RestoreTransactionResult::Published {
+        rolled_back: true,
+        finalization_pending: false
+      }
+    ));
   }
 
   #[test]

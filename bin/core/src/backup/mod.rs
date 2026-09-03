@@ -5909,9 +5909,6 @@ pub async fn execute_core_recovery(
     &stored.recovered_core_instance_id,
     Some(&stored.plan.current_database),
   )?;
-  let delete_result = core_recovery_collection()
-    .delete_one(doc! { "_id": &stored.id })
-    .await;
   // Once the durable pointer is published, restart even if recording the
   // final audit result encounters a transient database error.
   schedule_core_restart();
@@ -5920,22 +5917,77 @@ pub async fn execute_core_recovery(
   std::mem::forget(backup_operation);
   std::mem::forget(mutation);
   std::mem::forget(actions);
-  delete_result?;
-  let run = new_non_cancellable_run(
-    Some(BackupTarget::Core),
-    "Core recovery activating",
+  let mut run = committed_core_recovery_run(&stored.plan);
+  let mut warnings = Vec::new();
+  core_recovery_audit_step(
+    &mut run,
+    &mut warnings,
+    "recovery plan cleanup",
+    async {
+      core_recovery_collection()
+        .delete_one(doc! { "_id": &stored.id })
+        .await?;
+      Ok(())
+    },
   )
-  .await?;
-  let run = finish_run(
-    run,
-    BackupRunState::Complete,
-    format!(
-      "Core recovery validated; restarting into database '{}' (previous database '{}' retained)",
-      stored.plan.validation_database, stored.plan.current_database
-    ),
+  .await;
+  let audit = run.clone();
+  core_recovery_audit_step(
+    &mut run,
+    &mut warnings,
+    "recovery audit persistence",
+    async {
+      runs_collection().insert_one(&audit).await?;
+      Ok(())
+    },
   )
-  .await?;
+  .await;
+  for warning in warnings {
+    warn!("{warning}");
+    record_operational_alert(warning);
+  }
   Ok(run)
+}
+
+fn committed_core_recovery_run(plan: &CoreRecoveryPlan) -> BackupRun {
+  let now = komodo_timestamp();
+  BackupRun {
+    id: Uuid::new_v4().to_string(),
+    target: Some(BackupTarget::Core),
+    state: BackupRunState::Complete,
+    cancellable: false,
+    started_at: now,
+    finished_at: now,
+    message: format!(
+      "Core recovery activation committed; restart scheduled into database '{}' (previous database '{}' retained)",
+      plan.validation_database, plan.current_database
+    ),
+    ..Default::default()
+  }
+}
+
+async fn core_recovery_audit_step(
+  run: &mut BackupRun,
+  warnings: &mut Vec<String>,
+  step: &str,
+  operation: impl std::future::Future<Output = anyhow::Result<()>>,
+) {
+  // Both best-effort audit steps together get at most one second, leaving
+  // time to return the committed outcome before the scheduled restart.
+  let result = tokio::time::timeout(
+    std::time::Duration::from_millis(500),
+    operation,
+  )
+  .await
+  .context("Audit step timed out")
+  .and_then(|result| result);
+  if let Err(error) = result {
+    let warning = format!(
+      "Core recovery activation is committed and restart remains scheduled; {step} failed: {error:#}"
+    );
+    run.message.push_str(&format!("; warning: {warning}"));
+    warnings.push(warning);
+  }
 }
 
 fn find_file_named(root: &Path, name: &str) -> Option<PathBuf> {
@@ -6420,6 +6472,64 @@ pub fn spawn_scheduler() {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[tokio::test]
+  async fn committed_recovery_remains_complete_when_audit_steps_fail()
+  {
+    let plan = CoreRecoveryPlan {
+      current_database: "old-database".into(),
+      validation_database: "recovered-database".into(),
+      ..Default::default()
+    };
+    let mut run = committed_core_recovery_run(&plan);
+    let id = run.id.clone();
+    let mut warnings = Vec::new();
+    for step in
+      ["recovery plan cleanup", "recovery audit persistence"]
+    {
+      core_recovery_audit_step(
+        &mut run,
+        &mut warnings,
+        step,
+        async { Err(anyhow!("database unavailable")) },
+      )
+      .await;
+    }
+    assert_eq!(run.id, id);
+    assert_eq!(run.state, BackupRunState::Complete);
+    assert!(!run.cancellable);
+    assert!(run.finished_at >= run.started_at);
+    assert!(
+      run
+        .message
+        .contains("activation committed; restart scheduled")
+    );
+    assert!(run.message.contains("old-database"));
+    assert!(run.message.contains("recovered-database"));
+    assert_eq!(warnings.len(), 2);
+    assert!(run.message.contains("recovery plan cleanup failed"));
+    assert!(
+      run.message.contains("recovery audit persistence failed")
+    );
+  }
+
+  #[tokio::test]
+  async fn successful_recovery_audit_does_not_add_warnings() {
+    let mut run =
+      committed_core_recovery_run(&CoreRecoveryPlan::default());
+    let message = run.message.clone();
+    let mut warnings = Vec::new();
+    core_recovery_audit_step(
+      &mut run,
+      &mut warnings,
+      "recovery audit persistence",
+      async { Ok(()) },
+    )
+    .await;
+    assert!(warnings.is_empty());
+    assert_eq!(run.message, message);
+    assert_eq!(run.state, BackupRunState::Complete);
+  }
 
   #[test]
   fn operational_alerts_survive_a_fresh_read() {

@@ -10,6 +10,7 @@ services:
       - repos:/etc/komodo/repos
       - stacks:/etc/komodo/stacks
       - backups:/backups
+      - core-secrets:/core-secrets
     command: sleep infinity
     ports:
       - "9120:9120"
@@ -36,6 +37,9 @@ services:
 
 volumes:
   backups:
+    labels:
+      komodo.file-manager.excluded: "true"
+  core-secrets:
     labels:
       komodo.file-manager.excluded: "true"
   data:
