@@ -6399,6 +6399,8 @@ export interface BackupSettings {
 	volume_keep_last: U64;
 	stack_selection: BackupStackSelection;
 	volume_selection: BackupVolumeSelection;
+	/** Administrator-approved worker identities with fleet repository access. None are trusted by default. */
+	trusted_workers?: BackupTrustedWorker[];
 	/** Quiesce the affected running containers during backup. */
 	stop_containers: boolean;
 	/** Include Stack bind mounts that live on a different filesystem than the Stack run directory. Disabled by default. */
@@ -6414,6 +6416,15 @@ export interface BackupSettings {
 	advanced: BackupAdvancedSettings;
 	/** Changes whenever settings are saved. */
 	updated_at?: I64;
+}
+
+/** An administrator-approved worker identity with fleet repository access. */
+export interface BackupTrustedWorker {
+	server_id: string;
+	/** Exact configured address; empty for an inbound Periphery connection. */
+	address: string;
+	/** Required pinned Periphery public key. Passkey-only workers are refused. */
+	public_key: string;
 }
 
 export interface BackupSnapshot {

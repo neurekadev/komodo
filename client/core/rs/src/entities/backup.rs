@@ -239,6 +239,18 @@ impl Default for BackupAdvancedSettings {
   }
 }
 
+/// An administrator-approved worker identity with fleet repository access.
+#[typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+pub struct BackupTrustedWorker {
+  pub server_id: String,
+  /// Exact configured address; empty for an inbound Periphery connection.
+  pub address: String,
+  /// Required pinned Periphery public key. Passkey-only workers are refused.
+  pub public_key: String,
+}
+
 /// Singleton backup configuration. Core is always the scheduler.
 #[typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -258,6 +270,9 @@ pub struct BackupSettings {
   pub volume_keep_last: U64,
   pub stack_selection: BackupStackSelection,
   pub volume_selection: BackupVolumeSelection,
+  /// Only administrators can enroll workers. No workers are trusted by default.
+  #[serde(default)]
+  pub trusted_workers: Vec<BackupTrustedWorker>,
   /// Quiesce the affected running containers during backup.
   pub stop_containers: bool,
   /// Traverse filesystem boundaries encountered beneath a backup source and
@@ -298,6 +313,7 @@ impl Default for BackupSettings {
       volume_keep_last: 14,
       stack_selection: Default::default(),
       volume_selection: Default::default(),
+      trusted_workers: Vec::new(),
       stop_containers: true,
       include_cross_filesystem_mounts: false,
       include_anonymous_volumes: false,
@@ -568,6 +584,17 @@ mod tests {
     assert!(!settings.include_anonymous_volumes);
     assert!(settings.bind_mount_include_patterns.is_empty());
     assert!(settings.bind_mount_exclude_patterns.is_empty());
+    assert!(settings.trusted_workers.is_empty());
+  }
+
+  #[test]
+  fn settings_without_worker_enrollment_fail_closed() {
+    let mut value =
+      serde_json::to_value(BackupSettings::default()).unwrap();
+    value.as_object_mut().unwrap().remove("trusted_workers");
+    let settings: BackupSettings =
+      serde_json::from_value(value).unwrap();
+    assert!(settings.trusted_workers.is_empty());
   }
 
   #[test]

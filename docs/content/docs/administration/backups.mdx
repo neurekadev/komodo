@@ -18,8 +18,9 @@ Komodo uses the pinned Rust libraries from [Vykar v0.19.1](https://github.com/bo
 5. Choose how many complete snapshots to retain for each category. The value applies separately to Core, every Stack, and every Server/Volume pair.
 6. Keep **Stop affected containers while backing up** enabled unless your applications provide their own consistency guarantees.
 7. Review the bind-mount and anonymous-volume safety controls under **What to protect**.
-8. Select **Save settings**. If you added a Core-local mirror or changed a Core-local path, restart Core now so its Periphery endpoints use the saved locations.
-9. Select **Initialize repositories**, then **Back up fleet now**. Check **Fleet status** for partial nodes or integrity failures.
+8. Under **Trusted backup workers**, select each Server that may receive shared repository access. Verify its address and configured Periphery public key independently, then select **Trust worker with repository access**. Repeat for each backup source or restore destination. No workers are enrolled by default.
+9. Select **Save settings**. If you added a Core-local mirror or changed a Core-local path, restart Core now so its Periphery endpoints use the saved locations.
+10. Select **Initialize repositories**, then **Back up fleet now**. Check **Fleet status** for partial nodes or integrity failures. An unenrolled worker produces an explicit error rather than receiving repository credentials.
 
 Save form changes before initializing, verifying, promoting a mirror, or starting a manual backup. Those actions are disabled while displayed settings are unsaved or being saved, so they cannot act on an older repository or protection policy.
 
@@ -262,6 +263,18 @@ Every cycle performs bounded integrity sampling. A full verification is due ever
 
 ## Permissions
 
+### Enroll trusted workers
+
+Only administrators can change **Trusted backup workers** in Backups settings. Enrollment approves one stable Server ID, its exact configured address (empty for inbound Periphery connections), and its configured Periphery public key. It grants that host shared repository credentials and the encryption passphrase, including the ability to read and decrypt fleet and Core snapshots. Creating a Server, copying one, or granting `Backups` does not enroll it. Treat everyone who can execute code or administer an enrolled host as part of that fleet-wide trust boundary.
+
+Verify the address and public key through a trusted channel before enrollment; do not approve an unexpected key merely because it appears in the UI. Both manual and scheduled backups, restore previews, and restore execution require a matching enrollment before repository capabilities are sent. The sending connection is pinned to that identity even during reconnects. A configured public key cannot fall back to passkey-only authentication. Workers without a configured public key are not eligible.
+
+After changing a Server address or rotating its Periphery key, verify and re-enroll it, then save settings. Existing backup settings start with an empty trust list when this field is absent; administrators must enroll their workers before Stack/Volume operations resume. Core-only backup and recovery do not require a worker. The API field is `settings.trusted_workers` in `UpdateBackupSettings`, an array of `{ server_id, address, public_key }` records; only the administrator-only settings API can change it.
+
+**Remove trust** and **Save settings** prevent subsequent credential sends once active repository operations release their settings lock. They cannot retract credentials or plaintext already received, interrupt an ongoing backup, or replace backend revocation. If a worker is compromised, revoke its storage access and rotate shared credentials and passphrases through an independently verified recovery plan; old snapshots may remain decryptable with an old passphrase.
+
+### Resource access
+
 Core's served TypeScript client at `/client/lib.js` includes the backup request and response types used by the running product, including snapshot browsing, restore plans and cancellation capability. The Action editor loads the matching declarations from `/client`; Actions can read backup status and inventory, but the process-lifetime restriction above prevents starting backup or recovery work from inside an Action.
 
 Backups require both a base resource level and the `Backups` specific permission:
@@ -269,11 +282,11 @@ Backups require both a base resource level and the `Backups` specific permission
 - **Read + Backups** lists and browses snapshots the user may access.
 - **Execute or Write + Backups** permits manual backup and same-target restore.
 - A Volume uses its Server permission. A Stack accepts a direct grant or an inherited Server grant.
-- New Server and Stack creators receive `Backups` automatically.
+- New Server and Stack creators receive `Backups` automatically, but Server creation never grants trusted-worker enrollment.
 - Cross-node restore additionally requires **Execute + Backups** on the destination Server. Any restore that creates a recovered Stack requires the same destination Server permission, even when restoring onto the snapshot's historical Server, plus the existing Stack-create permission.
 - Repository settings, schedules, retention, Core recovery, unbound snapshots, mirror promotion, and maintenance are administrator-only.
 
-Repository credentials and encryption keys are never exposed through these grants. See [Users, Groups, and Permissions](/administration/users-groups-permissions#specific-permissions).
+Repository credentials and encryption keys are never returned to API users through these grants. Sending them to a worker additionally requires administrator enrollment as described above. See [Users, Groups, and Permissions](/administration/users-groups-permissions#specific-permissions).
 
 ## Backend notes
 

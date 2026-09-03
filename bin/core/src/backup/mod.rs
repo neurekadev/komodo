@@ -60,7 +60,9 @@ use uuid::Uuid;
 
 use crate::{
   config::core_config,
+  connection::PeripheryConnectionArgs,
   helpers::{periphery_client, query::id_or_name_filter},
+  periphery::PeripheryClient,
   permission::{get_check_permissions, load_list_permits},
   resource::{self, KomodoResource},
   state::{
@@ -500,6 +502,17 @@ async fn mark_repository_initialized(
 fn validate_settings(
   settings: &BackupSettings,
 ) -> anyhow::Result<()> {
+  let mut trusted_ids = HashSet::new();
+  for worker in &settings.trusted_workers {
+    if worker.server_id.trim().is_empty()
+      || worker.public_key.trim().is_empty()
+      || !trusted_ids.insert(&worker.server_id)
+    {
+      return Err(anyhow!(
+        "Trusted backup workers require unique Server IDs and non-empty pinned public keys"
+      ));
+    }
+  }
   if settings.schedule.trim().is_empty() {
     return Err(anyhow!("Backup schedule cannot be empty"));
   }
@@ -1116,6 +1129,60 @@ fn core_repository(
     &core_secret_dir()?,
     &settings.advanced,
   )
+}
+
+fn require_trusted_backup_worker(
+  settings: &BackupSettings,
+  server: &Server,
+) -> anyhow::Result<()> {
+  if server.info.public_key.trim().is_empty()
+    || !settings.trusted_workers.iter().any(|worker| {
+      worker.server_id == server.id
+        && worker.address == server.config.address
+        && worker.public_key == server.info.public_key
+    })
+  {
+    return Err(anyhow!(
+      "Server {} is not enrolled with its current address and public key as a trusted backup worker; an administrator must verify and enroll it in Backups settings",
+      server.id
+    ));
+  }
+  Ok(())
+}
+
+struct TrustedBackupClient<'a> {
+  client: PeripheryClient,
+  server: &'a Server,
+}
+
+impl TrustedBackupClient<'_> {
+  async fn request<T>(
+    &self,
+    request: T,
+  ) -> anyhow::Result<T::Response>
+  where
+    T: std::fmt::Debug + Serialize + mogh_resolver::HasResponse,
+    T::Response: serde::de::DeserializeOwned,
+  {
+    self
+      .client
+      .request_pinned(
+        PeripheryConnectionArgs::from_server(self.server),
+        request,
+      )
+      .await
+  }
+}
+
+async fn trusted_backup_client<'a>(
+  settings: &BackupSettings,
+  server: &'a Server,
+) -> anyhow::Result<TrustedBackupClient<'a>> {
+  require_trusted_backup_worker(settings, server)?;
+  Ok(TrustedBackupClient {
+    client: periphery_client(server).await?,
+    server,
+  })
 }
 
 /// Convert Core-local storage to the embedded authenticated REST endpoint, or
@@ -3441,7 +3508,7 @@ async fn run_node_batch(
 ) -> anyhow::Result<NodeBatchOutcome> {
   let server = resource::get::<Server>(server_id).await?;
   let expected = tasks.len();
-  let response = periphery_client(&server)
+  let response = trusted_backup_client(settings, &server)
     .await?
     .request(RunVykarBackupBatch {
       tasks: tasks.clone(),
@@ -3931,7 +3998,7 @@ async fn backup_stack(
   } else {
     Some(resource::get::<Repo>(&stack.config.linked_repo).await?)
   };
-  let response = periphery_client(&server)
+  let response = trusted_backup_client(settings, &server)
     .await?
     .request(RunVykarBackup {
       target: PeripheryBackupTarget::Stack {
@@ -3993,7 +4060,7 @@ async fn backup_volume(
   let server = resource::get::<Server>(server_id).await?;
   let snapshot_name = snapshot_name("volume", &run.id);
   let hostname = format!("{PERIPHERY_HOSTNAME_PREFIX}{}", server.id);
-  let response = periphery_client(&server)
+  let response = trusted_backup_client(settings, &server)
     .await?
     .request(RunVykarBackup {
       target: PeripheryBackupTarget::Volume {
@@ -4553,7 +4620,7 @@ pub async fn plan_restore(
   )
   .await?;
   let settings = get_settings().await?;
-  let preflight = periphery_client(&server)
+  let preflight = trusted_backup_client(&settings, &server)
     .await?
     .request(PreflightVykarRestore {
       target,
@@ -5029,7 +5096,7 @@ pub async fn execute_restore(
   )
   .await?;
   let settings = get_settings().await?;
-  let refreshed_preview = periphery_client(&server)
+  let refreshed_preview = trusted_backup_client(&settings, &server)
     .await?
     .request(PreflightVykarRestore {
       target: target.clone(),
@@ -5113,7 +5180,7 @@ pub async fn execute_restore(
       } else {
         None
       };
-    let periphery = periphery_client(&server).await?;
+    let periphery = trusted_backup_client(&settings, &server).await?;
     let existing_recovered_stack = recovered_creation
       .as_ref()
       .and_then(|(_, _, existing)| existing.as_ref());
@@ -7406,6 +7473,53 @@ mod tests {
       "unrelated",
       None
     ));
+  }
+
+  #[test]
+  fn backup_workers_require_explicit_matching_admin_enrollment() {
+    use komodo_client::entities::backup::BackupTrustedWorker;
+    let mut settings = BackupSettings::default();
+    let mut server = Server::default();
+    server.id = "server-a".into();
+    server.config.address = "wss://trusted.example".into();
+    server.info.public_key = "verified-key".into();
+    assert!(
+      require_trusted_backup_worker(&settings, &server).is_err()
+    );
+    settings.trusted_workers.push(BackupTrustedWorker {
+      server_id: server.id.clone(),
+      address: server.config.address.clone(),
+      public_key: server.info.public_key.clone(),
+    });
+    assert!(
+      require_trusted_backup_worker(&settings, &server).is_ok()
+    );
+    let original = server.clone();
+    server.id = "server-created-by-non-admin".into();
+    assert!(
+      require_trusted_backup_worker(&settings, &server).is_err()
+    );
+    server = original.clone();
+    server.config.address = "wss://attacker.example".into();
+    assert!(
+      require_trusted_backup_worker(&settings, &server).is_err()
+    );
+    server = original.clone();
+    server.info.public_key = "attacker-key".into();
+    assert!(
+      require_trusted_backup_worker(&settings, &server).is_err()
+    );
+    server = original;
+    server.config.address.clear();
+    settings.trusted_workers[0].address.clear();
+    assert!(
+      require_trusted_backup_worker(&settings, &server).is_ok()
+    );
+    server.info.public_key.clear();
+    settings.trusted_workers[0].public_key.clear();
+    assert!(
+      require_trusted_backup_worker(&settings, &server).is_err()
+    );
   }
 
   #[test]

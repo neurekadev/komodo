@@ -95,12 +95,50 @@ impl PeripheryClient {
         || format!("No connection found for server {}", self.id),
       )?;
 
+    self.request_on_connection(connection, request).await
+  }
+
+  /// Validate and retain the exact connection used to send capabilities.
+  /// A concurrent Server edit/reconnect must not redirect a pinned request.
+  pub async fn request_pinned<T>(
+    &self,
+    expected: PeripheryConnectionArgs<'_>,
+    request: T,
+  ) -> anyhow::Result<T::Response>
+  where
+    T: std::fmt::Debug + Serialize + HasResponse,
+    T::Response: DeserializeOwned,
+  {
+    let connection = periphery_connections()
+      .get(&self.id)
+      .await
+      .context("Trusted backup worker is not connected")?;
+    if !expected.matches(&connection.args) {
+      return Err(anyhow!(
+        "Backup worker connection changed; verify its enrolled identity and retry"
+      ));
+    }
+    self.request_on_connection(connection, request).await
+  }
+
+  async fn request_on_connection<T>(
+    &self,
+    connection: Arc<PeripheryConnection>,
+    request: T,
+  ) -> anyhow::Result<T::Response>
+  where
+    T: std::fmt::Debug + Serialize + HasResponse,
+    T::Response: DeserializeOwned,
+  {
     // Polls connected 3 times before bailing
     connection.bail_if_not_connected().await?;
 
     let channel_id = Uuid::new_v4();
     let (response_sender, mut response_receiever) = channel();
-    self.responses.insert(channel_id, response_sender).await;
+    connection
+      .responses
+      .insert(channel_id, response_sender)
+      .await;
 
     if let Err(e) = connection
       .sender
@@ -114,7 +152,7 @@ impl PeripheryClient {
       .await
       .context("Failed to send request over channel")
     {
-      self.responses.remove(&channel_id).await;
+      connection.responses.remove(&channel_id).await;
       return Err(e);
     }
 
@@ -140,8 +178,37 @@ impl PeripheryClient {
     }
     .await;
 
-    self.responses.remove(&channel_id).await;
+    connection.responses.remove(&channel_id).await;
 
     res
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use komodo_client::entities::server::Server;
+
+  #[test]
+  fn pinned_connection_identity_does_not_follow_server_replacement() {
+    let mut server = Server::default();
+    server.id = "server".into();
+    server.config.address = "wss://trusted.example".into();
+    server.info.public_key = "trusted-key".into();
+    let expected = PeripheryConnectionArgs::from_server(&server);
+    let (connection, _receiver) = PeripheryConnection::new(expected);
+    assert!(expected.matches(&connection.args));
+    let mut changed = server.clone();
+    changed.info.public_key = "replacement-key".into();
+    let (replacement, _receiver) = connection
+      .with_new_args(PeripheryConnectionArgs::from_server(&changed));
+    assert!(!expected.matches(&replacement.args));
+    assert!(expected.matches(&connection.args));
+    changed = server.clone();
+    changed.config.address = "wss://other.example".into();
+    assert!(
+      !expected
+        .matches(PeripheryConnectionArgs::from_server(&changed))
+    );
   }
 }

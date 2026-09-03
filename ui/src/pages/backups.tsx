@@ -504,6 +504,8 @@ function BackupSettingsForm({
         <VolumeSelectionEditor settings={settings} patch={patch} />
       </Section>
 
+      <TrustedWorkersEditor settings={settings} patch={patch} />
+
       <Section title="Encrypted repositories" icon={<ICONS.Volume size="1.3rem" />}>
         <Alert color="blue" mb="md">
           The primary is the only snapshot source of truth. A mirror is not
@@ -824,6 +826,87 @@ function StackSelectionEditor({
         />
       </Grid.Col>
     </Grid>
+  );
+}
+
+function TrustedWorkersEditor({
+  settings,
+  patch,
+}: {
+  settings: Types.BackupSettings;
+  patch: (value: Partial<Types.BackupSettings>) => void;
+}) {
+  const servers = useRead("ListServers", { query: {}, limit: 0 }).data ?? [];
+  const [selected, setSelected] = useState<string | null>(null);
+  const serverQuery = useRead(
+    "GetServer",
+    { server: selected ?? "" },
+    { enabled: !!selected, refetchOnWindowFocus: false },
+  );
+  // Never approve stale details from a different selected Server.
+  const server = serverQuery.data?._id?.$oid === selected ? serverQuery.data : undefined;
+  const publicKey = server?.info?.public_key;
+  const address = server?.config?.address;
+  const workers = settings.trusted_workers ?? [];
+  return (
+    <Section title="Trusted backup workers" icon={<ICONS.Server size="1.3rem" />}>
+      <Stack>
+        <Alert color="orange">
+          Enrollment gives this host the shared passphrase and worker credentials,
+          including read/decryption access to fleet and Core snapshots. Verify
+          the host and its public key independently. Server creation and Backups
+          permissions do not enroll a worker. Save settings to apply changes.
+        </Alert>
+        <Select
+          label="Server to trust"
+          searchable
+          clearable
+          value={selected}
+          onChange={setSelected}
+          data={servers.map((item) => ({ value: item.id, label: item.name }))}
+        />
+        {server && (
+          <>
+            <Text size="sm">Address: {address || "Inbound Periphery connection"}</Text>
+            <Text size="sm" style={{ overflowWrap: "anywhere" }}>
+              Public key: {publicKey || "Not configured; configure and verify a public key first"}
+            </Text>
+          </>
+        )}
+        <Button
+          color="orange"
+          disabled={!selected || !publicKey?.trim() || address === undefined || serverQuery.isFetching || !!serverQuery.error}
+          onClick={() => {
+            if (!selected || !publicKey?.trim() || address === undefined || serverQuery.isFetching || serverQuery.error) return;
+            patch({ trusted_workers: [
+              ...workers.filter((worker) => worker.server_id !== selected),
+              { server_id: selected, address, public_key: publicKey },
+            ] });
+            setSelected(null);
+          }}
+        >
+          Trust worker with repository access
+        </Button>
+        {workers.map((worker) => (
+          <Group key={worker.server_id} justify="space-between" wrap="nowrap">
+            <Stack gap={2} style={{ minWidth: 0 }}>
+              <Text size="sm">{servers.find((item) => item.id === worker.server_id)?.name ?? worker.server_id}</Text>
+              <Text size="xs" c="dimmed" style={{ overflowWrap: "anywhere" }}>
+                {worker.address || "Inbound Periphery connection"} — {worker.public_key}
+              </Text>
+            </Stack>
+            <Button
+              color="red"
+              variant="subtle"
+              onClick={() => patch({ trusted_workers: workers.filter((item) => item.server_id !== worker.server_id) })}
+            >
+              Remove trust
+            </Button>
+          </Group>
+        ))}
+        {!workers.length && <Text c="dimmed">No workers enrolled. Core-only backups remain available.</Text>}
+      </Stack>
+    </Section>
   );
 }
 
