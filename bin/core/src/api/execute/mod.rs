@@ -516,6 +516,32 @@ mod tests {
   }
 
   #[tokio::test]
+  async fn detached_redeploy_waits_for_a_backup_queued_behind_its_build()
+   {
+    let barrier = std::sync::Arc::new(tokio::sync::RwLock::new(()));
+    let build = barrier.clone().read_owned().await;
+    let mut backup = Box::pin(barrier.clone().write_owned());
+    assert!(futures_util::poll!(backup.as_mut()).is_pending());
+    let request = request("Deploy", json!({ "deployment": "id" }));
+    let mut redeploy = Box::pin(execution_mutation_guard_on(
+      &request,
+      barrier.clone(),
+    ));
+    assert!(futures_util::poll!(redeploy.as_mut()).is_pending());
+    // The detached dispatcher does not hold up the parent build's return.
+    drop(build);
+    let backup = backup.await;
+    assert!(futures_util::poll!(redeploy.as_mut()).is_pending());
+    drop(backup);
+    let redeploy = redeploy
+      .await
+      .expect("Deploy must retain its own mutation lease");
+    assert!(barrier.try_write().is_err());
+    drop(redeploy);
+    assert!(barrier.try_write().is_ok());
+  }
+
+  #[tokio::test]
   async fn individual_mutating_steps_still_wait_for_backup() {
     let barrier = std::sync::Arc::new(tokio::sync::RwLock::new(()));
     let backup = barrier.clone().write_owned().await;

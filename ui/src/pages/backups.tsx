@@ -63,7 +63,7 @@ const backendDefaults = (
         params: { url: "", access_token: {}, worker_access_token: {}, allow_insecure_http: false },
       };
     default:
-      return { type: "CoreLocal", params: { path: "/data/backups/vykar" } };
+      return { type: "CoreLocal", params: { path: "/backups/vykar" } };
   }
 };
 
@@ -534,7 +534,7 @@ function BackupSettingsForm({
                     name: "mirror",
                     backend: {
                       type: "CoreLocal",
-                      params: { path: "/data/backups/vykar-mirror" },
+                      params: { path: "/backups/vykar-mirror" },
                     },
                     passphrase: {},
                   }

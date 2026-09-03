@@ -9,6 +9,7 @@ services:
       - /proc:/proc
       - repos:/etc/komodo/repos
       - stacks:/etc/komodo/stacks
+      - backups:/backups
     command: sleep infinity
     ports:
       - "9120:9120"
@@ -34,6 +35,9 @@ services:
       service: ferretdb
 
 volumes:
+  backups:
+    labels:
+      komodo.file-manager.excluded: "true"
   data:
   repo-cache:
   repos:

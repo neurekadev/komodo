@@ -6,7 +6,45 @@ use komodo_client::entities::docker::{
 use crate::docker::DockerClient;
 use crate::docker::usage::volume_disk_usage;
 
+pub const FILE_MANAGER_EXCLUDED_LABEL: &str =
+  "komodo.file-manager.excluded";
+
+fn file_manager_volume_is_excluded(
+  labels: &std::collections::HashMap<String, String>,
+) -> bool {
+  labels
+    .get(FILE_MANAGER_EXCLUDED_LABEL)
+    .is_some_and(|value| value != "false")
+}
+
 impl DockerClient {
+  /// Protected volumes remain visible through the worker's Docker-volume-root
+  /// mount. File Manager must reject both direct targets and aliases into them.
+  pub async fn file_manager_excluded_volume_paths(
+    &self,
+  ) -> anyhow::Result<Vec<std::path::PathBuf>> {
+    self
+      .docker
+      .list_volumes(Option::<ListVolumesOptions>::None)
+      .await?
+      .volumes
+      .unwrap_or_default()
+      .into_iter()
+      .filter(|volume| {
+        file_manager_volume_is_excluded(&volume.labels)
+      })
+      .map(|volume| {
+        if volume.mountpoint.is_empty() {
+          anyhow::bail!(
+            "Protected File Manager volume '{}' has no mountpoint",
+            volume.name
+          );
+        }
+        Ok(std::path::PathBuf::from(volume.mountpoint))
+      })
+      .collect()
+  }
+
   pub async fn list_volumes(
     &self,
     containers: &[ContainerListItem],
@@ -161,5 +199,22 @@ impl DockerClient {
       }),
       disk_usage,
     })
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn protected_volume_label_requires_explicit_false_to_opt_out() {
+    let mut labels = std::collections::HashMap::new();
+    assert!(!file_manager_volume_is_excluded(&labels));
+    for value in ["true", "", "1"] {
+      labels.insert(FILE_MANAGER_EXCLUDED_LABEL.into(), value.into());
+      assert!(file_manager_volume_is_excluded(&labels));
+    }
+    labels.insert(FILE_MANAGER_EXCLUDED_LABEL.into(), "false".into());
+    assert!(!file_manager_volume_is_excluded(&labels));
   }
 }

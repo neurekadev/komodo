@@ -13,8 +13,10 @@ services:
     ports:
       - "9120:9120"
     volumes:
-      # Keys, backups, syncs, and repository cache stay in the existing volume.
+      # Communication keys, working data, and cache remain shared.
       - data:/data
+      # The repository is Core-only; workers use the authenticated endpoint.
+      - backups:/backups
       # Backup authentication and sealing material must remain Core-only.
       - core-secrets:/core-secrets
       # Optional: mount custom configuration or a trusted root CA.
@@ -69,5 +71,10 @@ volumes:
   mongo-data:
   mongo-config:
   data:
+  backups:
+    labels:
+      komodo.file-manager.excluded: "true"
   # Core-only backup authentication and sealing key
   core-secrets:
+    labels:
+      komodo.file-manager.excluded: "true"

@@ -1058,16 +1058,10 @@ fn persist_core_recovery_activation(
   {
     return Err(anyhow!("Recovered Core backup identity is invalid"));
   }
-  let valid_database_name = |database: &str| {
-    !database.is_empty()
-      && database.chars().all(|character| {
-        character.is_ascii_alphanumeric()
-          || matches!(character, '_' | '-')
-      })
-  };
-  if !valid_database_name(database)
-    || previous_database
-      .is_some_and(|name| !valid_database_name(name))
+  if !crate::state::valid_recovery_database_name(database)
+    || previous_database.is_some_and(|name| {
+      !crate::state::valid_recovery_database_name(name)
+    })
   {
     return Err(anyhow!("Unsafe active database name"));
   }
@@ -1403,6 +1397,12 @@ async fn finish_run(
 }
 
 pub async fn status() -> anyhow::Result<BackupStatus> {
+  // Fail fast before taking the role barrier. A timed-out health worker keeps
+  // this slot, but must not keep administrators from changing repository roles.
+  let health_refresh = repository_health_refresh_slots()
+    .clone()
+    .try_acquire_owned()
+    .context("Repository health inventory is still running; retry after it finishes")?;
   let _repository_roles =
     repository_role_barrier().clone().read_owned().await;
   let recent_runs = find_collect(
@@ -1431,9 +1431,7 @@ pub async fn status() -> anyhow::Result<BackupStatus> {
   )
   .await
   .unwrap_or_default();
-  // Coalesce concurrent browser polls before checking the shared persisted
-  // health cache, so only one caller performs an expired inventory refresh.
-  let _health_refresh = repository_health_refresh_lock().lock().await;
+  // Admission also coalesces concurrent refreshes of this persisted cache.
   let previous_primary = health_collection()
     .find_one(doc! { "_id": "primary" })
     .await
@@ -1485,34 +1483,15 @@ pub async fn status() -> anyhow::Result<BackupStatus> {
   }
   let primary_settings = settings.clone();
   let primary_repository = settings.primary.clone();
-  let primary = tokio::task::spawn_blocking(move || {
-    core_repository(&primary_repository, &primary_settings)?
-      .list_snapshots()
-      .map(|inventory| {
-        (
-          inventory
-            .snapshots
-            .into_iter()
-            .map(|snapshot| (snapshot.name, snapshot.partial))
-            .collect::<HashMap<_, _>>(),
-          inventory.hidden == 0,
-        )
-      })
-  })
-  .await
-  .context("Primary health worker failed")?;
-  let primary_inventory_healthy =
-    primary.as_ref().is_ok_and(|(_, healthy)| *healthy);
-  let primary_healthy = primary_inventory_healthy
-    && !previous_primary.verification_failed;
-  let primary_names =
-    primary.map(|(names, _)| names).unwrap_or_default();
-  let (mirror_healthy, mirror_lagging_snapshots) =
-    if let Some(mirror) = settings.mirror.clone() {
-      let mirror_settings = settings.clone();
-      let mirror = tokio::task::spawn_blocking(move || {
-        core_repository(&mirror, &mirror_settings)?
-          .list_snapshots()
+  let deadline =
+    std::time::Instant::now() + std::time::Duration::from_secs(60);
+  let (primary, health_refresh) = run_snapshot_inventory_worker(
+    health_refresh,
+    deadline,
+    move || {
+      Ok(
+        core_repository(&primary_repository, &primary_settings)
+          .and_then(|repository| repository.list_snapshots())
           .map(|inventory| {
             (
               inventory
@@ -1522,11 +1501,44 @@ pub async fn status() -> anyhow::Result<BackupStatus> {
                 .collect::<HashMap<_, _>>(),
               inventory.hidden == 0,
             )
-          })
-      })
+          }),
+      )
+    },
+  )
+  .await
+  .context("Primary health worker failed")?;
+  let primary_inventory_healthy =
+    primary.as_ref().is_ok_and(|(_, healthy)| *healthy);
+  let primary_healthy = primary_inventory_healthy
+    && !previous_primary.verification_failed;
+  let primary_names =
+    primary.map(|(names, _)| names).unwrap_or_default();
+  let (mirror_healthy, mirror_lagging_snapshots, _health_refresh) =
+    if let Some(mirror) = settings.mirror.clone() {
+      let mirror_settings = settings.clone();
+      let (mirror, health_refresh) = run_snapshot_inventory_worker(
+        health_refresh,
+        deadline,
+        move || {
+          Ok(
+            core_repository(&mirror, &mirror_settings)
+              .and_then(|repository| repository.list_snapshots())
+              .map(|inventory| {
+                (
+                  inventory
+                    .snapshots
+                    .into_iter()
+                    .map(|snapshot| (snapshot.name, snapshot.partial))
+                    .collect::<HashMap<_, _>>(),
+                  inventory.hidden == 0,
+                )
+              }),
+          )
+        },
+      )
       .await
       .context("Mirror health worker failed")?;
-      match mirror {
+      let (healthy, lagging) = match mirror {
         Ok((mirror_snapshots, healthy)) => (
           Some(healthy && !previous_mirror.verification_failed),
           primary_names
@@ -1540,9 +1552,10 @@ pub async fn status() -> anyhow::Result<BackupStatus> {
             .count() as u64,
         ),
         Err(_) => (Some(false), primary_names.len() as u64),
-      }
+      };
+      (healthy, lagging, health_refresh)
     } else {
-      (None, 0)
+      (None, 0, health_refresh)
     };
   let checked_at = komodo_timestamp();
   let _ = health_collection()
@@ -1582,10 +1595,11 @@ pub async fn status() -> anyhow::Result<BackupStatus> {
   })
 }
 
-fn repository_health_refresh_lock() -> &'static tokio::sync::Mutex<()>
-{
-  static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-  LOCK.get_or_init(Default::default)
+fn repository_health_refresh_slots()
+-> &'static Arc<tokio::sync::Semaphore> {
+  static SLOTS: OnceLock<Arc<tokio::sync::Semaphore>> =
+    OnceLock::new();
+  SLOTS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
 }
 
 fn repository_health_cache_is_fresh(
@@ -6772,9 +6786,7 @@ mod tests {
         .any(|path| path.path == CORE_PRIVATE_PATH)
     );
     assert!(
-      local_paths
-        .iter()
-        .any(|path| path.path == "/data/backups/vykar")
+      local_paths.iter().any(|path| path.path == "/backups/vykar")
     );
   }
 
@@ -7093,6 +7105,38 @@ mod tests {
       "unrelated",
       None
     ));
+  }
+
+  #[tokio::test]
+  async fn expired_health_inventory_releases_roles_but_retains_worker_admission()
+   {
+    let roles = Arc::new(tokio::sync::RwLock::new(()));
+    let slots = Arc::new(tokio::sync::Semaphore::new(1));
+    let permit = slots.clone().try_acquire_owned().unwrap();
+    let (started, ready) = tokio::sync::oneshot::channel();
+    let (finish, wait) = std::sync::mpsc::channel();
+    let result = async {
+      let _role = roles.clone().read_owned().await;
+      run_snapshot_inventory_worker(
+        permit,
+        std::time::Instant::now(),
+        move || {
+          let _ = started.send(());
+          let _ = wait.recv();
+          Ok(())
+        },
+      )
+      .await
+    }
+    .await;
+    assert!(result.is_err());
+    ready.await.unwrap();
+    // Settings/promotion are available even though the actual read is stuck.
+    assert!(roles.try_write().is_ok());
+    assert!(slots.clone().try_acquire_owned().is_err());
+    finish.send(()).unwrap();
+    drop(slots.clone().acquire_owned().await.unwrap());
+    assert!(slots.try_acquire_owned().is_ok());
   }
 
   #[tokio::test]

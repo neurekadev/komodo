@@ -1108,6 +1108,10 @@ pub async fn resolve_root(
   };
 
   ensure_outside_private_journal(&path, &journal_root())?;
+  let docker = docker_client().load();
+  let docker = docker.as_ref().as_ref().context("Could not connect to Docker to validate protected File Manager storage")?;
+  let excluded = docker.file_manager_excluded_volume_paths().await?;
+  ensure_outside_excluded_volumes(&path, &excluded)?;
 
   let mut hash = Sha256::new();
   hash.update(path.as_os_str().as_encoded_bytes());
@@ -1329,6 +1333,20 @@ fn write_private_file(
 }
 
 const PRIVATE_JOURNAL_OVERLAP_REASON: &str = "File Manager target overlaps protected Periphery private journal data and cannot be opened";
+
+fn ensure_outside_excluded_volumes(
+  path: &Path,
+  excluded: &[PathBuf],
+) -> anyhow::Result<()> {
+  for protected in excluded {
+    if paths_overlap(path, protected)? {
+      return Err(anyhow!(
+        "File Manager target overlaps protected Docker volume storage and cannot be opened"
+      ));
+    }
+  }
+  Ok(())
+}
 
 fn ensure_outside_private_journal(
   path: &Path,
@@ -9392,6 +9410,33 @@ mod tests {
     .unwrap();
 
     fs::remove_dir_all(directory).unwrap();
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn excluded_volume_rejects_direct_parent_and_aliased_file_manager_roots()
+   {
+    let directory = tempfile::tempdir().unwrap();
+    let private = directory.path().join("repository");
+    let alias = directory.path().join("alias");
+    fs::create_dir_all(private.join("vykar")).unwrap();
+    std::os::unix::fs::symlink(&private, &alias).unwrap();
+    let protected = vec![private.clone()];
+    for path in [
+      private,
+      alias.clone(),
+      alias.join("vykar"),
+      directory.path().to_path_buf(),
+    ] {
+      assert!(
+        ensure_outside_excluded_volumes(&path, &protected).is_err()
+      );
+    }
+    ensure_outside_excluded_volumes(
+      &directory.path().join("application"),
+      &protected,
+    )
+    .unwrap();
   }
 
   #[test]

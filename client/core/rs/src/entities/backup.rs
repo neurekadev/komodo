@@ -98,7 +98,7 @@ fn default_sftp_timeout_seconds() -> U64 {
 impl Default for BackupRepositoryBackend {
   fn default() -> Self {
     Self::CoreLocal {
-      path: "/data/backups/vykar".into(),
+      path: "/backups/vykar".into(),
     }
   }
 }

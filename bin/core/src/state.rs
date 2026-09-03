@@ -40,6 +40,17 @@ static DB_CLIENT: OnceLock<database::Client> = OnceLock::new();
 pub const CORE_RECOVERY_ACTIVATION_PATH: &str =
   "/core-secrets/backup-recovery-activation.json";
 
+/// MongoDB's database-name constraints on the supported Linux deployment.
+/// These are database identifiers passed to the driver, never shell/SQL text.
+/// Keep existing names (including Unicode and '+') intact for recovery/rollback.
+pub(crate) fn valid_recovery_database_name(name: &str) -> bool {
+  !name.is_empty()
+    && name.len() < 64
+    && !name.chars().any(|character| {
+      matches!(character, '/' | '\\' | '.' | ' ' | '"' | '$' | '\0')
+    })
+}
+
 pub(crate) fn read_core_recovery_activation()
 -> std::io::Result<Option<Vec<u8>>> {
   read_private_recovery_activation(
@@ -127,15 +138,9 @@ pub async fn init_db_client() {
       }
     };
     if let Some(name) = active_database {
-      let name = name.trim();
-      if !name.is_empty()
-        && name.chars().all(|character| {
-          character.is_ascii_alphanumeric()
-            || matches!(character, '_' | '-')
-        })
-      {
+      if valid_recovery_database_name(&name) {
         info!("Using recovered active database '{name}'");
-        database.db_name = name.to_string();
+        database.db_name = name;
       } else {
         return Err(anyhow!(
           "Invalid active database recovery pointer"
@@ -353,6 +358,25 @@ pub fn action_cancel_cache() -> &'static CancelCache {
 #[cfg(test)]
 mod recovery_activation_tests {
   use super::*;
+
+  #[test]
+  fn recovery_accepts_configured_names_without_a_generated_name_whitelist()
+   {
+    for name in
+      ["komodo+prod", "komodo-prod", "komodo_恢复", "komodo:prod"]
+    {
+      assert!(valid_recovery_database_name(name));
+    }
+    assert!(valid_recovery_database_name(&"a".repeat(63)));
+    assert!(!valid_recovery_database_name(&"a".repeat(64)));
+    assert!(!valid_recovery_database_name(&"é".repeat(32)));
+    for name in [
+      "", " komodo", "komodo ", "a/b", "a\\b", "a.b", "a\"b", "a$b",
+      "a\0b",
+    ] {
+      assert!(!valid_recovery_database_name(name));
+    }
+  }
 
   #[test]
   fn shared_pointer_cannot_select_or_migrate_a_database() {
