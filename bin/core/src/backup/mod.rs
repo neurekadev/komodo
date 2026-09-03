@@ -418,8 +418,8 @@ async fn save_settings_inner(
       _ => {}
     }
   } else {
-    require_repository_secrets(&proposed.primary)?;
-    if let Some(mirror) = &proposed.mirror {
+    require_repository_secrets(&mut proposed.primary)?;
+    if let Some(mirror) = &mut proposed.mirror {
       require_repository_secrets(mirror)?;
     }
   }
@@ -797,6 +797,11 @@ fn merge_repository_secrets(
     ));
   }
   preserve_secret(&mut proposed.passphrase, &existing.passphrase);
+  let use_worker_credentials =
+    proposed.use_worker_credentials.unwrap_or_else(|| {
+      repository_has_any_worker_credentials(proposed)
+        || repository_uses_worker_credentials(existing)
+    });
   match (&mut proposed.backend, &existing.backend) {
     (
       BackupRepositoryBackend::S3 {
@@ -816,8 +821,10 @@ fn merge_repository_secrets(
     ) => {
       preserve_secret(access_key_id, old_access);
       preserve_secret(secret_access_key, old_secret);
-      preserve_secret(worker_access_key_id, old_worker_access);
-      preserve_secret(worker_secret_access_key, old_worker_secret);
+      if use_worker_credentials {
+        preserve_secret(worker_access_key_id, old_worker_access);
+        preserve_secret(worker_secret_access_key, old_worker_secret);
+      }
     }
     (
       BackupRepositoryBackend::Sftp {
@@ -832,7 +839,9 @@ fn merge_repository_secrets(
       },
     ) => {
       preserve_secret(private_key, old_key);
-      preserve_secret(worker_private_key, old_worker_key);
+      if use_worker_credentials {
+        preserve_secret(worker_private_key, old_worker_key);
+      }
     }
     (
       BackupRepositoryBackend::Rest {
@@ -847,10 +856,23 @@ fn merge_repository_secrets(
       },
     ) => {
       preserve_secret(access_token, old_token);
-      preserve_secret(worker_access_token, old_worker_token);
+      if use_worker_credentials {
+        preserve_secret(worker_access_token, old_worker_token);
+      }
     }
     (BackupRepositoryBackend::CoreLocal { .. }, _) => {}
-    _ => require_repository_secrets(proposed)?,
+    _ => {}
+  }
+  if matches!(
+    proposed.backend,
+    BackupRepositoryBackend::CoreLocal { .. }
+  ) {
+    proposed.use_worker_credentials = None;
+  } else {
+    proposed.use_worker_credentials = Some(use_worker_credentials);
+    if !use_worker_credentials {
+      clear_worker_credentials(proposed);
+    }
   }
   require_repository_secrets(proposed)
 }
@@ -865,8 +887,63 @@ fn preserve_secret(
   proposed.configured = false;
 }
 
-fn require_repository_secrets(
+fn repository_has_any_worker_credentials(
   repository: &BackupRepository,
+) -> bool {
+  match &repository.backend {
+    BackupRepositoryBackend::CoreLocal { .. } => false,
+    BackupRepositoryBackend::S3 {
+      worker_access_key_id,
+      worker_secret_access_key,
+      ..
+    } => {
+      !worker_access_key_id.value.is_empty()
+        || !worker_secret_access_key.value.is_empty()
+    }
+    BackupRepositoryBackend::Sftp {
+      worker_private_key, ..
+    } => !worker_private_key.value.is_empty(),
+    BackupRepositoryBackend::Rest {
+      worker_access_token,
+      ..
+    } => !worker_access_token.value.is_empty(),
+  }
+}
+
+fn repository_uses_worker_credentials(
+  repository: &BackupRepository,
+) -> bool {
+  !matches!(
+    repository.backend,
+    BackupRepositoryBackend::CoreLocal { .. }
+  ) && repository.use_worker_credentials.unwrap_or_else(|| {
+    repository_has_any_worker_credentials(repository)
+  })
+}
+
+fn clear_worker_credentials(repository: &mut BackupRepository) {
+  match &mut repository.backend {
+    BackupRepositoryBackend::CoreLocal { .. } => {}
+    BackupRepositoryBackend::S3 {
+      worker_access_key_id,
+      worker_secret_access_key,
+      ..
+    } => {
+      *worker_access_key_id = BackupSecret::default();
+      *worker_secret_access_key = BackupSecret::default();
+    }
+    BackupRepositoryBackend::Sftp {
+      worker_private_key, ..
+    } => *worker_private_key = BackupSecret::default(),
+    BackupRepositoryBackend::Rest {
+      worker_access_token,
+      ..
+    } => *worker_access_token = BackupSecret::default(),
+  }
+}
+
+fn require_repository_secrets(
+  repository: &mut BackupRepository,
 ) -> anyhow::Result<()> {
   if repository.passphrase.value.is_empty() {
     return Err(anyhow!(
@@ -895,7 +972,22 @@ fn require_repository_secrets(
       "Authoritative repository credentials are required"
     ));
   }
-  require_worker_credentials(repository)
+  if matches!(
+    repository.backend,
+    BackupRepositoryBackend::CoreLocal { .. }
+  ) {
+    repository.use_worker_credentials = None;
+    return Ok(());
+  }
+  let use_worker_credentials =
+    repository_uses_worker_credentials(repository);
+  repository.use_worker_credentials = Some(use_worker_credentials);
+  if use_worker_credentials {
+    require_worker_credentials(repository)
+  } else {
+    clear_worker_credentials(repository);
+    Ok(())
+  }
 }
 
 fn require_worker_credentials(
@@ -1025,14 +1117,14 @@ async fn trusted_backup_client<'a>(
   })
 }
 
-/// Convert Core-local storage to the embedded authenticated REST endpoint, or
-/// substitute distinct maintenance-denied credentials for an external
-/// backend. Authoritative maintenance credentials never cross the
-/// Core/Periphery boundary. Vykar writers do receive the repository
-/// passphrase because its client-side encryption and deduplication require
-/// read access. Workers sharing a repository must also trust each other's
-/// backup writes: worker labels do not authenticate immutable contents or
-/// isolate writers, as documented in the administrator guide.
+/// Convert Core-local storage to the embedded authenticated REST endpoint. For
+/// external storage, substitute optional maintenance-denied worker credentials
+/// when enabled, otherwise use the authoritative repository credentials.
+/// Vykar writers receive the repository passphrase because its client-side
+/// encryption and deduplication require read access. Workers sharing a
+/// repository must also trust each other's backup writes: worker labels do not
+/// authenticate immutable contents or isolate writers, as documented in the
+/// administrator guide.
 fn repository_for_periphery(
   repository: &BackupRepository,
   mirror: bool,
@@ -1040,7 +1132,11 @@ fn repository_for_periphery(
   let BackupRepositoryBackend::CoreLocal { path } =
     &repository.backend
   else {
-    require_worker_credentials(repository)?;
+    let use_worker_credentials =
+      repository_uses_worker_credentials(repository);
+    if use_worker_credentials {
+      require_worker_credentials(repository)?;
+    }
     let mut worker = repository.clone();
     match &mut worker.backend {
       BackupRepositoryBackend::S3 {
@@ -1050,25 +1146,37 @@ fn repository_for_periphery(
         worker_secret_access_key,
         ..
       } => {
-        *access_key_id = std::mem::take(worker_access_key_id);
-        *secret_access_key = std::mem::take(worker_secret_access_key);
+        if use_worker_credentials {
+          *access_key_id = std::mem::take(worker_access_key_id);
+          *secret_access_key =
+            std::mem::take(worker_secret_access_key);
+        }
+        *worker_access_key_id = BackupSecret::default();
+        *worker_secret_access_key = BackupSecret::default();
       }
       BackupRepositoryBackend::Sftp {
         private_key,
         worker_private_key,
         ..
       } => {
-        *private_key = std::mem::take(worker_private_key);
+        if use_worker_credentials {
+          *private_key = std::mem::take(worker_private_key);
+        }
+        *worker_private_key = BackupSecret::default();
       }
       BackupRepositoryBackend::Rest {
         access_token,
         worker_access_token,
         ..
       } => {
-        *access_token = std::mem::take(worker_access_token);
+        if use_worker_credentials {
+          *access_token = std::mem::take(worker_access_token);
+        }
+        *worker_access_token = BackupSecret::default();
       }
       BackupRepositoryBackend::CoreLocal { .. } => unreachable!(),
     }
+    worker.use_worker_credentials = None;
     return Ok(worker);
   };
   let registered = embedded_repository_paths()
@@ -1101,6 +1209,7 @@ fn repository_for_periphery(
       allow_insecure_http: core_config().host.starts_with("http://"),
     },
     passphrase: repository.passphrase.clone(),
+    use_worker_credentials: None,
   })
 }
 
@@ -8015,27 +8124,149 @@ mod tests {
     assert_eq!(proposed.passphrase.value, "corrected");
   }
 
-  #[test]
-  fn external_worker_receives_only_distinct_scoped_credentials() {
-    let repository = BackupRepository {
-      backend: BackupRepositoryBackend::Rest {
-        url: "https://backup.example".into(),
-        access_token: BackupSecret {
-          value: "authoritative-token".into(),
-          configured: false,
-        },
-        worker_access_token: BackupSecret {
-          value: "append-only-worker-token".into(),
-          configured: false,
-        },
-        allow_insecure_http: false,
-      },
-      passphrase: BackupSecret {
-        value: "repository-passphrase".into(),
-        configured: false,
-      },
+  fn test_secret(value: &str) -> BackupSecret {
+    BackupSecret {
+      value: value.into(),
+      configured: false,
+    }
+  }
+
+  fn test_repository(
+    backend: BackupRepositoryBackend,
+  ) -> BackupRepository {
+    BackupRepository {
+      backend,
+      passphrase: test_secret("repository-passphrase"),
       ..Default::default()
+    }
+  }
+
+  #[test]
+  fn external_workers_fall_back_to_authoritative_credentials() {
+    let s3 = test_repository(BackupRepositoryBackend::S3 {
+      url: "s3://backups/repository".into(),
+      region: "auto".into(),
+      access_key_id: test_secret("core-access"),
+      secret_access_key: test_secret("core-secret"),
+      worker_access_key_id: BackupSecret::default(),
+      worker_secret_access_key: BackupSecret::default(),
+      soft_delete: false,
+    });
+    let s3_worker = repository_for_periphery(&s3, false).unwrap();
+    let BackupRepositoryBackend::S3 {
+      access_key_id,
+      secret_access_key,
+      worker_access_key_id,
+      worker_secret_access_key,
+      ..
+    } = s3_worker.backend
+    else {
+      panic!("wrong backend")
     };
+    assert_eq!(access_key_id.value, "core-access");
+    assert_eq!(secret_access_key.value, "core-secret");
+    assert!(worker_access_key_id.value.is_empty());
+    assert!(worker_secret_access_key.value.is_empty());
+    assert!(s3_worker.use_worker_credentials.is_none());
+
+    let sftp = test_repository(BackupRepositoryBackend::Sftp {
+      url: "sftp://backup.example/repository".into(),
+      private_key: test_secret("core-private-key"),
+      worker_private_key: BackupSecret::default(),
+      known_hosts: "backup.example ssh-ed25519 host-key".into(),
+      timeout_seconds: 30,
+    });
+    let sftp_worker = repository_for_periphery(&sftp, false).unwrap();
+    let BackupRepositoryBackend::Sftp {
+      private_key,
+      worker_private_key,
+      ..
+    } = sftp_worker.backend
+    else {
+      panic!("wrong backend")
+    };
+    assert_eq!(private_key.value, "core-private-key");
+    assert!(worker_private_key.value.is_empty());
+    assert!(sftp_worker.use_worker_credentials.is_none());
+
+    let rest = test_repository(BackupRepositoryBackend::Rest {
+      url: "https://backup.example/repository".into(),
+      access_token: test_secret("core-token"),
+      worker_access_token: BackupSecret::default(),
+      allow_insecure_http: false,
+    });
+    let rest_worker = repository_for_periphery(&rest, false).unwrap();
+    let BackupRepositoryBackend::Rest {
+      access_token,
+      worker_access_token,
+      ..
+    } = rest_worker.backend
+    else {
+      panic!("wrong backend")
+    };
+    assert_eq!(access_token.value, "core-token");
+    assert!(worker_access_token.value.is_empty());
+    assert!(rest_worker.use_worker_credentials.is_none());
+  }
+
+  #[test]
+  fn enabled_worker_credentials_remain_isolated_and_distinct() {
+    let mut s3 = test_repository(BackupRepositoryBackend::S3 {
+      url: "s3://backups/repository".into(),
+      region: "auto".into(),
+      access_key_id: test_secret("core-access"),
+      secret_access_key: test_secret("core-secret"),
+      worker_access_key_id: test_secret("worker-access"),
+      worker_secret_access_key: test_secret("worker-secret"),
+      soft_delete: false,
+    });
+    s3.use_worker_credentials = Some(true);
+    let s3_worker = repository_for_periphery(&s3, false).unwrap();
+    let BackupRepositoryBackend::S3 {
+      access_key_id,
+      secret_access_key,
+      worker_access_key_id,
+      worker_secret_access_key,
+      ..
+    } = s3_worker.backend
+    else {
+      panic!("wrong backend")
+    };
+    assert_eq!(access_key_id.value, "worker-access");
+    assert_eq!(secret_access_key.value, "worker-secret");
+    assert!(worker_access_key_id.value.is_empty());
+    assert!(worker_secret_access_key.value.is_empty());
+    assert!(s3_worker.use_worker_credentials.is_none());
+
+    let mut sftp = test_repository(BackupRepositoryBackend::Sftp {
+      url: "sftp://backup.example/repository".into(),
+      private_key: test_secret("core-private-key"),
+      worker_private_key: test_secret("worker-private-key"),
+      known_hosts: "backup.example ssh-ed25519 host-key".into(),
+      timeout_seconds: 30,
+    });
+    sftp.use_worker_credentials = Some(true);
+    let sftp_worker = repository_for_periphery(&sftp, false).unwrap();
+    let BackupRepositoryBackend::Sftp {
+      private_key,
+      worker_private_key,
+      ..
+    } = sftp_worker.backend
+    else {
+      panic!("wrong backend")
+    };
+    assert_eq!(private_key.value, "worker-private-key");
+    assert!(worker_private_key.value.is_empty());
+    assert!(sftp_worker.use_worker_credentials.is_none());
+
+    let mut repository =
+      test_repository(BackupRepositoryBackend::Rest {
+        url: "https://backup.example".into(),
+        access_token: test_secret("authoritative-token"),
+        worker_access_token: test_secret("append-only-worker-token"),
+        allow_insecure_http: false,
+      });
+    repository.use_worker_credentials = Some(true);
     let worker =
       repository_for_periphery(&repository, false).unwrap();
     let BackupRepositoryBackend::Rest {
@@ -8048,6 +8279,7 @@ mod tests {
     };
     assert_eq!(access_token.value, "append-only-worker-token");
     assert!(worker_access_token.value.is_empty());
+    assert!(worker.use_worker_credentials.is_none());
 
     let mut unsafe_repository = repository;
     let BackupRepositoryBackend::Rest {
@@ -8061,6 +8293,94 @@ mod tests {
     assert!(
       repository_for_periphery(&unsafe_repository, false).is_err()
     );
+  }
+
+  #[test]
+  fn enabled_s3_worker_credentials_require_a_complete_pair() {
+    let mut repository =
+      test_repository(BackupRepositoryBackend::S3 {
+        url: "s3://backups/repository".into(),
+        region: "auto".into(),
+        access_key_id: test_secret("core-access"),
+        secret_access_key: test_secret("core-secret"),
+        worker_access_key_id: test_secret("worker-access"),
+        worker_secret_access_key: BackupSecret::default(),
+        soft_delete: false,
+      });
+    repository.use_worker_credentials = Some(true);
+    assert!(require_repository_secrets(&mut repository).is_err());
+  }
+
+  #[test]
+  fn disabling_worker_credentials_clears_existing_secrets() {
+    let existing = BackupRepository {
+      use_worker_credentials: Some(true),
+      ..test_repository(BackupRepositoryBackend::Rest {
+        url: "https://backup.example/repository".into(),
+        access_token: test_secret("core-token"),
+        worker_access_token: test_secret("worker-token"),
+        allow_insecure_http: false,
+      })
+    };
+    let mut proposed = BackupRepository {
+      use_worker_credentials: Some(false),
+      ..test_repository(BackupRepositoryBackend::Rest {
+        url: "https://backup.example/repository".into(),
+        access_token: BackupSecret::default(),
+        worker_access_token: BackupSecret::default(),
+        allow_insecure_http: false,
+      })
+    };
+    proposed.passphrase = BackupSecret::default();
+
+    merge_repository_secrets(&mut proposed, &existing, true, false)
+      .unwrap();
+    let BackupRepositoryBackend::Rest {
+      access_token,
+      worker_access_token,
+      ..
+    } = proposed.backend
+    else {
+      panic!("wrong backend")
+    };
+    assert_eq!(access_token.value, "core-token");
+    assert!(worker_access_token.value.is_empty());
+    assert_eq!(proposed.use_worker_credentials, Some(false));
+  }
+
+  #[test]
+  fn legacy_worker_credentials_are_inferred_as_enabled() {
+    let repository = test_repository(BackupRepositoryBackend::Rest {
+      url: "https://backup.example/repository".into(),
+      access_token: test_secret("core-token"),
+      worker_access_token: test_secret("legacy-worker-token"),
+      allow_insecure_http: false,
+    });
+    assert!(repository.use_worker_credentials.is_none());
+    assert!(repository_uses_worker_credentials(&repository));
+
+    let worker =
+      repository_for_periphery(&repository, false).unwrap();
+    let BackupRepositoryBackend::Rest { access_token, .. } =
+      worker.backend
+    else {
+      panic!("wrong backend")
+    };
+    assert_eq!(access_token.value, "legacy-worker-token");
+  }
+
+  #[test]
+  fn core_local_repositories_ignore_worker_credential_mode() {
+    let mut repository = BackupRepository {
+      backend: BackupRepositoryBackend::CoreLocal {
+        path: "/backups/repository".into(),
+      },
+      passphrase: test_secret("repository-passphrase"),
+      use_worker_credentials: Some(true),
+      ..Default::default()
+    };
+    require_repository_secrets(&mut repository).unwrap();
+    assert!(repository.use_worker_credentials.is_none());
   }
 
   #[test]

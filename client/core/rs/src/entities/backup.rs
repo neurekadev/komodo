@@ -53,11 +53,12 @@ pub enum BackupRepositoryBackend {
   S3 {
     url: String,
     region: String,
-    /// Authoritative credentials used only by Core for maintenance.
+    /// Authoritative credentials used by Core for maintenance and, when
+    /// separate worker credentials are disabled, by trusted workers.
     access_key_id: BackupSecret,
     secret_access_key: BackupSecret,
-    /// Distinct worker-scoped credentials. Their storage policy must deny
-    /// deletion, compaction, and other maintenance operations.
+    /// Optional distinct worker-scoped credentials. Their storage policy
+    /// should deny deletion, compaction, and other maintenance operations.
     #[serde(default)]
     worker_access_key_id: BackupSecret,
     #[serde(default)]
@@ -68,10 +69,11 @@ pub enum BackupRepositoryBackend {
   /// SFTP storage. The key and known-hosts files must exist on the worker.
   Sftp {
     url: String,
-    /// Authoritative key used only by Core for maintenance.
+    /// Authoritative key used by Core for maintenance and, when separate
+    /// worker credentials are disabled, by trusted workers.
     private_key: BackupSecret,
-    /// Distinct worker-scoped key whose account cannot delete or maintain the
-    /// authoritative repository.
+    /// Optional distinct worker-scoped key whose account cannot delete or
+    /// maintain the authoritative repository.
     #[serde(default)]
     worker_private_key: BackupSecret,
     known_hosts: String,
@@ -81,9 +83,10 @@ pub enum BackupRepositoryBackend {
   /// A Vykar REST repository.
   Rest {
     url: String,
-    /// Authoritative token used only by Core for maintenance.
+    /// Authoritative token used by Core for maintenance and, when separate
+    /// worker credentials are disabled, by trusted workers.
     access_token: BackupSecret,
-    /// Distinct append-only or otherwise maintenance-denied worker token.
+    /// Optional append-only or otherwise maintenance-denied worker token.
     #[serde(default)]
     worker_access_token: BackupSecret,
     #[serde(default)]
@@ -151,10 +154,39 @@ pub struct BackupRepository {
   /// Vykar repository encryption passphrase. Encryption is mandatory.
   #[serde(default)]
   pub passphrase: BackupSecret,
+  /// Whether trusted workers use the optional worker credentials instead of
+  /// the authoritative repository credentials. Missing values are inferred
+  /// from configured worker credentials for backward compatibility.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub use_worker_credentials: Option<bool>,
 }
 
 impl BackupRepository {
   pub fn redact(&mut self) {
+    if !matches!(
+      self.backend,
+      BackupRepositoryBackend::CoreLocal { .. }
+    ) && self.use_worker_credentials.is_none()
+    {
+      self.use_worker_credentials = Some(match &self.backend {
+        BackupRepositoryBackend::CoreLocal { .. } => false,
+        BackupRepositoryBackend::S3 {
+          worker_access_key_id,
+          worker_secret_access_key,
+          ..
+        } => {
+          !worker_access_key_id.value.is_empty()
+            || !worker_secret_access_key.value.is_empty()
+        }
+        BackupRepositoryBackend::Sftp {
+          worker_private_key, ..
+        } => !worker_private_key.value.is_empty(),
+        BackupRepositoryBackend::Rest {
+          worker_access_token,
+          ..
+        } => !worker_access_token.value.is_empty(),
+      });
+    }
     self.backend.redact();
     self.passphrase.redact();
   }
@@ -640,8 +672,10 @@ mod tests {
         value: "passphrase".into(),
         configured: false,
       },
+      use_worker_credentials: None,
     };
     repo.redact();
+    assert_eq!(repo.use_worker_credentials, Some(true));
     assert!(repo.passphrase.value.is_empty());
     assert!(repo.passphrase.configured);
     let BackupRepositoryBackend::Rest {
@@ -656,5 +690,30 @@ mod tests {
     assert!(access_token.configured);
     assert!(worker_access_token.value.is_empty());
     assert!(worker_access_token.configured);
+  }
+
+  #[test]
+  fn repository_redaction_resolves_missing_worker_mode_to_false() {
+    let mut repo = BackupRepository {
+      name: "test".into(),
+      backend: BackupRepositoryBackend::Rest {
+        url: "https://backup.example".into(),
+        access_token: BackupSecret {
+          value: "core-secret".into(),
+          configured: false,
+        },
+        worker_access_token: BackupSecret::default(),
+        allow_insecure_http: false,
+      },
+      passphrase: BackupSecret {
+        value: "passphrase".into(),
+        configured: false,
+      },
+      use_worker_credentials: None,
+    };
+
+    repo.redact();
+
+    assert_eq!(repo.use_worker_credentials, Some(false));
   }
 }

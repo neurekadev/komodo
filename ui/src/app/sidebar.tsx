@@ -31,13 +31,6 @@ const Sidebar = ({ close }: { close: () => void }) => {
             to="/stats"
             {...linkProps}
           />
-          <SidebarLink
-            label="Backups"
-            icon={<ICONS.Backup size="1rem" />}
-            to="/backups"
-            {...linkProps}
-          />
-
           <Divider
             label={
               <Text opacity={0.7} size="sm">
@@ -97,6 +90,12 @@ const Sidebar = ({ close }: { close: () => void }) => {
             label="Schedules"
             icon={<ICONS.Schedule size="1rem" />}
             to="/schedules"
+            {...linkProps}
+          />
+          <SidebarLink
+            label="Backups"
+            icon={<ICONS.Backup size="1rem" />}
+            to="/backups"
             {...linkProps}
           />
           <SidebarLink

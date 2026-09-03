@@ -102,7 +102,7 @@ const Topbar = ({
           <OmniSearch />
         </Box>
         <TopbarLink to="/docs">API</TopbarLink>
-        <TopbarLink to="https://komodo.docs.neureka.dev/docs/intro">
+        <TopbarLink to="https://komodo.docs.neureka.dev">
           Docs
         </TopbarLink>
         {versionLink && version && (
