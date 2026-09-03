@@ -1,0 +1,29 @@
+---
+title: Recover Core
+description: Restore Komodo on a fresh installation from an encrypted Core snapshot.
+---
+
+
+Use a complete Core snapshot when the original installation is lost. You need the repository address, access credentials, encryption passphrase, and your saved deployment configuration. The snapshot contains Core's recovery identity and backup settings; you do not need a separately saved backup key.
+
+## Restore Core
+
+1. Stop the original Core if it still exists. Start a [fresh installation](/quick-start/install-komodo) using the same Komodo release and your saved host/authentication configuration.
+2. Sign in as the fresh installation's administrator and open **Backups → Fresh Core recovery**.
+3. Enter the **Existing recovery repository** address, access credentials, and passphrase. For Core-local storage, mount the surviving repository into the new Core and enter its path.
+4. Select **Load recovery snapshots**, choose a complete snapshot, and select **Restore and validate**. On another inventory page, load its snapshots again.
+5. Review the snapshot version and database names, then select **Activate and restart Core**.
+6. After restart, sign in with an administrator account from the snapshot. Check resources, users, Server connections, and repository access.
+7. Re-enroll trusted backup workers, verify the repository, and enable the schedule when ready. Recovery pauses scheduling and clears worker enrollment for review.
+
+Validation restores into a separate database before activation. The previous database and its matching recovery identity remain available for rollback. Use only one active Core during this process.
+
+## Roll back activation
+
+Stop Core. In its persistent `/data/core-secrets/state.json`, confirm `previous.database` names the database you intend to return to. Replace `identity` with the entire `previous.identity` object, set `database` to `previous.database`, and set `previous` to `null`. Preserve file permissions and start Core again. Keep a copy of the original state file until you verify the rollback.
+
+## Troubleshooting
+
+If the repository cannot be opened, check its mount or network address, credentials, and passphrase. If validation fails, use another complete compatible snapshot and inspect Core's logs. Do not activate an incomplete restore or delete database volumes to clear an error.
+
+External services, deployment files, and host configuration are restored separately from your saved installation configuration.

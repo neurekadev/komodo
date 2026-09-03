@@ -45,46 +45,9 @@ image_registry = [
 ]
 ```
 
-### Config fields
+Use build arguments for public build settings and secret arguments for credentials. In Dockerfiles, read a build secret with `RUN --mount=type=secret,id=KEY`; ordinary build arguments can appear in image history.
 
-| Field | Description | Default |
-|---|---|---|
-| `builder` | The Builder resource to run the build on. | — |
-| `version` | Current build version (`major.minor.patch`). | `0.0.0` |
-| `auto_increment_version` | Auto-increment patch number on each build. | `true` |
-| `image_name` | Alternate image name (uses build name if empty). | `""` |
-| `image_tag` | Extra tag postfix, e.g. `aarch64` → `:1.2.3-aarch64`. | `""` |
-| `include_latest_tag` | Push `:latest` / `:latest-{image_tag}` tags. | `true` |
-| `include_version_tags` | Push semver tags (`:1.2.3`, `:1.2`, `:1`). | `true` |
-| `include_commit_tag` | Push commit hash tag (`:a6v8h83`). | `true` |
-| `linked_repo` | A Komodo Repo resource to source files from. | `""` |
-| `git_provider` | Git provider domain. | `github.com` |
-| `git_https` | Use HTTPS to clone (versus HTTP). | `true` |
-| `git_account` | Git provider account for private repos. | `""` |
-| `repo` | Repository in `owner/repo` format. | `""` |
-| `branch` | Branch to clone. Webhooks only trigger on pushes to this branch. | `main` |
-| `commit` | Pin to a specific commit hash. | `""` |
-| `files_on_host` | Source Dockerfile and build context from files already on the builder. | `false` |
-| `dockerfile` | UI-defined Dockerfile contents. Supports variable/secret interpolation. | `""` |
-| `build_path` | Build context directory, relative to the repo root (or absolute path when `files_on_host`). | `.` |
-| `dockerfile_path` | Dockerfile path, relative to the build directory. | `Dockerfile` |
-| `image_registry` | Registry to push images to (domain + account + optional organization). | `[]` |
-| `build_args` | Build arguments in `KEY=value` format. Visible in `docker history`. | `""` |
-| `secret_args` | Build secrets in `KEY=value` format. Access via `RUN --mount=type=secret,id=KEY`. Not visible in image history. | `""` |
-| `skip_secret_interp` | Skip secret interpolation in build_args. | `false` |
-| `extra_args` | Additional flags passed to `docker build`. | `[]` |
-| `use_buildx` | Use `docker buildx build` instead of `docker build`. | `false` |
-| `pre_build` | Command to run after cloning but before `docker build`. | — |
-| `labels` | Docker labels in `key=value` format. | `""` |
-| `webhook_enabled` | Whether incoming webhooks trigger builds. | `true` |
-| `webhook_secret` | Alternate webhook secret (uses default from config if empty). | `""` |
-| `links` | Quick links displayed in the resource header. | `[]` |
-
-Komodo automatically supplies `IMAGE_NAME` and `VERSION` to the Docker build
-when those arguments are not already present in `build_args`. It also supplies
-`IMAGE_TAG` when the Build has a non-empty image tag. An explicit value in
-`build_args` takes precedence, which lets a Dockerfile use a different internal
-value without changing the image tags Komodo publishes.
+Komodo supplies `IMAGE_NAME`, `VERSION`, and a configured `IMAGE_TAG` unless you explicitly override them in build arguments.
 
 ## Image Versioning and Tagging
 
@@ -168,52 +131,4 @@ A `Builder` resource defines **where** builds run. Any Server connected to Komod
 
 Point the builder at an existing Server running the Periphery agent.
 
-### AWS EC2 builder
-
-Komodo can launch a temporary EC2 instance for each build and shut it down when finished.
-
-```toml
-[[builder]]
-name = "builder-01"
-[builder.config]
-type = "Aws"
-params.region = "us-east-2"
-params.instance_type = "c5.2xlarge"
-params.ami_id = "ami-xxxxxxxxxxxxxxxxxx"
-params.subnet_id = "subnet-xxxxxxxxxxxxxxxxxx"
-params.key_pair_name = "ssh-key"
-params.assign_public_ip = true ## Required for outbound internet access unless you have network gateway.
-params.use_public_ip = true ## Setting 'false' uses the private IP (when Komodo Core is in same subnet).
-params.security_group_ids = ["sg-xxxxxxxxxxxxxxxxxx"]
-params.user_data = """
-#!/bin/bash
-docker run -d \
-  --name komodo-periphery \
-  --init \
-  --restart unless-stopped \
-  -p 8120:8120 \
-  -e PERIPHERY_ROOT_DIRECTORY=/etc/komodo \
-  -e PERIPHERY_PRIVATE_KEY=file:/etc/komodo/keys/periphery.key \
-  -v /etc/komodo:/etc/komodo \
-  -v /etc/komodo/config:/config:ro \
-  -v /var/run/docker.sock:/var/run/docker.sock \
-  -v /proc:/proc \
-  ghcr.io/neurekadev/komodo-periphery:3
-"""
-```
-
-To create the AMI:
-
-1. Launch an EC2 instance and install Docker:
-   ```shell
-   apt update && apt upgrade -y
-   curl -fsSL https://get.docker.com | sh
-   systemctl enable docker.service containerd.service
-   ```
-2. If the builder needs custom Periphery configuration, place it at `/etc/komodo/config/periphery.config.toml`. The container mounts that directory read-only at `/config`, where the image loads configuration. An existing `/etc/komodo/periphery.config.toml` must be moved into this directory. Restrict access to the file and any AMI containing credentials; alternatively, provision secrets securely before the container starts.
-3. Create an AMI from the instance in the AWS console.
-4. Create a security group and ensure it allows inbound access on port **8120** from Komodo Core. The container has Docker-host control through its socket mount; allow access only from trusted Core instances.
-
-The instance `user_data` starts the official Periphery container as the instance boots. Komodo Core then connects to port `8120` and runs the build through that container. Keep `use_https` enabled unless you have explicitly configured another protected transport.
-
-Run a test Build before relying on the AMI. If private clones, registry pushes, or configured secrets fail, check the Periphery logs and confirm the configuration file is present at `/config/periphery.config.toml` inside the container.
+For temporary EC2 build hosts, follow [AWS Builders](/administration/aws-builders).

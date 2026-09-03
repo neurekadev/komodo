@@ -4,8 +4,8 @@ use typeshare::typeshare;
 
 use crate::entities::U64;
 use crate::entities::backup::{
-  BackupSettings, BackupSnapshot, BackupSnapshotItem, BackupStatus,
-  BackupTarget,
+  BackupRepository, BackupSettings, BackupSnapshot,
+  BackupSnapshotItem, BackupStatus, BackupTarget,
 };
 
 use super::KomodoReadRequest;
@@ -81,6 +81,22 @@ pub struct ListBackupSnapshotDirectory {
   pub parent: String,
   #[serde(default)]
   pub search: String,
+  #[serde(default)]
+  pub page: U64,
+  #[serde(default = "default_page_limit")]
+  pub limit: U64,
+}
+
+/// Admin-only discovery for Core recovery using an existing encrypted repository.
+/// Credentials remain in the POST body and are never returned.
+#[typeshare]
+#[derive(Serialize, Deserialize, Debug, Clone, Resolve)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[empty_traits(KomodoReadRequest)]
+#[response(BackupSnapshotList)]
+#[error(mogh_error::Error)]
+pub struct ListCoreRecoverySnapshots {
+  pub repository: Option<BackupRepository>,
   #[serde(default)]
   pub page: U64,
   #[serde(default = "default_page_limit")]

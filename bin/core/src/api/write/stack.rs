@@ -370,6 +370,7 @@ async fn write_stack_file_contents_on_host(
     WriteComposeContentsToHost {
       name: stack.name,
       run_directory: stack.config.run_directory,
+      protected_paths: crate::backup::file_manager_protected_paths()?,
       file_path,
       contents,
     },
@@ -450,6 +451,7 @@ async fn write_stack_file_contents_git(
     .join(file_path);
   let full_path =
     root.join(&file_path).components().collect::<PathBuf>();
+  crate::backup::ensure_outside_core_storage(&full_path)?;
 
   if let Some(parent) = full_path.parent() {
     tokio::fs::create_dir_all(parent).await.with_context(|| {
@@ -502,6 +504,8 @@ async fn write_stack_file_contents_git(
     return Ok(update);
   }
 
+  // Pulling can replace repository entries with symlinks.
+  crate::backup::ensure_outside_core_storage(&full_path)?;
   if let Err(e) = tokio::fs::write(&full_path, &contents)
     .await
     .with_context(|| {
@@ -628,6 +632,8 @@ impl Resolve<WriteArgs> for RefreshStackCache {
               file_paths: stack.all_file_dependencies(),
               name: stack.name.clone(),
               run_directory: stack.config.run_directory.clone(),
+              protected_paths:
+                crate::backup::file_manager_protected_paths()?,
             },
           )
           .await

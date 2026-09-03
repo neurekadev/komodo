@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 use typeshare::typeshare;
 
 use crate::entities::backup::{
-  BackupRestorePlan, BackupRun, BackupSettings, BackupTarget,
-  CoreRecoveryPlan,
+  BackupRepository, BackupRestorePlan, BackupRun, BackupSettings,
+  BackupTarget, CoreRecoveryPlan,
 };
 
 use super::KomodoWriteRequest;
@@ -123,6 +123,7 @@ pub struct CancelBackupRun {
 #[error(mogh_error::Error)]
 pub struct PlanCoreRecovery {
   pub snapshot: String,
+  pub repository: Option<BackupRepository>,
 }
 
 /// Admin-only. Persist the validated database pointer and restart Core.

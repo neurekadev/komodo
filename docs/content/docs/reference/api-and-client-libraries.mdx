@@ -56,3 +56,52 @@ const update = await komodo.execute("DeployStack", {
   stack: stacks[0].name,
 });
 ```
+
+
+## Execute Terminal
+
+The `execute_terminal` API method allows you to run a command on a terminal and stream the output back over HTTP. This is useful for:
+
+- **Actions** — TypeScript scripts can call `execute_terminal` on the Komodo client to run commands on any server or container and process the output programmatically.
+- **Automation** — integrate terminal command execution into external tools via the REST API.
+
+The TypeScript client provides convenience methods for each target type. All methods accept optional `callbacks` with `onLine` (called per output line) and `onFinish` (called with the exit code).
+
+```typescript
+// Server terminal
+await komodo.execute_server_terminal({
+  server: "my-server",
+  terminal: "automation",
+  command: "df -h",
+  init: { command: "bash", recreate: "DifferentCommand" },
+}, {
+  onLine: (line) => console.log(line),
+  onFinish: (code) => console.log("Exit code:", code),
+});
+
+// Container terminal
+await komodo.execute_container_terminal({
+  server: "my-server",
+  container: "my-container",
+  terminal: "debug",
+  command: "cat /var/log/errors.log",
+  init: { command: "sh", mode: "Exec", recreate: "Never" },
+});
+
+// Stack service terminal
+await komodo.execute_stack_service_terminal({
+  stack: "my-stack",
+  service: "web",
+  terminal: "debug",
+  command: "nginx -t",
+  init: { command: "sh" },
+});
+
+// Deployment terminal
+await komodo.execute_deployment_terminal({
+  deployment: "my-deployment",
+  terminal: "check",
+  command: "node --version",
+  init: { command: "sh", recreate: "Always" },
+});
+```

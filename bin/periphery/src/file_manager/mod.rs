@@ -1003,7 +1003,7 @@ pub async fn resolve_root(
     managed_files,
     create_if_missing,
   ) = match target {
-    PeripheryFileManagerTarget::Stack { stack, repo } => {
+    PeripheryFileManagerTarget::Stack { stack, repo, .. } => {
       if !stack.config.swarm_id.is_empty() {
         return Err(anyhow!(
           "File Manager is unavailable for Swarm stacks"
@@ -1085,7 +1085,7 @@ pub async fn resolve_root(
         (root, read_only, None, Vec::new(), false)
       }
     }
-    PeripheryFileManagerTarget::Volume { volume } => {
+    PeripheryFileManagerTarget::Volume { volume, .. } => {
       let client = docker_client().load();
       let client = client
         .iter()
@@ -1114,6 +1114,20 @@ pub async fn resolve_root(
   )?;
   let docker = docker_client().load();
   let docker = docker.as_ref().as_ref().context("Could not connect to Docker to validate protected File Manager storage")?;
+  let protected_paths = match target {
+    PeripheryFileManagerTarget::Stack {
+      protected_paths, ..
+    }
+    | PeripheryFileManagerTarget::Volume {
+      protected_paths, ..
+    } => protected_paths,
+  };
+  let protected = crate::api::backup::file_manager_protected_sources(
+    docker,
+    protected_paths,
+  )
+  .await?;
+  ensure_outside_excluded_volumes(&path, &protected)?;
   let excluded = docker.file_manager_excluded_volume_paths().await?;
   ensure_outside_excluded_volumes(&path, &excluded)?;
 

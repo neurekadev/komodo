@@ -473,6 +473,8 @@ pub async fn resolve_target(
         periphery: PeripheryFileManagerTarget::Stack {
           stack: Box::new(stack.clone()),
           repo: repo.map(Box::new),
+          protected_paths:
+            crate::backup::file_manager_protected_paths()?,
         },
         resource: ResourceTarget::Stack(stack.id.clone()),
         stack: Some(stack),
@@ -493,6 +495,8 @@ pub async fn resolve_target(
       Ok(ResolvedFileManagerTarget {
         periphery: PeripheryFileManagerTarget::Volume {
           volume: volume.clone(),
+          protected_paths:
+            crate::backup::file_manager_protected_paths()?,
         },
         resource: ResourceTarget::Server(server.id.clone()),
         server,

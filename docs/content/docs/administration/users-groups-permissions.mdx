@@ -1,111 +1,62 @@
 ---
 title: Users, Groups, and Permissions
-description: Grant people and teams the minimum Komodo access they need.
+description: Give people and teams the Komodo access they need.
 ---
 
+Use User Groups to grant a team's access once, then add or remove members as needed. You must be an administrator to enable accounts and manage other users' access.
 
-Komodo has a granular, layer-based permissioning system to provide non-admin users access only to intended Resources.
+## Grant access to a team
 
-## Grant Access to a Team
+1. Open **Settings → Users** and enable approved accounts.
+2. Create a User Group and add its members.
+3. Grant a base level on the required resources, then add specific permissions from the table below.
+4. Sign in as a team member and check an allowed operation and one that should be denied.
 
-1. Open **Settings → Users** and enable each approved account.
-2. Create a User Group for the team's role instead of granting the same permissions user by user.
-3. Add the users to the group.
-4. Grant the narrowest base level on the required resources, then add specific permissions such as Logs, Terminal, or File Manager only when needed.
-5. Sign in as a test member and verify both an allowed operation and an operation that should be denied.
+Users inherit grants from every group they belong to. An **Everyone** group applies to all users. If access is broader than expected, inspect direct grants, group membership, and resource-type grants before changing anything else.
 
-The expected result is that users see only permitted resources and cannot update or execute beyond the group's grants. If access is surprising, inspect direct user grants, every inherited group, type-wide permissions, and `Everyone` groups before increasing access.
+## Permission levels
 
-## User Groups
+| Level | Allows |
+| --- | --- |
+| None | No resource visibility or access. The default for non-admins. |
+| Read | View the resource and configuration. |
+| Execute | Read and run actions, such as deployment or builds. |
+| Write | Execute, change configuration, and delete the resource. |
 
-While Komodo can assign permissions to specific users directly, it is recommended to instead **create User Groups and assign permissions to them**, as if they were a user.
+`KOMODO_TRANSPARENT_MODE=true` gives everyone base Read access. It does not grant specific permissions such as File Manager.
 
-Users can then be **added to multiple User Groups** and they **inherit the group's permissions**, similar to linux permissions.
-There is also an `Everyone` mode for User Groups, if this is enabled then **all users implicitly gain the groups permissions**.
+## Specific permissions
 
-For permissioning at scale, users can define [**User Groups in Resource Syncs**](/features/resource-sync#user-group).
+| Permission | Adds access to |
+| --- | --- |
+| Backups | Snapshot listing and browsing with Read; backup and restore with Execute or Write. |
+| FileManager | Browsing and downloads with Read or Execute; file changes with Write on writable targets. |
+| Logs | Docker and Compose logs. |
+| Inspect | Container details, including environments that may contain secrets. |
+| Terminal | Host terminals when granted on a Server; container terminals on attached Stacks or Deployments. |
+| Attach | Attaching workloads to a Server, Builds to a Builder, or dependent resources to a Build or Repo. |
+| Processes | The Server's running process list. |
 
-## Permission Levels
+A Stack can inherit specific permissions from its Server, but still needs a base permission on the Stack. Volume access uses the Server's permissions. **Server FileManager permission covers every eligible named volume on that host**, including application data and credentials; it cannot be limited to one Volume. Private Komodo recovery storage remains unavailable in File Manager.
 
-There are 4 permission levels a user / group can be given on a Resource:
+Cross-server restore also requires Execute and Backups on the destination Server. Creating a recovered Stack additionally requires Stack creation access. Repository configuration, fleet scheduling, and Core recovery are administrator-only. Granting Backups does not enroll a worker; administrators separately [approve trusted hosts](/administration/backups#configure-backups).
 
- 1. **None**. The user will not have any access to the resource. The user **will not see it in the GUI, and it will not show up if the user queries the Komodo API directly**. All attempts to view or update the resource will be blocked. This is the default for non-admins, unless using `KOMODO_TRANSPARENT_MODE=true`.
+## Permissioning by resource type
 
- 2. **Read**. This is the first permission level that grants any access. It will enable the user to **see the resource in the GUI and read the configuration**. Any attempts to update configuration or trigger any action **will be blocked**.  Using `KOMODO_TRANSPARENT_MODE=true` will make this level the base level on all resources, for all users.
-
- 3. **Execute**. This level will allow the user to execute actions on the resource, **like send a build command** or **trigger a redeploy**. The user will still be blocked from updating configuration on the resource.
-
- 4. **Write**. The user has full config write access to the resource, **they can execute any actions, update the configuration, and delete the resource**.
-
-## Specific Permissions
-
-Permission levels alone are not quite enough to provide granular access control.
-Some features are additionally gated behind a specific permission for that feature.
-
-- **`Backups`**: User can access encrypted snapshots for the associated Stack or Server-backed Volume.
-  - Read permits listing snapshots and browsing their file trees. Execute or Write permits manual backup and same-target restore.
-  - A Stack accepts `Backups` directly or inherits it from its attached Server. A Volume uses the Server grant.
-  - New Server and Stack creators receive `Backups` with their creator permissions. Existing grants are unchanged and must be updated explicitly. Creation does not enroll the Server as a trusted backup worker: an administrator must separately verify its address and Periphery public key in [Trusted backup workers](/administration/backups#enroll-trusted-workers) before Core sends shared repository credentials. Anyone administering an enrolled host must be trusted with fleet-wide repository access.
-  - Cross-node restore also requires Execute plus `Backups` on the destination Server. Any recovered Stack requires that destination Server permission—even on its historical Server—plus the existing Stack-create permission.
-  - Fleet schedule, repositories, retention, Core recovery, mirror promotion, unbound snapshots, and maintenance remain admin-only. See [Backups](/administration/backups#permissions).
-- **`FileManager`**: User can access the [File Manager](/features/file-manager) on the associated resource.
-  - Valid on `Server` and `Stack`.
-  - The base level still controls the allowed operation: Read or Execute permits browsing and downloads, while Write permits changes when the target is writable.
-  - On a `Stack`, access is confined to that Stack's resolved file root. Stacks inherit specific permissions from their attached Server, but still require a base permission level on the Stack.
-  - On a `Server`, this permits File Manager access to **every eligible Docker named volume on that Server**; there is no per-volume permission target. Volume roots that overlap Periphery's private File Manager journal are excluded by filesystem identity. This makes the official template's `komodo_data` volume unavailable in File Manager. Treat the grant as a sensitive, host-wide data permission for every other named volume.
-  - `KOMODO_TRANSPARENT_MODE=true` grants a base Read level, not this specific permission.
-- **`Logs`**: User can retrieve docker / docker compose logs on the associated resource.
-  - Valid on `Server`, `Stack`, `Deployment`.
-  - For admins wanting this permission by default for all users with read permissions, see below on default user groups.
-- **`Inspect`**:  User can "inspect" docker containers.
-  - Valid on `Server`, `Stack`, `Deployment`.
-  - **On Servers**: Access to this api will expose all container environments on the given server,
-  and can easily lead to secrets being leaked to unintended users if not protected.
-- **`Terminal`**: User can access the associated resource's terminal.
-  - If given on a `Server`, this allows server level terminal access, and all container exec priviledges (Including attached `Stacks` / `Deployments`).
-  - If given on a `Stack` or `Deployment`, this allows container exec terminal (even without `Terminal` on `Server`).
-- **`Attach`**: User can "attach" *other resources* to the resource.
-  - If given on a `Server`, allows users to attach `Stacks`, `Deployments`, `Repos`, and `Builders`.
-  - If given on a `Builder`, allows users to attach `Builds` and `Repos`.
-  - If given on a `Build`, allows users to attach it to `Deployments`.
-  - If given on a `Repo`, allows users to attach it to `Stacks`, `Builds`, and `Resource Syncs`.
-- **`Processes`**: User can retrieve the full running process list on the `Server`.
-
-## Permissioning by Resource Type
-
-Users or User Groups can be given a base permission level on all Resources of a particular type, such as Stack.
-In TOML form, this looks like:
+Use a resource-type grant when a team should access all resources of that type. Resource-specific grants can add access for selected resources. For example, in a [Resource Sync](/features/resource-sync#user-group):
 
 ```toml
 [[user_group]]
-name = "groupo"
-users = ["mbecker20", "karamvirsingh98"]
-all.Build = "Execute" # <- Group members can run all builds (but not update config),
-all.Stack = { level = "Read", specific = ["Logs"] }    # <- And see all Stacks / logs (no deploy / update, file manager, inspect, or terminal access).
-```
-
-A user / group can still be given a greater permission level on select resources:
-
-```toml
+name = "operators"
+users = ["alice", "bob"]
+all.Stack = { level = "Read", specific = ["Logs"] }
 permissions = [
-  # Grant addition specific permission (Logs are already granted above)
-  { target.type = "Stack", target.id = "my-stack", level = "Execute", specific = ["Inspect", "Terminal"] },
-  # Use regex to match multiple resources, for example give john execute on all of their Stacks
-  { target.type = "Stack", target.id = "\\^john-(.+)$\\", level = "Execute" },
+  { target.type = "Stack", target.id = "web", level = "Execute" },
 ]
 ```
 
 ## Administration
 
-Users can be given Admin privileges by a `Super Admin` (only the first user is given this status, set with `super_admin: true` on a User document in database). Super admins will see the "Make Admin" button when on a User page `/users/${user_id}`.
+The initial super administrator can use **Make Admin** on a user's page. Administrators have unrestricted resource access and can manage non-admin users.
 
-These users have unrestricted access to all Komodo Resources. Additionally, these users can update other (non-admin) user's permissions on resources.
-
-Komodo admins are responsible for managing user accounts as well. When a user logs into Komodo for the first time, they will not immediately be granted access (this can changed with `KOMODO_ENABLE_NEW_USERS=true`). An admin must first **enable** the user, which can be done from the `Users` tab on `Settings` page. Users can also be **disabled** by an admin at any time, which blocks all their access to the GUI and API. 
-
-Users also have some configurable global permissions, these are:
-
- - create server permission
- - create build permission
-
-Only users with these permissions (as well as admins) can add additional servers to Komodo, and can create additional builds, respectively.
+New users need administrator approval unless `KOMODO_ENABLE_NEW_USERS=true`. Disable an account from **Settings → Users** to block its GUI and API access. Grant global Server or Build creation permission only when the user should create those resources.

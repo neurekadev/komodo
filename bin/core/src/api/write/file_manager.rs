@@ -306,7 +306,7 @@ fn start_live_managed_transaction(
 
 fn transaction_periphery_target(
   transaction: &ManagedFileManagerTransaction,
-) -> periphery::PeripheryFileManagerTarget {
+) -> anyhow::Result<periphery::PeripheryFileManagerTarget> {
   let mut stack = Stack {
     id: transaction.stack_id.clone(),
     name: transaction.stack_name.clone(),
@@ -319,15 +319,16 @@ fn transaction_periphery_target(
   if managed.kind == ManagedFileKind::Environment {
     stack.config.env_file_path = managed.path;
   }
-  periphery::PeripheryFileManagerTarget::Stack {
+  Ok(periphery::PeripheryFileManagerTarget::Stack {
     stack: Box::new(stack),
     repo: None,
-  }
+    protected_paths: crate::backup::file_manager_protected_paths()?,
+  })
 }
 
 fn environment_migration_periphery_target(
   transaction: &ManagedEnvironmentPathMigration,
-) -> periphery::PeripheryFileManagerTarget {
+) -> anyhow::Result<periphery::PeripheryFileManagerTarget> {
   let mut stack = Stack {
     id: transaction.stack_id.clone(),
     name: transaction.stack_name.clone(),
@@ -337,10 +338,11 @@ fn environment_migration_periphery_target(
   stack.config.file_paths =
     vec![transaction.compose_file_path.clone()];
   stack.config.env_file_path = transaction.old_path.clone();
-  periphery::PeripheryFileManagerTarget::Stack {
+  Ok(periphery::PeripheryFileManagerTarget::Stack {
     stack: Box::new(stack),
     repo: None,
-  }
+    protected_paths: crate::backup::file_manager_protected_paths()?,
+  })
 }
 
 async fn stored_stack_environment_path(
@@ -532,7 +534,7 @@ async fn reconcile_managed_environment_migration(
   let server = resource::get::<Server>(&transaction.server_id)
     .await
     .context("Managed environment migration server is unavailable")?;
-  let target = environment_migration_periphery_target(transaction);
+  let target = environment_migration_periphery_target(transaction)?;
   let stored_path =
     stored_stack_environment_path(&transaction.stack_id).await?;
   let status = periphery_client(&server)
@@ -628,7 +630,7 @@ pub async fn prepare_managed_environment_path_migration(
     let status = periphery_client(&server)
       .await?
       .request(periphery::PrepareManagedEnvironmentFileMigration {
-        target: environment_migration_periphery_target(&transaction),
+        target: environment_migration_periphery_target(&transaction)?,
         operation_id: transaction.operation_id.clone(),
         old_path: transaction.old_path.clone(),
         new_path: transaction.new_path.clone(),
@@ -865,7 +867,7 @@ async fn reconcile_managed_transaction(
   let server = resource::get::<Server>(&transaction.server_id)
     .await
     .context("Managed save server is unavailable")?;
-  let target = transaction_periphery_target(transaction);
+  let target = transaction_periphery_target(transaction)?;
   let managed = transaction_managed_file(transaction);
   let source =
     managed_stack_source(&transaction.stack_id, managed.kind).await?;

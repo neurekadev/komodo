@@ -1280,6 +1280,7 @@ async fn validate_restore_destinations(
       docker,
       &containers,
       protected_repository_paths,
+      true,
     )
     .await?;
   for item in publish {
@@ -1942,6 +1943,7 @@ async fn discover_source(
       docker,
       &containers,
       protected_repository_paths,
+      true,
     )
     .await?;
   match target {
@@ -2148,16 +2150,32 @@ fn unfiltered_source_filters() -> BackupSourceFilters {
   }
 }
 
+pub(crate) async fn file_manager_protected_sources(
+  docker: &crate::docker::DockerClient,
+  protected_paths: &[ProtectedRepositoryPath],
+) -> anyhow::Result<Vec<PathBuf>> {
+  let containers = docker.list_containers().await?;
+  resolve_protected_repository_sources(
+    docker,
+    &containers,
+    protected_paths,
+    false,
+  )
+  .await
+}
+
 async fn resolve_protected_repository_sources(
   docker: &crate::docker::DockerClient,
   containers: &[ContainerListItem],
   protected_repository_paths: &[ProtectedRepositoryPath],
+  include_skipped: bool,
 ) -> anyhow::Result<Vec<PathBuf>> {
   let mut sources = BTreeSet::new();
   let own_id = komodo_backup::container::current_container_id();
   for container in containers.iter().filter(|container| {
     is_core_container(container, protected_repository_paths)
-      || (container_backup_is_skipped(container)
+      || (include_skipped
+        && container_backup_is_skipped(container)
         && !own_id
           .as_deref()
           .is_some_and(|id| container_matches_id(container, id)))
@@ -2282,7 +2300,7 @@ fn map_path_through_mount(
   }
 }
 
-fn validate_path_outside_protected_repositories(
+pub(super) fn validate_path_outside_protected_repositories(
   path: &Path,
   protected_repository_sources: &[PathBuf],
   label: &str,
