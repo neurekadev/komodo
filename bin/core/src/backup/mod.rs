@@ -8671,7 +8671,11 @@ mod tests {
       backend: BackupRepositoryBackend::S3 {
         url: url.into(),
         region: "ca-vancouver-1".into(),
-        ..Default::default()
+        access_key_id: Default::default(),
+        secret_access_key: Default::default(),
+        worker_access_key_id: Default::default(),
+        worker_secret_access_key: Default::default(),
+        soft_delete: false,
       },
       ..Default::default()
     };
@@ -8764,7 +8768,11 @@ mod tests {
       backend: BackupRepositoryBackend::S3 {
         url: url.into(),
         region: "ca-vancouver-1".into(),
-        ..Default::default()
+        access_key_id: Default::default(),
+        secret_access_key: Default::default(),
+        worker_access_key_id: Default::default(),
+        worker_secret_access_key: Default::default(),
+        soft_delete: false,
       },
       ..Default::default()
     };
