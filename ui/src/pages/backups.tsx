@@ -1292,7 +1292,7 @@ function RepositoryEditor({
       )}
       {backend.type === "S3" && (
         <SimpleGrid cols={{ base: 1, md: 2 }}>
-          <TextInput label="S3 URL" placeholder="s3://bucket/prefix" value={backend.params.url} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, url: event.currentTarget.value } })} />
+          <TextInput label="S3 URL" placeholder="s3://endpoint/bucket/prefix" value={backend.params.url} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, url: event.currentTarget.value } })} />
           {<Checkbox label="S3 soft delete" description="Uses tombstones; bucket policies may retain older data and increase storage." checked={backend.params.soft_delete ?? false} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, soft_delete: event.currentTarget.checked } })} />}
           <TextInput label="Region" value={backend.params.region} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, region: event.currentTarget.value } })} />
           <PasswordInput label={recoveryOnly ? "Access key ID" : "Core access key ID"} description={backend.params.access_key_id.configured ? "Configured" : undefined} value={backend.params.access_key_id.value ?? ""} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, access_key_id: { ...backend.params.access_key_id, value: event.currentTarget.value } } })} />
