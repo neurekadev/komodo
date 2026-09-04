@@ -2,7 +2,6 @@ import { BrowseSnapshotButton, RestoreSnapshotButton } from "@/components/backup
 import { usePreviewRequest } from "@/components/backups/use-preview-request";
 import { komodo_client, useInvalidate, useRead, useSetTitle, useUser, useWrite } from "@/lib/hooks";
 import { ICONS } from "@/lib/icons";
-import { useUrlBackedTab } from "@/lib/navigation";
 import {
   Accordion,
   Alert,
@@ -32,16 +31,8 @@ import { notifications } from "@mantine/notifications";
 import { Types } from "komodo_client";
 import { MobileFriendlyTabsSelector, Page, Section, TabNoContent } from "mogh_ui";
 import { useEffect, useMemo, useState } from "react";
-import { useSearchParams } from "react-router-dom";
 
 type BackupTabsView = "Overview" | "Schedule" | "Repositories" | "Recovery";
-
-const BACKUP_TAB_VALUES: readonly BackupTabsView[] = [
-  "Overview",
-  "Schedule",
-  "Repositories",
-  "Recovery",
-];
 
 const backendDefaults = (
   type: Types.BackupRepositoryBackend["type"],
@@ -91,22 +82,10 @@ export default function Backups() {
   const status = useRead("GetBackupStatus", {}, { refetchInterval: 15_000 });
   const settingsQuery = useRead("GetBackupSettings", {}, { enabled: admin });
   const [settings, setSettings] = useState<Types.BackupSettings>();
-  const [storedView, setStoredView] = useLocalStorage<BackupTabsView>({
+  const [view, setView] = useLocalStorage<BackupTabsView>({
     key: "backups-tab-v1",
     defaultValue: "Overview",
   });
-  const [requestedView, setView] = useUrlBackedTab(
-    "tab",
-    BACKUP_TAB_VALUES,
-    storedView,
-    setStoredView,
-  );
-  const [searchParams] = useSearchParams();
-  const tabParameter = searchParams.get("tab")?.toLowerCase();
-  const invalidTab =
-    tabParameter !== undefined &&
-    !BACKUP_TAB_VALUES.some((tab) => tab.toLowerCase() === tabParameter);
-  const view = admin && !invalidTab ? requestedView : "Overview";
   const tabs = useMemo<TabNoContent[]>(
     () => [
       { value: "Overview", icon: ICONS.Dashboard },
@@ -122,10 +101,10 @@ export default function Backups() {
   }, [settingsQuery.data?.updated_at]);
 
   useEffect(() => {
-    if (invalidTab || (user && !admin && requestedView !== "Overview")) {
+    if (user && !admin && view !== "Overview") {
       setView("Overview");
     }
-  }, [admin, invalidTab, requestedView, setView, user]);
+  }, [admin, setView, user, view]);
 
   return (
     <Page
