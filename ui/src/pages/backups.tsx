@@ -14,7 +14,6 @@ import {
   Group,
   Loader,
   Modal,
-  MultiSelect,
   NumberInput,
   Pagination,
   Paper,
