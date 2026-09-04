@@ -1238,7 +1238,12 @@ function RepositoryEditor({
           <Select
             label="Backend"
             value={backend.type}
-            data={["CoreLocal", "S3", "Sftp", "Rest"]}
+            data={[
+              { value: "CoreLocal", label: "Local" },
+              { value: "S3", label: "S3" },
+              { value: "Sftp", label: "SFTP" },
+              { value: "Rest", label: "REST" },
+            ]}
             onChange={(value) => {
               const next = backendDefaults(
                 value as Types.BackupRepositoryBackend["type"],
@@ -1264,7 +1269,7 @@ function RepositoryEditor({
       {backend.type === "CoreLocal" && (
         <TextInput
           label="Persistent Core path"
-          description={recoveryOnly ? "Path to the existing repository mounted into Core." : "Restart Core after adding or changing a Core-local repository."}
+          description={recoveryOnly ? "Path to the existing repository mounted into Core." : "Restart Core after adding or changing a local repository."}
           value={backend.params.path}
           onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, path: event.currentTarget.value } })}
         />
