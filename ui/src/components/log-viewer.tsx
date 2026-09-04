@@ -7,11 +7,14 @@ import {
 } from "@mantine/core";
 import { useEffect, useRef, useState, useMemo } from "react";
 import Convert from "ansi-to-html";
-import { ChevronsDown } from "lucide-react";
+import { ChevronsDown, Copy, Download } from "lucide-react";
+import { updateLogToText } from "@/lib/utils";
+import { sendCopyNotification } from "mogh_ui";
 
 export interface LogViewerProps extends ScrollAreaProps {
   log: string | undefined;
   autoScroll?: boolean;
+  filename?: string;
 }
 
 const convert = new Convert({
@@ -25,6 +28,7 @@ const convert = new Convert({
 export default function LogViewer({
   log,
   autoScroll = true,
+  filename = "komodo-log.txt",
   h = "max(200px, calc(100vh - 320px))",
   ...props
 }: LogViewerProps) {
@@ -69,6 +73,27 @@ export default function LogViewer({
       viewportRef.current.scrollTop = viewportRef.current.scrollHeight;
       setIsAtBottom(true);
     }
+  };
+
+  const copyLog = async () => {
+    if (!log) return;
+    try {
+      await navigator.clipboard.writeText(updateLogToText(log));
+      sendCopyNotification();
+    } catch {
+      // Clipboard APIs can be unavailable (e.g. insecure context); no-op.
+    }
+  };
+
+  const downloadLog = () => {
+    if (!log) return;
+    const blob = new Blob([updateLogToText(log)], { type: "text/plain" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    link.click();
+    URL.revokeObjectURL(url);
   };
 
   return (
@@ -119,6 +144,28 @@ export default function LogViewer({
         right={12}
       >
         <ChevronsDown size="1.3rem" />
+      </ActionIcon>
+      <ActionIcon
+        onClick={() => void copyLog()}
+        title="Copy log"
+        size="lg"
+        pos="absolute"
+        top={12}
+        right={48}
+        disabled={!log}
+      >
+        <Copy size="1.3rem" />
+      </ActionIcon>
+      <ActionIcon
+        onClick={downloadLog}
+        title="Download log"
+        size="lg"
+        pos="absolute"
+        top={12}
+        right={84}
+        disabled={!log}
+      >
+        <Download size="1.3rem" />
       </ActionIcon>
     </ScrollArea>
   );
