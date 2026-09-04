@@ -1033,30 +1033,86 @@ function StackSelectionEditor({
   settings: Types.BackupSettings;
   patch: (value: Partial<Types.BackupSettings>) => void;
 }) {
-  // The resource-list API explicitly uses zero for an unlimited result set.
-  const stacks = useRead("ListStacks", { query: {}, limit: 0 }).data ?? [];
+  const servers = useRead("ListServers", { query: {}, limit: 0 }).data ?? [];
+  const mode = settings.stack_selection.mode ?? Types.BackupSelectionMode.All;
+  const selected = settings.stack_selection.stack_ids ?? [];
+  const toggle = (stackId: string) => {
+    patch({
+      stack_selection: {
+        ...settings.stack_selection,
+        stack_ids: selected.includes(stackId)
+          ? selected.filter((id) => id !== stackId)
+          : [...selected, stackId],
+      },
+    });
+  };
+
   return (
-    <Grid align="end">
-      <Grid.Col span={{ base: 12, md: 3 }}>
-        <Select
-          label="Stack selection"
-          value={settings.stack_selection.mode ?? Types.BackupSelectionMode.All}
-          data={Object.values(Types.BackupSelectionMode)}
-          onChange={(mode) => patch({ stack_selection: { ...settings.stack_selection, mode: mode as Types.BackupSelectionMode } })}
-        />
-      </Grid.Col>
-      <Grid.Col span={{ base: 12, md: 9 }}>
-        <MultiSelect
-          label="Selected Stacks"
-          disabled={(settings.stack_selection.mode ?? Types.BackupSelectionMode.All) === Types.BackupSelectionMode.All}
-          data={stacks.map((stack) => ({ value: stack.id, label: stack.name }))}
-          value={settings.stack_selection.stack_ids ?? []}
-          onChange={(stack_ids) => patch({ stack_selection: { ...settings.stack_selection, stack_ids } })}
-          searchable
-          clearable
-        />
-      </Grid.Col>
-    </Grid>
+    <Stack mt="md">
+      <Select
+        label="Stack selection"
+        value={mode}
+        data={Object.values(Types.BackupSelectionMode)}
+        onChange={(value) =>
+          patch({
+            stack_selection: {
+              ...settings.stack_selection,
+              mode: value as Types.BackupSelectionMode,
+            },
+          })
+        }
+      />
+      {mode !== Types.BackupSelectionMode.All && (
+        <Accordion variant="separated">
+          {servers.map((server) => (
+            <StackServerChoices
+              key={server.id}
+              serverId={server.id}
+              serverName={server.name}
+              selected={selected}
+              toggle={toggle}
+            />
+          ))}
+        </Accordion>
+      )}
+    </Stack>
+  );
+}
+
+function StackServerChoices({
+  serverId,
+  serverName,
+  selected,
+  toggle,
+}: {
+  serverId: string;
+  serverName: string;
+  selected: string[];
+  toggle: (stackId: string) => void;
+}) {
+  const stacks =
+    useRead("ListStacks", {
+      query: { specific: { server_ids: [serverId] } },
+      limit: 0,
+    }).data ?? [];
+
+  return (
+    <Accordion.Item value={serverId}>
+      <Accordion.Control>{serverName}</Accordion.Control>
+      <Accordion.Panel>
+        <SimpleGrid cols={{ base: 1, md: 3 }}>
+          {stacks.map((stack) => (
+            <Checkbox
+              key={stack.id}
+              label={stack.name}
+              checked={selected.includes(stack.id)}
+              onChange={() => toggle(stack.id)}
+            />
+          ))}
+          {!stacks.length && <Text c="dimmed">No stacks reported.</Text>}
+        </SimpleGrid>
+      </Accordion.Panel>
+    </Accordion.Item>
   );
 }
 
