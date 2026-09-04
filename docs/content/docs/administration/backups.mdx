@@ -27,7 +27,7 @@ Trusted workers receive the shared repository passphrase and can decrypt all sna
 | Backend | What to provide |
 | --- | --- |
 | CoreLocal | A persistent absolute path mounted into Core. Workers connect through Core's authenticated endpoint. |
-| S3 | Bucket/prefix URL, region, and Core and worker access keys. **S3 soft delete** is off by default. |
+| S3 | Endpoint/bucket/prefix URL in the form `s3://endpoint/bucket/prefix`, region, and Core and worker access keys. A bare provider hostname is read as a local path. **S3 soft delete** is off by default. |
 | SFTP | Repository URL, complete private keys for Core and worker accounts, and the server's known-hosts entry. |
 | REST | Repository URL and separate Core and worker tokens. Use HTTPS. |
 

@@ -664,6 +664,7 @@ fn validate_repository_definition(
           "S3 repository URL and region are required"
         ));
       }
+      validate_s3_repository_url(url)?;
     }
     BackupRepositoryBackend::Sftp {
       url, known_hosts, ..
@@ -688,6 +689,41 @@ fn validate_repository_definition(
         ));
       }
     }
+  }
+  Ok(())
+}
+
+/// Vykar treats any repository URL without a recognized scheme as a local
+/// filesystem path, so a bare provider hostname like `s3.example.com` would
+/// create a repository directory inside the Core container instead of
+/// contacting S3. Reject anything that is not a valid S3 endpoint/bucket/prefix
+/// URL before it reaches Vykar.
+fn validate_s3_repository_url(url: &str) -> anyhow::Result<()> {
+  let parsed = url::Url::parse(url.trim()).map_err(|_| {
+    anyhow!(
+      "S3 repository URL must be s3://endpoint/bucket[/prefix]; Vykar treats anything else as a local filesystem path"
+    )
+  })?;
+  if !matches!(parsed.scheme(), "s3" | "s3+https" | "s3+http") {
+    return Err(anyhow!(
+      "S3 repository URL must use the s3:// (or s3+http://) scheme"
+    ));
+  }
+  if parsed.host_str().is_none() {
+    return Err(anyhow!(
+      "S3 repository URL must include an endpoint host"
+    ));
+  }
+  let bucket = parsed
+    .path()
+    .trim_start_matches('/')
+    .split('/')
+    .next()
+    .unwrap_or("");
+  if bucket.is_empty() {
+    return Err(anyhow!(
+      "S3 repository URL must include a bucket in the path (expected s3://endpoint/bucket[/prefix])"
+    ));
   }
   Ok(())
 }
@@ -8259,6 +8295,44 @@ mod tests {
       assert!(
         validate_repository_definition(&repository).is_err(),
         "accepted noncanonical path {path:?}"
+      );
+    }
+  }
+
+  #[test]
+  fn s3_repository_urls_must_be_endpoint_bucket_urls() {
+    let repository = |url: &str| BackupRepository {
+      name: "S3".into(),
+      backend: BackupRepositoryBackend::S3 {
+        url: url.into(),
+        region: "ca-vancouver-1".into(),
+        ..Default::default()
+      },
+      ..Default::default()
+    };
+    // A bare provider hostname must never silently become a local path.
+    for url in [
+      "s3.ca-vancouver-1.megas4.com",
+      "https://s3.example.com/bucket/prefix",
+      "s3://",
+      "s3://endpoint",
+      "s3://endpoint/",
+      "",
+    ] {
+      assert!(
+        validate_repository_definition(&repository(url)).is_err(),
+        "accepted unsafe S3 URL {url:?}"
+      );
+    }
+    for url in [
+      "s3://s3.us-east-1.amazonaws.com/my-bucket/vykar",
+      "s3://s3.ca-vancouver-1.megas4.com/komodo-backups",
+      "s3://s3.ca-vancouver-1.megas4.com/komodo-backups/vykar",
+      "s3+http://minio.local:9000/my-bucket/vykar",
+    ] {
+      assert!(
+        validate_repository_definition(&repository(url)).is_ok(),
+        "rejected valid S3 URL {url:?}"
       );
     }
   }
