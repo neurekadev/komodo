@@ -96,11 +96,12 @@ export interface ActionConfig {
     schedule_alert: boolean;
     /** Whether to send alerts when this action fails. */
     failure_alert: boolean;
-    /** Whether incoming webhooks actually trigger action. */
+    /** Whether incoming webhooks actually trigger action. Disabled by default. */
     webhook_enabled: boolean;
     /**
      * Optionally provide an alternate webhook secret for this procedure.
-     * If its an empty string, use the default secret from the config.
+     * If empty, use the global configured secret. Requests are rejected
+     * when neither location contains a valid secret.
      */
     webhook_secret?: string;
     /**
@@ -692,11 +693,12 @@ export interface BuildConfig {
     branch: string;
     /** Optionally set a specific commit hash. */
     commit?: string;
-    /** Whether incoming webhooks actually trigger action. */
+    /** Whether incoming webhooks actually trigger action. Disabled by default. */
     webhook_enabled: boolean;
     /**
      * Optionally provide an alternate webhook secret for this build.
-     * If its an empty string, use the default secret from the config.
+     * If empty, use the global configured secret. Requests are rejected
+     * when neither location contains a valid secret.
      */
     webhook_secret?: string;
     /**
@@ -1196,11 +1198,12 @@ export interface ProcedureConfig {
     schedule_alert: boolean;
     /** Whether to send alerts when this procedure fails. */
     failure_alert: boolean;
-    /** Whether incoming webhooks actually trigger action. */
+    /** Whether incoming webhooks actually trigger action. Disabled by default. */
     webhook_enabled: boolean;
     /**
      * Optionally provide an alternate webhook secret for this procedure.
-     * If its an empty string, use the default secret from the config.
+     * If empty, use the global configured secret. Requests are rejected
+     * when neither location contains a valid secret.
      */
     webhook_secret?: string;
 }
@@ -2252,11 +2255,12 @@ export interface RepoConfig {
      * - Taken relative to Periphery `repo_dir` (ie `${root_directory}/repos`)
      */
     path?: string;
-    /** Whether incoming webhooks actually trigger action. */
+    /** Whether incoming webhooks actually trigger action. Disabled by default. */
     webhook_enabled: boolean;
     /**
      * Optionally provide an alternate webhook secret for this repo.
-     * If its an empty string, use the default secret from the config.
+     * If empty, use the global configured secret. Requests are rejected
+     * when neither location contains a valid secret.
      */
     webhook_secret?: string;
     /**
@@ -2335,11 +2339,12 @@ export interface ResourceSyncConfig {
      * for the configured git provider.
      */
     git_account?: string;
-    /** Whether incoming webhooks actually trigger action. */
+    /** Whether incoming webhooks actually trigger action. Disabled by default. */
     webhook_enabled: boolean;
     /**
      * Optionally provide an alternate webhook secret for this sync.
-     * If its an empty string, use the default secret from the config.
+     * If empty, use the global configured secret. Requests are rejected
+     * when neither location contains a valid secret.
      */
     webhook_secret?: string;
     /**
@@ -2740,11 +2745,12 @@ export interface StackConfig {
      * If this option is enabled, the repo folder will be deleted and recloned instead.
      */
     reclone?: boolean;
-    /** Whether incoming webhooks actually trigger action. */
+    /** Whether incoming webhooks actually trigger action. Disabled by default. */
     webhook_enabled: boolean;
     /**
      * Optionally provide an alternate webhook secret for this stack.
-     * If its an empty string, use the default secret from the config.
+     * If empty, use the global configured secret. Requests are rejected
+     * when neither location contains a valid secret.
      */
     webhook_secret?: string;
     /**
@@ -6054,12 +6060,15 @@ export type BackupRepositoryBackend =
     params: {
         url: string;
         region: string;
-        /** Authoritative credentials used only by Core for maintenance. */
+        /**
+         * Authoritative credentials used by Core for maintenance and, when
+         * separate worker credentials are disabled, by trusted workers.
+         */
         access_key_id: BackupSecret;
         secret_access_key: BackupSecret;
         /**
-         * Distinct worker-scoped credentials. Their storage policy must deny
-         * deletion, compaction, and other maintenance operations.
+         * Optional distinct worker-scoped credentials. Their storage policy
+         * should deny deletion, compaction, and other maintenance operations.
          */
         worker_access_key_id?: BackupSecret;
         worker_secret_access_key?: BackupSecret;
@@ -6071,11 +6080,14 @@ export type BackupRepositoryBackend =
     type: "Sftp";
     params: {
         url: string;
-        /** Authoritative key used only by Core for maintenance. */
+        /**
+         * Authoritative key used by Core for maintenance and, when separate
+         * worker credentials are disabled, by trusted workers.
+         */
         private_key: BackupSecret;
         /**
-         * Distinct worker-scoped key whose account cannot delete or maintain the
-         * authoritative repository.
+         * Optional distinct worker-scoped key whose account cannot delete or
+         * maintain the authoritative repository.
          */
         worker_private_key?: BackupSecret;
         known_hosts: string;
@@ -6087,9 +6099,12 @@ export type BackupRepositoryBackend =
     type: "Rest";
     params: {
         url: string;
-        /** Authoritative token used only by Core for maintenance. */
+        /**
+         * Authoritative token used by Core for maintenance and, when separate
+         * worker credentials are disabled, by trusted workers.
+         */
         access_token: BackupSecret;
-        /** Distinct append-only or otherwise maintenance-denied worker token. */
+        /** Optional append-only or otherwise maintenance-denied worker token. */
         worker_access_token?: BackupSecret;
         allow_insecure_http?: boolean;
     };
@@ -6107,6 +6122,20 @@ export interface BackupRepository {
     backend: BackupRepositoryBackend;
     /** Vykar repository encryption passphrase. Encryption is mandatory. */
     passphrase?: BackupSecret;
+    /**
+     * Whether trusted workers use the optional worker credentials instead of
+     * the authoritative repository credentials. Missing values are inferred
+     * from configured worker credentials for backward compatibility.
+     */
+    use_worker_credentials?: boolean;
+}
+/** Counts and digest of every changed path, including rows omitted from display. */
+export interface BackupRestorePathSummary {
+    created: number;
+    overwritten: number;
+    deleted: number;
+    /** SHA-256 of the complete, sorted path sets and their change categories. */
+    sha256: string;
 }
 export type BackupTarget = {
     type: "Core";
@@ -6130,14 +6159,6 @@ export type BackupTarget = {
         source_label: string;
     };
 };
-/** Counts and digest of every changed path, including rows omitted from display. */
-export interface BackupRestorePathSummary {
-    created: number;
-    overwritten: number;
-    deleted: number;
-    /** SHA-256 of the complete, sorted path sets and their change categories. */
-    sha256: string;
-}
 export interface BackupRestorePlan {
     id: string;
     snapshot: string;
@@ -6189,6 +6210,14 @@ export interface BackupVolumeSelection {
     mode?: BackupSelectionMode;
     volumes?: BackupVolumeTarget[];
 }
+/** An administrator-approved worker identity with fleet repository access. */
+export interface BackupTrustedWorker {
+    server_id: string;
+    /** Exact configured address; empty for an inbound Periphery connection. */
+    address: string;
+    /** Required pinned Periphery public key. Passkey-only workers are refused. */
+    public_key: string;
+}
 /** Singleton backup configuration. Core is always the scheduler. */
 export interface BackupSettings {
     /** Whether the shared backup schedule is active. */
@@ -6205,31 +6234,35 @@ export interface BackupSettings {
     volume_keep_last: U64;
     stack_selection: BackupStackSelection;
     volume_selection: BackupVolumeSelection;
-    /** Administrator-approved worker identities with fleet repository access. None are trusted by default. */
+    /** Only administrators can enroll workers. No workers are trusted by default. */
     trusted_workers?: BackupTrustedWorker[];
     /** Quiesce the affected running containers during backup. */
     stop_containers: boolean;
-    /** Include Stack bind mounts that live on a different filesystem than the Stack run directory. Disabled by default. */
+    /**
+     * Traverse filesystem boundaries encountered beneath a backup source and
+     * include Stack bind roots stored on a different filesystem.
+     */
     include_cross_filesystem_mounts?: boolean;
-    /** Include anonymous Docker volumes in volume backups. Disabled by default. */
+    /**
+     * Include Docker volumes with daemon-generated anonymous names in Volume
+     * backups. Disabled by default.
+     */
     include_anonymous_volumes?: boolean;
-    /** Vykar/gitignore-style patterns selecting Stack bind-mount source roots. An empty list includes every eligible root. */
+    /**
+     * Vykar/gitignore-style patterns selecting eligible absolute Stack bind
+     * source paths. An empty list includes every otherwise eligible bind.
+     */
     bind_mount_include_patterns?: string[];
-    /** Vykar/gitignore-style patterns excluding Stack bind-mount source roots after include matching. */
+    /**
+     * Vykar/gitignore-style patterns excluding absolute Stack bind source
+     * paths after the include rules are evaluated.
+     */
     bind_mount_exclude_patterns?: string[];
     primary: BackupRepository;
     mirror?: BackupRepository;
     advanced: BackupAdvancedSettings;
     /** Changes whenever settings are saved. */
     updated_at?: I64;
-}
-/** An administrator-approved worker identity with fleet repository access. */
-export interface BackupTrustedWorker {
-    server_id: string;
-    /** Exact configured address; empty for an inbound Periphery connection. */
-    address: string;
-    /** Required pinned Periphery public key. Passkey-only workers are refused. */
-    public_key: string;
 }
 export interface BackupSnapshot {
     name: string;
@@ -6239,8 +6272,11 @@ export interface BackupSnapshot {
     /** Absolute source roots recorded by Vykar at backup time. */
     source_paths: string[];
     /** Exact user-restorable roots, excluding Komodo's internal manifest. */
-    restorable_source_paths: string[];
-    /** Whether the current Stack still resolves to the snapshot's source roots. Populated by Core when snapshots are listed for a Stack. */
+    restorable_source_paths?: string[];
+    /**
+     * Whether the current Stack still resolves to the snapshot's source roots.
+     * Populated by Core when snapshots are listed for a Stack.
+     */
     source_paths_match_current?: boolean;
     created_at: I64;
     original_size: U64;
@@ -6271,7 +6307,7 @@ export interface BackupSnapshotList {
     hidden: U64;
 }
 export interface BackupStatus {
-    active_runs: BackupRun[];
+    active_runs?: BackupRun[];
     recent_runs: BackupRun[];
     next_run_at: I64;
     primary_healthy: boolean;
@@ -9477,6 +9513,15 @@ export interface ListContainers {
     /** Id or name */
     server: string;
 }
+/**
+ * Admin-only discovery for Core recovery using an existing encrypted repository.
+ * Credentials remain in the POST body and are never returned.
+ */
+export interface ListCoreRecoverySnapshots {
+    repository?: BackupRepository;
+    page?: U64;
+    limit: U64;
+}
 export declare enum DeploymentSortBy {
     /** Sort by name. Default. */
     Name = "Name",
@@ -10462,6 +10507,7 @@ export interface PlanBackupRestore {
 /** Admin-only. Restore and validate a Core snapshot without switching databases. */
 export interface PlanCoreRecovery {
     snapshot: string;
+    repository?: BackupRepository;
 }
 export type FileManagerOperation = {
     type: "CreateFile";
@@ -12298,6 +12344,9 @@ export type ReadRequest = {
 } | {
     type: "ListBackupSnapshots";
     params: ListBackupSnapshots;
+} | {
+    type: "ListCoreRecoverySnapshots";
+    params: ListCoreRecoverySnapshots;
 } | {
     type: "ListBackupSnapshotDirectory";
     params: ListBackupSnapshotDirectory;

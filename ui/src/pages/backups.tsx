@@ -2,6 +2,7 @@ import { BrowseSnapshotButton, RestoreSnapshotButton } from "@/components/backup
 import { usePreviewRequest } from "@/components/backups/use-preview-request";
 import { komodo_client, useInvalidate, useRead, useSetTitle, useUser, useWrite } from "@/lib/hooks";
 import { ICONS } from "@/lib/icons";
+import { useUrlBackedTab } from "@/lib/navigation";
 import {
   Accordion,
   Alert,
@@ -16,19 +17,32 @@ import {
   MultiSelect,
   NumberInput,
   Pagination,
+  Paper,
   PasswordInput,
   Select,
   SimpleGrid,
   Stack,
   Switch,
+  Tabs,
   Text,
   TextInput,
   Textarea,
 } from "@mantine/core";
+import { useLocalStorage } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
 import { Types } from "komodo_client";
-import { Page, Section } from "mogh_ui";
-import { useEffect, useState } from "react";
+import { MobileFriendlyTabsSelector, Page, Section, TabNoContent } from "mogh_ui";
+import { useEffect, useMemo, useState } from "react";
+import { useSearchParams } from "react-router-dom";
+
+type BackupTabsView = "Overview" | "Schedule" | "Repositories" | "Recovery";
+
+const BACKUP_TAB_VALUES: readonly BackupTabsView[] = [
+  "Overview",
+  "Schedule",
+  "Repositories",
+  "Recovery",
+];
 
 const backendDefaults = (
   type: Types.BackupRepositoryBackend["type"],
@@ -73,14 +87,46 @@ const patternLines = (value: string) =>
 
 export default function Backups() {
   useSetTitle("Backups");
-  const admin = useUser().data?.admin ?? false;
+  const user = useUser().data;
+  const admin = user?.admin ?? false;
   const status = useRead("GetBackupStatus", {}, { refetchInterval: 15_000 });
   const settingsQuery = useRead("GetBackupSettings", {}, { enabled: admin });
   const [settings, setSettings] = useState<Types.BackupSettings>();
+  const [storedView, setStoredView] = useLocalStorage<BackupTabsView>({
+    key: "backups-tab-v1",
+    defaultValue: "Overview",
+  });
+  const [requestedView, setView] = useUrlBackedTab(
+    "tab",
+    BACKUP_TAB_VALUES,
+    storedView,
+    setStoredView,
+  );
+  const [searchParams] = useSearchParams();
+  const tabParameter = searchParams.get("tab")?.toLowerCase();
+  const invalidTab =
+    tabParameter !== undefined &&
+    !BACKUP_TAB_VALUES.some((tab) => tab.toLowerCase() === tabParameter);
+  const view = admin && !invalidTab ? requestedView : "Overview";
+  const tabs = useMemo<TabNoContent[]>(
+    () => [
+      { value: "Overview", icon: ICONS.Dashboard },
+      { value: "Schedule", icon: ICONS.Schedule, hidden: !admin },
+      { value: "Repositories", icon: ICONS.Volume, hidden: !admin },
+      { value: "Recovery", icon: ICONS.Restart, hidden: !admin },
+    ],
+    [admin],
+  );
 
   useEffect(() => {
     if (settingsQuery.data) setSettings(structuredClone(settingsQuery.data));
   }, [settingsQuery.data?.updated_at]);
+
+  useEffect(() => {
+    if (invalidTab || (user && !admin && requestedView !== "Overview")) {
+      setView("Overview");
+    }
+  }, [admin, invalidTab, requestedView, setView, user]);
 
   return (
     <Page
@@ -88,8 +134,18 @@ export default function Backups() {
       icon={ICONS.Backup}
       description="Schedule and recover encrypted Core, Stack, and Volume backups across every Periphery."
     >
-      <Stack gap="xl">
-        <Group justify="end">
+      <Tabs value={view}>
+        <Stack gap="xl">
+          <Group justify="space-between">
+            {admin ? (
+              <MobileFriendlyTabsSelector
+                tabs={tabs}
+                value={view}
+                onValueChange={setView as any}
+              />
+            ) : (
+              <div />
+            )}
           <Button
             component="a"
             href="https://komodo.docs.neureka.dev/administration/backups"
@@ -98,26 +154,69 @@ export default function Backups() {
           >
             Backup and recovery guide
           </Button>
-        </Group>
-        <StatusSection status={status.data} />
-        {admin && <SnapshotInventory />}
-        {!admin ? (
-          <Alert color="blue">
-            Repository setup and fleet scheduling are administrator-only. Use
-            the Backups tab on a permitted Stack or Volume to browse snapshots,
-            run a backup, or restore it.
-          </Alert>
-        ) : !settings ? (
-          <Loader />
-        ) : (
-          <BackupSettingsForm
-            settings={settings}
-            persistedSettings={settingsQuery.data}
-            onChange={setSettings}
-          />
-        )}
-      </Stack>
+          </Group>
+          {view === "Overview" ? (
+            <OverviewTab status={status.data} />
+          ) : !settings ? (
+            <Loader />
+          ) : view === "Recovery" ? (
+            <CoreRecoverySection />
+          ) : (
+            <BackupSettingsForm
+              view={view}
+              settings={settings}
+              persistedSettings={settingsQuery.data}
+              onChange={setSettings}
+            />
+          )}
+          {!admin && (
+            <Alert color="blue">
+              Repository setup and fleet scheduling are administrator-only. Use
+              the Backups tab on a permitted Stack or Volume to browse snapshots,
+              run a backup, or restore it.
+            </Alert>
+          )}
+        </Stack>
+      </Tabs>
     </Page>
+  );
+}
+
+function OverviewTab({ status }: { status?: Types.BackupStatus }) {
+  const admin = useUser().data?.admin ?? false;
+  const invalidate = useInvalidate();
+  const { mutate: run, isPending: running } = useWrite("RunBackup", {
+    onSuccess: (result) => {
+      invalidate(["GetBackupStatus"]);
+      notifications.show({
+        color: result.state === Types.BackupRunState.Failed ? "red" : "green",
+        message: result.message,
+      });
+    },
+  });
+  return (
+    <Stack gap="xl">
+      {admin && (
+        <Group justify="end">
+          <Button
+            variant="light"
+            loading={running}
+            onClick={() => run({})}
+          >
+            Back up fleet now
+          </Button>
+          <Button
+            variant="light"
+            loading={running}
+            onClick={() => run({ target: { type: "Core" } })}
+          >
+            Back up Core now
+          </Button>
+        </Group>
+      )}
+      <StatusSection status={status} />
+      {admin && <SnapshotInventory />}
+    </Stack>
   );
 }
 
@@ -232,7 +331,7 @@ function StatusSection({ status }: { status?: Types.BackupStatus }) {
             status?.mirror_healthy == null
               ? "Not configured"
               : status.mirror_healthy
-                ? "Healthy"
+                ? `Healthy · ${status.mirror_lagging_snapshots} lagging`
                 : "Unavailable"
           }
           color={
@@ -244,15 +343,19 @@ function StatusSection({ status }: { status?: Types.BackupStatus }) {
           }
         />
         <StatusItem
-          label="Mirror lag"
-          value={`${status?.mirror_lagging_snapshots ?? 0} snapshots`}
-        />
-        <StatusItem
           label="Next run"
           value={
             status?.next_run_at
               ? new Date(status.next_run_at).toLocaleString()
               : "Not scheduled"
+            }
+          />
+        <StatusItem
+          label="Last full verification"
+          value={
+            status?.last_full_verification_at
+              ? new Date(status.last_full_verification_at).toLocaleString()
+              : "Never"
           }
         />
       </SimpleGrid>
@@ -266,9 +369,9 @@ function StatusSection({ status }: { status?: Types.BackupStatus }) {
           {status.critical_alert}
         </Alert>
       )}
-      {admin && !!status?.active_runs.length && (
+      {admin && !!status?.active_runs?.length && (
         <Stack mt="md" gap="xs">
-          {status.active_runs.map((run) => (
+          {(status.active_runs ?? []).map((run) => (
             <Group key={run.id} justify="space-between">
               <Text size="sm">Active: {run.message}</Text>
               {run.cancellable && (
@@ -330,10 +433,12 @@ function StatusItem({
 }
 
 function BackupSettingsForm({
+  view,
   settings,
   persistedSettings,
   onChange,
 }: {
+  view: "Schedule" | "Repositories";
   settings: Types.BackupSettings;
   persistedSettings?: Types.BackupSettings;
   onChange: (settings: Types.BackupSettings) => void;
@@ -357,15 +462,6 @@ function BackupSettingsForm({
     "InitializeBackupRepositories",
     { onSuccess: (run) => notifications.show({ color: "green", message: run.message }) },
   );
-  const { mutate: run, isPending: running } = useWrite("RunBackup", {
-    onSuccess: (result) => {
-      invalidate(["GetBackupStatus"]);
-      notifications.show({
-        color: result.state === Types.BackupRunState.Failed ? "red" : "green",
-        message: result.message,
-      });
-    },
-  });
   const { mutate: verify, isPending: verifying } = useWrite(
     "VerifyBackupRepository",
     {
@@ -389,7 +485,9 @@ function BackupSettingsForm({
 
   return (
     <Stack gap="xl">
-      <Section title="Simple schedule" icon={<ICONS.Schedule size="1.3rem" />}>
+      {view === "Schedule" && (
+        <>
+          <Section title="Simple schedule" icon={<ICONS.Schedule size="1.3rem" />}>
         <Stack>
           <Switch
             label="Enable scheduled backups"
@@ -420,9 +518,9 @@ function BackupSettingsForm({
             onChange={(event) => patch({ stop_containers: event.currentTarget.checked })}
           />
         </Stack>
-      </Section>
+          </Section>
 
-      <Section title="What to protect" icon={<ICONS.Backup size="1.3rem" />}>
+          <Section title="What to protect" icon={<ICONS.Backup size="1.3rem" />}>
         <SimpleGrid cols={{ base: 1, md: 3 }}>
           <CategoryEditor
             label="Core"
@@ -504,11 +602,13 @@ function BackupSettingsForm({
         </Stack>
         <StackSelectionEditor settings={settings} patch={patch} />
         <VolumeSelectionEditor settings={settings} patch={patch} />
-      </Section>
+          </Section>
+        </>
+      )}
 
-      <TrustedWorkersEditor settings={settings} patch={patch} />
-
-      <Section title="Encrypted repositories" icon={<ICONS.Volume size="1.3rem" />}>
+      {view === "Repositories" && (
+        <>
+          <Section title="Encrypted repositories" icon={<ICONS.Volume size="1.3rem" />}>
         <Alert color="blue" mb="md">
           The primary is the only snapshot source of truth. A mirror is not
           readable until full verification and explicit promotion.
@@ -553,122 +653,215 @@ function BackupSettingsForm({
             onChange={(mirror) => patch({ mirror })}
           />
         )}
-      </Section>
-
-      <CoreRecoverySection />
+          </Section>
+          <TrustedWorkersEditor settings={settings} patch={patch} />
+        </>
+      )}
 
       <Accordion variant="contained">
         <Accordion.Item value="advanced">
-          <Accordion.Control>Advanced integrity and performance</Accordion.Control>
+          <Accordion.Control>
+            {view === "Schedule"
+              ? "Advanced execution settings"
+              : "Advanced integrity and maintenance"}
+          </Accordion.Control>
           <Accordion.Panel>
             <SimpleGrid cols={{ base: 1, md: 2 }}>
-              <NumberInput
-                label="Concurrent nodes"
-                min={1}
-                value={settings.advanced.node_concurrency}
-                onChange={(value) => patch({ advanced: { ...settings.advanced, node_concurrency: Number(value) } })}
-              />
-              <NumberInput
-                label="Upload MiB/s, per node"
-                description="Zero is unlimited."
-                min={0}
-                step={1}
-                allowDecimal={false}
-                value={settings.advanced.upload_bytes_per_second / (1024 * 1024)}
-                onChange={(value) => patch({ advanced: { ...settings.advanced, upload_bytes_per_second: Number(value) * 1024 * 1024 } })}
-              />
-              <NumberInput
-                label="Client repack cap (bytes)"
-                description="Defaults to 5 GiB per S3/SFTP maintenance cycle."
-                min={0}
-                value={settings.advanced.client_repack_limit_bytes}
-                onChange={(value) => patch({ advanced: { ...settings.advanced, client_repack_limit_bytes: Number(value) } })}
-              />
-              <NumberInput
-                label="Compaction threshold (%)"
-                min={1}
-                max={100}
-                value={settings.advanced.compact_threshold_percent}
-                onChange={(value) => patch({ advanced: { ...settings.advanced, compact_threshold_percent: Number(value) } })}
-              />
-              <NumberInput
-                label="Full verification interval (days)"
-                min={1}
-                value={settings.advanced.full_verify_every_days}
-                onChange={(value) => patch({ advanced: { ...settings.advanced, full_verify_every_days: Number(value) } })}
-              />
-              <NumberInput
-                label="Repository sample per cycle (%)"
-                min={1}
-                max={100}
-                value={settings.advanced.verify_sample_percent}
-                onChange={(value) => patch({ advanced: { ...settings.advanced, verify_sample_percent: Number(value) } })}
-              />
+              {view === "Schedule" ? (
+                <>
+                  <NumberInput
+                    label="Concurrent nodes"
+                    min={1}
+                    value={settings.advanced.node_concurrency}
+                    onChange={(value) =>
+                      patch({
+                        advanced: {
+                          ...settings.advanced,
+                          node_concurrency: Number(value),
+                        },
+                      })
+                    }
+                  />
+                  <NumberInput
+                    label="Upload MiB/s, per node"
+                    description="Zero is unlimited."
+                    min={0}
+                    step={1}
+                    allowDecimal={false}
+                    value={
+                      settings.advanced.upload_bytes_per_second / (1024 * 1024)
+                    }
+                    onChange={(value) =>
+                      patch({
+                        advanced: {
+                          ...settings.advanced,
+                          upload_bytes_per_second:
+                            Number(value) * 1024 * 1024,
+                        },
+                      })
+                    }
+                  />
+                </>
+              ) : (
+                <>
+                  <NumberInput
+                    label="Client repack cap (bytes)"
+                    description="Defaults to 5 GiB per S3/SFTP maintenance cycle."
+                    min={0}
+                    value={settings.advanced.client_repack_limit_bytes}
+                    onChange={(value) =>
+                      patch({
+                        advanced: {
+                          ...settings.advanced,
+                          client_repack_limit_bytes: Number(value),
+                        },
+                      })
+                    }
+                  />
+                  <NumberInput
+                    label="Compaction threshold (%)"
+                    min={1}
+                    max={100}
+                    value={settings.advanced.compact_threshold_percent}
+                    onChange={(value) =>
+                      patch({
+                        advanced: {
+                          ...settings.advanced,
+                          compact_threshold_percent: Number(value),
+                        },
+                      })
+                    }
+                  />
+                  <NumberInput
+                    label="Full verification interval (days)"
+                    min={1}
+                    value={settings.advanced.full_verify_every_days}
+                    onChange={(value) =>
+                      patch({
+                        advanced: {
+                          ...settings.advanced,
+                          full_verify_every_days: Number(value),
+                        },
+                      })
+                    }
+                  />
+                  <NumberInput
+                    label="Repository sample per cycle (%)"
+                    min={1}
+                    max={100}
+                    value={settings.advanced.verify_sample_percent}
+                    onChange={(value) =>
+                      patch({
+                        advanced: {
+                          ...settings.advanced,
+                          verify_sample_percent: Number(value),
+                        },
+                      })
+                    }
+                  />
+                </>
+              )}
             </SimpleGrid>
           </Accordion.Panel>
         </Accordion.Item>
       </Accordion>
 
-      {settingsDirty && (
-        <Text size="sm" c="dimmed">
-          Save the displayed settings before initializing, verifying, promoting, or running backups.
-        </Text>
-      )}
-      <Group justify="end">
-        <Button variant="default" loading={verifying} disabled={settingsDirty || saving} onClick={() => verify({ mirror: false, full: true })}>
-          Verify primary
-        </Button>
-        {settings.mirror && (
-          <>
-            <Button variant="default" loading={verifying} disabled={settingsDirty || saving} onClick={() => verify({ mirror: true, full: true })}>
-              Verify mirror
-            </Button>
-            <Button color="orange" loading={promoting} disabled={settingsDirty || saving} onClick={() => promote({ allow_primary_unavailable: false })}>
-              Verify and promote mirror
+      {view === "Repositories" && (
+        <Section
+          title="Repository operations"
+          icon={<ICONS.Execution size="1.3rem" />}
+        >
+          {settingsDirty && (
+            <Text size="sm" c="dimmed" mb="md">
+              Save settings before initializing, verifying, or promoting a
+              repository.
+            </Text>
+          )}
+          <Group justify="end">
+            <Button
+              variant="default"
+              loading={initializing}
+              disabled={settingsDirty || saving}
+              title={
+                settingsDirty
+                  ? "Save the displayed settings before initializing repositories."
+                  : undefined
+              }
+              onClick={() => initialize({})}
+            >
+              Initialize repositories
             </Button>
             <Button
-              color="red"
-              variant="light"
-              loading={promoting}
+              variant="default"
+              loading={verifying}
               disabled={settingsDirty || saving}
-              onClick={() => {
-                if (globalThis.confirm("The primary repository is unavailable. Fully verify and promote the mirror without comparing it to the primary inventory?")) {
-                  promote({ allow_primary_unavailable: true });
-                }
-              }}
+              onClick={() => verify({ mirror: false, full: true })}
             >
-              Disaster recovery promotion
+              Verify primary
             </Button>
-          </>
-        )}
-        <Button
-          variant="default"
-          loading={initializing}
-          disabled={settingsDirty || saving}
-          title={
-            settingsDirty
-              ? "Save the displayed settings before initializing repositories."
-              : undefined
-          }
-          onClick={() => initialize({})}
-        >
-          Initialize repositories
-        </Button>
-        <Button variant="light" loading={running} disabled={settingsDirty || saving} onClick={() => run({})}>
-          Back up fleet now
-        </Button>
-        <Button
-          variant="light"
-          loading={running}
-          disabled={settingsDirty || saving}
-          onClick={() => run({ target: { type: "Core" } })}
-        >
-          Back up Core now
-        </Button>
-        <Button leftSection={<ICONS.Save size="1rem" />} loading={saving} onClick={() => save({ settings })}>
-          Save settings
-        </Button>
-      </Group>
+            {settings.mirror && (
+              <>
+                <Button
+                  variant="default"
+                  loading={verifying}
+                  disabled={settingsDirty || saving}
+                  onClick={() => verify({ mirror: true, full: true })}
+                >
+                  Verify mirror
+                </Button>
+                <Button
+                  color="orange"
+                  loading={promoting}
+                  disabled={settingsDirty || saving}
+                  onClick={() =>
+                    promote({ allow_primary_unavailable: false })
+                  }
+                >
+                  Verify and promote mirror
+                </Button>
+                <Button
+                  color="red"
+                  variant="light"
+                  loading={promoting}
+                  disabled={settingsDirty || saving}
+                  onClick={() => {
+                    if (
+                      globalThis.confirm(
+                        "The primary repository is unavailable. Fully verify and promote the mirror without comparing it to the primary inventory?",
+                      )
+                    ) {
+                      promote({ allow_primary_unavailable: true });
+                    }
+                  }}
+                >
+                  Disaster recovery promotion
+                </Button>
+              </>
+            )}
+          </Group>
+        </Section>
+      )}
+
+      <Paper
+        withBorder
+        shadow="md"
+        p="md"
+        style={{ position: "sticky", bottom: "1rem", zIndex: 10 }}
+      >
+        <Group justify="space-between">
+          <Text size="sm" c={settingsDirty ? undefined : "dimmed"}>
+            {settingsDirty ? "You have unsaved changes." : "Settings are up to date."}
+          </Text>
+          <Button
+            leftSection={<ICONS.Save size="1rem" />}
+            loading={saving}
+            disabled={!settingsDirty}
+            onClick={() => save({ settings })}
+          >
+            Save settings
+          </Button>
+        </Group>
+      </Paper>
     </Stack>
   );
 }
@@ -890,10 +1083,11 @@ function TrustedWorkersEditor({
     <Section title="Trusted backup workers" icon={<ICONS.Server size="1.3rem" />}>
       <Stack>
         <Alert color="orange">
-          Enrollment gives this host the shared passphrase and worker credentials,
-          including read/decryption access to fleet and Core snapshots. Verify
-          the host and its public key independently. Server creation and Backups
-          permissions do not enroll a worker. Save settings to apply changes.
+          Enrollment gives this host the shared passphrase and repository
+          credentials available to workers, including read/decryption access to
+          fleet and Core snapshots. Verify the host and its public key
+          independently. Server creation and Backups permissions do not enroll a
+          worker. Save settings to apply changes.
         </Alert>
         <Select
           label="Server to trust"
@@ -1031,6 +1225,8 @@ function RepositoryEditor({
 }) {
   const backend = repository.backend;
   const updateBackend = (next: Types.BackupRepositoryBackend) => onChange({ ...repository, backend: next });
+  const useWorkerCredentials =
+    repository.use_worker_credentials ?? workerCredentialsConfigured(backend);
   return (
     <Stack mt="md">
       <Text fw={600}>{label}</Text>
@@ -1039,7 +1235,22 @@ function RepositoryEditor({
           <TextInput label="Repository name" value={repository.name} onChange={(event) => onChange({ ...repository, name: event.currentTarget.value })} />
         </Grid.Col>
         <Grid.Col span={{ base: 12, md: 4 }}>
-          <Select label="Backend" value={backend.type} data={["CoreLocal", "S3", "Sftp", "Rest"]} onChange={(value) => updateBackend(backendDefaults(value as Types.BackupRepositoryBackend["type"]))} />
+          <Select
+            label="Backend"
+            value={backend.type}
+            data={["CoreLocal", "S3", "Sftp", "Rest"]}
+            onChange={(value) => {
+              const next = backendDefaults(
+                value as Types.BackupRepositoryBackend["type"],
+              );
+              onChange({
+                ...repository,
+                backend: next,
+                use_worker_credentials:
+                  next.type === "CoreLocal" ? undefined : false,
+              });
+            }}
+          />
         </Grid.Col>
         <Grid.Col span={{ base: 12, md: 4 }}>
           <PasswordInput
@@ -1059,38 +1270,80 @@ function RepositoryEditor({
         />
       )}
       {backend.type !== "CoreLocal" && !recoveryOnly && (
-        <Alert color="blue">
-          Use distinct worker credentials that permit backup reads and writes but deny deletion and maintenance. Trusted workers can also decrypt Core recovery secrets stored in snapshots.
-        </Alert>
+        <Stack gap="xs">
+          <Switch
+            label="Use separate credentials for backup workers"
+            description="Recommended when workers should not be able to delete or maintain repository data."
+            checked={useWorkerCredentials}
+            onChange={(event) =>
+              onChange({
+                ...repository,
+                use_worker_credentials: event.currentTarget.checked,
+              })
+            }
+          />
+          {!useWorkerCredentials && (
+            <Alert color="orange">
+              Trusted workers will receive the Core repository credentials. A
+              compromised worker could delete or maintain backup data.
+            </Alert>
+          )}
+        </Stack>
       )}
       {backend.type === "S3" && (
         <SimpleGrid cols={{ base: 1, md: 2 }}>
           <TextInput label="S3 URL" placeholder="s3://endpoint/bucket/prefix" value={backend.params.url} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, url: event.currentTarget.value } })} />
           {<Checkbox label="S3 soft delete" description="Uses tombstones; bucket policies may retain older data and increase storage." checked={backend.params.soft_delete ?? false} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, soft_delete: event.currentTarget.checked } })} />}
           <TextInput label="Region" value={backend.params.region} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, region: event.currentTarget.value } })} />
-          <PasswordInput label="Access key ID" description={backend.params.access_key_id.configured ? "Configured" : undefined} value={backend.params.access_key_id.value ?? ""} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, access_key_id: { ...backend.params.access_key_id, value: event.currentTarget.value } } })} />
-          <PasswordInput label="Secret access key" description={backend.params.secret_access_key.configured ? "Configured" : undefined} value={backend.params.secret_access_key.value ?? ""} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, secret_access_key: { ...backend.params.secret_access_key, value: event.currentTarget.value } } })} />
-          {!recoveryOnly && (<PasswordInput label="Worker access key ID" description={backend.params.worker_access_key_id?.configured ? "Configured" : "Required; must be maintenance-denied"} value={backend.params.worker_access_key_id?.value ?? ""} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, worker_access_key_id: { ...backend.params.worker_access_key_id, value: event.currentTarget.value } } })} />)}
-          {!recoveryOnly && (<PasswordInput label="Worker secret access key" description={backend.params.worker_secret_access_key?.configured ? "Configured" : "Required; must be maintenance-denied"} value={backend.params.worker_secret_access_key?.value ?? ""} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, worker_secret_access_key: { ...backend.params.worker_secret_access_key, value: event.currentTarget.value } } })} />)}
+          <PasswordInput label={recoveryOnly ? "Access key ID" : "Core access key ID"} description={backend.params.access_key_id.configured ? "Configured" : undefined} value={backend.params.access_key_id.value ?? ""} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, access_key_id: { ...backend.params.access_key_id, value: event.currentTarget.value } } })} />
+          <PasswordInput label={recoveryOnly ? "Secret access key" : "Core secret access key"} description={backend.params.secret_access_key.configured ? "Configured" : undefined} value={backend.params.secret_access_key.value ?? ""} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, secret_access_key: { ...backend.params.secret_access_key, value: event.currentTarget.value } } })} />
+          {!recoveryOnly && useWorkerCredentials && (<PasswordInput label="Worker access key ID" description={backend.params.worker_access_key_id?.configured ? "Configured" : "Required; must differ from Core credentials"} value={backend.params.worker_access_key_id?.value ?? ""} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, worker_access_key_id: { ...backend.params.worker_access_key_id, value: event.currentTarget.value } } })} />)}
+          {!recoveryOnly && useWorkerCredentials && (<PasswordInput label="Worker secret access key" description={backend.params.worker_secret_access_key?.configured ? "Configured" : "Required; must differ from Core credentials"} value={backend.params.worker_secret_access_key?.value ?? ""} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, worker_secret_access_key: { ...backend.params.worker_secret_access_key, value: event.currentTarget.value } } })} />)}
         </SimpleGrid>
       )}
       {backend.type === "Sftp" && (
         <SimpleGrid cols={{ base: 1, md: 2 }}>
           <TextInput label="SFTP URL" placeholder="sftp://user@host/path" value={backend.params.url} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, url: event.currentTarget.value } })} />
           <NumberInput label="Timeout (seconds)" min={1} value={backend.params.timeout_seconds} onChange={(value) => updateBackend({ ...backend, params: { ...backend.params, timeout_seconds: Number(value) } })} />
-          <Textarea autosize minRows={5} autoComplete="off" spellCheck={false} label="Private key" description={backend.params.private_key.configured ? "Configured; paste only to replace it" : "Paste the complete multiline OpenSSH private key"} value={backend.params.private_key.value ?? ""} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, private_key: { ...backend.params.private_key, value: event.currentTarget.value } } })} />
-          {!recoveryOnly && (<Textarea autosize minRows={5} autoComplete="off" spellCheck={false} label="Worker private key" description={backend.params.worker_private_key?.configured ? "Configured; paste only to replace it" : "Paste the complete multiline key for a maintenance-denied account"} value={backend.params.worker_private_key?.value ?? ""} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, worker_private_key: { ...backend.params.worker_private_key, value: event.currentTarget.value } } })} />)}
+          <Textarea autosize minRows={5} autoComplete="off" spellCheck={false} label={recoveryOnly ? "Private key" : "Core private key"} description={backend.params.private_key.configured ? "Configured; paste only to replace it" : "Paste the complete multiline OpenSSH private key"} value={backend.params.private_key.value ?? ""} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, private_key: { ...backend.params.private_key, value: event.currentTarget.value } } })} />
+          {!recoveryOnly && useWorkerCredentials && (<Textarea autosize minRows={5} autoComplete="off" spellCheck={false} label="Worker private key" description={backend.params.worker_private_key?.configured ? "Configured; paste only to replace it" : "Paste a distinct key for a maintenance-denied account"} value={backend.params.worker_private_key?.value ?? ""} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, worker_private_key: { ...backend.params.worker_private_key, value: event.currentTarget.value } } })} />)}
           <TextInput label="Known-hosts entry" value={backend.params.known_hosts} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, known_hosts: event.currentTarget.value } })} />
         </SimpleGrid>
       )}
       {backend.type === "Rest" && (
         <SimpleGrid cols={{ base: 1, md: 2 }}>
           <TextInput label="REST repository URL" value={backend.params.url} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, url: event.currentTarget.value } })} />
-          <PasswordInput label="Access token" description={backend.params.access_token.configured ? "Configured" : undefined} value={backend.params.access_token.value ?? ""} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, access_token: { ...backend.params.access_token, value: event.currentTarget.value } } })} />
-          {!recoveryOnly && (<PasswordInput label="Worker access token" description={backend.params.worker_access_token?.configured ? "Configured" : "Required; must deny deletion and maintenance"} value={backend.params.worker_access_token?.value ?? ""} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, worker_access_token: { ...backend.params.worker_access_token, value: event.currentTarget.value } } })} />)}
+          <PasswordInput label={recoveryOnly ? "Access token" : "Core access token"} description={backend.params.access_token.configured ? "Configured" : undefined} value={backend.params.access_token.value ?? ""} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, access_token: { ...backend.params.access_token, value: event.currentTarget.value } } })} />
+          {!recoveryOnly && useWorkerCredentials && (<PasswordInput label="Worker access token" description={backend.params.worker_access_token?.configured ? "Configured" : "Required; must differ from the Core token"} value={backend.params.worker_access_token?.value ?? ""} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, worker_access_token: { ...backend.params.worker_access_token, value: event.currentTarget.value } } })} />)}
           <Checkbox label="Allow insecure HTTP" checked={backend.params.allow_insecure_http ?? false} onChange={(event) => updateBackend({ ...backend, params: { ...backend.params, allow_insecure_http: event.currentTarget.checked } })} />
         </SimpleGrid>
       )}
     </Stack>
   );
+}
+
+function workerCredentialsConfigured(
+  backend: Types.BackupRepositoryBackend,
+) {
+  switch (backend.type) {
+    case "S3":
+      return (
+        !!backend.params.worker_access_key_id?.configured ||
+        !!backend.params.worker_secret_access_key?.configured ||
+        !!backend.params.worker_access_key_id?.value ||
+        !!backend.params.worker_secret_access_key?.value
+      );
+    case "Sftp":
+      return (
+        !!backend.params.worker_private_key?.configured ||
+        !!backend.params.worker_private_key?.value
+      );
+    case "Rest":
+      return (
+        !!backend.params.worker_access_token?.configured ||
+        !!backend.params.worker_access_token?.value
+      );
+    default:
+      return false;
+  }
 }

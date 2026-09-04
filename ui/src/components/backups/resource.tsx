@@ -414,7 +414,7 @@ export function RestoreSnapshotButton({
               key={snapshot.name}
               snapshot={snapshot.name}
               selection={{
-                roots: snapshot.restorable_source_paths,
+                roots: snapshot.restorable_source_paths ?? [],
                 paths: selectedPaths,
                 onChange: setSelectedPaths,
               }}

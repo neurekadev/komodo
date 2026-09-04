@@ -5,6 +5,7 @@ export type ReadResponses = {
     GetBackupSettings: Types.BackupSettings;
     GetBackupStatus: Types.BackupStatus;
     ListBackupSnapshots: Types.BackupSnapshotList;
+    ListCoreRecoverySnapshots: Types.BackupSnapshotList;
     ListBackupSnapshotDirectory: Types.BackupSnapshotDirectory;
     ListSecrets: Types.ListSecretsResponse;
     ListGitProvidersFromConfig: Types.ListGitProvidersFromConfigResponse;

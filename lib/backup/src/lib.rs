@@ -1414,6 +1414,7 @@ mod tests {
         value: "correct horse battery staple".into(),
         configured: false,
       },
+      use_worker_credentials: None,
     }
   }
 
@@ -1468,6 +1469,7 @@ mod tests {
         value: "test-only-passphrase".into(),
         configured: false,
       },
+      use_worker_credentials: None,
     };
     let vykar = VykarRepository::new(
       &repository,
@@ -1611,6 +1613,7 @@ mod tests {
         value: "correct horse battery staple".into(),
         configured: false,
       },
+      use_worker_credentials: None,
     };
     tokio::task::spawn_blocking(move || {
       exercise_repository(repository)

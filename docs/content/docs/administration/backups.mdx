@@ -12,29 +12,30 @@ Keep the repository address, access credentials, and encryption passphrase somew
 
 ## Configure backups
 
-1. Open **Backups** and configure the **Primary** repository. **CoreLocal** uses `/backups/vykar` by default. Remote choices are S3, SFTP, and Vykar REST.
-2. Enter an encryption passphrase. For remote storage, enter Core credentials and distinct worker credentials that allow backup reads and writes but deny deletion and maintenance.
-3. Optionally add a **Mirror** on another host or storage service. Two directories on the same disk do not protect against disk loss.
-4. Choose the schedule, timezone, protected categories, and complete snapshots to keep. Keep **Stop affected containers while backing up** enabled unless your applications provide their own consistency guarantees.
+1. Open **Backups → Repositories** and configure the **Primary** repository. **CoreLocal** uses `/backups/vykar` by default. Remote choices are S3, SFTP, and Vykar REST.
+2. Enter an encryption passphrase and the Core credentials for remote storage. By default, trusted workers reuse the Core credentials.
+3. To limit what a compromised worker can do, enable **Use separate credentials for backup workers** and enter distinct credentials that allow backup reads and writes but deny deletion and maintenance.
+4. Optionally add a **Mirror** on another host or storage service. Two directories on the same disk do not protect against disk loss.
 5. Under **Trusted backup workers**, select each source or restore-destination Server. Independently verify its address and Periphery public key, then select **Trust worker with repository access**.
-6. Select **Save settings**. Restart Core after adding or changing a Core-local repository path.
-7. Select **Initialize repositories**, then **Back up fleet now**. Check **Fleet status** and confirm a complete snapshot appears.
+6. Select **Save settings**, then **Initialize repositories**. Restart Core after adding or changing a Core-local repository path.
+7. Open **Schedule** and choose the schedule, timezone, protected categories, and complete snapshots to keep. Keep **Stop affected containers while backing up** enabled unless your applications provide their own consistency guarantees, then save the settings.
+8. Open **Overview**, select **Back up fleet now**, and confirm a complete snapshot appears under **Primary snapshots**.
 
-Trusted workers receive the shared repository passphrase and can decrypt all snapshots, including Core recovery secrets and saved repository credentials. Enroll only hosts you trust with that access. Separate worker credentials limit routine operations; they do not isolate secrets from a compromised trusted worker.
+Trusted workers receive the shared repository passphrase and can decrypt all snapshots, including Core recovery secrets and saved repository credentials. Enroll only hosts you trust with that access. When separate worker credentials are disabled, workers also receive the Core credentials and may be able to delete or maintain the repository. Separate worker credentials reduce that risk; they do not isolate secrets from a compromised trusted worker.
 
 ## Choose storage
 
 | Backend | What to provide |
 | --- | --- |
 | CoreLocal | A persistent absolute path mounted into Core. Workers connect through Core's authenticated endpoint. |
-| S3 | Endpoint/bucket/prefix URL in the form `s3://endpoint/bucket/prefix`, region, and Core and worker access keys. A bare provider hostname is read as a local path. **S3 soft delete** is off by default. |
-| SFTP | Repository URL, complete private keys for Core and worker accounts, and the server's known-hosts entry. |
-| REST | Repository URL and separate Core and worker tokens. Use HTTPS. |
+| S3 | Endpoint/bucket/prefix URL in the form `s3://endpoint/bucket/prefix`, region, and a Core access key. A separate worker access key is optional. A bare provider hostname is read as a local path. **S3 soft delete** is off by default. |
+| SFTP | Repository URL, a complete Core private key, and the server's known-hosts entry. A separate worker key is optional. |
+| REST | Repository URL and a Core access token. A separate worker token is optional. Use HTTPS. |
 
 The `backups` volume stores local repositories, not another copy of your application data. Komodo excludes repositories, live database storage, temporary backup files, and recovery journals from workload backups. Core recovery secrets live in the shared data volume under `/data/core-secrets` and enter backups through the Core export.
 
 ## If setup fails
 
-Save changes before initializing or running a backup. If a worker is refused, check its enrollment and pinned public key. If a Core-local endpoint is unavailable, restart Core and verify the saved path is mounted persistently.
+Save changes before initializing, verifying, or promoting a repository. If a worker is refused, check its enrollment and pinned public key. If separate worker credentials are enabled, confirm that every required value is present and differs from the Core credentials. If a Core-local endpoint is unavailable, restart Core and verify the saved path is mounted persistently.
 
 Next: [run backups](/features/backups), [manage repositories](/administration/backup-repositories), or [recover Core](/administration/recover-core).
