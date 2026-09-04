@@ -5,6 +5,7 @@ import {
   fileManagerTargetKey,
   useFileOperations,
 } from "@/components/file-manager/operations";
+import FileManagerKeyboardShortcuts from "@/components/file-manager/keyboard-shortcuts";
 import {
   ActionIcon,
   Alert,
@@ -1688,6 +1689,8 @@ function TargetFileManager({ target, titleOther }: FileManagerProps) {
                 disabled={readOnly || !journal.data?.can_redo || busy}
                 onClick={() => void runHistoryOperation("redo")}
               />
+              <Divider orientation="vertical" />
+              <FileManagerKeyboardShortcuts />
             </Group>
           </Group>
 
