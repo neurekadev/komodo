@@ -122,6 +122,8 @@ export function LogSectionInner({
         ? "stdout"
         : _stream;
 
+  const filename = logFilename(target, stream);
+
   return (
     <Section
       actions={
@@ -204,9 +206,23 @@ export function LogSectionInner({
       }
       {...props}
     >
-      <LogViewer log={log?.[stream]} />
+      <LogViewer log={log?.[stream]} filename={filename} />
     </Section>
   );
+}
+
+function logFilename(target: LogTarget, stream: LogStream) {
+  const name =
+    target.type === "Container"
+      ? target.container
+      : target.type === "SwarmService"
+        ? target.service
+        : target.type === "Deployment"
+          ? target.deploymentId
+          : target.type === "Stack" && target.services.length === 1
+            ? target.services[0]
+            : target.stackId;
+  return `${name.replace(/[^a-zA-Z0-9-_]/g, "_")}-${stream}.log`;
 }
 
 function targetParams(target: LogTarget) {
