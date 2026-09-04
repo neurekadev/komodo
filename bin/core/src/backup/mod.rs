@@ -389,14 +389,11 @@ async fn save_settings_inner(
     .transpose()?
     .unwrap_or(true);
   if let Some(existing) = &existing {
-    if primary_initialized
-      && !allow_primary_location_change
-      && !primary_location_unchanged
-    {
-      return Err(anyhow!(
-        "Primary repository location cannot be changed after initialization; configure a mirror and use verified promotion"
-      ));
-    }
+    // An administrator may replace the primary repository directly instead of
+    // routing through mirror promotion. A changed location requires fresh
+    // authoritative credentials (see merge_repository_secrets below), clears
+    // verification health, and resets the initialized flag so the new
+    // repository must be initialized before backup.
     merge_repository_secrets(
       &mut proposed.primary,
       &existing.primary,
@@ -459,8 +456,15 @@ async fn save_settings_inner(
     id: SETTINGS_ID.into(),
     sealed: crypto::seal(&bytes)?,
     updated_at: proposed.updated_at,
-    primary_initialized: primary_initialized
-      || allow_primary_location_change,
+    primary_initialized: if allow_primary_location_change {
+      // Promotion swaps in the verified, already-initialized mirror.
+      true
+    } else if !primary_location_unchanged {
+      // A replaced primary is a new location that must be initialized again.
+      false
+    } else {
+      primary_initialized
+    },
     mirror_initialized: if allow_primary_location_change {
       proposed.mirror.is_some()
     } else if mirror_changed {
@@ -674,6 +678,7 @@ fn validate_repository_definition(
           "SFTP repository URL and known-hosts entry are required"
         ));
       }
+      validate_sftp_repository_url(url)?;
     }
     BackupRepositoryBackend::Rest {
       url,
@@ -683,6 +688,7 @@ fn validate_repository_definition(
       if url.trim().is_empty() {
         return Err(anyhow!("REST repository URL is required"));
       }
+      validate_rest_repository_url(url)?;
       if url.starts_with("http://") && !allow_insecure_http {
         return Err(anyhow!(
           "Plain HTTP REST repositories require explicit insecure-HTTP approval"
@@ -723,6 +729,45 @@ fn validate_s3_repository_url(url: &str) -> anyhow::Result<()> {
   if bucket.is_empty() {
     return Err(anyhow!(
       "S3 repository URL must include a bucket in the path (expected s3://endpoint/bucket[/prefix])"
+    ));
+  }
+  Ok(())
+}
+
+/// Vykar parses URLs without a recognized scheme as local filesystem paths.
+/// Require an `sftp://` URL with a host so a bare `user@host/path` address
+/// cannot silently become a repository directory inside Core.
+fn validate_sftp_repository_url(url: &str) -> anyhow::Result<()> {
+  let parsed = url::Url::parse(url.trim()).map_err(|_| {
+    anyhow!(
+      "SFTP repository URL must be sftp://[user@]host/path; Vykar treats anything else as a local filesystem path"
+    )
+  })?;
+  if parsed.scheme() != "sftp" {
+    return Err(anyhow!(
+      "SFTP repository URL must use the sftp:// scheme"
+    ));
+  }
+  if parsed.host_str().is_none() {
+    return Err(anyhow!(
+      "SFTP repository URL must include a host"
+    ));
+  }
+  Ok(())
+}
+
+/// Vykar parses URLs without a recognized scheme as local filesystem paths.
+/// Require an HTTP(S) URL so a bare hostname cannot silently become a local
+/// repository directory inside Core.
+fn validate_rest_repository_url(url: &str) -> anyhow::Result<()> {
+  let parsed = url::Url::parse(url.trim()).map_err(|_| {
+    anyhow!(
+      "REST repository URL must be http(s)://host/path; Vykar treats anything else as a local filesystem path"
+    )
+  })?;
+  if !matches!(parsed.scheme(), "http" | "https") {
+    return Err(anyhow!(
+      "REST repository URL must use the https:// (or http://) scheme"
     ));
   }
   Ok(())
@@ -8655,6 +8700,122 @@ mod tests {
         "rejected valid S3 URL {url:?}"
       );
     }
+  }
+
+  #[test]
+  fn sftp_and_rest_urls_require_their_schemes() {
+    let sftp = |url: &str| BackupRepository {
+      name: "SFTP".into(),
+      backend: BackupRepositoryBackend::Sftp {
+        url: url.into(),
+        private_key: Default::default(),
+        worker_private_key: Default::default(),
+        known_hosts: "host ssh-ed25519 AAAA".into(),
+        timeout_seconds: 30,
+      },
+      ..Default::default()
+    };
+    let rest = |url: &str| BackupRepository {
+      name: "REST".into(),
+      backend: BackupRepositoryBackend::Rest {
+        url: url.into(),
+        access_token: Default::default(),
+        worker_access_token: Default::default(),
+        allow_insecure_http: false,
+      },
+      ..Default::default()
+    };
+    // Bare hostnames must never silently become local paths.
+    for url in ["backup@nas.local/backups/vykar", "sftp://", ""] {
+      assert!(
+        validate_repository_definition(&sftp(url)).is_err(),
+        "accepted unsafe SFTP URL {url:?}"
+      );
+    }
+    for url in [
+      "sftp://backup@nas.local/backups/vykar",
+      "sftp://nas.local:2222/repo",
+    ] {
+      assert!(
+        validate_repository_definition(&sftp(url)).is_ok(),
+        "rejected valid SFTP URL {url:?}"
+      );
+    }
+    for url in ["backup.example.com/repo", "ftp://host/repo", ""] {
+      assert!(
+        validate_repository_definition(&rest(url)).is_err(),
+        "accepted unsafe REST URL {url:?}"
+      );
+    }
+    for url in [
+      "https://backup.example.com/repo",
+      "http://localhost:8080/repo",
+    ] {
+      assert!(
+        validate_repository_definition(&rest(url)).is_ok(),
+        "rejected valid REST URL {url:?}"
+      );
+    }
+  }
+
+  #[test]
+  fn bare_host_urls_are_not_the_same_location_as_scheme_urls() {
+    let s3 = |url: &str| BackupRepository {
+      backend: BackupRepositoryBackend::S3 {
+        url: url.into(),
+        region: "ca-vancouver-1".into(),
+        ..Default::default()
+      },
+      ..Default::default()
+    };
+    let sftp = |url: &str| BackupRepository {
+      backend: BackupRepositoryBackend::Sftp {
+        url: url.into(),
+        private_key: Default::default(),
+        worker_private_key: Default::default(),
+        known_hosts: "host ssh-ed25519 AAAA".into(),
+        timeout_seconds: 30,
+      },
+      ..Default::default()
+    };
+    let rest = |url: &str| BackupRepository {
+      backend: BackupRepositoryBackend::Rest {
+        url: url.into(),
+        access_token: Default::default(),
+        worker_access_token: Default::default(),
+        allow_insecure_http: false,
+      },
+      ..Default::default()
+    };
+    assert!(
+      !repositories_share_location(
+        &s3("s3.ca-vancouver-1.megas4.com"),
+        &s3("s3://s3.ca-vancouver-1.megas4.com/komodo-backups"),
+      )
+      .unwrap()
+    );
+    assert!(
+      !repositories_share_location(
+        &sftp("backup@nas.local/repo"),
+        &sftp("sftp://backup@nas.local/repo"),
+      )
+      .unwrap()
+    );
+    assert!(
+      !repositories_share_location(
+        &rest("backup.example.com/repo"),
+        &rest("https://backup.example.com/repo"),
+      )
+      .unwrap()
+    );
+    // Equivalent scheme URLs still share one location.
+    assert!(
+      repositories_share_location(
+        &s3("s3://s3.ca-vancouver-1.megas4.com/komodo-backups"),
+        &s3("s3://s3.ca-vancouver-1.megas4.com/komodo-backups/"),
+      )
+      .unwrap()
+    );
   }
 
   #[test]

@@ -12,7 +12,7 @@ Keep the repository address, access credentials, and encryption passphrase somew
 
 ## Configure backups
 
-1. Open **Backups → Repositories** and configure the **Primary** repository. **CoreLocal** uses `/backups/vykar` by default. Remote choices are S3, SFTP, and Vykar REST.
+1. Open **Backups → Repositories** and configure the **Primary** repository. **Local** uses `/backups/vykar` by default. Remote choices are S3, SFTP, and Vykar REST.
 2. Enter an encryption passphrase and the Core credentials for remote storage. By default, trusted workers reuse the Core credentials.
 3. To limit what a compromised worker can do, enable **Use separate credentials for backup workers** and enter distinct credentials that allow backup reads and writes but deny deletion and maintenance.
 4. Optionally add a **Mirror** on another host or storage service. Two directories on the same disk do not protect against disk loss.
@@ -27,7 +27,7 @@ Trusted workers receive the shared repository passphrase and can decrypt all sna
 
 | Backend | What to provide |
 | --- | --- |
-| CoreLocal | A persistent absolute path mounted into Core. Workers connect through Core's authenticated endpoint. |
+| Local | A persistent absolute path mounted into Core. Workers connect through Core's authenticated endpoint. |
 | S3 | Endpoint/bucket/prefix URL in the form `s3://endpoint/bucket/prefix`, region, and a Core access key. A separate worker access key is optional. A bare provider hostname is read as a local path. **S3 soft delete** is off by default. |
 | SFTP | Repository URL, a complete Core private key, and the server's known-hosts entry. A separate worker key is optional. |
 | REST | Repository URL and a Core access token. A separate worker token is optional. Use HTTPS. |
