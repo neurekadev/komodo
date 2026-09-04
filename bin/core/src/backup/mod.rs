@@ -749,9 +749,7 @@ fn validate_sftp_repository_url(url: &str) -> anyhow::Result<()> {
     ));
   }
   if parsed.host_str().is_none() {
-    return Err(anyhow!(
-      "SFTP repository URL must include a host"
-    ));
+    return Err(anyhow!("SFTP repository URL must include a host"));
   }
   Ok(())
 }
@@ -8725,7 +8723,9 @@ mod tests {
         url: url.into(),
         access_token: Default::default(),
         worker_access_token: Default::default(),
-        allow_insecure_http: false,
+        // This test only checks scheme validation; do not let the insecure-HTTP
+        // approval gate reject a valid `http://` REST URL.
+        allow_insecure_http: true,
       },
       ..Default::default()
     };
