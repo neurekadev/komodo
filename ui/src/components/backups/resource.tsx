@@ -102,8 +102,8 @@ export default function ResourceBackups({
 
   return (
     <Section
-      title={`${targetLabel(target)} backups`}
-      icon={<ICONS.Backup size="1.3rem" />}
+      title={titleOther ? undefined : `${targetLabel(target)} backups`}
+      icon={titleOther ? undefined : <ICONS.Backup size="1.3rem" />}
       titleOther={titleOther}
     >
       <Stack>
